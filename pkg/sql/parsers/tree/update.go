@@ -85,6 +85,9 @@ type UpdateExpr struct {
 }
 
 func (node *UpdateExpr) Format(ctx *FmtCtx) {
+	if node == nil {
+		return
+	}
 	prefix := ""
 	for _, n := range node.Names {
 		ctx.WriteString(prefix)
@@ -116,12 +119,15 @@ const (
 	LZW        = "lzw"
 	ZLIB       = "zlib"
 	LZ4        = "lz4"
+	TAR_GZ     = "tar.gz"
+	TAR_BZ2    = "tar.bz2"
 )
 
 // load data fotmat
 const (
 	CSV      = "csv"
 	JSONLINE = "jsonline"
+	PARQUET  = "parquet"
 )
 
 // if $format is jsonline
@@ -131,7 +137,9 @@ const (
 )
 
 const (
-	S3 = 1
+	INFILE = 0
+	S3     = 1
+	INLINE = 2
 )
 
 type ExternParam struct {
@@ -143,24 +151,27 @@ type ExternParam struct {
 
 type ExParamConst struct {
 	ScanType     int
+	FileSize     int64
+	FileStartOff int64
 	Filepath     string
 	CompressType string
 	Format       string
 	Option       []string
+	Data         string
 	Tail         *TailParameter
+	StageName    Identifier
 }
 
 type ExParam struct {
+	ExternType  int32
 	JsonData    string
 	FileService fileservice.FileService
 	NullMap     map[string]([]string)
 	S3Param     *S3Parameter
 	Ctx         context.Context
-	LoadFile    bool
 	Local       bool
-	QueryResult bool
-	SysTable    bool
 	Parallel    bool
+	Strict      bool
 }
 
 type S3Parameter struct {
@@ -175,6 +186,8 @@ type S3Parameter struct {
 }
 
 type TailParameter struct {
+	//Charset
+	Charset string
 	//Fields
 	Fields *Fields
 	//Lines
@@ -203,48 +216,35 @@ func (node *Load) Format(ctx *FmtCtx) {
 	if node.Local {
 		ctx.WriteString(" local")
 	}
-
-	if len(node.Param.Option) == 0 {
-		ctx.WriteString(" infile ")
-		ctx.WriteString(node.Param.Filepath)
+	if len(node.Param.StageName) != 0 {
+		ctx.WriteString(" url from stage ")
+		node.Param.StageName.Format(ctx)
 	} else {
-		if node.Param.ScanType == S3 {
-			ctx.WriteString(" url s3option ")
+		if node.Param.ScanType == INLINE {
+			ctx.WriteString(" inline format='")
+			ctx.WriteString(node.Param.Format)
+			ctx.WriteString("', data='")
+			ctx.WriteString(node.Param.Data)
+			if node.Param.JsonData == "" {
+				ctx.WriteString("'")
+			} else {
+				ctx.WriteString("', jsontype='")
+				ctx.WriteString(node.Param.JsonData)
+				ctx.WriteString("'")
+			}
 		} else {
-			ctx.WriteString(" infile ")
-
-		}
-		ctx.WriteString("{")
-		for i := 0; i < len(node.Param.Option); i += 2 {
-			switch strings.ToLower(node.Param.Option[i]) {
-			case "endpoint":
-				ctx.WriteString("'endpoint'='" + node.Param.Option[i+1] + "'")
-			case "region":
-				ctx.WriteString("'region'='" + node.Param.Option[i+1] + "'")
-			case "access_key_id":
-				ctx.WriteString("'access_key_id'='******'")
-			case "secret_access_key":
-				ctx.WriteString("'secret_access_key'='******'")
-			case "bucket":
-				ctx.WriteString("'bucket'='" + node.Param.Option[i+1] + "'")
-			case "filepath":
-				ctx.WriteString("'filepath'='" + node.Param.Option[i+1] + "'")
-			case "compression":
-				ctx.WriteString("'compression'='" + node.Param.Option[i+1] + "'")
-			case "format":
-				ctx.WriteString("'format'='" + node.Param.Option[i+1] + "'")
-			case "jsondata":
-				ctx.WriteString("'jsondata'='" + node.Param.Option[i+1] + "'")
-			case "role_arn":
-				ctx.WriteString("'role_arn'='" + node.Param.Option[i+1] + "'")
-			case "external_id":
-				ctx.WriteString("'external_id'='" + node.Param.Option[i+1] + "'")
-			}
-			if i != len(node.Param.Option)-2 {
-				ctx.WriteString(", ")
+			if len(node.Param.Option) == 0 {
+				ctx.WriteString(" infile ")
+				ctx.WriteString(node.Param.Filepath)
+			} else {
+				if node.Param.ScanType == S3 {
+					ctx.WriteString(" url s3option ")
+				} else {
+					ctx.WriteString(" infile ")
+				}
+				formatS3option(ctx, node.Param.Option)
 			}
 		}
-		ctx.WriteString("}")
 	}
 
 	switch node.DuplicateHandling.(type) {
@@ -262,6 +262,12 @@ func (node *Load) Format(ctx *FmtCtx) {
 		ctx.WriteString(" accounts(")
 		node.Accounts.Format(ctx)
 		ctx.WriteByte(')')
+	}
+
+	if len(node.Param.Tail.Charset) != 0 {
+		ctx.WriteByte(' ')
+		ctx.WriteString("character set ")
+		ctx.WriteString(node.Param.Tail.Charset)
 	}
 
 	if node.Param.Tail.Fields != nil {
@@ -292,6 +298,46 @@ func (node *Load) Format(ctx *FmtCtx) {
 		ctx.WriteString(" set ")
 		node.Param.Tail.Assignments.Format(ctx)
 	}
+	if node.Param.Parallel {
+		ctx.WriteString(" parallel true ")
+		if node.Param.Strict {
+			ctx.WriteString("strict true ")
+		}
+	}
+}
+
+func formatS3option(ctx *FmtCtx, option []string) {
+	ctx.WriteString("{")
+	for i := 0; i < len(option); i += 2 {
+		switch strings.ToLower(option[i]) {
+		case "endpoint":
+			ctx.WriteString("'endpoint'='" + option[i+1] + "'")
+		case "region":
+			ctx.WriteString("'region'='" + option[i+1] + "'")
+		case "access_key_id":
+			ctx.WriteString("'access_key_id'='******'")
+		case "secret_access_key":
+			ctx.WriteString("'secret_access_key'='******'")
+		case "bucket":
+			ctx.WriteString("'bucket'='" + option[i+1] + "'")
+		case "filepath":
+			ctx.WriteString("'filepath'='" + option[i+1] + "'")
+		case "compression":
+			ctx.WriteString("'compression'='" + option[i+1] + "'")
+		case "format":
+			ctx.WriteString("'format'='" + option[i+1] + "'")
+		case "jsondata":
+			ctx.WriteString("'jsondata'='" + option[i+1] + "'")
+		case "role_arn":
+			ctx.WriteString("'role_arn'='" + option[i+1] + "'")
+		case "external_id":
+			ctx.WriteString("'external_id'='" + option[i+1] + "'")
+		}
+		if i != len(option)-2 {
+			ctx.WriteString(", ")
+		}
+	}
+	ctx.WriteString("}")
 }
 
 func (node *Load) GetStatementType() string { return "Load" }
@@ -327,49 +373,79 @@ func NewDuplicateKeyIgnore() *DuplicateKeyIgnore {
 	return &DuplicateKeyIgnore{}
 }
 
+type EscapedBy struct {
+	Value byte
+}
+
+type EnclosedBy struct {
+	Value byte
+}
+
+type Terminated struct {
+	Value string
+}
+
 type Fields struct {
-	Terminated string
+	Terminated *Terminated
 	Optionally bool
-	EnclosedBy byte
-	EscapedBy  byte
+	EnclosedBy *EnclosedBy
+	EscapedBy  *EscapedBy
 }
 
 func (node *Fields) Format(ctx *FmtCtx) {
 	ctx.WriteString("fields")
 	prefix := ""
-	if node.Terminated != "" {
+	if node.Terminated != nil {
 		ctx.WriteString(" terminated by ")
-		ctx.WriteStringQuote(node.Terminated)
+		if node.Terminated.Value == "" {
+			ctx.WriteString("''")
+		} else {
+			ctx.WriteStringQuote(node.Terminated.Value)
+		}
 		prefix = " "
 	}
 	if node.Optionally {
 		ctx.WriteString(prefix)
 		ctx.WriteString("optionally enclosed by ")
-		ctx.WriteStringQuote(string(node.EnclosedBy))
-	} else if node.EnclosedBy != 0 {
+		if node.EnclosedBy.Value == 0 {
+			ctx.WriteString("''")
+		} else {
+			ctx.WriteStringQuote(string(node.EnclosedBy.Value))
+		}
+	} else if node.EnclosedBy != nil && node.EnclosedBy.Value != 0 {
 		ctx.WriteString(prefix)
 		ctx.WriteString("enclosed by ")
-		ctx.WriteStringQuote(string(node.EnclosedBy))
+		ctx.WriteStringQuote(string(node.EnclosedBy.Value))
 	}
-	if node.EscapedBy != 0 {
+	if node.EscapedBy != nil {
 		ctx.WriteString(prefix)
 		ctx.WriteString("escaped by ")
-		ctx.WriteStringQuote(string(node.EscapedBy))
+		if node.EscapedBy.Value == 0 {
+			ctx.WriteString("''")
+		} else {
+			ctx.WriteStringQuote(string(node.EscapedBy.Value))
+		}
 	}
 }
 
 func NewFields(t string, o bool, en byte, es byte) *Fields {
 	return &Fields{
-		Terminated: t,
+		Terminated: &Terminated{
+			Value: t,
+		},
 		Optionally: o,
-		EnclosedBy: en,
-		EscapedBy:  es,
+		EnclosedBy: &EnclosedBy{
+			Value: en,
+		},
+		EscapedBy: &EscapedBy{
+			Value: es,
+		},
 	}
 }
 
 type Lines struct {
 	StartingBy   string
-	TerminatedBy string
+	TerminatedBy *Terminated
 }
 
 func (node *Lines) Format(ctx *FmtCtx) {
@@ -378,16 +454,22 @@ func (node *Lines) Format(ctx *FmtCtx) {
 		ctx.WriteString(" starting by ")
 		ctx.WriteStringQuote(node.StartingBy)
 	}
-	if node.TerminatedBy != "" {
+	if node.TerminatedBy != nil {
 		ctx.WriteString(" terminated by ")
-		ctx.WriteStringQuote(node.TerminatedBy)
+		if node.TerminatedBy.Value == "" {
+			ctx.WriteString("''")
+		} else {
+			ctx.WriteStringQuote(node.TerminatedBy.Value)
+		}
 	}
 }
 
 func NewLines(s string, t string) *Lines {
 	return &Lines{
-		StartingBy:   s,
-		TerminatedBy: t,
+		StartingBy: s,
+		TerminatedBy: &Terminated{
+			Value: t,
+		},
 	}
 }
 
@@ -412,6 +494,8 @@ type ExportParam struct {
 	// header flag
 	Header     bool
 	ForceQuote []string
+	// stage filename path
+	StageFilePath string
 }
 
 func (ep *ExportParam) Format(ctx *FmtCtx) {

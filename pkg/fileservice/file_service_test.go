@@ -19,7 +19,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/csv"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -35,11 +34,15 @@ import (
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 	"github.com/stretchr/testify/assert"
 )
 
 func testFileService(
 	t *testing.T,
+	policy Policy,
 	newFS func(name string) FileService,
 ) {
 
@@ -48,10 +51,11 @@ func testFileService(
 	t.Run("basic", func(t *testing.T) {
 		ctx := context.Background()
 		fs := newFS(fsName)
+		defer fs.Close(ctx)
 
 		assert.True(t, strings.Contains(fs.Name(), fsName))
 
-		entries, err := fs.List(ctx, "")
+		entries, err := SortedList(fs.List(ctx, ""))
 		assert.Nil(t, err)
 		assert.Equal(t, 0, len(entries))
 
@@ -74,10 +78,11 @@ func testFileService(
 					ReaderForWrite: bytes.NewReader([]byte("9ab")),
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 
-		entries, err = fs.List(ctx, "")
+		entries, err = SortedList(fs.List(ctx, ""))
 		assert.Nil(t, err)
 		assert.Equal(t, 1, len(entries))
 
@@ -119,6 +124,7 @@ func testFileService(
 					Size:   -1,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, &vec)
 		assert.Nil(t, err)
@@ -133,6 +139,7 @@ func testFileService(
 		assert.Equal(t, []byte("1234567"), content)
 		assert.Equal(t, []byte("56"), buf1.Bytes())
 		assert.Equal(t, []byte("123456789ab"), vec.Entries[6].Data)
+		vec.Release()
 
 		// stat
 		entry, err := fs.StatFile(ctx, "foo")
@@ -150,10 +157,12 @@ func testFileService(
 					Size:   1,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, &vec)
 		assert.Nil(t, err)
 		assert.Equal(t, []byte("8"), vec.Entries[0].Data)
+		vec.Release()
 
 		// sub path
 		err = fs.Write(ctx, IOVector{
@@ -165,6 +174,7 @@ func testFileService(
 					Data:   []byte("1"),
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 
@@ -173,6 +183,7 @@ func testFileService(
 	t.Run("WriterForRead", func(t *testing.T) {
 		fs := newFS(fsName)
 		ctx := context.Background()
+		defer fs.Close(ctx)
 
 		err := fs.Write(ctx, IOVector{
 			FilePath: "foo",
@@ -183,6 +194,7 @@ func testFileService(
 					Data:   []byte("1234"),
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 
@@ -196,6 +208,7 @@ func testFileService(
 					WriterForRead: buf,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, vec)
 		assert.Nil(t, err)
@@ -211,6 +224,7 @@ func testFileService(
 					WriterForRead: buf,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, vec)
 		assert.Nil(t, err)
@@ -219,8 +233,10 @@ func testFileService(
 	})
 
 	t.Run("ReadCloserForRead", func(t *testing.T) {
-		fs := newFS(fsName)
 		ctx := context.Background()
+		fs := newFS(fsName)
+		defer fs.Close(ctx)
+
 		err := fs.Write(ctx, IOVector{
 			FilePath: "foo",
 			Entries: []IOEntry{
@@ -230,10 +246,12 @@ func testFileService(
 					Data:   []byte("1234"),
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 
 		var r io.ReadCloser
+
 		vec := &IOVector{
 			FilePath: "foo",
 			Entries: []IOEntry{
@@ -243,6 +261,7 @@ func testFileService(
 					ReadCloserForRead: &r,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, vec)
 		assert.Nil(t, err)
@@ -256,11 +275,31 @@ func testFileService(
 			FilePath: "foo",
 			Entries: []IOEntry{
 				{
+					Offset:            0,
+					Size:              3,
+					ReadCloserForRead: &r,
+				},
+			},
+			Policy: policy,
+		}
+		err = fs.Read(ctx, vec)
+		assert.Nil(t, err)
+		data, err = io.ReadAll(r)
+		assert.Nil(t, err)
+		assert.Equal(t, []byte("123"), data)
+		err = r.Close()
+		assert.Nil(t, err)
+
+		vec = &IOVector{
+			FilePath: "foo",
+			Entries: []IOEntry{
+				{
 					Offset:            1,
 					Size:              3,
 					ReadCloserForRead: &r,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, vec)
 		assert.Nil(t, err)
@@ -275,6 +314,7 @@ func testFileService(
 	t.Run("random", func(t *testing.T) {
 		fs := newFS(fsName)
 		ctx := context.Background()
+		defer fs.Close(ctx)
 
 		for i := 0; i < 8; i++ {
 			filePath := fmt.Sprintf("%d", mrand.Int63())
@@ -283,11 +323,12 @@ func testFileService(
 			content := make([]byte, _BlockContentSize*4)
 			_, err := rand.Read(content)
 			assert.Nil(t, err)
-			parts := randomSplit(content, 32)
+			parts := randomCut(content, 16)
 
 			// write
 			writeVector := IOVector{
 				FilePath: filePath,
+				Policy:   policy,
 			}
 			offset := int64(0)
 			for _, part := range parts {
@@ -304,6 +345,7 @@ func testFileService(
 			// read, align to write vector
 			readVector := &IOVector{
 				FilePath: filePath,
+				Policy:   policy,
 			}
 			for _, entry := range writeVector.Entries {
 				readVector.Entries = append(readVector.Entries, IOEntry{
@@ -316,9 +358,10 @@ func testFileService(
 			for i, entry := range readVector.Entries {
 				assert.Equal(t, parts[i], entry.Data, "part %d, got %+v", i, entry)
 			}
+			readVector.Release()
 
 			// read, random entry
-			parts = randomSplit(content, 16)
+			parts = randomCut(content, 16)
 			readVector.Entries = readVector.Entries[:0]
 			offset = int64(0)
 			for _, part := range parts {
@@ -331,11 +374,12 @@ func testFileService(
 			err = fs.Read(ctx, readVector)
 			assert.Nil(t, err)
 			for i, entry := range readVector.Entries {
-				assert.Equal(t, parts[i], entry.Data, "path: %s, entry: %+v, content %v", filePath, entry, content)
+				assert.Equal(t, parts[i], entry.Data, "path: %s, entry: %+v", filePath, entry)
 			}
+			readVector.Release()
 
 			// read, random entry with ReadCloserForRead
-			parts = randomSplit(content, len(content)/10)
+			parts = randomCut(content, 16)
 			readVector.Entries = readVector.Entries[:0]
 			offset = int64(0)
 			readers := make([]io.ReadCloser, len(parts))
@@ -354,8 +398,6 @@ func testFileService(
 			numDone := int64(0)
 			for i, entry := range readVector.Entries {
 				wg.Add(1)
-				i := i
-				entry := entry
 				go func() {
 					defer wg.Done()
 					reader := readers[i]
@@ -364,7 +406,7 @@ func testFileService(
 					reader.Close()
 					if !bytes.Equal(parts[i], data) {
 						select {
-						case errCh <- moerr.NewInternalError(context.Background(),
+						case errCh <- moerr.NewInternalErrorf(context.Background(),
 							"not equal: path: %s, entry: %+v, content %v",
 							filePath, entry, content,
 						):
@@ -385,7 +427,7 @@ func testFileService(
 			}
 
 			// list
-			entries, err := fs.List(ctx, "/")
+			entries, err := SortedList(fs.List(ctx, "/"))
 			assert.Nil(t, err)
 			for _, entry := range entries {
 				if entry.Name != filePath {
@@ -402,6 +444,7 @@ func testFileService(
 	t.Run("tree", func(t *testing.T) {
 		fs := newFS(fsName)
 		ctx := context.Background()
+		defer fs.Close(ctx)
 
 		for _, dir := range []string{
 			"",
@@ -418,12 +461,13 @@ func testFileService(
 							Data: []byte(strings.Repeat(fmt.Sprintf("%d", i), int(i))),
 						},
 					},
+					Policy: policy,
 				})
 				assert.Nil(t, err)
 			}
 		}
 
-		entries, err := fs.List(ctx, "")
+		entries, err := SortedList(fs.List(ctx, ""))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 11)
 		sort.Slice(entries, func(i, j int) bool {
@@ -451,11 +495,11 @@ func testFileService(
 			assert.Equal(t, entries[10].Size, int64(7))
 		}
 
-		entries, err = fs.List(ctx, "abc")
+		entries, err = SortedList(fs.List(ctx, "abc"))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 0)
 
-		entries, err = fs.List(ctx, "foo")
+		entries, err = SortedList(fs.List(ctx, "foo"))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 8)
 		assert.Equal(t, entries[0].IsDir, false)
@@ -463,7 +507,7 @@ func testFileService(
 		assert.Equal(t, entries[7].IsDir, false)
 		assert.Equal(t, entries[7].Name, "7")
 
-		entries, err = fs.List(ctx, "qux/quux")
+		entries, err = SortedList(fs.List(ctx, "qux/quux"))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 8)
 		assert.Equal(t, entries[0].IsDir, false)
@@ -472,7 +516,7 @@ func testFileService(
 		assert.Equal(t, entries[7].Name, "7")
 
 		// with / suffix
-		entries, err = fs.List(ctx, "qux/quux/")
+		entries, err = SortedList(fs.List(ctx, "qux/quux/"))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 8)
 		assert.Equal(t, entries[0].IsDir, false)
@@ -481,7 +525,7 @@ func testFileService(
 		assert.Equal(t, entries[7].Name, "7")
 
 		// with / prefix
-		entries, err = fs.List(ctx, "/qux/quux/")
+		entries, err = SortedList(fs.List(ctx, "/qux/quux/"))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 8)
 		assert.Equal(t, entries[0].IsDir, false)
@@ -490,7 +534,7 @@ func testFileService(
 		assert.Equal(t, entries[7].Name, "7")
 
 		// with fs name
-		entries, err = fs.List(ctx, JoinPath(fs.Name(), "qux/quux/"))
+		entries, err = SortedList(fs.List(ctx, JoinPath(fs.Name(), "qux/quux/")))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 8)
 		assert.Equal(t, entries[0].IsDir, false)
@@ -499,7 +543,7 @@ func testFileService(
 		assert.Equal(t, entries[7].Name, "7")
 
 		// with fs name and / prefix and suffix
-		entries, err = fs.List(ctx, JoinPath(fs.Name(), "/qux/quux/"))
+		entries, err = SortedList(fs.List(ctx, JoinPath(fs.Name(), "/qux/quux/")))
 		assert.Nil(t, err)
 		assert.Equal(t, len(entries), 8)
 		assert.Equal(t, entries[0].IsDir, false)
@@ -510,8 +554,11 @@ func testFileService(
 		for _, entry := range entries {
 			err := fs.Delete(ctx, path.Join("qux/quux", entry.Name))
 			assert.Nil(t, err)
+			// delete again
+			err = fs.Delete(ctx, path.Join("qux/quux", entry.Name))
+			assert.Nil(t, err)
 		}
-		entries, err = fs.List(ctx, "qux/quux")
+		entries, err = SortedList(fs.List(ctx, "qux/quux"))
 		assert.Nil(t, err)
 		assert.Equal(t, 0, len(entries))
 
@@ -520,9 +567,11 @@ func testFileService(
 	t.Run("errors", func(t *testing.T) {
 		fs := newFS(fsName)
 		ctx := context.Background()
+		defer fs.Close(ctx)
 
 		err := fs.Read(ctx, &IOVector{
 			FilePath: "foo",
+			Policy:   policy,
 		})
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrEmptyVector))
 
@@ -533,6 +582,7 @@ func testFileService(
 					Size: -1,
 				},
 			},
+			Policy: policy,
 		})
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrFileNotFound))
 
@@ -544,10 +594,12 @@ func testFileService(
 					Data: []byte("ab"),
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 		err = fs.Write(ctx, IOVector{
 			FilePath: "foo",
+			Policy:   policy,
 		})
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrFileAlreadyExists))
 
@@ -559,6 +611,7 @@ func testFileService(
 					Size:   3,
 				},
 			},
+			Policy: policy,
 		})
 		assert.True(t, moerr.IsMoErrCode(moerr.ConvertGoError(ctx, err), moerr.ErrUnexpectedEOF))
 
@@ -570,6 +623,7 @@ func testFileService(
 					Size:   0,
 				},
 			},
+			Policy: policy,
 		})
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrEmptyRange))
 
@@ -580,6 +634,7 @@ func testFileService(
 					Size: 1,
 				},
 			},
+			Policy: policy,
 		})
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrSizeNotMatch))
 
@@ -590,6 +645,7 @@ func testFileService(
 					ReaderForWrite: iotest.ErrReader(io.ErrNoProgress),
 				},
 			},
+			Policy: policy,
 		})
 		// fs leaking io error, but I don't know what this test really tests.
 		// assert.True(t, err == io.ErrNoProgress)
@@ -601,27 +657,32 @@ func testFileService(
 			Entries: []IOEntry{
 				{Size: 1, Data: []byte("a")},
 			},
+			Policy: policy,
 		}
 		err = fs.Write(ctx, vector)
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidPath))
 		err = fs.Read(ctx, &vector)
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidPath))
-		_, err = fs.List(ctx, vector.FilePath)
+		_, err = SortedList(fs.List(ctx, vector.FilePath))
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidPath))
 		err = fs.Delete(ctx, vector.FilePath)
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrInvalidPath))
 	})
 
-	t.Run("object", func(t *testing.T) {
-		fs := newFS(fsName)
+	t.Run("cache data", func(t *testing.T) {
 		ctx := context.Background()
+		fs := newFS(fsName)
+		defer fs.Close(ctx)
+		var counterSet perfcounter.CounterSet
+		ctx = perfcounter.WithCounterSet(ctx, &counterSet)
 
-		buf := new(bytes.Buffer)
-		err := gob.NewEncoder(buf).Encode(map[int]int{
-			42: 42,
-		})
+		m := api.Int64Map{
+			M: map[int64]int64{
+				42: 42,
+			},
+		}
+		data, err := m.Marshal()
 		assert.Nil(t, err)
-		data := buf.Bytes()
 		err = fs.Write(ctx, IOVector{
 			FilePath: "foo",
 			Entries: []IOEntry{
@@ -630,43 +691,65 @@ func testFileService(
 					Data: data,
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 
+		// read with ToCacheData
 		vec := &IOVector{
 			FilePath: "foo",
 			Entries: []IOEntry{
 				{
 					Size: int64(len(data)),
-					ToObject: func(r io.Reader, data []byte) (any, int64, error) {
+					ToCacheData: func(ctx context.Context, r io.Reader, data []byte, allocator CacheDataAllocator) (fscache.Data, error) {
 						bs, err := io.ReadAll(r)
 						assert.Nil(t, err)
 						if len(data) > 0 {
 							assert.Equal(t, bs, data)
 						}
-						var m map[int]int
-						if err := gob.NewDecoder(bytes.NewReader(bs)).Decode(&m); err != nil {
-							return nil, 0, err
-						}
-						return m, 1, nil
+						cacheData := allocator.CopyToCacheData(ctx, bs)
+						return cacheData, nil
 					},
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, vec)
 		assert.Nil(t, err)
 
-		m, ok := vec.Entries[0].Object.(map[int]int)
-		assert.True(t, ok)
-		assert.Equal(t, 1, len(m))
-		assert.Equal(t, 42, m[42])
-		assert.Equal(t, int64(1), vec.Entries[0].ObjectSize)
+		cachedData := vec.Entries[0].CachedData
+		assert.NotNil(t, cachedData)
+		assert.Equal(t, data, cachedData.Bytes())
 
+		err = m.Unmarshal(vec.Entries[0].CachedData.Bytes())
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(m.M))
+		assert.Equal(t, int64(42), m.M[42])
+
+		vec.Release()
+
+		// ReadCache
+		vec = &IOVector{
+			FilePath: "foo",
+			Entries: []IOEntry{
+				{
+					Size: int64(len(data)),
+				},
+			},
+			Policy: policy,
+		}
+		err = fs.ReadCache(ctx, vec)
+		assert.Nil(t, err)
+		if vec.Entries[0].CachedData != nil {
+			assert.Equal(t, data, vec.Entries[0].CachedData.Bytes())
+		}
+		vec.Release()
 	})
 
 	t.Run("ignore", func(t *testing.T) {
-		fs := newFS(fsName)
 		ctx := context.Background()
+		fs := newFS(fsName)
+		defer fs.Close(ctx)
 
 		data := []byte("foo")
 		err := fs.Write(ctx, IOVector{
@@ -677,6 +760,7 @@ func testFileService(
 					Data: data,
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 
@@ -691,18 +775,19 @@ func testFileService(
 					Size: int64(len(data)),
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, vec)
 		assert.Nil(t, err)
-
 		assert.Nil(t, vec.Entries[0].Data)
 		assert.Equal(t, []byte("foo"), vec.Entries[1].Data)
-
+		vec.Release()
 	})
 
 	t.Run("named path", func(t *testing.T) {
 		ctx := context.Background()
 		fs := newFS(fsName)
+		defer fs.Close(ctx)
 
 		// write
 		err := fs.Write(ctx, IOVector{
@@ -713,6 +798,7 @@ func testFileService(
 					Data: []byte("1234"),
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
 
@@ -724,6 +810,7 @@ func testFileService(
 					Size: -1,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, &vec)
 		assert.Nil(t, err)
@@ -737,6 +824,7 @@ func testFileService(
 					Size: -1,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, &vec)
 		assert.Nil(t, err)
@@ -750,6 +838,7 @@ func testFileService(
 					Size: -1,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, &vec)
 		assert.Nil(t, err)
@@ -768,6 +857,8 @@ func testFileService(
 	t.Run("issue6110", func(t *testing.T) {
 		ctx := context.Background()
 		fs := newFS(fsName)
+		defer fs.Close(ctx)
+
 		err := fs.Write(ctx, IOVector{
 			FilePath: "path/to/file/foo",
 			Entries: []IOEntry{
@@ -777,9 +868,10 @@ func testFileService(
 					Data:   []byte("1234"),
 				},
 			},
+			Policy: policy,
 		})
 		assert.Nil(t, err)
-		entries, err := fs.List(ctx, JoinPath(fs.Name(), "/path"))
+		entries, err := SortedList(fs.List(ctx, JoinPath(fs.Name(), "/path")))
 		assert.Nil(t, err)
 		assert.Equal(t, 1, len(entries))
 		assert.Equal(t, "to", entries[0].Name)
@@ -788,6 +880,7 @@ func testFileService(
 	t.Run("streaming write", func(t *testing.T) {
 		ctx := context.Background()
 		fs := newFS(fsName)
+		defer fs.Close(ctx)
 
 		reader, writer := io.Pipe()
 		n := 65536
@@ -820,6 +913,7 @@ func testFileService(
 					Size:           -1, // must set to -1
 				},
 			},
+			Policy: policy,
 		}
 
 		// write
@@ -834,6 +928,7 @@ func testFileService(
 					Size: -1,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Read(ctx, &vec)
 		assert.Nil(t, err)
@@ -859,6 +954,7 @@ func testFileService(
 					Size:           -1,
 				},
 			},
+			Policy: policy,
 		}
 		err = fs.Write(ctx, vec)
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrFileAlreadyExists))
@@ -875,6 +971,7 @@ func testFileService(
 					Size:           -1,
 				},
 			},
+			Policy: policy,
 		}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
@@ -893,17 +990,22 @@ func testFileService(
 	})
 
 	t.Run("context cancel", func(t *testing.T) {
-		fs := newFS(fsName)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
+		fs := newFS(fsName)
+		defer fs.Close(ctx)
 
-		err := fs.Write(ctx, IOVector{})
+		err := fs.Write(ctx, IOVector{
+			Policy: policy,
+		})
 		assert.ErrorIs(t, err, context.Canceled)
 
-		err = fs.Read(ctx, &IOVector{})
+		err = fs.Read(ctx, &IOVector{
+			Policy: policy,
+		})
 		assert.ErrorIs(t, err, context.Canceled)
 
-		_, err = fs.List(ctx, "")
+		_, err = SortedList(fs.List(ctx, ""))
 		assert.ErrorIs(t, err, context.Canceled)
 
 		err = fs.Delete(ctx, "")
@@ -912,19 +1014,25 @@ func testFileService(
 
 }
 
-func randomSplit(data []byte, maxLen int) (ret [][]byte) {
-	for {
-		if len(data) == 0 {
-			return
+func randomCut(data []byte, parts int) [][]byte {
+	positions := mrand.Perm(len(data))[:parts-1]
+	sort.Ints(positions)
+	slices := make([][]byte, 0, parts)
+	slices = append(slices, data[:positions[0]])
+	for i, pos := range positions {
+		if i == len(positions)-1 {
+			break
 		}
-		if len(data) < maxLen {
-			ret = append(ret, data)
-			return
-		}
-		cut := 1 + mrand.Intn(maxLen)
-		ret = append(ret, data[:cut])
-		data = data[cut:]
+		slices = append(slices, data[pos:positions[i+1]])
 	}
+	slices = append(slices, data[positions[len(positions)-1]:])
+	ret := slices[:0]
+	for _, slice := range slices {
+		if len(slice) > 0 {
+			ret = append(ret, slice)
+		}
+	}
+	return ret
 }
 
 func fixedSplit(data []byte, l int) (ret [][]byte) {

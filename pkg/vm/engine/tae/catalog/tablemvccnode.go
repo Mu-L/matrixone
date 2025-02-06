@@ -15,146 +15,83 @@
 package catalog
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
-
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
+	"sync/atomic"
 )
 
 type TableMVCCNode struct {
-	*EntryMVCCNode
-	*txnbase.TxnMVCCNode
-	SchemaConstraints string // store as immutable, bytes actually
+	// history schema
+	Schema          *Schema
+	TombstoneSchema *Schema
 }
 
-func NewEmptyTableMVCCNode() txnif.MVCCNode {
+func NewEmptyTableMVCCNode() *TableMVCCNode {
+	return &TableMVCCNode{}
+}
+
+func (e *TableMVCCNode) CloneAll() *TableMVCCNode {
+	schema := e.Schema.Clone()
 	return &TableMVCCNode{
-		EntryMVCCNode: &EntryMVCCNode{},
-		TxnMVCCNode:   &txnbase.TxnMVCCNode{},
+		Schema:          schema,
+		TombstoneSchema: GetTombstoneSchema(schema),
 	}
 }
 
-func CompareTableBaseNode(e, o txnif.MVCCNode) int {
-	return e.(*TableMVCCNode).Compare(o.(*TableMVCCNode).TxnMVCCNode)
+func (e *TableMVCCNode) CloneData() *TableMVCCNode {
+	return e.CloneAll()
 }
-
-func (e *TableMVCCNode) CloneAll() txnif.MVCCNode {
-	node := &TableMVCCNode{}
-	node.EntryMVCCNode = e.EntryMVCCNode.Clone()
-	node.TxnMVCCNode = e.TxnMVCCNode.CloneAll()
-	node.SchemaConstraints = e.SchemaConstraints
-	return node
-}
-
-func (e *TableMVCCNode) CloneData() txnif.MVCCNode {
-	return &TableMVCCNode{
-		EntryMVCCNode:     e.EntryMVCCNode.CloneData(),
-		TxnMVCCNode:       &txnbase.TxnMVCCNode{},
-		SchemaConstraints: e.SchemaConstraints,
+func (e *TableMVCCNode) GetTombstoneSchema() *Schema {
+	if e.TombstoneSchema == nil {
+		panic(fmt.Sprintf("logic error, table %v, has pk %v", e.Schema.Name, e.Schema.HasPKOrFakePK()))
 	}
+	return e.TombstoneSchema
 }
 
 func (e *TableMVCCNode) String() string {
-
-	return fmt.Sprintf("%s%scstr[%d]",
-		e.TxnMVCCNode.String(),
-		e.EntryMVCCNode.String(),
-		len(e.SchemaConstraints))
+	return fmt.Sprintf("schema.v%d.s%d.c%d", e.Schema.Version, e.Schema.Extra.NextColSeqnum, len(e.Schema.ColDefs))
 }
 
 // for create drop in one txn
-func (e *TableMVCCNode) Update(vun txnif.MVCCNode) {
-	un := vun.(*TableMVCCNode)
-	e.CreatedAt = un.CreatedAt
-	e.DeletedAt = un.DeletedAt
-	e.SchemaConstraints = un.SchemaConstraints
-}
-
-func (e *TableMVCCNode) ApplyCommit(index *wal.Index) (err error) {
-	var commitTS types.TS
-	commitTS, err = e.TxnMVCCNode.ApplyCommit(index)
-	if err != nil {
-		return
-	}
-	err = e.EntryMVCCNode.ApplyCommit(commitTS)
-	return err
-}
-func (e *TableMVCCNode) ApplyRollback(index *wal.Index) (err error) {
-	var commitTS types.TS
-	commitTS, err = e.TxnMVCCNode.ApplyRollback(index)
-	if err != nil {
-		return
-	}
-	err = e.EntryMVCCNode.ApplyCommit(commitTS)
-	return err
-}
-func (e *TableMVCCNode) PrepareCommit() (err error) {
-	_, err = e.TxnMVCCNode.PrepareCommit()
-	if err != nil {
-		return
-	}
-	err = e.EntryMVCCNode.PrepareCommit()
-	return
+func (e *TableMVCCNode) Update(un *TableMVCCNode) {
+	e.Schema = un.Schema
+	e.TombstoneSchema = GetTombstoneSchema(un.Schema)
 }
 
 func (e *TableMVCCNode) WriteTo(w io.Writer) (n int64, err error) {
-	var sn int64
-	sn, err = e.EntryMVCCNode.WriteTo(w)
-	if err != nil {
+	var schemaBuf []byte
+	if schemaBuf, err = e.Schema.Marshal(); err != nil {
 		return
 	}
-	n += sn
-	sn, err = e.TxnMVCCNode.WriteTo(w)
-	if err != nil {
+	if _, err = w.Write(schemaBuf); err != nil {
 		return
 	}
-	n += sn
-	condata := []byte(e.SchemaConstraints)
-	l := uint32(len(condata))
-	if err = binary.Write(w, binary.BigEndian, l); err != nil {
-		return
-	}
-	n += 4
-	var n1 int
-	if n1, err = w.Write(condata); err != nil {
-		return
-	}
-	n += int64(n1)
+	n += int64(len(schemaBuf))
 	return
 }
 
-func (e *TableMVCCNode) ReadFrom(r io.Reader) (n int64, err error) {
-	var sn int64
-	sn, err = e.EntryMVCCNode.ReadFrom(r)
-	if err != nil {
+func (e *TableMVCCNode) ReadFromWithVersion(r io.Reader, ver uint16) (n int64, err error) {
+	e.Schema = NewEmptySchema("")
+	if n, err = e.Schema.ReadFromWithVersion(r, ver); err != nil {
 		return
 	}
-	n += sn
-	sn, err = e.TxnMVCCNode.ReadFrom(r)
-	if err != nil {
-		return
-	}
-	n += sn
+	e.TombstoneSchema = GetTombstoneSchema(e.Schema)
+	return
+}
 
-	length := uint32(0)
-	if err = binary.Read(r, binary.BigEndian, &length); err != nil {
-		return
-	}
-	n += 4
-	buf := make([]byte, length)
-	var n2 int
-	n2, err = r.Read(buf)
-	if err != nil {
-		return
-	}
-	if n2 != int(length) {
-		panic(moerr.NewInternalErrorNoCtx("logic err %d!=%d, %v", n2, length, err))
-	}
-	e.SchemaConstraints = string(buf)
+type TableNode struct {
+	// The latest schema. A shortcut to the schema in the last mvvcnode.
+	tombstoneSchema, schema atomic.Pointer[Schema]
+}
+
+func (node *TableNode) WriteTo(w io.Writer) (n int64, err error) {
+	// do not writeTo inherit from mvvcnode in replay phrase
+	// reference: function onReplayCreateTable and onReplayUpdateTable
+	return
+}
+
+func (node *TableNode) ReadFrom(r io.Reader) (n int64, err error) {
+	// do not readFrom, inherit from mvvcnode in replay phrase
+	// reference: function onReplayCreateTable and onReplayUpdateTable
 	return
 }

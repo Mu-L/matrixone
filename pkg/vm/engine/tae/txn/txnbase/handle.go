@@ -15,10 +15,14 @@
 package txnbase
 
 import (
+	"context"
+
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 )
@@ -32,15 +36,17 @@ type TxnRelation struct {
 	DB  handle.Database
 }
 
-type TxnSegment struct {
+type TxnObject struct {
 	Txn txnif.AsyncTxn
 	Rel handle.Relation
 }
 
 type TxnBlock struct {
 	Txn txnif.AsyncTxn
-	Seg handle.Segment
+	Seg handle.Object
 }
+
+var _ handle.Relation = &TxnRelation{}
 
 func (db *TxnDatabase) GetID() uint64                                                   { return 0 }
 func (db *TxnDatabase) GetName() string                                                 { return "" }
@@ -55,68 +61,90 @@ func (db *TxnDatabase) Relations() (rels []handle.Relation)                     
 func (db *TxnDatabase) MakeRelationIt() (it handle.RelationIt)                          { return }
 func (db *TxnDatabase) GetMeta() any                                                    { return nil }
 
-func (rel *TxnRelation) SimplePPString(_ common.PPLevel) string { return "" }
-func (rel *TxnRelation) String() string                         { return "" }
-func (rel *TxnRelation) Close() error                           { return nil }
-func (rel *TxnRelation) ID() uint64                             { return 0 }
-func (rel *TxnRelation) Rows() int64                            { return 0 }
-func (rel *TxnRelation) Size(attr string) int64                 { return 0 }
-func (rel *TxnRelation) GetCardinality(attr string) int64       { return 0 }
-func (rel *TxnRelation) Schema() any                            { return nil }
-func (rel *TxnRelation) MakeSegmentIt() handle.SegmentIt        { return nil }
-func (rel *TxnRelation) MakeBlockIt() handle.BlockIt            { return nil }
-func (rel *TxnRelation) BatchDedup(col containers.Vector) error { return nil }
-func (rel *TxnRelation) Append(data *containers.Batch) error    { return nil }
-func (rel *TxnRelation) AddBlksWithMetaLoc([]dataio.Index, []string) error {
+func (rel *TxnRelation) SimplePPString(_ common.PPLevel) string                   { return "" }
+func (rel *TxnRelation) String() string                                           { return "" }
+func (rel *TxnRelation) Close() error                                             { return nil }
+func (rel *TxnRelation) ID() uint64                                               { return 0 }
+func (rel *TxnRelation) Rows() int64                                              { return 0 }
+func (rel *TxnRelation) Size(attr string) int64                                   { return 0 }
+func (rel *TxnRelation) Schema(bool) any                                          { return nil }
+func (rel *TxnRelation) MakeObjectIt(bool) handle.ObjectIt                        { return nil }
+func (rel *TxnRelation) MakeObjectItOnSnap(bool) handle.ObjectIt                  { return nil }
+func (rel *TxnRelation) BatchDedup(containers.Vector) error                       { return nil }
+func (rel *TxnRelation) Append(ctx context.Context, data *containers.Batch) error { return nil }
+func (rel *TxnRelation) AddDataFiles(context.Context, containers.Vector) error {
 	return nil
 }
-func (rel *TxnRelation) GetMeta() any                                                    { return nil }
-func (rel *TxnRelation) GetSegment(id types.Uuid) (seg handle.Segment, err error)        { return }
-func (rel *TxnRelation) SoftDeleteSegment(id types.Uuid) (err error)                     { return }
-func (rel *TxnRelation) CreateSegment(bool) (seg handle.Segment, err error)              { return }
-func (rel *TxnRelation) CreateNonAppendableSegment(bool) (seg handle.Segment, err error) { return }
-func (rel *TxnRelation) GetValue(*common.ID, uint32, uint16) (v any, err error)          { return }
-func (rel *TxnRelation) GetValueByPhyAddrKey(any, int) (v any, err error)                { return }
-func (rel *TxnRelation) Update(*common.ID, uint32, uint16, any) (err error)              { return }
-func (rel *TxnRelation) DeleteByPhyAddrKey(any) (err error)                              { return }
-func (rel *TxnRelation) DeleteByPhyAddrKeys(containers.Vector) (err error)               { return }
+func (rel *TxnRelation) GetMeta() any                    { return nil }
+func (rel *TxnRelation) GetDB() (handle.Database, error) { return nil, nil }
+func (rel *TxnRelation) GetObject(id *types.Objectid, isTombstone bool) (obj handle.Object, err error) {
+	return
+}
+func (rel *TxnRelation) SoftDeleteObject(id *types.Objectid, isTombstone bool) (err error) { return }
+func (rel *TxnRelation) CreateObject(bool) (obj handle.Object, err error)                  { return }
+func (rel *TxnRelation) CreateNonAppendableObject(bool, *objectio.CreateObjOpt) (obj handle.Object, err error) {
+	return
+}
+func (rel *TxnRelation) GetValue(*common.ID, uint32, uint16, bool) (v any, isNull bool, err error) {
+	return
+}
+func (rel *TxnRelation) GetValueByPhyAddrKey(any, int) (v any, isNull bool, err error) {
+	return
+}
+func (rel *TxnRelation) DeleteByPhyAddrKey(any) (err error) { return }
+func (rel *TxnRelation) DeleteByPhyAddrKeys(containers.Vector, containers.Vector, handle.DeleteType) (err error) {
+	return
+}
 func (rel *TxnRelation) RangeDelete(*common.ID, uint32, uint32, handle.DeleteType) (err error) {
 	return
 }
-func (rel *TxnRelation) GetByFilter(*handle.Filter) (id *common.ID, offset uint32, err error) { return }
-func (rel *TxnRelation) GetValueByFilter(filter *handle.Filter, col int) (v any, err error)   { return }
-func (rel *TxnRelation) UpdateByFilter(filter *handle.Filter, col uint16, v any) (err error)  { return }
-func (rel *TxnRelation) DeleteByFilter(filter *handle.Filter) (err error)                     { return }
+
+func (rel *TxnRelation) AddPersistedTombstoneFile(id *common.ID, stats objectio.ObjectStats) (ok bool, err error) {
+	return
+}
+
+func (rel *TxnRelation) GetByFilter(context.Context, *handle.Filter) (id *common.ID, offset uint32, err error) {
+	return
+}
+func (rel *TxnRelation) GetValueByFilter(context.Context, *handle.Filter, int) (v any, isNull bool, err error) {
+	return
+}
+func (rel *TxnRelation) UpdateByFilter(ctx context.Context, filter *handle.Filter, col uint16, v any, isNull bool) (err error) {
+	return
+}
+func (rel *TxnRelation) DeleteByFilter(ctx context.Context, filter *handle.Filter) (err error) {
+	return
+}
 func (rel *TxnRelation) LogTxnEntry(entry txnif.TxnEntry, readed []*common.ID) (err error) {
 	return
 }
-func (rel *TxnRelation) UpdateConstraint(cstr []byte) (err error) { return }
+func (rel *TxnRelation) AlterTable(context.Context, *apipb.AlterTableReq) (err error) { return }
+func (rel *TxnRelation) FillInWorkspaceDeletes(blkID types.Blockid, view **nulls.Nulls, deleteStartOffset uint64) error {
+	return nil
+}
+func (obj *TxnObject) Reset() {
+	obj.Txn = nil
+	obj.Rel = nil
+}
+func (obj *TxnObject) GetMeta() any   { return nil }
+func (obj *TxnObject) String() string { return "" }
+func (obj *TxnObject) Close() error   { return nil }
+func (obj *TxnObject) GetID() uint64  { return 0 }
 
-func (seg *TxnSegment) GetMeta() any                     { return nil }
-func (seg *TxnSegment) String() string                   { return "" }
-func (seg *TxnSegment) Close() error                     { return nil }
-func (seg *TxnSegment) GetID() uint64                    { return 0 }
-func (seg *TxnSegment) MakeBlockIt() (it handle.BlockIt) { return }
-
-// func (seg *TxnSegment) GetByFilter(*handle.Filter) (id *common.ID, offset uint32, err error) {
+// func (obj *TxnObject) GetByFilter(*handle.Filter) (id *common.ID, offset uint32, err error) {
 // 	return
 // }
 
-func (seg *TxnSegment) GetRelation() (rel handle.Relation)                                { return }
-func (seg *TxnSegment) Update(uint64, uint32, uint16, any) (err error)                    { return }
-func (seg *TxnSegment) RangeDelete(uint64, uint32, uint32, handle.DeleteType) (err error) { return }
-
-func (seg *TxnSegment) PushDeleteOp(handle.Filter) (err error)                  { return }
-func (seg *TxnSegment) PushUpdateOp(handle.Filter, string, any) (err error)     { return }
-func (seg *TxnSegment) SoftDeleteBlock(id types.Blockid) (err error)            { return }
-func (seg *TxnSegment) GetBlock(id uint64) (blk handle.Block, err error)        { return }
-func (seg *TxnSegment) CreateBlock() (blk handle.Block, err error)              { return }
-func (seg *TxnSegment) CreateNonAppendableBlock() (blk handle.Block, err error) { return }
-func (seg *TxnSegment) BatchDedup(containers.Vector) (err error)                { return }
+func (obj *TxnObject) GetRelation() (rel handle.Relation)                                { return }
+func (obj *TxnObject) Update(uint64, uint32, uint16, any) (err error)                    { return }
+func (obj *TxnObject) RangeDelete(uint64, uint32, uint32, handle.DeleteType) (err error) { return }
 
 // func (blk *TxnBlock) IsAppendable() bool                                   { return true }
 
-func (blk *TxnBlock) GetTotalChanges() int                                  { return 0 }
+func (blk *TxnBlock) Reset() {
+	blk.Txn = nil
+	blk.Seg = nil
+}
 func (blk *TxnBlock) IsAppendableBlock() bool                               { return true }
 func (blk *TxnBlock) Fingerprint() *common.ID                               { return &common.ID{} }
 func (blk *TxnBlock) Rows() int                                             { return 0 }
@@ -126,10 +154,8 @@ func (blk *TxnBlock) Close() error                                          { re
 func (blk *TxnBlock) GetMeta() any                                          { return nil }
 func (blk *TxnBlock) GetByFilter(*handle.Filter) (offset uint32, err error) { return }
 
-func (blk *TxnBlock) GetSegment() (seg handle.Segment) { return }
+func (blk *TxnBlock) GetObject() (obj handle.Object) { return }
 
 func (blk *TxnBlock) Append(*containers.Batch, uint32) (n uint32, err error)    { return }
 func (blk *TxnBlock) Update(uint32, uint16, any) (err error)                    { return }
 func (blk *TxnBlock) RangeDelete(uint32, uint32, handle.DeleteType) (err error) { return }
-func (blk *TxnBlock) PushDeleteOp(handle.Filter) (err error)                    { return }
-func (blk *TxnBlock) PushUpdateOp(handle.Filter, string, any) (err error)       { return }

@@ -16,10 +16,13 @@ package stopper
 
 import (
 	"context"
+	"io"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestRunTaskOnNotRunning(t *testing.T) {
@@ -66,5 +69,59 @@ func TestRunTaskWithTimeout(t *testing.T) {
 
 	s.Stop()
 	assert.Equal(t, 1, len(names))
-	assert.Equal(t, "timeout", names[0])
+	assert.Contains(t, names[0], "timeout")
+}
+
+func TestRunNamedRetryTask(t *testing.T) {
+	s := NewStopper("TestRunNamedRetryTask")
+
+	called := 0
+	err := s.RunNamedRetryTask(
+		"retry",
+		0,
+		2,
+		func(ctx context.Context, _ int32) error {
+			called++
+			if called == 0 {
+				return io.EOF
+			}
+			return nil
+		},
+	)
+	require.NoError(t, err)
+
+	s.Stop()
+	require.Equal(t, 1, called)
+}
+
+func BenchmarkRunTask1000(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		runTasks(b, 1000)
+	}
+}
+
+func BenchmarkRunTask10000(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		runTasks(b, 10000)
+	}
+}
+
+func BenchmarkRunTask100000(b *testing.B) {
+	for i := 0; i < b.N; i++ {
+		runTasks(b, 100000)
+	}
+}
+
+func runTasks(b *testing.B, n int) {
+	s := NewStopper("BenchmarkRunTask")
+	defer s.Stop()
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		assert.NoError(b, s.RunTask(func(ctx context.Context) {
+			wg.Done()
+			<-ctx.Done()
+		}))
+	}
+	wg.Wait()
 }

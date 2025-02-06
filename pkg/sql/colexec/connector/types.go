@@ -15,28 +15,84 @@
 package connector
 
 import (
+	"context"
+
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/pSpool"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-// Argument pipe connector
-type Argument struct {
+var _ vm.Operator = new(Connector)
+
+// Connector pipe connector
+type Connector struct {
+	ctr container
+
 	Reg *process.WaitRegister
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	if pipelineFailed {
-		for len(arg.Reg.Ch) > 0 {
-			bat := <-arg.Reg.Ch
-			if bat == nil {
-				break
-			}
-			bat.Clean(proc.Mp())
-		}
-	}
+type container struct {
+	sp *pSpool.PipelineSpool
+}
 
-	select {
-	case arg.Reg.Ch <- nil:
-	case <-arg.Reg.Ctx.Done():
+func (connector *Connector) GetOperatorBase() *vm.OperatorBase {
+	return &connector.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Connector](
+		func() *Connector {
+			return &Connector{}
+		},
+		func(a *Connector) {
+			*a = Connector{}
+		},
+		reuse.DefaultOptions[Connector]().
+			WithEnableChecker(),
+	)
+}
+
+func (connector Connector) TypeName() string {
+	return opName
+}
+
+func (connector *Connector) OpType() vm.OpType {
+	return vm.Connector
+}
+
+func NewArgument() *Connector {
+	return reuse.Alloc[Connector](nil)
+}
+
+func (connector *Connector) WithReg(reg *process.WaitRegister) *Connector {
+	connector.Reg = reg
+	return connector
+}
+
+func (connector *Connector) Release() {
+	if connector != nil {
+		reuse.Free[Connector](connector, nil)
 	}
-	close(arg.Reg.Ch)
+}
+
+func (connector *Connector) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	if connector.ctr.sp != nil {
+		_, _ = connector.ctr.sp.SendBatch(context.TODO(), pSpool.SendToAllLocal, nil, err)
+		connector.Reg.Ch2 <- process.NewPipelineSignalToGetFromSpool(connector.ctr.sp, 0)
+
+		connector.ctr.sp.Close()
+		connector.ctr.sp = nil
+	} else {
+		connector.Reg.Ch2 <- process.NewPipelineSignalToDirectly(nil, err, proc.Mp())
+	}
+}
+
+func (connector *Connector) Free(proc *process.Process, pipelineFailed bool, err error) {
+}
+
+func (connector *Connector) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }

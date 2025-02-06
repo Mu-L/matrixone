@@ -22,7 +22,7 @@ import (
 	"time"
 
 	"github.com/fagongzi/goetty/v2/buf"
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
 	"github.com/stretchr/testify/assert"
@@ -45,7 +45,7 @@ func TestEncodeAndDecode(t *testing.T) {
 	assert.Equal(t, msg.Message, v.(RPCMessage).Message)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }
 
 func TestEncodeAndDecodeWithStream(t *testing.T) {
@@ -66,7 +66,7 @@ func TestEncodeAndDecodeWithStream(t *testing.T) {
 	assert.Equal(t, uint32(1), v.(RPCMessage).streamSequence)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }
 
 func TestEncodeAndDecodeWithChecksum(t *testing.T) {
@@ -87,16 +87,13 @@ func TestEncodeAndDecodeWithChecksum(t *testing.T) {
 }
 
 func TestEncodeAndDecodeWithCompress(t *testing.T) {
-	p, err := mpool.NewMPool("test", 0, 0)
-	require.NoError(t, err)
-
 	ctx, cancel := context.WithTimeout(context.TODO(), time.Hour*10)
 	defer cancel()
-	codec := newTestCodec(WithCodecEnableCompress(p))
+	codec := newTestCodec(WithCodecEnableCompress(malloc.GetDefault(nil)))
 	buf1 := buf.NewByteBuf(32)
 
 	msg := newTestMessage(1)
-	err = codec.Encode(RPCMessage{Ctx: ctx, Message: msg}, buf1, nil)
+	err := codec.Encode(RPCMessage{Ctx: ctx, Message: msg}, buf1, nil)
 	assert.NoError(t, err)
 
 	buf.Uint64ToBytesTo(0, buf1.RawSlice(5, 5+8))
@@ -108,25 +105,16 @@ func TestEncodeAndDecodeWithCompress(t *testing.T) {
 }
 
 func TestEncodeAndDecodeWithCompressAndHasPayload(t *testing.T) {
-	// XXX Zhang Xu
-	//
-	// in codec, readMessage, dstPayload is freed c.pool.Free(dstPayload)
-	// but it is returned again in SetPayloadField
-	// We have to enable the NoFixed flag so that mpool Free does not
-	// really destroy the memory.
-	p, err := mpool.NewMPool("test", 0, mpool.NoFixed)
-	require.NoError(t, err)
-
 	ctx, cancel := context.WithTimeout(context.TODO(), time.Hour*10)
 	defer cancel()
 
-	codec := newTestCodec(WithCodecEnableCompress(p))
+	codec := newTestCodec(WithCodecEnableCompress(malloc.GetDefault(nil)))
 	buf1 := buf.NewByteBuf(32)
 	buf2 := buf.NewByteBuf(32)
 
 	msg := RPCMessage{Ctx: ctx, Message: newTestMessage(1)}
 	msg.Message.(*testMessage).payload = []byte(strings.Repeat("payload", 100))
-	err = codec.Encode(msg, buf1, buf2)
+	err := codec.Encode(msg, buf1, buf2)
 	assert.NoError(t, err)
 
 	v, ok, err := codec.Decode(buf2)
@@ -134,7 +122,7 @@ func TestEncodeAndDecodeWithCompressAndHasPayload(t *testing.T) {
 	assert.Equal(t, msg.Message, v.(RPCMessage).Message)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }
 
 func TestEncodeAndDecodeAndChecksumMismatch(t *testing.T) {
@@ -174,7 +162,7 @@ func TestEncodeAndDecodeWithPayload(t *testing.T) {
 	assert.Equal(t, msg.Message, v.(RPCMessage).Message)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }
 
 func TestEncodeAndDecodeWithPayloadAndChecksum(t *testing.T) {
@@ -195,7 +183,7 @@ func TestEncodeAndDecodeWithPayloadAndChecksum(t *testing.T) {
 	assert.Equal(t, msg.Message, v.(RPCMessage).Message)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }
 
 func TestEncodeAndDecodeWithEmptyPayloadAndChecksum(t *testing.T) {
@@ -216,7 +204,7 @@ func TestEncodeAndDecodeWithEmptyPayloadAndChecksum(t *testing.T) {
 	assert.Equal(t, msg.Message, v.(RPCMessage).Message)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }
 
 func TestEncodeAndDecodeWithEmptyPayloadAndChecksumMismatch(t *testing.T) {
@@ -257,7 +245,7 @@ func TestNewWithMaxBodySize(t *testing.T) {
 	assert.Equal(t, msg.Message, v.(RPCMessage).Message)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }
 
 func TestBufferScale(t *testing.T) {
@@ -315,5 +303,5 @@ func TestEncodeAndDecodeInternal(t *testing.T) {
 	assert.Equal(t, msg.Message, v.(RPCMessage).Message)
 	assert.NoError(t, err)
 	assert.NotNil(t, v.(RPCMessage).Ctx)
-	assert.NotNil(t, v.(RPCMessage).cancel)
+	assert.NotNil(t, v.(RPCMessage).Cancel)
 }

@@ -25,7 +25,7 @@ var (
 	defaultColDefs = []*plan.ColDef{
 		{
 			Name: "col",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       types.MaxVarcharLen,
@@ -33,7 +33,7 @@ var (
 		},
 		{
 			Name: "seq",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_int32),
 				NotNullable: false,
 				Width:       4,
@@ -41,7 +41,7 @@ var (
 		},
 		{
 			Name: "key",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       types.MaxVarcharLen,
@@ -49,7 +49,7 @@ var (
 		},
 		{
 			Name: "path",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       types.MaxVarcharLen,
@@ -57,7 +57,7 @@ var (
 		},
 		{
 			Name: "index",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_int32),
 				NotNullable: false,
 				Width:       4,
@@ -65,14 +65,14 @@ var (
 		},
 		{
 			Name: "value",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_json),
 				NotNullable: false,
 			},
 		},
 		{
 			Name: "this",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_json),
 				NotNullable: false,
 			},
@@ -91,21 +91,22 @@ func _dupType(typ *plan.Type) *plan.Type {
 
 func _dupColDef(src *plan.ColDef) *plan.ColDef {
 	return &plan.ColDef{
-		Name: src.Name,
-		Typ:  _dupType(src.Typ),
+		Name:       src.Name,
+		OriginName: src.OriginName,
+		Typ:        *_dupType(&src.Typ),
 	}
 }
 
-func _getDefaultColDefs() []*plan.ColDef {
-	ret := make([]*plan.ColDef, 0, len(defaultColDefs))
-	for _, v := range defaultColDefs {
+func _getColDefs(colDefs []*plan.ColDef) []*plan.ColDef {
+	ret := make([]*plan.ColDef, 0, len(colDefs))
+	for _, v := range colDefs {
 		ret = append(ret, _dupColDef(v))
 	}
 	return ret
 }
 
-func (builder *QueryBuilder) buildUnnest(tbl *tree.TableFunction, ctx *BindContext, exprs []*plan.Expr, childId int32) (int32, error) {
-	colDefs := _getDefaultColDefs()
+func (builder *QueryBuilder) buildUnnest(tbl *tree.TableFunction, ctx *BindContext, exprs []*plan.Expr, children []int32) (int32, error) {
+	colDefs := _getColDefs(defaultColDefs)
 	colName := findColName(tbl.Func)
 	node := &plan.Node{
 		NodeType: plan.Node_FUNCTION_SCAN,
@@ -120,8 +121,8 @@ func (builder *QueryBuilder) buildUnnest(tbl *tree.TableFunction, ctx *BindConte
 			Cols: colDefs,
 		},
 		BindingTags:     []int32{builder.genNewTag()},
+		Children:        children,
 		TblFuncExprList: exprs,
-		Children:        []int32{childId},
 	}
 	return builder.appendNode(node, ctx), nil
 }

@@ -16,100 +16,616 @@ package containers
 
 import (
 	"bytes"
+	"fmt"
 	"io"
-	"unsafe"
+	"sync/atomic"
 
 	"github.com/RoaringBitmap/roaring"
-	"github.com/RoaringBitmap/roaring/roaring64"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	"github.com/matrixorigin/matrixone/pkg/compress"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/stl"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/stl/containers"
 )
 
-type internalVector interface {
-	Vector
-	forEachWindowWithBias(offset, length int, op ItOp,
-		sels *roaring.Bitmap, bias int, shallow bool) (err error)
+type vectorWrapper struct {
+	// wrapped is the vector.Vector that is wrapped by this vectorWrapper.
+	wrapped *vector.Vector
+
+	// mpool is the memory pool used by the wrapped vector.Vector.
+	mpool *mpool.MPool
+
+	// it is used to call Close in an idempotent way
+	closed atomic.Bool
+
+	element *vectorPoolElement
 }
 
-type vector[T any] struct {
-	stlvec    stl.Vector[T]
-	impl      internalVector
-	typ       types.Type
-	nulls     *roaring64.Bitmap
-	roStorage []byte
-}
-
-func NewVector[T any](typ types.Type, nullable bool, opts ...Options) *vector[T] {
-	vec := &vector[T]{
-		stlvec: containers.NewVector[T](opts...),
-		typ:    typ,
+func NewConstFixed[T any](typ types.Type, val T, length int, opts ...Options) *vectorWrapper {
+	var (
+		alloc *mpool.MPool
+	)
+	if len(opts) > 0 {
+		alloc = opts[0].Allocator
 	}
-	if nullable {
-		vec.impl = newNullableVecImpl(vec)
-	} else {
-		vec.impl = newVecImpl(vec)
+	if alloc == nil {
+		alloc = common.DefaultAllocator
+	}
+
+	vc, err := vector.NewConstFixed[T](typ, val, length, alloc)
+	if err != nil {
+		panic(err)
+	}
+	vec := &vectorWrapper{
+		wrapped: vc,
+	}
+	vec.mpool = alloc
+	return vec
+}
+
+func NewConstBytes(typ types.Type, val []byte, length int, opts ...Options) *vectorWrapper {
+	var (
+		alloc *mpool.MPool
+	)
+	if len(opts) > 0 {
+		alloc = opts[0].Allocator
+	}
+	if alloc == nil {
+		alloc = common.DefaultAllocator
+	}
+
+	vc, err := vector.NewConstBytes(typ, val, length, alloc)
+	if err != nil {
+		panic(err)
+	}
+	vec := &vectorWrapper{
+		wrapped: vc,
+	}
+	vec.mpool = alloc
+	return vec
+}
+
+func NewConstNullVector(
+	typ types.Type,
+	length int,
+	mp *mpool.MPool,
+) *vectorWrapper {
+	vec := &vectorWrapper{
+		wrapped: vector.NewConstNull(typ, length, mp),
+	}
+	vec.mpool = mp
+	return vec
+}
+
+func NewVector(typ types.Type, opts ...Options) *vectorWrapper {
+	vec := &vectorWrapper{
+		wrapped: vector.NewVec(typ),
+	}
+
+	// setting mpool variables
+	var (
+		alloc    *mpool.MPool
+		capacity int
+	)
+	if len(opts) > 0 {
+		alloc = opts[0].Allocator
+		capacity = opts[0].Capacity
+	}
+	if alloc == nil {
+		alloc = common.DefaultAllocator
+	}
+	vec.mpool = alloc
+	if capacity > 0 {
+		if err := vec.wrapped.PreExtend(capacity, vec.mpool); err != nil {
+			panic(err)
+		}
 	}
 	return vec
 }
 
-// func NewEmptyVector[T any](typ types.Type, opts ...*Options) *vector[T] {
-// 	vec := new(vector[T])
-// 	vec.typ = typ
-// 	vec.stlvec = container.NewVector[T](opts...)
-// 	return vec
-// }
+func (vec *vectorWrapper) ApproxSize() int {
+	if vec.wrapped.NeedDup() {
+		return 0
+	} else {
+		return vec.wrapped.Size()
+	}
+}
 
-func (vec *vector[T]) Equals(o Vector) bool {
+func (vec *vectorWrapper) PreExtend(length int) (err error) {
+	vec.tryCOW()
+	return vec.wrapped.PreExtend(length, vec.mpool)
+}
+
+func (vec *vectorWrapper) Get(i int) any {
+	if vec.wrapped.IsConstNull() {
+		return nil
+	}
+	if vec.GetType().IsVarlen() {
+		if vec.IsNull(i) {
+			var val []byte
+			return val
+		}
+		bs := vec.ShallowGet(i).([]byte)
+		ret := make([]byte, len(bs))
+		copy(ret, bs)
+		return any(ret)
+	}
+
+	return getNonNullValue(vec.wrapped, uint32(i))
+}
+
+func (vec *vectorWrapper) ShallowGet(i int) any {
+	return getNonNullValue(vec.wrapped, uint32(i))
+}
+
+func (vec *vectorWrapper) Length() int {
+	if vec.wrapped == nil {
+		return 0
+	}
+	return vec.wrapped.Length()
+}
+
+func (vec *vectorWrapper) Append(v any, isNull bool) {
+	// innsert AppendAny will check IsConst
+	vec.tryCOW()
+
+	var err error
+	if isNull {
+		err = vector.AppendAny(vec.wrapped, nil, true, vec.mpool)
+	} else {
+		err = vector.AppendAny(vec.wrapped, v, false, vec.mpool)
+	}
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (vec *vectorWrapper) GetAllocator() *mpool.MPool {
+	return vec.mpool
+}
+
+func (vec *vectorWrapper) IsNull(i int) bool {
+	inner := vec.wrapped
+	if inner.IsConstNull() {
+		return true
+	}
+	if inner.IsConst() {
+		return false
+	}
+	return nulls.Contains(inner.GetNulls(), uint64(i))
+}
+
+func (vec *vectorWrapper) NullMask() *nulls.Nulls {
+	return vec.wrapped.GetNulls()
+}
+
+func (vec *vectorWrapper) GetType() *types.Type {
+	return vec.wrapped.GetType()
+}
+
+func (vec *vectorWrapper) Extend(src Vector) {
+	vec.ExtendWithOffset(src, 0, src.Length())
+}
+
+func (vec *vectorWrapper) Update(i int, v any, isNull bool) {
+	if vec.wrapped.IsConst() {
+		panic(moerr.NewInternalErrorNoCtx("update to const vectorWrapper"))
+	}
+	vec.tryCOW()
+	UpdateValue(vec.wrapped, uint32(i), v, isNull, vec.mpool)
+}
+
+func (vec *vectorWrapper) WriteTo(w io.Writer) (n int64, err error) {
+	var bs bytes.Buffer
+
+	var size int64
+	_, _ = bs.Write(types.EncodeInt64(&size))
+
+	if err = vec.wrapped.MarshalBinaryWithBuffer(&bs); err != nil {
+		return
+	}
+
+	size = int64(bs.Len() - 8)
+
+	buf := bs.Bytes()
+	copy(buf[:8], types.EncodeInt64(&size))
+
+	if _, err = w.Write(buf); err != nil {
+		return
+	}
+
+	n = int64(len(buf))
+	return
+}
+
+// WriteToV1 in version 1, vector.nulls.bitmap is v1
+func (vec *vectorWrapper) WriteToV1(w io.Writer) (n int64, err error) {
+	var bs bytes.Buffer
+
+	var size int64
+	_, _ = bs.Write(types.EncodeInt64(&size))
+
+	if err = vec.wrapped.MarshalBinaryWithBufferV1(&bs); err != nil {
+		return
+	}
+
+	size = int64(bs.Len() - 8)
+
+	buf := bs.Bytes()
+	copy(buf[:8], types.EncodeInt64(&size))
+
+	if _, err = w.Write(buf); err != nil {
+		return
+	}
+
+	n = int64(len(buf))
+	return
+}
+
+func (vec *vectorWrapper) ReadFrom(r io.Reader) (n int64, err error) {
+	buf := make([]byte, 8)
+	if _, err = io.ReadFull(r, buf); err != nil {
+		return
+	}
+
+	n += 8
+
+	// 1. Whole TN Vector
+	buf = make([]byte, types.DecodeInt64(buf[:]))
+	if _, err = io.ReadFull(r, buf); err != nil {
+		return
+	}
+
+	n += int64(len(buf))
+
+	t := vec.wrapped.GetType()
+	vec.releaseWrapped()
+	vec.wrapped = vector.NewVec(*t)
+	if err = vec.wrapped.UnmarshalBinary(buf); err != nil {
+		return
+	}
+
+	return
+}
+
+// ReadFromV1 in version 1, vector.nulls.bitmap is v1
+func (vec *vectorWrapper) ReadFromV1(r io.Reader) (n int64, err error) {
+	buf := make([]byte, 8)
+	if _, err = r.Read(buf); err != nil {
+		return
+	}
+
+	n += 8
+
+	// 1. Whole TN Vector
+	buf = make([]byte, types.DecodeInt64(buf[:]))
+	if _, err = r.Read(buf); err != nil {
+		return
+	}
+
+	n += int64(len(buf))
+
+	t := vec.wrapped.GetType()
+	vec.releaseWrapped()
+	vec.wrapped = vector.NewVec(*t)
+	if err = vec.wrapped.UnmarshalBinaryV1(buf); err != nil {
+		return
+	}
+
+	return
+}
+
+func (vec *vectorWrapper) HasNull() bool {
+	if vec.wrapped.IsConstNull() {
+		return true
+	}
+	if vec.wrapped.IsConst() {
+		return false
+	}
+	return vec.NullMask() != nil && !vec.NullMask().IsEmpty()
+}
+
+func (vec *vectorWrapper) NullCount() int {
+	if vec.wrapped.IsConstNull() {
+		return vec.Length()
+	}
+	if vec.wrapped.IsConst() {
+		return 0
+	}
+	if vec.NullMask() != nil {
+		return vec.NullMask().GetCardinality()
+	}
+	return 0
+}
+
+func (vec *vectorWrapper) IsConst() bool {
+	return vec.wrapped.IsConst()
+}
+
+func (vec *vectorWrapper) IsConstNull() bool {
+	return vec.wrapped.IsConstNull()
+}
+
+// conver a const vectorWrapper to a normal one, getting ready to edit
+func (vec *vectorWrapper) TryConvertConst() Vector {
+	if vec.wrapped.IsConstNull() {
+		ret := NewVector(*vec.GetType())
+		ret.mpool = vec.mpool
+		for i := 0; i < vec.Length(); i++ {
+			ret.Append(nil, true)
+		}
+		return ret
+	}
+
+	if vec.wrapped.IsConst() {
+		ret := NewVector(*vec.GetType())
+		ret.mpool = vec.mpool
+		v := vec.Get(0)
+		for i := 0; i < vec.Length(); i++ {
+			ret.Append(v, false)
+		}
+		return ret
+	}
+	return vec
+}
+
+func (vec *vectorWrapper) Foreach(op ItOp, sels *nulls.Bitmap) error {
+	return vec.ForeachWindow(0, vec.wrapped.Length(), op, sels)
+}
+
+func (vec *vectorWrapper) ForeachWindow(offset, length int, op ItOp, sels *nulls.Bitmap) (err error) {
+	return ForeachVectorWindow(vec, offset, length, nil, op, sels)
+}
+
+func (vec *vectorWrapper) Close() {
+	if !vec.closed.CompareAndSwap(false, true) {
+		return
+	}
+	if vec.element != nil {
+		vec.element.put()
+		vec.element = nil
+		vec.wrapped = nil
+		return
+	}
+
+	// if this wrapper is not get from a pool, we should release the wrapped vector
+	vec.releaseWrapped()
+}
+
+func (vec *vectorWrapper) releaseWrapped() {
+	if vec.wrapped == nil {
+		return
+	}
+	if !vec.wrapped.NeedDup() {
+		vec.wrapped.Free(vec.mpool)
+	}
+	vec.wrapped = nil
+}
+
+func (vec *vectorWrapper) Allocated() int {
+	if vec.wrapped.NeedDup() {
+		return 0
+	}
+	return vec.wrapped.Allocated()
+}
+
+// When a new Append() is happening on a SharedMemory vectorWrapper, we allocate the data[] from the mpool.
+func (vec *vectorWrapper) tryCOW() {
+	if !vec.wrapped.NeedDup() {
+		return
+	}
+
+	newCnVector, err := vec.wrapped.Dup(vec.mpool)
+	if err != nil {
+		panic(err)
+	}
+	vec.wrapped = newCnVector
+}
+
+func (vec *vectorWrapper) Window(offset, length int) Vector {
+	var err error
+	win := new(vectorWrapper)
+	win.mpool = vec.mpool
+	win.wrapped, err = vec.wrapped.Window(offset, offset+length)
+	if err != nil {
+		panic(err)
+	}
+
+	return win
+}
+
+func (vec *vectorWrapper) CloneWindow(offset, length int, allocator ...*mpool.MPool) Vector {
+	opts := Options{}
+	if len(allocator) == 0 {
+		opts.Allocator = vec.GetAllocator()
+	} else {
+		opts.Allocator = allocator[0]
+	}
+
+	cloned := NewVector(*vec.GetType(), opts)
+	v, err := vec.wrapped.CloneWindow(offset, offset+length, cloned.GetAllocator())
+	if err != nil {
+		panic(err)
+	}
+	cloned.setDownstreamVector(v)
+	return cloned
+}
+
+func (vec *vectorWrapper) CloneWindowWithPool(offset, length int, pool *VectorPool) Vector {
+	cloned := pool.GetVector(vec.GetType())
+	if err := vec.wrapped.CloneWindowTo(cloned.wrapped, offset, offset+length, cloned.GetAllocator()); err != nil {
+		panic(err)
+	}
+	return cloned
+}
+
+func (vec *vectorWrapper) ExtendWithOffset(src Vector, srcOff, srcLen int) {
+	if err := vec.extendWithOffset(src.GetDownstreamVector(), srcOff, srcLen); err != nil {
+		panic(err)
+	}
+}
+
+func (vec *vectorWrapper) ExtendVec(src *vector.Vector) (err error) {
+	return vec.extendWithOffset(src, 0, src.Length())
+}
+
+func (vec *vectorWrapper) extendWithOffset(src *vector.Vector, srcOff, srcLen int) (err error) {
+	if vec.wrapped.IsConst() {
+		panic(moerr.NewInternalErrorNoCtx("extend to const vectorWrapper"))
+	}
+	if srcLen <= 0 {
+		return
+	}
+	err = vec.wrapped.UnionBatch(src, int64(srcOff), srcLen, nil, vec.mpool)
+	return
+}
+
+func (vec *vectorWrapper) CompactByBitmap(mask *nulls.Bitmap) {
+	if mask.IsEmpty() {
+		return
+	}
+	vec.tryCOW()
+
+	dels := vec.mpool.GetSels()
+	mask.Foreach(func(i uint64) bool {
+		dels = append(dels, int64(i))
+		return true
+	})
+	vec.wrapped.Shrink(dels, true)
+	vec.mpool.PutSels(dels)
+}
+
+func (vec *vectorWrapper) Compact(deletes *roaring.Bitmap) {
+	if deletes == nil || deletes.IsEmpty() {
+		return
+	}
+	vec.tryCOW()
+
+	dels := vec.mpool.GetSels()
+	itr := deletes.Iterator()
+	for itr.HasNext() {
+		r := itr.Next()
+		dels = append(dels, int64(r))
+	}
+
+	vec.wrapped.Shrink(dels, true)
+	vec.mpool.PutSels(dels)
+}
+
+func (vec *vectorWrapper) GetDownstreamVector() *vector.Vector {
+	return vec.wrapped
+}
+
+func (vec *vectorWrapper) setDownstreamVector(dsVec *vector.Vector) {
+	vec.wrapped = dsVec
+}
+
+/****** Below functions are not used in critical path. Used mainly for testing */
+
+// String value of vectorWrapper
+// Deprecated: Only use for test functions
+func (vec *vectorWrapper) String() string {
+	s := fmt.Sprintf("DN Vector: Len=%d[Rows];Allocted:%d[Bytes]", vec.Length(), vec.Allocated())
+
+	end := 100
+	if vec.Length() < end {
+		end = vec.Length()
+	}
+	if end == 0 {
+		return s
+	}
+
+	data := "Vals=["
+	for i := 0; i < end; i++ {
+		data = fmt.Sprintf("%s %v", data, vec.Get(i))
+	}
+	if vec.Length() > end {
+		s = fmt.Sprintf("%s %s...]", s, data)
+	} else {
+		s = fmt.Sprintf("%s %s]", s, data)
+	}
+
+	return s
+}
+
+// PPString Pretty Print
+// Deprecated: Only use for test functions
+func (vec *vectorWrapper) PPString(num int) string {
+	var w bytes.Buffer
+	limit := vec.Length()
+	if num > 0 && num < limit {
+		limit = num
+	}
+	_, _ = w.WriteString(fmt.Sprintf("[T=%s]%s", vec.GetType().String(), common.MoVectorToString(vec.GetDownstreamVector(), limit)))
+	if vec.Length() > num {
+		_, _ = w.WriteString("...")
+	}
+	_, _ = w.WriteString(fmt.Sprintf("[%v]", vec.element != nil))
+	return w.String()
+}
+
+// AppendMany appends multiple values
+// Deprecated: Only use for test functions
+func (vec *vectorWrapper) AppendMany(vs []any, isNulls []bool) {
+	for i, v := range vs {
+		vec.Append(v, isNulls[i])
+	}
+}
+
+// Delete Deletes an item from vectorWrapper
+// Deprecated: Only use for test functions
+func (vec *vectorWrapper) Delete(delRowId int) {
+	deletes := roaring.BitmapOf(uint32(delRowId))
+	vec.Compact(deletes)
+}
+
+// Equals Compares two vectors
+// Deprecated: Only use for test functions
+func (vec *vectorWrapper) Equals(o Vector) bool {
 	if vec.Length() != o.Length() {
 		return false
 	}
-	if vec.GetType() != o.GetType() {
-		return false
-	}
-	if vec.Nullable() != o.Nullable() {
+	if *vec.GetType() != *o.GetType() {
 		return false
 	}
 	if vec.HasNull() != o.HasNull() {
 		return false
 	}
 	if vec.HasNull() {
-		if !vec.NullMask().Equals(o.NullMask()) {
+		if !vec.NullMask().IsSame(o.NullMask()) {
 			return false
 		}
 	}
 	mask := vec.NullMask()
+	typ := vec.wrapped.GetType()
 	for i := 0; i < vec.Length(); i++ {
-		if mask != nil && mask.ContainsInt(i) {
+		if mask != nil && mask.Contains(uint64(i)) {
 			continue
 		}
-		var v T
-		if _, ok := any(v).([]byte); ok {
+		if typ.IsVarlen() {
 			if !bytes.Equal(vec.ShallowGet(i).([]byte), o.ShallowGet(i).([]byte)) {
 				return false
 			}
-		} else if _, ok := any(v).(types.Decimal64); ok {
+		} else if typ.Oid == types.T_decimal64 {
 			d := vec.Get(i).(types.Decimal64)
 			od := vec.Get(i).(types.Decimal64)
 			if d != od {
 				return false
 			}
-		} else if _, ok := any(v).(types.Decimal128); ok {
+		} else if typ.Oid == types.T_decimal128 {
 			d := vec.Get(i).(types.Decimal128)
 			od := vec.Get(i).(types.Decimal128)
 			if d != od {
 				return false
 			}
-		} else if _, ok := any(v).(types.TS); ok {
+		} else if typ.Oid == types.T_TS {
 			d := vec.Get(i).(types.TS)
 			od := vec.Get(i).(types.TS)
 			if types.CompareTSTSAligned(d, od) != 0 {
 				return false
 			}
-		} else if _, ok := any(v).(types.Rowid); ok {
+		} else if typ.Oid == types.T_Rowid {
 			d := vec.Get(i).(types.Rowid)
 			od := vec.Get(i).(types.Rowid)
 			if types.CompareRowidRowidAligned(d, od) != 0 {
@@ -122,305 +638,4 @@ func (vec *vector[T]) Equals(o Vector) bool {
 		}
 	}
 	return true
-}
-func (vec *vector[T]) IsView() bool                { return vec.impl.IsView() }
-func (vec *vector[T]) Nullable() bool              { return vec.impl.Nullable() }
-func (vec *vector[T]) IsNull(i int) bool           { return vec.impl.IsNull(i) }
-func (vec *vector[T]) HasNull() bool               { return vec.impl.HasNull() }
-func (vec *vector[T]) NullMask() *roaring64.Bitmap { return vec.impl.NullMask() }
-func (vec *vector[T]) Bytes() *Bytes               { return vec.impl.Bytes() }
-func (vec *vector[T]) Data() []byte                { return vec.impl.Data() }
-func (vec *vector[T]) DataWindow(offset, length int) []byte {
-	return vec.impl.DataWindow(offset, length)
-}
-func (vec *vector[T]) CloneWindow(offset, length int, allocator ...*mpool.MPool) Vector {
-	opts := Options{}
-	if len(allocator) == 0 {
-		opts.Allocator = vec.GetAllocator()
-	} else {
-		opts.Allocator = allocator[0]
-	}
-	cloned := NewVector[T](vec.typ, vec.Nullable(), opts)
-	if vec.nulls != nil {
-		if offset == 0 || length == vec.Length() {
-			cloned.nulls = vec.nulls.Clone()
-			if length < vec.Length() {
-				cloned.nulls.RemoveRange(uint64(length), uint64(vec.Length()))
-			}
-		} else {
-			cloned.nulls = roaring64.New()
-			for i := offset; i < offset+length; i++ {
-				if vec.nulls.ContainsInt(i) {
-					cloned.nulls.AddInt(i - offset)
-				}
-			}
-		}
-	}
-	cloned.stlvec.Close()
-	cloned.stlvec = vec.stlvec.Clone(offset, length, allocator...)
-	return cloned
-}
-func (vec *vector[T]) fastSlice() []T {
-	return vec.stlvec.Slice()
-}
-func (vec *vector[T]) Slice() any {
-	return vec.stlvec.Slice()
-}
-func (vec *vector[T]) SlicePtr() unsafe.Pointer {
-	return vec.stlvec.SlicePtr()
-}
-
-func (vec *vector[T]) Get(i int) (v any)               { return vec.impl.Get(i) }
-func (vec *vector[T]) ShallowGet(i int) (v any)        { return vec.impl.ShallowGet(i) }
-func (vec *vector[T]) Update(i int, v any)             { vec.impl.Update(i, v) }
-func (vec *vector[T]) Delete(i int)                    { vec.impl.Delete(i) }
-func (vec *vector[T]) Compact(deletes *roaring.Bitmap) { vec.impl.Compact(deletes) }
-func (vec *vector[T]) Append(v any)                    { vec.impl.Append(v) }
-func (vec *vector[T]) AppendMany(vs ...any)            { vec.impl.AppendMany(vs...) }
-func (vec *vector[T]) AppendNoNulls(s any)             { vec.impl.AppendNoNulls(s) }
-func (vec *vector[T]) Extend(o Vector)                 { vec.impl.Extend(o) }
-func (vec *vector[T]) ExtendWithOffset(src Vector, srcOff, srcLen int) {
-	vec.impl.ExtendWithOffset(src, srcOff, srcLen)
-}
-
-// func (vec *vector[T]) ExtendView(o VectorView) { vec.impl.ExtendView(o) }
-func (vec *vector[T]) Length() int    { return vec.impl.Length() }
-func (vec *vector[T]) Capacity() int  { return vec.impl.Capacity() }
-func (vec *vector[T]) Allocated() int { return vec.impl.Allocated() }
-
-func (vec *vector[T]) GetAllocator() *mpool.MPool { return vec.stlvec.GetAllocator() }
-func (vec *vector[T]) GetType() types.Type        { return vec.typ }
-func (vec *vector[T]) String() string             { return vec.impl.String() }
-func (vec *vector[T]) PPString(num int) string    { return vec.impl.PPString(num) }
-func (vec *vector[T]) Close()                     { vec.impl.Close() }
-
-func (vec *vector[T]) cow() {
-	vec.stlvec = vec.stlvec.Clone(0, vec.stlvec.Length())
-	vec.releaseRoStorage()
-}
-func (vec *vector[T]) releaseRoStorage() {
-	if vec.roStorage != nil {
-		vec.GetAllocator().Free(vec.roStorage)
-	}
-	vec.roStorage = nil
-}
-
-func (vec *vector[T]) Window(offset, length int) Vector {
-	return &vectorWindow[T]{
-		ref: vec,
-		windowBase: &windowBase{
-			offset: offset,
-			length: length,
-		},
-	}
-}
-
-func (vec *vector[T]) WriteTo(w io.Writer) (n int64, err error) {
-	var nr int
-	var tmpn int64
-	// 1. Vector type
-	vt := vec.GetType()
-	if nr, err = w.Write(types.EncodeType(&vt)); err != nil {
-		return
-	}
-	n += int64(nr)
-	// 2. Nullable
-	if nr, err = w.Write(types.EncodeFixed(vec.Nullable())); err != nil {
-		return
-	}
-	n += int64(nr)
-	// 3. Vector data
-	if tmpn, err = vec.stlvec.WriteTo(w); err != nil {
-		return
-	}
-	n += tmpn
-	if !vec.Nullable() {
-		return
-	}
-	// 4. Nulls
-	var nullBuf []byte
-	if vec.nulls != nil {
-		if nullBuf, err = vec.nulls.ToBytes(); err != nil {
-			return
-		}
-	}
-	if nr, err = w.Write(types.EncodeFixed(uint32(len(nullBuf)))); err != nil {
-		return
-	}
-	n += int64(nr)
-	if len(nullBuf) == 0 {
-		return
-	}
-	if nr, err = w.Write(nullBuf); err != nil {
-		return
-	}
-	n += int64(nr)
-
-	return
-}
-
-func (vec *vector[T]) ReadFrom(r io.Reader) (n int64, err error) {
-	vec.releaseRoStorage()
-	var tmpn int64
-	// 1. Vector type
-	typeBuf := make([]byte, types.TSize)
-	if _, err = r.Read(typeBuf); err != nil {
-		return
-	}
-	vec.typ = types.DecodeType(typeBuf)
-	n += int64(len(typeBuf))
-
-	// 2. Nullable
-	oneBuf := make([]byte, 1)
-	if _, err = r.Read(oneBuf); err != nil {
-		return
-	}
-	nullable := types.DecodeFixed[bool](oneBuf)
-	n += 1
-
-	if nullable {
-		vec.impl = newNullableVecImpl(vec)
-	} else {
-		vec.impl = newVecImpl(vec)
-	}
-
-	// 3. Data
-	if tmpn, err = vec.stlvec.ReadFrom(r); err != nil {
-		return
-	}
-	n += tmpn
-
-	// 4. Null
-	if !nullable {
-		return
-	}
-	fourBuf := make([]byte, int(unsafe.Sizeof(uint32(0))))
-	if _, err = r.Read(fourBuf); err != nil {
-		return
-	}
-	n += int64(len(fourBuf))
-	nullSize := types.DecodeFixed[uint32](fourBuf)
-	if nullSize == 0 {
-		return
-	}
-	vec.nulls = roaring64.New()
-	if tmpn, err = vec.nulls.ReadFrom(r); err != nil {
-		return
-	}
-	n += tmpn
-	return
-}
-
-func (vec *vector[T]) ReadFromFile(f common.IVFile, buffer *bytes.Buffer) (err error) {
-	vec.releaseRoStorage()
-	stat := f.Stat()
-	var n []byte
-	var buf []byte
-	var tmpNode []byte
-	if stat.CompressAlgo() != compress.None {
-		osize := int(stat.OriginSize())
-		size := stat.Size()
-		tmpNode, err = vec.GetAllocator().Alloc(int(size))
-		if err != nil {
-			return
-		}
-		defer vec.GetAllocator().Free(tmpNode)
-		srcBuf := tmpNode[:size]
-		if _, err = f.Read(srcBuf); err != nil {
-			return
-		}
-		if buffer == nil {
-			n, err = vec.GetAllocator().Alloc(osize)
-			if err != nil {
-				return
-			}
-			buf = n[:osize]
-		} else {
-			buffer.Reset()
-			if osize > buffer.Cap() {
-				buffer.Grow(osize)
-			}
-			buf = buffer.Bytes()[:osize]
-		}
-		if _, err = compress.Decompress(srcBuf, buf, compress.Lz4); err != nil {
-			if n != nil {
-				vec.GetAllocator().Free(n)
-			}
-			return
-		}
-	}
-	vec.typ = types.DecodeType(buf[:types.TSize])
-	buf = buf[types.TSize:]
-
-	nullable := types.DecodeFixed[bool](buf[:1])
-	buf = buf[1:]
-
-	if nullable {
-		vec.impl = newNullableVecImpl(vec)
-	} else {
-		vec.impl = newVecImpl(vec)
-	}
-	var nr int64
-	if nr, err = vec.stlvec.InitFromSharedBuf(buf); err != nil {
-		if n != nil {
-			vec.GetAllocator().Free(n)
-		}
-		return
-	}
-	buf = buf[nr:]
-	if !nullable {
-		vec.roStorage = n
-		return
-	}
-
-	nullSize := types.DecodeFixed[uint32](buf[:4])
-	buf = buf[4:]
-	if nullSize > 0 {
-		nullBuf := buf[:nullSize]
-		nulls := roaring64.New()
-		r := bytes.NewBuffer(nullBuf)
-		if _, err = nulls.ReadFrom(r); err != nil {
-			if n != nil {
-				vec.GetAllocator().Free(n)
-			}
-			return
-		}
-		vec.nulls = nulls
-	}
-	vec.roStorage = n
-	return
-}
-
-func (vec *vector[T]) Foreach(op ItOp, sels *roaring.Bitmap) (err error) {
-	return vec.impl.ForeachWindow(0, vec.Length(), op, sels)
-}
-
-func (vec *vector[T]) ForeachWindow(offset, length int, op ItOp, sels *roaring.Bitmap) (err error) {
-	return vec.impl.ForeachWindow(offset, length, op, sels)
-}
-
-func (vec *vector[T]) ForeachShallow(op ItOp, sels *roaring.Bitmap) (err error) {
-	return vec.impl.ForeachWindowShallow(0, vec.Length(), op, sels)
-}
-
-func (vec *vector[T]) ForeachWindowShallow(offset, length int, op ItOp, sels *roaring.Bitmap) (err error) {
-	return vec.impl.ForeachWindowShallow(offset, length, op, sels)
-}
-
-func (vec *vector[T]) GetView() (view VectorView) {
-	return newVecView(vec)
-}
-
-func (vec *vector[T]) ResetWithData(bs *Bytes, nulls *roaring64.Bitmap) {
-	vec.releaseRoStorage()
-	if vec.Nullable() {
-		vec.nulls = nulls
-	}
-	vec.stlvec.ReadBytes(bs, true)
-}
-
-func (vec *vector[T]) Reset() {
-	vec.releaseRoStorage()
-	vec.stlvec.Reset()
-	vec.nulls = nil
 }

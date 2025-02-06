@@ -1,25 +1,42 @@
-select reldatabase,relname,relkind from mo_catalog.mo_tables where relname = '%!%mo_increment_columns' and account_id = 0 order by reldatabase;
+select reldatabase,relname,relkind from mo_catalog.mo_tables where relname = 'mo_increment_columns' and account_id = 0 order by reldatabase;
 reldatabase    relname    relkind
-information_schema    %!%mo_increment_columns    
-mo_catalog    %!%mo_increment_columns    
-mo_task    %!%mo_increment_columns    
-mysql    %!%mo_increment_columns    
-sp_table    %!%mo_increment_columns    
-system    %!%mo_increment_columns    
-system_metrics    %!%mo_increment_columns    
-select relname,relkind from mo_catalog.mo_tables where reldatabase = 'mo_catalog' and account_id = 0 order by relname;
+mo_catalog    mo_increment_columns    
+select relname,relkind from mo_catalog.mo_tables where reldatabase = 'mo_catalog' and account_id = 0 and relname not like '__mo_index_unique__%' and relname != '__mo_account_lock' order by relname;
 relname    relkind
-%!%mo_increment_columns
 mo_account    r
+mo_cache    v
+mo_cdc_task    r
+mo_cdc_watermark    r
 mo_columns    r
+mo_configurations    v
+mo_data_key    r
 mo_database    r
+mo_foreign_keys    r
+mo_increment_columns    
 mo_indexes    r
-mo_mysql_compatbility_mode    r
+mo_locks    v
+mo_mysql_compatibility_mode    r
 mo_pubs    r
+mo_retention    r
 mo_role    r
 mo_role_grant    r
 mo_role_privs    r
+mo_sessions    v
+mo_shards    r
+mo_shards_metadata    r
+mo_snapshots    r
+mo_stages    r
+mo_stored_procedure    r
+mo_subs    r
+mo_table_partitions    r
+mo_table_stats_alpha    r
 mo_tables    r
+mo_transactions    v
+mo_upgrade    r
+mo_upgrade_tenant    r
 mo_user    r
 mo_user_defined_function    r
 mo_user_grant    r
+mo_variables    v
+mo_version    r
+mo_pitr    r

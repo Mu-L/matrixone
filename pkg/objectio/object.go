@@ -14,7 +14,9 @@
 
 package objectio
 
-import "github.com/matrixorigin/matrixone/pkg/fileservice"
+import (
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
+)
 
 const Magic = 0xFFFFFFFF
 const Version = 1
@@ -33,4 +35,8 @@ func NewObject(name string, fs fileservice.FileService) *Object {
 		fs:   fs,
 	}
 	return object
+}
+
+func (o *Object) GetFs() fileservice.FileService {
+	return o.fs
 }

@@ -16,29 +16,39 @@ package frontend
 
 import (
 	"context"
-	"github.com/matrixorigin/matrixone/pkg/defines"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/fagongzi/goetty/v2"
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/config"
+	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/query"
 	"github.com/matrixorigin/matrixone/pkg/util/metric"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/matrixorigin/matrixone/pkg/util/status"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
+
+type holder[T any] struct {
+	value T
+}
 
 // Routine handles requests.
 // Read requests from the IOSession layer,
 // use the executor to handle requests, and response them.
 type Routine struct {
 	//protocol layer
-	protocol MysqlProtocol
-
-	//execution layer
-	executor CmdExecutor
+	protocol atomic.Pointer[holder[MysqlRrWr]]
 
 	cancelRoutineCtx  context.Context
 	cancelRoutineFunc context.CancelFunc
+	cancelRequestFunc context.CancelFunc
 
 	parameters *config.FrontendParameters
 
@@ -53,6 +63,41 @@ type Routine struct {
 	connectionBeCounted atomic.Bool
 
 	mu sync.Mutex
+
+	// the id of goroutine that executes the request
+	goroutineID uint64
+
+	restricted atomic.Bool
+
+	expired atomic.Bool
+
+	printInfoOnce bool
+
+	mc *migrateController
+}
+
+func (rt *Routine) needPrintSessionInfo() bool {
+	if rt.printInfoOnce {
+		rt.printInfoOnce = false
+		return true
+	}
+	return false
+}
+
+func (rt *Routine) setResricted(val bool) {
+	rt.restricted.Store(val)
+}
+
+func (rt *Routine) isRestricted() bool {
+	return rt.restricted.Load()
+}
+
+func (rt *Routine) setExpired(val bool) {
+	rt.expired.Store(val)
+}
+
+func (rt *Routine) isExpired() bool {
+	return rt.expired.Load()
 }
 
 func (rt *Routine) increaseCount(counter func()) {
@@ -98,10 +143,12 @@ func (rt *Routine) execCallbackBasedOnRequest(want bool, callback func()) {
 	}
 }
 
-func (rt *Routine) getCancelRoutineFunc() context.CancelFunc {
+func (rt *Routine) releaseRoutineCtx() {
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
-	return rt.cancelRoutineFunc
+	if rt.cancelRoutineFunc != nil {
+		rt.cancelRoutineFunc()
+	}
 }
 
 func (rt *Routine) getCancelRoutineCtx() context.Context {
@@ -110,20 +157,19 @@ func (rt *Routine) getCancelRoutineCtx() context.Context {
 	return rt.cancelRoutineCtx
 }
 
-func (rt *Routine) getProtocol() MysqlProtocol {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return rt.protocol
-}
-
-func (rt *Routine) getCmdExecutor() CmdExecutor {
-	rt.mu.Lock()
-	defer rt.mu.Unlock()
-	return rt.executor
+func (rt *Routine) getProtocol() MysqlRrWr {
+	return rt.protocol.Load().value
 }
 
 func (rt *Routine) getConnectionID() uint32 {
-	return rt.getProtocol().ConnectionID()
+	return rt.getProtocol().GetU32(CONNID)
+}
+
+func (rt *Routine) getGoroutineId() uint64 {
+	if rt.goroutineID == 0 {
+		rt.goroutineID = GetRoutineId()
+	}
+	return rt.goroutineID
 }
 
 func (rt *Routine) getParameters() *config.FrontendParameters {
@@ -139,50 +185,147 @@ func (rt *Routine) setSession(ses *Session) {
 }
 
 func (rt *Routine) getSession() *Session {
+	if rt == nil {
+		return nil
+	}
 	rt.mu.Lock()
 	defer rt.mu.Unlock()
 	return rt.ses
 }
 
+func (rt *Routine) setCancelRequestFunc(cf context.CancelFunc) {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	rt.cancelRequestFunc = cf
+}
+
+func (rt *Routine) cancelRequestCtx() {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	if rt.cancelRequestFunc != nil {
+		rt.cancelRequestFunc()
+	}
+}
+
+func (rt *Routine) reportSystemStatus() (r bool) {
+	ss := rt.ses
+	if ss == nil {
+		return
+	}
+	rm := ss.getRoutineManager()
+	if rm == nil {
+		return
+	}
+
+	now := time.Now()
+	defer func() {
+		if r {
+			rm.reportSystemStatusTime.Store(&now)
+		}
+	}()
+	last := rm.reportSystemStatusTime.Load()
+	if last == nil {
+		r = true
+		return
+	}
+	if now.Sub(*last) > time.Minute {
+		r = true
+		return
+	}
+	return
+}
+
 func (rt *Routine) handleRequest(req *Request) error {
-	var ses *Session
 	var routineCtx context.Context
 	var err error
 	var resp *Response
 	var quit bool
+
+	ses := rt.getSession()
+
+	execCtx := ExecCtx{
+		ses: ses,
+	}
+	defer execCtx.Close()
+	v2.StartHandleRequestCounter.Inc()
+	defer func() {
+		v2.EndHandleRequestCounter.Inc()
+	}()
+
 	reqBegin := time.Now()
-	routineCtx = rt.getCancelRoutineCtx()
+	var span trace.Span
+	routineCtx, span = trace.Start(rt.getCancelRoutineCtx(), "Routine.handleRequest",
+		trace.WithHungThreshold(30*time.Minute),
+		trace.WithProfileGoroutine(),
+		trace.WithConstBackOff(5*time.Minute),
+		trace.WithProfileSystemStatus(func() ([]byte, error) {
+			ss, ok := runtime.ServiceRuntime(ses.GetService()).GetGlobalVariables(runtime.StatusServer)
+			if !ok {
+				return nil, nil
+			}
+			if !rt.reportSystemStatus() {
+				return nil, nil
+			}
+			data, err := ss.(*status.Server).Dump()
+			return data, err
+		}),
+	)
+	defer span.End()
+
 	parameters := rt.getParameters()
-	mpi := rt.getProtocol()
-	mpi.SetSequenceID(req.seq)
-	cancelRequestCtx, cancelRequestFunc := context.WithTimeout(routineCtx, parameters.SessionTimeout.Duration)
-	executor := rt.getCmdExecutor()
-	executor.SetCancelFunc(cancelRequestFunc)
-	ses = rt.getSession()
-	ses.UpdateDebugString()
+	//all offspring related to the request inherit the txnCtx
+	cancelRequestCtx, cancelRequestFunc := context.WithTimeoutCause(ses.GetTxnHandler().GetTxnCtx(), parameters.SessionTimeout.Duration, moerr.CauseHandleRequest)
+	rt.setCancelRequestFunc(cancelRequestFunc)
+	ses.EnterFPrint(FPHandleRequest)
+	defer ses.ExitFPrint(FPHandleRequest)
+
+	if rt.needPrintSessionInfo() {
+		ses.Debug(routineCtx, "mo received first request")
+	}
+
 	tenant := ses.GetTenantInfo()
-	tenantCtx := context.WithValue(cancelRequestCtx, defines.TenantIDKey{}, tenant.GetTenantID())
-	tenantCtx = context.WithValue(tenantCtx, defines.UserIDKey{}, tenant.GetUserID())
-	tenantCtx = context.WithValue(tenantCtx, defines.RoleIDKey{}, tenant.GetDefaultRoleID())
-	tenantCtx = trace.ContextWithSpanContext(tenantCtx, trace.SpanContextWithID(trace.TraceID(ses.uuid), trace.SpanKindSession))
-	ses.SetRequestContext(tenantCtx)
-	executor.SetSession(rt.getSession())
+	nodeCtx := cancelRequestCtx
+	if ses.getRoutineManager().baseService != nil {
+		nodeCtx = context.WithValue(cancelRequestCtx, defines.NodeIDKey{}, ses.getRoutineManager().baseService.ID())
+	}
+	tenantCtx := defines.AttachAccount(nodeCtx, tenant.GetTenantID(), tenant.GetUserID(), tenant.GetDefaultRoleID())
 
 	rt.increaseCount(func() {
 		metric.ConnectionCounter(ses.GetTenantInfo().GetTenant()).Inc()
 	})
 
-	if resp, err = executor.ExecRequest(tenantCtx, ses, req); err != nil {
-		logErrorf(ses.GetDebugString(), "rt execute request failed. error:%v \n", err)
-	}
-
-	if resp != nil {
-		if err = rt.getProtocol().SendResponse(tenantCtx, resp); err != nil {
-			logErrorf(ses.GetDebugString(), "rt send response failed %v. error:%v ", resp, err)
+	execCtx.reqCtx = tenantCtx
+	if resp, err = ExecRequest(ses, &execCtx, req); err != nil {
+		err = moerr.AttachCause(tenantCtx, err)
+		if !skipClientQuit(err.Error()) {
+			ses.Error(tenantCtx,
+				"Failed to execute request",
+				zap.Error(err))
 		}
 	}
 
-	logDebugf(ses.GetDebugString(), "the time of handling the request %s", time.Since(reqBegin).String())
+	if resp != nil {
+		if err = rt.getProtocol().WriteResponse(tenantCtx, resp); err != nil {
+			err = moerr.AttachCause(tenantCtx, err)
+			if resp.isIssue3482 {
+				ses.Error(tenantCtx,
+					"Failed to send response",
+					zap.String("response", fmt.Sprintf("%v", resp)),
+					zap.String("load local ", resp.loadLocalFile),
+					zap.Error(err))
+			} else {
+				ses.Error(tenantCtx,
+					"Failed to send response",
+					zap.String("response", fmt.Sprintf("%v", resp)),
+					zap.Error(err))
+			}
+		}
+		if resp.isIssue3482 {
+			ses.Infof(tenantCtx, "load local '%s' exec failed. response error success", resp.loadLocalFile)
+		}
+	}
+
+	ses.Debugf(tenantCtx, "the time of handling the request %s", time.Since(reqBegin).String())
 
 	cancelRequestFunc()
 
@@ -201,29 +344,38 @@ func (rt *Routine) handleRequest(req *Request) error {
 		})
 
 		//ensure cleaning the transaction
-		logErrorf(ses.GetDebugString(), "rollback the txn.")
-		err = ses.TxnRollback()
+		ses.Error(tenantCtx, "rollback the txn.")
+		tempExecCtx := ExecCtx{
+			ses:    ses,
+			txnOpt: FeTxnOption{byRollback: true},
+		}
+		defer tempExecCtx.Close()
+		err = ses.GetTxnHandler().Rollback(&tempExecCtx)
 		if err != nil {
-			logErrorf(ses.GetDebugString(), "rollback txn failed.error:%v", err)
+			ses.Error(tenantCtx,
+				"Failed to rollback txn",
+				zap.Error(err))
 		}
 
 		//close the network connection
 		proto := rt.getProtocol()
 		if proto != nil {
-			proto.Quit()
+			proto.Close()
 		}
 	}
 
-	return nil
+	return err
 }
 
 // killQuery if there is a running query, just cancel it.
 func (rt *Routine) killQuery(killMyself bool, statementId string) {
 	if !killMyself {
-		executor := rt.getCmdExecutor()
-		if executor != nil {
-			//just cancel the request context.
-			executor.CancelRequest()
+		//1,cancel request ctx
+		rt.cancelRequestCtx()
+		//2.update execute state
+		ses := rt.getSession()
+		if ses != nil {
+			ses.SetQueryInExecute(false)
 		}
 	}
 }
@@ -248,18 +400,15 @@ func (rt *Routine) killConnection(killMyself bool) {
 		//(includes the request context) derived from the root context.
 		//After the context is cancelled. In handleRequest, the network
 		//will be closed finally.
-		cancel := rt.getCancelRoutineFunc()
-		if cancel != nil {
-			cancel()
-		}
+		rt.releaseRoutineCtx()
 
 		//If it is in processing the request, it responds to the client normally
 		//before closing the network to avoid the mysql client to be hung.
 		closeConn := func() {
 			//If it is not in processing the request, just close the network
-			proto := rt.protocol
+			proto := rt.getProtocol()
 			if proto != nil {
-				proto.Quit()
+				proto.Close()
 			}
 		}
 
@@ -274,10 +423,35 @@ func (rt *Routine) cleanup() {
 	//step 1: cancel the query if there is a running query.
 	//step 2: close the connection.
 	rt.closeOnce.Do(func() {
-		//step A: release the mempool related to the session
+		// we should wait for the migration and close the migration controller.
+		rt.mc.waitAndClose()
+
+		var txnMeta string
+		curRtId := GetRoutineId()
 		ses := rt.getSession()
+		//step A: rollback the txn
 		if ses != nil {
-			ses.Dispose()
+			ses.EnterFPrint(FPCleanup)
+			defer ses.ExitFPrint(FPCleanup)
+			tempExecCtx := ExecCtx{
+				ses:    ses,
+				txnOpt: FeTxnOption{byRollback: true},
+			}
+			defer tempExecCtx.Close()
+			txnHandler := ses.GetTxnHandler()
+			err := txnHandler.Rollback(&tempExecCtx)
+			if err != nil {
+				ses.Error(tempExecCtx.reqCtx,
+					"Failed to rollback txn",
+					zap.Error(err))
+			}
+			if txnHandler != nil && txnHandler.GetTxn() != nil {
+				txnOp := txnHandler.GetTxn()
+				txnMeta = txnOp.Txn().DebugString()
+			}
+			ses.Info(tempExecCtx.reqCtx, "routine cleanup", zap.Uint64("current go id", curRtId), zap.Uint64("record go id", rt.goroutineID), zap.String("last txnMeta", txnMeta))
+		} else {
+			logutil.Info("routine cleanup without session", zap.Uint64("current go id", curRtId), zap.Uint64("record go id", rt.goroutineID))
 		}
 
 		//step B: cancel the query
@@ -286,23 +460,92 @@ func (rt *Routine) cleanup() {
 		//step C: cancel the root context of the connection.
 		//At the same time, it cancels all the contexts
 		//(includes the request context) derived from the root context.
-		cancel := rt.getCancelRoutineFunc()
-		if cancel != nil {
-			cancel()
+		rt.releaseRoutineCtx()
+
+		//step D: clean protocol
+		rt.getProtocol().Close()
+		rt.protocol.Store(&holder[MysqlRrWr]{})
+
+		//step E: release the resources related to the session
+		if ses != nil {
+			ses.Close()
+			rt.ses = nil
 		}
 	})
 }
 
-func NewRoutine(ctx context.Context, protocol MysqlProtocol, executor CmdExecutor, parameters *config.FrontendParameters, rs goetty.IOSession) *Routine {
+func (rt *Routine) migrateConnectionTo(ctx context.Context, req *query.MigrateConnToRequest) error {
+	var err error
+	rt.mc.migrateOnce.Do(func() {
+		if !rt.mc.beginMigrate() {
+			err = moerr.NewInternalErrorNoCtx("cannot start migrate as routine has been closed")
+			return
+		}
+		defer rt.mc.endMigrate()
+		ses := rt.getSession()
+		ses.UpdateDebugString()
+		err = Migrate(ses, req)
+	})
+	return err
+}
+
+func (rt *Routine) migrateConnectionFrom(resp *query.MigrateConnFromResponse) error {
+	ses := rt.getSession()
+	resp.DB = ses.GetDatabaseName()
+	for _, st := range ses.GetPrepareStmts() {
+		resp.PrepareStmts = append(resp.PrepareStmts, &query.PrepareStmt{
+			Name:       st.Name,
+			SQL:        st.Sql,
+			ParamTypes: st.ParamTypes,
+		})
+	}
+	return nil
+}
+
+func (rt *Routine) resetSession(baseServiceID string, resp *query.ResetSessionResponse) error {
+	// retrieve the old session.
+	oldSession := rt.getSession()
+
+	// create a new session with a new context.
+	cancelCtx := rt.getCancelRoutineCtx()
+	cancelCtx = context.WithValue(cancelCtx, defines.NodeIDKey{}, baseServiceID)
+
+	// before create new session, we should reset the database on the protocol.
+	rt.getProtocol().SetStr(DBNAME, "")
+
+	newSession := NewSession(cancelCtx, baseServiceID, rt.getProtocol(), nil)
+
+	// reset the old and new session.
+	if err := newSession.reset(oldSession); err != nil {
+		return err
+	}
+
+	// some cleanups in the routine.
+	rt.killQuery(false, "")
+
+	// reset the new session in other instances.
+	rt.getProtocol().Reset(newSession)
+	rt.setSession(newSession)
+
+	// update the password filed in response.
+	resp.AuthString = []byte(rt.getProtocol().GetStr(AuthString))
+
+	return nil
+}
+
+func NewRoutine(ctx context.Context, protocol MysqlRrWr, parameters *config.FrontendParameters) *Routine {
 	ctx = trace.Generate(ctx) // fill span{trace_id} in ctx
 	cancelRoutineCtx, cancelRoutineFunc := context.WithCancel(ctx)
 	ri := &Routine{
-		protocol:          protocol,
-		executor:          executor,
 		cancelRoutineCtx:  cancelRoutineCtx,
 		cancelRoutineFunc: cancelRoutineFunc,
 		parameters:        parameters,
+		printInfoOnce:     true,
+		mc:                newMigrateController(),
+		goroutineID:       GetRoutineId(),
 	}
+	ri.protocol.Store(&holder[MysqlRrWr]{value: protocol})
+	protocol.UpdateCtx(cancelRoutineCtx)
 
 	return ri
 }

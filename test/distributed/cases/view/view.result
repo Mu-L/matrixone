@@ -4,27 +4,27 @@ create table t1 (a int, b int);
 create table t2 (aa int, bb varchar(20));
 create view v1 as select * from t1;
 select * from v1;
-a	b
+a    b
 insert into t1 values (1, 11), (2, 22), (3, 33);
 insert into t2 values (1, "aa"), (2, "bb");
 show columns from v1;
 Field    Type    Null    Key    Default    Extra    Comment
-a    INT(32)    YES        null
-b    INT(32)    YES        null
+a    INT(32)    YES        null        
+b    INT(32)    YES        null        
 select * from v1 where a > 1;
-a	b
-2	22
-3	33
+a    b
+2    22
+3    33
 select * from v1, t2 where v1.a = t2.aa;
-a	b	aa	bb
-1	11	1	aa
-2	22	2	bb
+a    b    aa    bb
+1    11    1    aa
+2    22    2    bb
 create database db2;
 use db2;
 select * from view.v1 where a > 1;
-a	b
-2	22
-3	33
+a    b
+2    22
+3    33
 use view;
 drop database db2;
 drop table t1;
@@ -37,15 +37,15 @@ show create view vvvv;
 invalid input: show view 'vvvv' is not a valid view
 create view v1 as select "a";
 show create view v1;
-View    Create View
-v1    create view v1 as select "a";
+View    Create View    character_set_client    collation_connection
+v1    create view v1 as select "a";    utf8mb4    utf8mb4_general_ci
 create view v2 as select 'a';
 show create view v2;
-View    Create View
-v2    create view v2 as select 'a';
+View    Create View    character_set_client    collation_connection
+v2    create view v2 as select 'a';    utf8mb4    utf8mb4_general_ci
 show create table v2;
-View    Create View
-v2    create view v2 as select 'a';
+View    Create View    character_set_client    collation_connection
+v2    create view v2 as select 'a';    utf8mb4    utf8mb4_general_ci
 drop view v1;
 drop view v2;
 create table tt(a int);
@@ -53,7 +53,6 @@ create view vv as select * from tt;
 drop table if exists tt;
 drop table if exists vv;
 drop view vv;
-
 drop table if exists t1;
 create table t1 (a int);
 insert into t1 values(1);
@@ -66,7 +65,6 @@ a
 1
 1
 drop view vvvv;
-
 drop table if exists t1;
 create table t1 (a int);
 insert into t1 values(1),(2),(3),(4);
@@ -94,7 +92,7 @@ insert into t1 values(1, 'aaaa'),(2, 'bbbbbb'),(3, 'cccccccc');
 create view v1 as select (case when a>1 then 'NO' else 'YES' end) as IS_NULLABLE from t1;
 desc v1;
 Field    Type    Null    Key    Default    Extra    Comment
-is_nullable    VARCHAR(3)    YES        NULL
+is_nullable    VARCHAR(3)    NO        null        
 drop view v1;
 drop database if exists test;
 create database test;
@@ -104,7 +102,53 @@ create table t1(a int);
 create view v1 as select * from t1;
 SELECT relname, rel_createsql,relkind FROM mo_catalog.mo_tables WHERE reldatabase='test' order by relname;
 relname    rel_createsql    relkind
-%!%mo_increment_columns        
-t1    create table t1(a int);    r
+t1    create table t1 (a int)    r
 v1    create view v1 as select * from t1;    v
+create table t2(a int not null, b varchar(20), c char(20));
+create view v2 as select * from t2;
+desc v2;
+Field    Type    Null    Key    Default    Extra    Comment
+a    INT(32)    NO        null        
+b    VARCHAR(20)    YES        null        
+c    CHAR(20)    YES        null        
 drop database test;
+drop database if exists test;
+create database test;
+use test;
+drop table if exists t1;
+create table t1 (project_id varchar(64)   NOT NULL);
+drop table if exists t2;
+create table t2  (project_id varchar(64) NOT NULL, project_name varchar(255) NOT NULL);
+drop view if exists v1;
+create view v1 as select a.project_id as project_id, b.project_name as project_name from t1 a left join t2 b on a.project_id = b.project_id;
+desc v1;
+Field    Type    Null    Key    Default    Extra    Comment
+project_id    VARCHAR(64)    NO        null        
+project_name    VARCHAR(255)    YES        null        
+drop table t1;
+drop table t2;
+drop view v1;
+drop database test;
+drop database if exists test;
+create database test;
+use test;
+drop table if exists table01;
+/* cloud_user */create table table01 (col1 int, col2 decimal(6), col3 varchar(30));
+insert into table01 values (1, null, 'database');
+insert into table01 values (2, 38291.32132, 'database');
+insert into table01 values (3, null, 'database management system');
+insert into table01 values (4, 10, null);
+insert into table01 values (1, -321.321, null);
+insert into table01 values (2, -1, null);
+select count(*) from table01;
+count(*)
+6
+show create table table01;
+Table    Create Table
+table01    CREATE TABLE `table01` (\n  `col1` int DEFAULT NULL,\n  `col2` decimal(6,0) DEFAULT NULL,\n  `col3` varchar(30) DEFAULT NULL\n)
+drop view if exists v01;
+/* cloud_user */create view v01 as select * from table01;
+show create view v01;
+View    Create View    character_set_client    collation_connection
+v01    create view v01 as select * from table01;    utf8mb4    utf8mb4_general_ci
+drop database if exists test;

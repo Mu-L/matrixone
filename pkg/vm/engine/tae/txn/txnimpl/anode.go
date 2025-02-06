@@ -15,205 +15,227 @@
 package txnimpl
 
 import (
+	"context"
+
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer/base"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
 // anode corresponds to an appendable standalone-uncommitted block
 // which belongs to txn's workspace and can be appended data into.
 type anode struct {
 	*baseNode
+	data        *containers.Batch
+	rows        uint32
+	appends     []*appendInfo
+	isTombstone bool
+
+	isMergeCompact bool
 }
 
 // NewANode creates a InsertNode with data in memory.
 func NewANode(
 	tbl *txnTable,
-	fs *objectio.ObjectFS,
-	mgr base.INodeManager,
-	sched tasks.TaskScheduler,
-	meta *catalog.BlockEntry,
+	meta *catalog.ObjectEntry,
+	isTombstone bool,
 ) *anode {
 	impl := new(anode)
-	impl.baseNode = newBaseNode(tbl, fs, mgr, sched, meta)
-	impl.storage.mnode = newMemoryNode(impl.baseNode)
-	impl.storage.mnode.Ref()
+	impl.baseNode = newBaseNode(tbl, meta)
+	impl.appends = make([]*appendInfo, 0)
+	impl.isTombstone = isTombstone
 	return impl
 }
 
-func (n *anode) GetAppends() []*appendInfo {
-	return n.storage.mnode.appends
+func (n *anode) Rows() uint32 {
+	return n.rows
 }
-func (n *anode) AddApplyInfo(srcOff, srcLen, destOff, destLen uint32, dbid uint64, dest *common.ID) *appendInfo {
-	seq := len(n.storage.mnode.appends)
+
+func (n *anode) GetAppends() []*appendInfo {
+	return n.appends
+}
+func (n *anode) AddApplyInfo(srcOff, srcLen, destOff, destLen uint32, dest *common.ID) *appendInfo {
+	seq := len(n.appends)
 	info := &appendInfo{
-		dest:    dest,
+		dest:    *dest,
 		destOff: destOff,
 		destLen: destLen,
-		dbid:    dbid,
 		srcOff:  srcOff,
 		srcLen:  srcLen,
 		seq:     uint32(seq),
 	}
-	n.storage.mnode.appends = append(n.storage.mnode.appends, info)
+	n.appends = append(n.appends, info)
 	return info
 }
 
+func (n *anode) IsPersisted() bool {
+	return false
+}
+
 func (n *anode) MakeCommand(id uint32) (cmd txnif.TxnCmd, err error) {
-	if n.IsPersisted() {
-		return nil, nil
-	}
-	if n.storage.mnode.data == nil {
+	if n.data == nil {
 		return
 	}
-	composedCmd := NewAppendCmd(id, n)
-	batCmd := txnbase.NewBatchCmd(n.storage.mnode.data)
-	composedCmd.AddCmd(batCmd)
+	composedCmd := NewAppendCmd(id, n, n.data, n.isTombstone)
 	return composedCmd, nil
 }
 
 func (n *anode) Close() (err error) {
-	if n.storage.mnode.data != nil {
-		n.storage.mnode.data.Close()
+	if n.data != nil {
+		n.data.Close()
+		n.data = nil
 	}
 	return
 }
 
+func (n *anode) PrepareAppend(data *containers.Batch, offset uint32) uint32 {
+	return uint32(data.Length()) - offset
+}
+
 func (n *anode) Append(data *containers.Batch, offset uint32) (an uint32, err error) {
-	schema := n.table.entry.GetSchema()
-	if n.storage.mnode.data == nil {
-		opts := containers.Options{}
-		opts.Capacity = data.Length() - int(offset)
-		if opts.Capacity > int(txnbase.MaxNodeRows) {
-			opts.Capacity = int(txnbase.MaxNodeRows)
-		}
-		n.storage.mnode.data = containers.BuildBatch(
+	schema := n.table.GetLocalSchema(n.isTombstone)
+	if n.data == nil {
+		capacity := data.Length() - int(offset)
+		n.data = containers.BuildBatchWithPool(
 			schema.AllNames(),
 			schema.AllTypes(),
-			schema.AllNullables(),
-			opts)
+			capacity,
+			n.table.store.rt.VectorPool.Small,
+		)
+
+		// n.data = containers.BuildBatch(
+		// 	schema.AllNames(),
+		// 	schema.AllTypes(),
+		// 	containers.Options{
+		// 		Capacity: capacity,
+		// 	},
+		// )
 	}
 
-	from := uint32(n.storage.mnode.data.Length())
-	an = n.storage.mnode.PrepareAppend(data, offset)
+	from := uint32(n.data.Length())
+	an = n.PrepareAppend(data, offset)
 	for _, attr := range data.Attrs {
 		if attr == catalog.PhyAddrColumnName {
 			continue
 		}
+		// if n.isTombstone {
+		// 	if attr == objectio.TombstoneAttr_CommitTs_Attr || attr == catalog.AttrAborted {
+		// 		continue
+		// 	}
+		// }
 		def := schema.ColDefs[schema.GetColIdx(attr)]
-		destVec := n.storage.mnode.data.Vecs[def.Idx]
+		destVec := n.data.Vecs[def.Idx]
 		// logutil.Infof("destVec: %s, %d, %d", destVec.String(), cnt, data.Length())
 		destVec.ExtendWithOffset(data.Vecs[def.Idx], int(offset), int(an))
 	}
-	n.storage.mnode.rows = uint32(n.storage.mnode.data.Length())
-	err = n.storage.mnode.FillPhyAddrColumn(from, an)
+	n.rows = uint32(n.data.Length())
+	err = n.FillPhyAddrColumn(from, an)
 	return
 }
 
-func (n *anode) FillBlockView(view *model.BlockView, colIdxes []int) (err error) {
+func (n *anode) FillPhyAddrColumn(startRow, length uint32) (err error) {
+	if n.isTombstone {
+		return
+	}
+	col := n.table.store.rt.VectorPool.Small.GetVector(&objectio.RowidType)
+	blkID := objectio.NewBlockidWithObjectID(n.meta.ID(), 0)
+	if err = objectio.ConstructRowidColumnTo(
+		col.GetDownstreamVector(),
+		blkID, startRow, length,
+		col.GetAllocator(),
+	); err != nil {
+		col.Close()
+		return
+	}
+	err = n.data.Vecs[n.table.GetLocalSchema(n.isTombstone).PhyAddrKey.Idx].ExtendVec(col.GetDownstreamVector())
+	col.Close()
+	return
+}
+
+func (n *anode) FillBlockView(
+	view *containers.Batch, colIdxes []int, mp *mpool.MPool,
+) (err error) {
 	for _, colIdx := range colIdxes {
-		orig := n.storage.mnode.data.Vecs[colIdx]
-		view.SetData(colIdx, orig.CloneWindow(0, orig.Length()))
+		orig := n.data.Vecs[colIdx]
+		view.AddVector(n.data.Attrs[colIdx], orig.CloneWindow(0, orig.Length(), mp))
 	}
-	view.DeleteMask = n.storage.mnode.data.Deletes
-	return
-}
-func (n *anode) FillColumnView(view *model.ColumnView) (err error) {
-	orig := n.storage.mnode.data.Vecs[view.ColIdx]
-	view.SetData(orig.CloneWindow(0, orig.Length()))
-	view.DeleteMask = n.storage.mnode.data.Deletes
+	view.Deletes = n.data.Deletes
 	return
 }
 
-func (n *anode) GetSpace() uint32 {
-	return txnbase.MaxNodeRows - n.storage.mnode.rows
+func (n *anode) Compact() {
+	if n.data == nil {
+		return
+	}
+	n.data.Compact()
+	n.rows = uint32(n.data.Length())
 }
 
-func (n *anode) RowsWithoutDeletes() uint32 {
-	deletes := uint32(0)
-	if n.storage.mnode.data != nil && n.storage.mnode.data.Deletes != nil {
-		deletes = uint32(n.storage.mnode.data.DeleteCnt())
-	}
-	return uint32(n.storage.mnode.data.Length()) - deletes
-}
-
-func (n *anode) LengthWithDeletes(appended, toAppend uint32) uint32 {
-	if !n.storage.mnode.data.HasDelete() {
-		return toAppend
-	}
-	appendedOffset := n.OffsetWithDeletes(appended)
-	toAppendOffset := n.OffsetWithDeletes(toAppend + appended)
-	// logutil.Infof("appened:%d, toAppend:%d, off1=%d, off2=%d", appended, toAppend, appendedOffset, toAppendOffset)
-	return toAppendOffset - appendedOffset
-}
-
-func (n *anode) OffsetWithDeletes(count uint32) uint32 {
-	if !n.storage.mnode.data.HasDelete() {
-		return count
-	}
-	offset := count
-	for offset < n.storage.mnode.rows {
-		deletes := n.storage.mnode.data.Deletes.Rank(offset)
-		if offset == count+uint32(deletes) {
-			break
-		}
-		offset = count + uint32(deletes)
-	}
-	return offset
-}
-
-func (n *anode) GetValue(col int, row uint32) (any, error) {
-	if !n.IsPersisted() {
-		return n.storage.mnode.data.Vecs[col].Get(int(row)), nil
-	}
-	//TODO:: get value from S3/FS
-	panic("not implemented yet :GetValue from FS/S3 ")
+func (n *anode) GetValue(col int, row uint32) (any, bool, error) {
+	vec := n.data.Vecs[col]
+	return vec.Get(int(row)), vec.IsNull(int(row)), nil
 }
 
 func (n *anode) RangeDelete(start, end uint32) error {
-	n.storage.mnode.data.RangeDelete(int(start), int(end+1))
+	n.data.RangeDelete(int(start), int(end+1))
 	return nil
 }
 
 func (n *anode) IsRowDeleted(row uint32) bool {
-	return n.storage.mnode.data.IsDeleted(int(row))
+	return n.data.IsDeleted(int(row))
 }
 
 func (n *anode) PrintDeletes() string {
-	if !n.storage.mnode.data.HasDelete() {
+	if !n.data.HasDelete() {
 		return "NoDeletes"
 	}
-	return n.storage.mnode.data.Deletes.String()
+	return nulls.String(n.data.Deletes)
 }
 
-func (n *anode) Window(start, end uint32) (bat *containers.Batch, err error) {
-	bat = n.storage.mnode.data.CloneWindow(int(start), int(end-start))
-	bat.Compact()
+func (n *anode) WindowColumn(start, end uint32, pos int) (vec containers.Vector, err error) {
+	data := n.data
+	deletes := data.WindowDeletes(int(start), int(end-start), false)
+	if deletes != nil {
+		vec = data.Vecs[pos].CloneWindow(int(start), int(end-start))
+		vec.CompactByBitmap(deletes)
+	} else {
+		vec = data.Vecs[pos].Window(int(start), int(end-start))
+	}
 	return
 }
 
-func (n *anode) GetColumnDataByIds(
-	colIdxes []int,
-) (view *model.BlockView, err error) {
-	if !n.IsPersisted() {
-		view = model.NewBlockView(n.table.store.txn.GetStartTS())
-		err = n.FillBlockView(view, colIdxes)
-		return
+func (n *anode) Window(start, end uint32) (bat *containers.Batch, err error) {
+	data := n.data
+	if data.HasDelete() {
+		bat = data.CloneWindow(int(start), int(end-start))
+		bat.Compact()
+	} else {
+		bat = data.Window(int(start), int(end-start))
 	}
-	panic("Not Implemented yet : GetColumnDataByIds from S3/FS ")
+	return
 }
 
-func (n *anode) GetColumnDataById(colIdx int) (view *model.ColumnView, err error) {
-	if !n.IsPersisted() {
-		view = model.NewColumnView(n.table.store.txn.GetStartTS(), colIdx)
-		err = n.FillColumnView(view)
+func (n *anode) Scan(ctx context.Context, bat **containers.Batch, colIdxes []int, mp *mpool.MPool) {
+	if *bat == nil {
+		*bat = containers.NewBatch()
+		for _, colIdx := range colIdxes {
+			orig := n.data.Vecs[colIdx]
+			attr := n.data.Attrs[colIdx]
+			(*bat).AddVector(attr, orig.CloneWindow(0, orig.Length(), mp))
+		}
 		return
 	}
-	panic("Not Implemented yet : GetColumnDataByIds from S3/FS ")
+	for _, colIdx := range colIdxes {
+		orig := n.data.Vecs[colIdx]
+		attr := n.data.Attrs[colIdx]
+		(*bat).GetVectorByName(attr).Extend(orig)
+	}
+}
+
+func (n *anode) Prefetch() error {
+	return nil
 }

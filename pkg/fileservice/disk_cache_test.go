@@ -17,22 +17,37 @@ package fileservice
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"fmt"
 	"io"
-	"sync"
+	"io/fs"
+	mrand "math/rand"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
+	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestDiskCache(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
 
+	// counter
+	numWritten := 0
+	ctx = OnDiskCacheWritten(ctx, func(path string, entry IOEntry) {
+		numWritten++
+	})
+
 	// new
-	cache, err := NewDiskCache(dir, 1024, nil)
+	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
 	assert.Nil(t, err)
+	defer cache.Close(ctx)
 
 	// update
 	testUpdate := func(cache *DiskCache) {
@@ -62,8 +77,12 @@ func TestDiskCache(t *testing.T) {
 	}
 	testUpdate(cache)
 
+	assert.Equal(t, 1, numWritten)
+
 	// update again
 	testUpdate(cache)
+
+	assert.Equal(t, 1, numWritten)
 
 	// read
 	testRead := func(cache *DiskCache) {
@@ -93,6 +112,7 @@ func TestDiskCache(t *testing.T) {
 		}
 		err = cache.Read(ctx, vec)
 		assert.Nil(t, err)
+		assert.NotNil(t, r)
 		defer r.Close()
 		assert.True(t, vec.Entries[0].done)
 		assert.Equal(t, []byte("a"), vec.Entries[0].Data)
@@ -102,6 +122,7 @@ func TestDiskCache(t *testing.T) {
 		assert.Equal(t, []byte("a"), bs)
 		assert.False(t, vec.Entries[1].done)
 		assert.False(t, vec.Entries[2].done)
+		vec.Release()
 	}
 	testRead(cache)
 
@@ -109,165 +130,576 @@ func TestDiskCache(t *testing.T) {
 	testRead(cache)
 
 	// new cache instance and read
-	cache, err = NewDiskCache(dir, 1024, nil)
+	cache, err = NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
 	assert.Nil(t, err)
+	defer cache.Close(ctx)
+
 	testRead(cache)
 
+	assert.Equal(t, 1, numWritten)
+
 	// new cache instance and update
-	cache, err = NewDiskCache(dir, 1024, nil)
+	cache, err = NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
 	assert.Nil(t, err)
+	defer cache.Close(ctx)
+
 	testUpdate(cache)
 
+	assert.Equal(t, 1, numWritten)
+
+	// delete file
+	err = cache.DeletePaths(ctx, []string{"foo"})
+	assert.Nil(t, err)
 }
 
-func TestDiskCachePreload(t *testing.T) {
+func TestDiskCacheWriteAgain(t *testing.T) {
+
 	dir := t.TempDir()
 	ctx := context.Background()
 	var counterSet perfcounter.CounterSet
 	ctx = perfcounter.WithCounterSet(ctx, &counterSet)
 
-	// new
-	cache, err := NewDiskCache(dir, 1024, nil)
+	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(4096), nil, false, nil, "")
 	assert.Nil(t, err)
+	defer cache.Close(ctx)
 
-	// set content
-	err = cache.SetFileContent(ctx, "foo", func(_ context.Context, vec *IOVector) error {
-		_, err := vec.Entries[0].WriterForRead.Write([]byte("foo"))
-		if err != nil {
-			return err
-		}
-		return nil
-	})
+	// update
+	err = cache.Update(ctx, &IOVector{
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Size: 3,
+				Data: []byte("foo"),
+			},
+		},
+	}, false)
 	assert.Nil(t, err)
-	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.SetFileContent.Load())
-	assert.Equal(t, int64(0), counterSet.FileService.Cache.Disk.OpenFile.Load())
-	assert.Equal(t, int64(0), counterSet.FileService.Cache.Disk.StatFile.Load())
+	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.WriteFile.Load())
+	assert.Equal(t, int64(0), counterSet.FileService.Cache.Disk.Evict.Load())
 
-	// get content
-	r, err := cache.GetFileContent(ctx, "foo", 0)
+	// update another entry
+	err = cache.Update(ctx, &IOVector{
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Size:   3,
+				Data:   []byte("foo"),
+				Offset: 99,
+			},
+		},
+	}, false)
 	assert.Nil(t, err)
-	data, err := io.ReadAll(r)
-	assert.Nil(t, err)
-	assert.Equal(t, []byte("foo"), data)
-	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.GetFileContent.Load())
-	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.OpenFile.Load())
-	assert.Equal(t, int64(0), counterSet.FileService.Cache.Disk.StatFile.Load())
+	assert.Equal(t, int64(2), counterSet.FileService.Cache.Disk.WriteFile.Load())
+	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.Evict.Load())
 
-	r, err = cache.GetFileContent(ctx, "foo", 1)
+	// update again, should write cache file again
+	err = cache.Update(ctx, &IOVector{
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Size: 3,
+				Data: []byte("foo"),
+			},
+		},
+	}, false)
 	assert.Nil(t, err)
-	data, err = io.ReadAll(r)
-	assert.Nil(t, err)
-	assert.Equal(t, []byte("oo"), data)
-	assert.Equal(t, int64(2), counterSet.FileService.Cache.Disk.GetFileContent.Load())
-	assert.Equal(t, int64(2), counterSet.FileService.Cache.Disk.OpenFile.Load())
-	assert.Equal(t, int64(0), counterSet.FileService.Cache.Disk.StatFile.Load())
+	assert.Equal(t, int64(3), counterSet.FileService.Cache.Disk.WriteFile.Load())
+	assert.Equal(t, int64(2), counterSet.FileService.Cache.Disk.Evict.Load())
 
-	// read
 	vec := &IOVector{
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Size: 3,
+			},
+		},
+	}
+	err = cache.Read(ctx, vec)
+	assert.Nil(t, err)
+	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.Hit.Load())
+	vec.Release()
+
+}
+
+func TestDiskCacheFileCache(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	assert.Nil(t, err)
+	defer cache.Close(ctx)
+
+	vector := IOVector{
 		FilePath: "foo",
 		Entries: []IOEntry{
 			{
 				Offset: 0,
 				Size:   3,
+				Data:   []byte("foo"),
 			},
 			{
-				Offset: 1,
+				Offset: 3,
+				Size:   3,
+				Data:   []byte("bar"),
+			},
+		},
+	}
+
+	data, err := io.ReadAll(newIOEntriesReader(ctx, vector.Entries))
+	assert.Nil(t, err)
+	err = cache.SetFile(ctx, vector.FilePath, func(context.Context) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	})
+	assert.Nil(t, err)
+
+	readVector := &IOVector{
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Offset: 0,
 				Size:   2,
 			},
 			{
 				Offset: 2,
-				Size:   1,
+				Size:   2,
+			},
+			{
+				Offset: 4,
+				Size:   2,
 			},
 		},
 	}
-	assert.Nil(t, cache.Read(ctx, vec))
-	assert.Equal(t, []byte("foo"), vec.Entries[0].Data)
-	assert.Equal(t, []byte("oo"), vec.Entries[1].Data)
-	assert.Equal(t, []byte("o"), vec.Entries[2].Data)
-	assert.Equal(t, int64(3), counterSet.FileService.Cache.Disk.OpenFile.Load())
-	assert.Equal(t, int64(0), counterSet.FileService.Cache.Disk.StatFile.Load())
-
-	// update
-	assert.Nil(t, cache.Update(ctx, vec, false))
-	assert.Equal(t, int64(3), counterSet.FileService.Cache.Disk.OpenFile.Load())
-	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.StatFile.Load())
-
-	// read and update again
-	assert.Nil(t, cache.Read(ctx, vec))
-	assert.Equal(t, []byte("foo"), vec.Entries[0].Data)
-	assert.Equal(t, []byte("oo"), vec.Entries[1].Data)
-	assert.Equal(t, []byte("o"), vec.Entries[2].Data)
-	assert.Equal(t, int64(4), counterSet.FileService.Cache.Disk.OpenFile.Load())
-	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.StatFile.Load())
-	assert.Nil(t, cache.Update(ctx, vec, false))
-	assert.Equal(t, int64(4), counterSet.FileService.Cache.Disk.OpenFile.Load())
-	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.StatFile.Load())
+	err = cache.Read(ctx, readVector)
+	assert.Nil(t, err)
+	assert.Equal(t, []byte("fo"), readVector.Entries[0].Data)
+	assert.Equal(t, []byte("ob"), readVector.Entries[1].Data)
+	assert.Equal(t, []byte("ar"), readVector.Entries[2].Data)
+	readVector.Release()
 
 }
 
-func TestDiskCacheConcurrentSetFileContent(t *testing.T) {
-	dir := t.TempDir()
+func TestDiskCacheDirSize(t *testing.T) {
 	ctx := context.Background()
-	var counterSet perfcounter.CounterSet
-	ctx = perfcounter.WithCounterSet(ctx, &counterSet)
+	var counter perfcounter.CounterSet
+	ctx = perfcounter.WithCounterSet(ctx, &counter)
 
-	// new
-	cache, err := NewDiskCache(dir, 1024, nil)
+	dir := t.TempDir()
+	capacity := 1 << 20
+	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(int64(capacity)), nil, false, nil, "")
 	assert.Nil(t, err)
+	defer cache.Close(ctx)
 
-	n := 128
-	wg := new(sync.WaitGroup)
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		go func() {
-			defer wg.Done()
-			err := cache.SetFileContent(ctx, "foo", func(_ context.Context, vec *IOVector) error {
-				_, err := vec.Entries[0].WriterForRead.Write([]byte("foo"))
-				if err != nil {
-					return err
-				}
-				return nil
-			})
-			assert.Nil(t, err)
-		}()
+	data := bytes.Repeat([]byte("a"), capacity/128)
+	for i := 0; i < capacity/len(data)*2; i++ {
+		err := cache.Update(ctx, &IOVector{
+			FilePath: fmt.Sprintf("%v", i),
+			Entries: []IOEntry{
+				{
+					Offset: 0,
+					Size:   int64(len(data)),
+					Data:   data,
+				},
+			},
+		}, false)
+		assert.Nil(t, err)
+		size := dirSize(dir)
+		assert.LessOrEqual(t, size, capacity)
 	}
-	wg.Wait()
-
-	assert.Equal(t, int64(1), counterSet.FileService.Cache.Disk.SetFileContent.Load())
+	assert.True(t, counter.FileService.Cache.Disk.Evict.Load() > 0)
 }
 
-func TestDiskCacheEviction(t *testing.T) {
+func dirSize(path string) (ret int) {
+	if err := filepath.WalkDir(path, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		stat, err := d.Info()
+		if err != nil {
+			return err
+		}
+		ret += int(fileSize(stat))
+		return nil
+	}); err != nil {
+		panic(err)
+	}
+	return
+}
+
+func benchmarkDiskCacheWriteThenRead(
+	b *testing.B,
+	size int64,
+) {
+	b.Helper()
+
+	b.SetBytes(size)
+	data := bytes.Repeat([]byte("a"), int(size))
+
+	dir := b.TempDir()
+	ctx := context.Background()
+
+	cache, err := NewDiskCache(
+		ctx,
+		dir,
+		fscache.ConstCapacity(10<<30),
+		nil,
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cache.Close(ctx)
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		buf := make([]byte, 0, size)
+		for pb.Next() {
+
+			path := strconv.FormatInt(mrand.Int63(), 10)
+
+			// update
+			err := cache.Update(
+				ctx,
+				&IOVector{
+					FilePath: path,
+					Entries: []IOEntry{
+						{
+							Size: size,
+							Data: data,
+						},
+					},
+				},
+				false,
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			// read
+			vec := &IOVector{
+				FilePath: path,
+				Entries: []IOEntry{
+					{
+						Size: size,
+						Data: buf,
+					},
+				},
+			}
+			err = cache.Read(
+				ctx,
+				vec,
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if !bytes.Equal(vec.Entries[0].Data, data) {
+				b.Fatal()
+			}
+
+		}
+	})
+
+}
+
+func BenchmarkDiskCacheWriteThenRead(b *testing.B) {
+	b.Run("4K", func(b *testing.B) {
+		benchmarkDiskCacheWriteThenRead(b, 4096)
+	})
+	b.Run("1M", func(b *testing.B) {
+		benchmarkDiskCacheWriteThenRead(b, 1<<20)
+	})
+	b.Run("16M", func(b *testing.B) {
+		benchmarkDiskCacheWriteThenRead(b, 16<<20)
+	})
+}
+
+func benchmarkDiskCacheReadRandomOffsetAtLargeFile(
+	b *testing.B,
+	fileSize int64,
+	readSize int64,
+) {
+	b.Helper()
+
+	b.SetBytes(readSize)
+	data := make([]byte, fileSize)
+	_, err := rand.Read(data)
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	dir := b.TempDir()
+	ctx := context.Background()
+
+	cache, err := NewDiskCache(
+		ctx,
+		dir,
+		fscache.ConstCapacity(8<<30),
+		nil,
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cache.Close(ctx)
+
+	err = cache.SetFile(ctx, "foo", func(ctx context.Context) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(data)), nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		buf := make([]byte, 0, readSize)
+		for pb.Next() {
+
+			// read
+			offset := mrand.Intn(int(fileSize - readSize))
+			vec := &IOVector{
+				FilePath: "foo",
+				Entries: []IOEntry{
+					{
+						Offset: int64(offset),
+						Size:   readSize,
+						Data:   buf,
+					},
+				},
+			}
+			err = cache.Read(
+				ctx,
+				vec,
+			)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if !bytes.Equal(vec.Entries[0].Data, data[offset:offset+int(readSize)]) {
+				b.Fatal()
+			}
+
+		}
+	})
+
+}
+
+func BenchmarkDiskCacheReadRandomOffsetAtLargeFile(b *testing.B) {
+	b.Run("4K", func(b *testing.B) {
+		benchmarkDiskCacheReadRandomOffsetAtLargeFile(b, 1<<30, 4096)
+	})
+	b.Run("1M", func(b *testing.B) {
+		benchmarkDiskCacheReadRandomOffsetAtLargeFile(b, 1<<30, 1<<20)
+	})
+	b.Run("16M", func(b *testing.B) {
+		benchmarkDiskCacheReadRandomOffsetAtLargeFile(b, 1<<30, 16<<20)
+	})
+}
+
+func BenchmarkDiskCacheMultipleIOEntries(b *testing.B) {
+	dir := b.TempDir()
+	ctx := context.Background()
+
+	cache, err := NewDiskCache(
+		ctx,
+		dir,
+		fscache.ConstCapacity(8<<30),
+		nil,
+		false,
+		nil,
+		"",
+	)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer cache.Close(ctx)
+
+	err = cache.SetFile(ctx, "foo", func(ctx context.Context) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("a"), 1<<20))), nil
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		var entries []IOEntry
+		for i := 0; i < 64; i++ {
+			entries = append(entries, IOEntry{
+				Offset: 0,
+				Size:   4096,
+			})
+		}
+		var counter perfcounter.CounterSet
+		ctx := perfcounter.WithCounterSet(ctx, &counter)
+		vec := &IOVector{
+			FilePath: "foo",
+			Entries:  entries,
+		}
+		err := cache.Read(ctx, vec)
+		if err != nil {
+			b.Fatal(err)
+		}
+		numOpen := counter.FileService.Cache.Disk.OpenFullFile.Load()
+		if numOpen != 1 {
+			b.Fatal()
+		}
+		vec.Release()
+	}
+}
+
+func TestDiskCacheClearFiles(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
-	var counterSet perfcounter.CounterSet
-	ctx = perfcounter.WithCounterSet(ctx, &counterSet)
 
-	// new
-	cache, err := NewDiskCache(dir, 1, nil)
+	// write garbage temp file
+	err := os.WriteFile(
+		filepath.Join(dir, "a"+cacheFileTempSuffix),
+		[]byte("foo"),
+		0644,
+	)
+	assert.Nil(t, err)
+	err = os.Chtimes(
+		filepath.Join(dir, "a"+cacheFileTempSuffix),
+		time.Now().Add(-time.Hour*24),
+		time.Now().Add(-time.Hour*24),
+	)
 	assert.Nil(t, err)
 
-	n := 128
-	wg := new(sync.WaitGroup)
-	wg.Add(n)
-	for i := 0; i < n; i++ {
-		i := i
-		go func() {
-			defer wg.Done()
-			err := cache.SetFileContent(ctx, fmt.Sprintf("%v", i), func(_ context.Context, vec *IOVector) error {
-				_, err := vec.Entries[0].WriterForRead.Write([]byte("foo"))
-				if err != nil {
-					return err
-				}
-				return nil
-			})
-			assert.Nil(t, err)
-		}()
+	// write garbage file
+	err = os.WriteFile(
+		filepath.Join(dir, "foo"),
+		[]byte("foo"),
+		0644,
+	)
+	assert.Nil(t, err)
+
+	files, err := filepath.Glob(filepath.Join(dir, "*"))
+	assert.Nil(t, err)
+	numFiles := len(files)
+
+	_, err = NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	assert.Nil(t, err)
+
+	files, err = filepath.Glob(filepath.Join(dir, "*"))
+	assert.Nil(t, err)
+	if len(files) != numFiles-2 {
+		t.Fatalf("got %v", files)
 	}
-	wg.Wait()
 
-	assert.Equal(t, int64(128), counterSet.FileService.Cache.Disk.SetFileContent.Load())
+}
 
-	cache.stats.Lock()
-	cache.evict()
-	cache.stats.Unlock()
+func TestDiskCacheBadWrite(t *testing.T) {
+	dir := t.TempDir()
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, dir, fscache.ConstCapacity(1<<20), nil, false, nil, "")
+	assert.Nil(t, err)
+
+	written, err := cache.writeFile(
+		ctx,
+		filepath.Join(dir, "foo"),
+		func(ctx context.Context) (io.ReadCloser, error) {
+			// bad reader
+			return nil, io.ErrUnexpectedEOF
+		},
+	)
+	assert.Nil(t, err)
+	if written {
+		t.Fatal()
+	}
+
+	// ensure no temp files
+	files, err := filepath.Glob(filepath.Join(dir, "*"))
+	assert.Nil(t, err)
+	assert.Empty(t, files)
+
+}
+
+func TestDiskCacheGlobalSizeHint(t *testing.T) {
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	cache, err := NewDiskCache(
+		context.Background(),
+		dir,
+		fscache.ConstCapacity(1<<20),
+		nil,
+		false,
+		nil,
+		"test",
+	)
+	assert.Nil(t, err)
+	defer cache.Close(ctx)
+
+	ch := make(chan int64, 1)
+	cache.Evict(ctx, ch)
+	n := <-ch
+	if n > 1<<20 {
+		t.Fatalf("got %v", n)
+	}
+
+	// shrink
+	GlobalDiskCacheSizeHint.Store(1 << 10)
+	defer GlobalDiskCacheSizeHint.Store(0)
+	cache.Evict(ctx, ch)
+	n = <-ch
+	if n > 1<<10 {
+		t.Fatalf("got %v", n)
+	}
+
+	// shrink
+	GlobalDiskCacheSizeHint.Store(1 << 9)
+	defer GlobalDiskCacheSizeHint.Store(0)
+	ret := EvictDiskCaches(ctx)
+	if ret["test"] > 1<<9 {
+		t.Fatalf("got %v", ret)
+	}
+
+}
+
+func TestDiskCacheSetFromFile(t *testing.T) {
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(1<<30), nil, false, nil, "")
+	require.Nil(t, err)
+	defer cache.Close(ctx)
+
+	path := filepath.Join(t.TempDir(), "foo")
+	err = os.WriteFile(
+		path,
+		[]byte("foo"),
+		0644,
+	)
+	require.Nil(t, err)
+
+	written, err := cache.writeFile(
+		ctx,
+		cache.pathForFile("foo"),
+		func(ctx context.Context) (io.ReadCloser, error) {
+			return os.Open(path)
+		},
+	)
+	require.Nil(t, err)
+	require.True(t, written)
+}
+
+func TestDiskCacheQuotaExceeded(t *testing.T) {
+	ctx := context.Background()
+	cache, err := NewDiskCache(ctx, t.TempDir(), fscache.ConstCapacity(3), nil, false, nil, "")
+	require.Nil(t, err)
+	defer cache.Close(ctx)
+
+	cache.writeFile(
+		ctx,
+		cache.pathForFile("bar"),
+		func(ctx context.Context) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte("foo"))), errorStr("disk quota exceeded")
+		},
+	)
+
 }

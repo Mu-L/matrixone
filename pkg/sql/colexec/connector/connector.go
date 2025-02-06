@@ -16,47 +16,55 @@ package connector
 
 import (
 	"bytes"
+	"github.com/matrixorigin/matrixone/pkg/container/pSpool"
 
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(arg any, buf *bytes.Buffer) {
-	buf.WriteString("pipe connector")
+const opName = "connector"
+
+func (connector *Connector) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(": pipe connector")
 }
 
-func Prepare(_ *process.Process, _ any) error {
+func (connector *Connector) Prepare(proc *process.Process) error {
+	if connector.ctr.sp == nil {
+		connector.ctr.sp = pSpool.InitMyPipelineSpool(proc.Mp(), 1)
+	}
+
+	if connector.OpAnalyzer == nil {
+		connector.OpAnalyzer = process.NewAnalyzer(connector.GetIdx(), connector.IsFirst, connector.IsLast, "connector")
+	} else {
+		connector.OpAnalyzer.Reset()
+	}
 	return nil
 }
 
-func Call(_ int, proc *process.Process, arg any, _ bool, _ bool) (bool, error) {
-	ap := arg.(*Argument)
-	reg := ap.Reg
-	bat := proc.InputBatch()
-	if bat == nil {
-		return true, nil
-	}
-	if bat.Length() == 0 {
-		return false, nil
+func (connector *Connector) Call(proc *process.Process) (vm.CallResult, error) {
+	result, err := vm.ChildrenCall(connector.GetChildren(0), proc, connector.OpAnalyzer)
+	if err != nil {
+		return result, err
 	}
 
-	// do not send the source batch to remote node.
-	for i := range bat.Vecs {
-		if bat.Vecs[i].NeedDup() {
-			vec, err := bat.Vecs[i].Dup(proc.Mp())
-			if err != nil {
-				return false, err
-			}
-			bat.Vecs[i].Free(proc.Mp())
-			bat.Vecs[i] = vec
-		}
+	// pipeline ends normally.
+	if result.Batch == nil {
+		result.Status = vm.ExecStop
+		return result, nil
+	}
+	// batch with no data, no need to send.
+	if result.Batch.IsEmpty() {
+		result.Batch = batch.EmptyBatch
+		return result, nil
 	}
 
-	select {
-	case <-reg.Ctx.Done():
-		bat.Clean(proc.Mp())
-		return true, nil
-	case reg.Ch <- bat:
-		proc.SetInputBatch(nil)
-		return false, nil
+	var queryDone bool
+	queryDone, err = connector.ctr.sp.SendBatch(proc.Ctx, 0, result.Batch, nil)
+	if queryDone || err != nil {
+		return result, err
 	}
+	connector.Reg.Ch2 <- process.NewPipelineSignalToGetFromSpool(connector.ctr.sp, 0)
+	return result, nil
 }

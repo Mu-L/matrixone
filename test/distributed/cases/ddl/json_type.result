@@ -107,7 +107,7 @@ invalid input: json text
 create table json_table_5(j1 json primary key,j2 json default '{"x": 17, "x": "red"}',j3 json not null );
 not supported: JSON column 'j1' cannot be in primary key
 create table json_table_5(j1 json) partition by hash(j1);
-SQL syntax error: type JSON not allowed in partition clause
+Field 'j1' is of a not allowed type for this type of partitioning
 select j1 from json_table_1 where j1>'{"": "", "123456": "中文mo"}';
 invalid argument operator >, bad value [JSON VARCHAR]
 create table json_table_61(j1 json,a varchar(25),b int);
@@ -369,3 +369,30 @@ select * from unnest('abc',"$.*") as u;
 invalid input: json text abc
 select unnest('abc',"$.*") ;
 not supported: function or operator 'unnest'
+select json_extract('[1,2,3]', '$[0]');
+json_extract([1,2,3], $[0])
+1
+select json_extract('[1,2,3]', '$[1]');
+json_extract([1,2,3], $[1])
+2
+select json_extract('[1,2,3]', '$[2]');
+json_extract([1,2,3], $[2])
+3
+select json_extract('[1,2,3]', '$[3]');
+json_extract([1,2,3], $[3])
+null
+SELECT JSON_EXTRACT('["apple", "banana", "cherry"]', '$[0]') AS FRUIT;
+FRUIT
+"apple"
+SELECT JSON_EXTRACT('["apple", "banana", "cherry"]', '$[1]') AS FRUIT;
+FRUIT
+"banana"
+select json_extract('[1,2,3]', '$[4]');
+json_extract([1,2,3], $[4])
+null
+select json_extract('[1,2,3]', '$[5]');
+json_extract([1,2,3], $[5])
+null
+select json_extract('[1,2,3]', '$[6]');
+json_extract([1,2,3], $[6])
+null

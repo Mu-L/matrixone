@@ -15,6 +15,7 @@
 package ops
 
 import (
+	"context"
 	"fmt"
 	"sync/atomic"
 
@@ -28,7 +29,8 @@ import (
 type Cmd = uint8
 
 const (
-	QUIT Cmd = iota
+	QUIT  Cmd = iota
+	stuck     // For tests only. Stop executing Ops.
 )
 
 const (
@@ -85,6 +87,7 @@ func (s *Stats) String() string {
 }
 
 type OpWorker struct {
+	Ctx        context.Context
 	Name       string
 	OpC        chan iops.IOp
 	CmdC       chan Cmd
@@ -96,7 +99,7 @@ type OpWorker struct {
 	CancelFunc OpExecFunc
 }
 
-func NewOpWorker(name string, args ...int) *OpWorker {
+func NewOpWorker(ctx context.Context, name string, args ...int) *OpWorker {
 	var l int
 	if len(args) == 0 {
 		l = QueueSize
@@ -111,6 +114,7 @@ func NewOpWorker(name string, args ...int) *OpWorker {
 		name = fmt.Sprintf("[worker-%d]", common.NextGlobalSeqNum())
 	}
 	worker := &OpWorker{
+		Ctx:      ctx,
 		Name:     name,
 		OpC:      make(chan iops.IOp, l),
 		CmdC:     make(chan Cmd, l),
@@ -195,8 +199,13 @@ func (w *OpWorker) SendOp(op iops.IOp) bool {
 		w.Pending.Add(-1)
 		return false
 	}
-	w.OpC <- op
-	return true
+	select {
+	case w.OpC <- op:
+		return true
+	default:
+	}
+	w.Pending.Add(-1)
+	return false
 }
 
 func (w *OpWorker) opCancelOp(op iops.IOp) {
@@ -204,7 +213,7 @@ func (w *OpWorker) opCancelOp(op iops.IOp) {
 }
 
 func (w *OpWorker) onOp(op iops.IOp) {
-	err := op.OnExec()
+	err := op.OnExec(w.Ctx)
 	w.Stats.AddProcessed()
 	if err != nil {
 		w.Stats.AddFailed()
@@ -225,6 +234,9 @@ func (w *OpWorker) onCmd(cmd Cmd) {
 			panic("logic error")
 		}
 		w.ClosedCh <- struct{}{}
+	case stuck: // For test only
+		<-w.Ctx.Done()
+		return
 	default:
 		panic(fmt.Sprintf("Unsupported cmd %d", cmd))
 	}

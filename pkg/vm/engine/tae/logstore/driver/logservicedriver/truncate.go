@@ -16,15 +16,31 @@ package logservicedriver
 
 import (
 	"context"
+	"time"
 
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	// "time"
 )
 
+// PXU TODO: Truncate(ctx context.Context, dsn uint64, sync bool) error
 // driver lsn -> entry lsn
-func (d *LogServiceDriver) Truncate(lsn uint64) error {
-	if lsn > d.truncating.Load() {
-		d.truncating.Store(lsn)
+func (d *LogServiceDriver) Truncate(dsn uint64) error {
+	for {
+		old := d.truncateDSNIntent.Load()
+		if dsn <= old {
+			break
+		}
+		if d.truncateDSNIntent.CompareAndSwap(old, dsn) {
+			logutil.Info(
+				"Wal-Set-Truncate-Intent",
+				zap.Uint64("dsn-intent", dsn),
+				zap.Uint64("old-intent", old),
+			)
+			break
+		}
 	}
 	_, err := d.truncateQueue.Enqueue(struct{}{})
 	if err != nil {
@@ -33,85 +49,188 @@ func (d *LogServiceDriver) Truncate(lsn uint64) error {
 	return nil
 }
 
-func (d *LogServiceDriver) GetTruncated() (lsn uint64, err error) {
-	lsn = d.truncating.Load()
-	return
+// PXU TODO: ???
+func (d *LogServiceDriver) GetTruncated() (dsn uint64, err error) {
+	return d.truncateDSNIntent.Load(), nil
 }
 
-func (d *LogServiceDriver) onTruncate(items ...any) {
+func (d *LogServiceDriver) onTruncateRequests(items ...any) {
+	if !d.canWrite() {
+		logutil.Warn(
+			"Wal-Readonly-Skip-Truncate",
+			zap.Uint64("dsn-intent", d.truncateDSNIntent.Load()),
+			zap.Uint64("truncated-psn", d.truncatedPSN),
+		)
+		return
+	}
 	d.doTruncate()
 }
 
+// this is always called by one goroutine
 func (d *LogServiceDriver) doTruncate() {
-	target := d.truncating.Load()
-	lastServiceLsn := d.truncatedLogserviceLsn
-	lsn := lastServiceLsn
-	//TODO use valid lsn
-	next := d.getNextValidLogserviceLsn(lsn)
-	for d.isToTruncate(next, target) {
-		lsn = next
-		next = d.getNextValidLogserviceLsn(lsn)
-		if next <= lsn {
+	t0 := time.Now()
+
+	dsnIntent := d.truncateDSNIntent.Load()
+	truncatedPSN := d.truncatedPSN
+	psnIntent := truncatedPSN
+
+	nextValidPSN := d.getNextValidPSN(psnIntent)
+	loopCount := 0
+	for d.isToTruncate(nextValidPSN, dsnIntent) {
+		loopCount++
+		psnIntent = nextValidPSN
+		nextValidPSN = d.getNextValidPSN(psnIntent)
+		if nextValidPSN <= psnIntent {
 			break
 		}
 	}
-	if lsn == lastServiceLsn {
+	d.sequence.mu.RLock()
+	minPSN := d.sequence.psns.Minimum()
+	maxPSN := d.sequence.psns.Maximum()
+	d.sequence.mu.RUnlock()
+	logutil.Info(
+		"Wal-Truncate-Prepare",
+		zap.Int("loop-count", loopCount),
+		zap.Duration("duration", time.Since(t0)),
+		zap.Uint64("dsn-intent", dsnIntent),
+		zap.Uint64("psn-intent", psnIntent),
+		zap.Uint64("truncated-psn", truncatedPSN),
+		zap.Uint64("valid-min-psn", minPSN),
+		zap.Uint64("valid-max-psn", maxPSN),
+		zap.Bool("do-truncate", psnIntent > truncatedPSN),
+	)
+	if psnIntent <= truncatedPSN {
 		return
 	}
-	d.truncateLogservice(lsn)
-	d.truncatedLogserviceLsn = lsn
+	var (
+		err          error
+		psnTruncated uint64
+	)
+	if psnTruncated, err = d.truncateFromRemote(
+		context.Background(),
+		psnIntent,
+		10,
+	); err != nil {
+		// PXU TODO: metrics
+		logutil.Error(
+			"Wal-Truncate-Error",
+			zap.Uint64("psn-intent", psnIntent),
+			zap.Error(err),
+		)
+		return
+	}
+	if psnTruncated > d.truncatedPSN {
+		d.truncatedPSN = psnTruncated
+	}
+	d.truncateByPSN(psnTruncated)
 }
 
-func (d *LogServiceDriver) truncateLogservice(lsn uint64) {
-	client, err := d.clientPool.Get()
-	if err == ErrClientPoolClosed {
+func (d *LogServiceDriver) truncateFromRemote(
+	ctx context.Context,
+	psnIntent uint64,
+	maxRetry int,
+) (psnTruncated uint64, err error) {
+	var (
+		t0         = time.Now()
+		client     *wrappedClient
+		retryTimes int
+	)
+	psnTruncated = psnIntent
+	defer func() {
+		logger := logutil.Info
+		if err != nil {
+			logger = logutil.Error
+		}
+		logger(
+			"Wal-Truncate-Execute",
+			zap.Uint64("psn-intent", psnIntent),
+			zap.Uint64("psn-truncated", psnTruncated),
+			zap.Duration("duration", time.Since(t0)),
+			zap.Int("retry-times", retryTimes),
+			zap.Error(err),
+		)
+	}()
+
+	if client, err = d.clientPool.GetOnFly(); err == ErrClientPoolClosed {
 		return
 	}
-	if err != nil {
-		panic(err)
-	}
-	defer d.clientPool.Put(client)
-	ctx, cancel := context.WithTimeout(context.Background(), d.config.TruncateDuration)
-	err = client.c.Truncate(ctx, lsn)
-	cancel()
-	if err != nil {
-		err = RetryWithTimeout(d.config.RetryTimeout, func() (shouldReturn bool) {
-			logutil.Infof("LogService Driver: retry truncate, err is %v", err)
-			ctx, cancel := context.WithTimeout(context.Background(), d.config.TruncateDuration)
-			err = client.c.Truncate(ctx, lsn)
+	defer client.Putback()
+
+	for ; retryTimes < maxRetry+1; retryTimes++ {
+		var (
+			cancel  context.CancelFunc
+			loopCtx context.Context
+		)
+		loopCtx, cancel = context.WithTimeoutCause(
+			ctx, d.config.MaxTimeout, moerr.CauseTruncateLogservice,
+		)
+		err = client.wrapped.Truncate(loopCtx, psnIntent)
+		err = moerr.AttachCause(loopCtx, err)
+		cancel()
+
+		// the psnIntent is already truncated
+		if moerr.IsMoErrCode(err, moerr.ErrInvalidTruncateLsn) {
+			loopCtx, cancel = context.WithTimeoutCause(
+				ctx, d.config.MaxTimeout, moerr.CauseGetLogserviceTruncate,
+			)
+			psnTruncated, err = d.getTruncatedPSNFromBackend(loopCtx)
 			cancel()
-			return err == nil
-		})
-		if err != nil {
-			panic(err)
+			if err != nil {
+				return
+			}
+			if psnTruncated >= psnIntent {
+				break
+			}
+		}
+		if err == nil {
+			break
 		}
 	}
-	logutil.Infof("LogService Driver: Truncate %d", lsn)
+	return
 }
-func (d *LogServiceDriver) getLogserviceTruncate() (lsn uint64) {
-	client, err := d.clientPool.Get()
-	if err == ErrClientPoolClosed {
+
+func (d *LogServiceDriver) getTruncatedPSNFromBackend(
+	ctx context.Context,
+) (psn uint64, err error) {
+	var (
+		client     *wrappedClient
+		retryTimes int
+		start      = time.Now()
+	)
+	defer func() {
+		logger := logutil.Info
+		if err != nil {
+			logger = logutil.Error
+		}
+		logger(
+			"Wal-Get-Truncate",
+			zap.Uint64("psn", psn),
+			zap.Int("retry-times", retryTimes),
+			zap.Error(err),
+			zap.Duration("duration", time.Since(start)),
+		)
+	}()
+	if client, err = d.clientPool.Get(); err != nil {
 		return
 	}
-	if err != nil {
-		panic(err)
-	}
-	defer d.clientPool.Put(client)
-	ctx, cancel := context.WithTimeout(context.Background(), d.config.GetTruncateDuration)
-	lsn, err = client.c.GetTruncatedLsn(ctx)
-	cancel()
-	if err != nil {
-		err = RetryWithTimeout(d.config.RetryTimeout, func() (shouldReturn bool) {
-			logutil.Infof("LogService Driver: retry gettruncate, err is %v", err)
-			ctx, cancel := context.WithTimeout(context.Background(), d.config.GetTruncateDuration)
-			lsn, err = client.c.GetTruncatedLsn(ctx)
-			cancel()
-			return err == nil
-		})
-		if err != nil {
-			panic(err)
+	defer client.Putback()
+
+	cfg := d.config
+
+	for ; retryTimes < cfg.MaxRetryCount; retryTimes++ {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeoutCause(
+			ctx,
+			cfg.MaxTimeout,
+			moerr.CauseGetLogserviceTruncate,
+		)
+		psn, err = client.wrapped.GetTruncatedLsn(ctx)
+		err = moerr.AttachCause(ctx, err)
+		cancel()
+		if err == nil {
+			break
 		}
+		time.Sleep(cfg.RetryInterval() * time.Duration(retryTimes+1))
 	}
-	logutil.Infof("Logservice Driver: Get Truncate %d", lsn)
 	return
 }

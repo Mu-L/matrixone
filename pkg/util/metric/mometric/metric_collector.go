@@ -18,15 +18,20 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"math"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/metric"
 	bp "github.com/matrixorigin/matrixone/pkg/util/batchpipe"
 	"github.com/matrixorigin/matrixone/pkg/util/export/table"
 	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
 const CHAN_CAPACITY = 10000
@@ -49,16 +54,15 @@ type collectorOpts struct {
 	flushInterval time.Duration
 	// the number of goroutines to execute insert into sql, default is runtime.NumCPU()
 	sqlWorkerNum int
-	// multiTable
-	multiTable bool
 }
 
 func defaultCollectorOpts() collectorOpts {
+	var defaultSqlWorkerNum = int(math.Ceil(float64(runtime.NumCPU()) * 0.1))
 	return collectorOpts{
 		metricThreshold: 1000,
 		sampleThreshold: 4096,
 		flushInterval:   15 * time.Second,
-		sqlWorkerNum:    runtime.NumCPU(),
+		sqlWorkerNum:    defaultSqlWorkerNum,
 	}
 }
 
@@ -88,12 +92,6 @@ type WithFlushInterval time.Duration
 
 func (x WithFlushInterval) ApplyTo(o *collectorOpts) {
 	o.flushInterval = time.Duration(x)
-}
-
-type ExportMultiTable bool
-
-func (x ExportMultiTable) ApplyTo(o *collectorOpts) {
-	o.multiTable = bool(x)
 }
 
 var _ MetricCollector = (*metricCollector)(nil)
@@ -266,13 +264,11 @@ func newMetricFSCollector(writerFactory table.WriterFactory, opts ...collectorOp
 		writerFactory: writerFactory,
 		opts:          initOpts,
 	}
-	pipeOpts := []bp.BaseBatchPipeOpt{bp.PipeWithBatchWorkerNum(c.opts.sqlWorkerNum)}
-	if !initOpts.multiTable {
-		pipeOpts = append(pipeOpts,
-			bp.PipeWithBufferWorkerNum(1),
-			bp.PipeWithItemNameFormatter(func(bp.HasName) string {
-				return SingleMetricTable.GetName()
-			}))
+	pipeOpts := []bp.BaseBatchPipeOpt{bp.PipeWithBatchWorkerNum(c.opts.sqlWorkerNum),
+		bp.PipeWithBufferWorkerNum(1), // only one table
+		bp.PipeWithItemNameFormatter(func(bp.HasName) string {
+			return SingleMetricTable.GetName()
+		}),
 	}
 	base := bp.NewBaseBatchPipe[*pb.MetricFamily, table.ExportRequests](c, pipeOpts...)
 	c.BaseBatchPipe = base
@@ -289,6 +285,9 @@ func (c *metricFSCollector) NewItemBatchHandler(ctx context.Context) func(batch 
 	}
 }
 
+const bufferInitSize = 128 * mpool.KB
+const backOffThreshold = mpool.MB / bufferInitSize
+
 func (c *metricFSCollector) NewItemBuffer(_ string) bp.ItemBuffer[*pb.MetricFamily, table.ExportRequests] {
 	return &mfsetETL{
 		mfset: mfset{
@@ -297,72 +296,106 @@ func (c *metricFSCollector) NewItemBuffer(_ string) bp.ItemBuffer[*pb.MetricFami
 			sampleThreshold: c.opts.sampleThreshold,
 		},
 		collector: c,
+		// for backoff strategy
+		bufferPool:             &sync.Pool{New: func() any { return bytes.NewBuffer(make([]byte, 0, bufferInitSize)) }},
+		bufferBackOffThreshold: backOffThreshold,
 	}
 }
 
 type mfsetETL struct {
 	mfset
 	collector *metricFSCollector
+	// bufferPool adapt backoff strategy
+	bufferPool  *sync.Pool
+	bufferCount atomic.Int32
+	// bufferBackOffThreshold check backoff case.
+	bufferBackOffThreshold int32
 }
 
+// GetBatch implements table.Table.GetBatch.
+// Write metric into two tables: one for metric table, another for sql_statement_cu table.
 func (s *mfsetETL) GetBatch(ctx context.Context, buf *bytes.Buffer) table.ExportRequests {
 	buf.Reset()
 
 	ts := time.Now()
-	buffer := make(map[string]table.RowWriter, 2)
+	writer := make(map[string]table.RowWriter, 2)
 	writeValues := func(row *table.Row) error {
-		w, exist := buffer[row.GetAccount()]
+		w, exist := writer[row.Table.GetName()]
 		if !exist {
-			w = s.collector.writerFactory(ctx, row.GetAccount(), SingleMetricTable, ts)
-			buffer[row.GetAccount()] = w
+			w = s.collector.writerFactory.GetRowWriter(ctx, row.GetAccount(), row.Table, ts)
+			if setter, ok := (w).(table.BufferSettable); ok && setter.NeedBuffer() {
+				setter.SetBuffer(s.getBuffer(), s.putBuffer)
+			}
+			writer[row.Table.GetName()] = w
 		}
 		if err := w.WriteRow(row); err != nil {
 			return err
 		}
 		return nil
 	}
+	rows := make(map[string]*table.Row, 2)
+	defer func() {
+		for _, r := range rows {
+			r.Free()
+		}
+	}()
+	getRow := func(metricName string) *table.Row {
+		tbl := SingleMetricTable
+		if metricName == SqlStatementCUTable.GetName() {
+			tbl = SqlStatementCUTable
+		}
+		row, exist := rows[tbl.GetName()]
+		if !exist {
+			row = tbl.GetRow(ctx)
+			rows[tbl.GetName()] = row
+		}
+		return row
+	}
 
-	row := SingleMetricTable.GetRow(ctx)
-	defer row.Free()
 	for _, mf := range s.mfs {
 		for _, metric := range mf.Metric {
 			// reserved labels
+			row := getRow(mf.GetName())
 			row.Reset()
-			row.SetColumnVal(metricNameColumn, mf.GetName())
-			row.SetColumnVal(metricNodeColumn, mf.GetNode())
-			row.SetColumnVal(metricRoleColumn, mf.GetRole())
+			// table `metric` NEED column `metric_name`
+			// table `sql_statement_cu` NO column `metric_name`
+			if row.Table.GetName() == SingleMetricTable.GetName() {
+				row.SetColumnVal(metricNameColumn, table.StringField(mf.GetName()))
+			}
+			row.SetColumnVal(metricNodeColumn, table.StringField(mf.GetNode()))
+			row.SetColumnVal(metricRoleColumn, table.StringField(mf.GetRole()))
 			// custom labels
 			for _, lbl := range metric.Label {
-				row.SetVal(lbl.GetName(), lbl.GetValue())
+				row.SetVal(lbl.GetName(), table.StringField(lbl.GetValue()))
 			}
 
 			switch mf.GetType() {
 			case pb.MetricType_COUNTER:
 				time := localTime(metric.GetCollecttime())
-				row.SetColumnVal(metricCollectTimeColumn, time)
-				row.SetColumnVal(metricValueColumn, metric.Counter.GetValue())
+				row.SetColumnVal(metricCollectTimeColumn, table.TimeField(time))
+				row.SetColumnVal(metricValueColumn, table.Float64Field(metric.Counter.GetValue()))
 				_ = writeValues(row)
 			case pb.MetricType_GAUGE:
 				time := localTime(metric.GetCollecttime())
-				row.SetColumnVal(metricCollectTimeColumn, time)
-				row.SetColumnVal(metricValueColumn, metric.Gauge.GetValue())
+				row.SetColumnVal(metricCollectTimeColumn, table.TimeField(time))
+				row.SetColumnVal(metricValueColumn, table.Float64Field(metric.Gauge.GetValue()))
 				_ = writeValues(row)
 			case pb.MetricType_RAWHIST:
 				for _, sample := range metric.RawHist.Samples {
 					time := localTime(sample.GetDatetime())
-					row.SetColumnVal(metricCollectTimeColumn, time)
-					row.SetColumnVal(metricValueColumn, sample.GetValue())
+					row.SetColumnVal(metricCollectTimeColumn, table.TimeField(time))
+					row.SetColumnVal(metricValueColumn, table.Float64Field(sample.GetValue()))
 					_ = writeValues(row)
 				}
 			default:
-				panic(moerr.NewInternalError(ctx, "unsupported metric type %v", mf.GetType()))
+				panic(moerr.NewInternalErrorf(ctx, "unsupported metric type %v", mf.GetType()))
 			}
 		}
 	}
 
-	reqs := make([]table.WriteRequest, 0, len(buffer))
-	for _, w := range buffer {
-		reqs = append(reqs, table.NewRowRequest(w))
+	reqs := make([]table.WriteRequest, 0, len(writer))
+	for _, w := range writer {
+		reqs = append(reqs, table.NewRowRequest(w, s /*table.BackOff*/))
 	}
 
 	return reqs
@@ -374,4 +407,24 @@ func localTime(value int64) time.Time {
 
 func localTimeStr(value int64) string {
 	return time.UnixMicro(value).In(time.Local).Format("2006-01-02 15:04:05.000000")
+}
+
+func (s *mfsetETL) getBuffer() *bytes.Buffer {
+	v2.TraceMOLoggerBufferMetricAlloc.Inc()
+	s.bufferCount.Add(1)
+	return s.bufferPool.Get().(*bytes.Buffer)
+}
+func (s *mfsetETL) putBuffer(b *bytes.Buffer) {
+	b.Reset()
+	s.bufferPool.Put(b)
+	v2.TraceMOLoggerBufferMetricFree.Inc()
+	v2.TraceCollectorContentQueueLengthMetric.Inc()
+	s.bufferCount.Add(-1)
+}
+
+var _ table.BackOff = (*mfsetETL)(nil)
+
+// Count implement table.BackOff
+func (s *mfsetETL) Count() bool {
+	return s.bufferCount.Load() <= s.bufferBackOffThreshold
 }

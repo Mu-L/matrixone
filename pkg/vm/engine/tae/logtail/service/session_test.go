@@ -54,7 +54,7 @@ func TestSessionManger(t *testing.T) {
 	pooler := NewLogtailResponsePool()
 	notifier := mockSessionErrorNotifier(logger.RawLogger())
 	sendTimeout := 5 * time.Second
-	poisionTime := 10 * time.Millisecond
+	poisonTime := 10 * time.Millisecond
 	heartbeatInterval := 50 * time.Millisecond
 	chunkSize := 1024
 
@@ -63,7 +63,7 @@ func TestSessionManger(t *testing.T) {
 	streamA := mockMorpcStream(csA, 10, chunkSize)
 	sessionA := sm.GetSession(
 		ctx, logger, pooler, notifier, streamA,
-		sendTimeout, poisionTime, heartbeatInterval,
+		sendTimeout, poisonTime, heartbeatInterval,
 	)
 	require.NotNil(t, sessionA)
 	require.Equal(t, 1, len(sm.ListSession()))
@@ -73,7 +73,7 @@ func TestSessionManger(t *testing.T) {
 	streamB := mockMorpcStream(csB, 11, chunkSize)
 	sessionB := sm.GetSession(
 		ctx, logger, pooler, notifier, streamB,
-		sendTimeout, poisionTime, heartbeatInterval,
+		sendTimeout, poisonTime, heartbeatInterval,
 	)
 	require.NotNil(t, sessionB)
 	require.Equal(t, 2, len(sm.ListSession()))
@@ -111,6 +111,7 @@ func TestSessionError(t *testing.T) {
 		logtail.TableLogtail{
 			Table: &tableA,
 		},
+		nil,
 	)
 	require.NoError(t, err)
 
@@ -123,6 +124,7 @@ func TestSessionError(t *testing.T) {
 		logtail.TableLogtail{
 			Table: &tableA,
 		},
+		nil,
 	)
 	require.Error(t, err)
 }
@@ -153,6 +155,7 @@ func TestPoisionSession(t *testing.T) {
 			context.Background(),
 			mockTimestamp(int64(i), 0),
 			mockTimestamp(int64(i+1), 0),
+			nil,
 			logtail.TableLogtail{
 				Table: &tableA,
 			},
@@ -246,6 +249,7 @@ func TestSession(t *testing.T) {
 		logtail.TableLogtail{
 			Table: &tableA,
 		},
+		nil,
 	)
 	require.NoError(t, err)
 
@@ -264,6 +268,7 @@ func TestSession(t *testing.T) {
 			context.Background(),
 			from,
 			to,
+			nil,
 			mockLogtail(tableA, to),
 			mockLogtail(tableB, to),
 		)
@@ -275,6 +280,7 @@ func TestSession(t *testing.T) {
 		context.Background(),
 		mockTimestamp(2, 0),
 		mockTimestamp(3, 0),
+		nil,
 		mockWrapLogtail(tableA),
 		mockWrapLogtail(tableB),
 	)
@@ -292,7 +298,20 @@ func mockBlockStream() morpc.ClientSession {
 	}
 }
 
+func (m *blockStream) RemoteAddress() string {
+	return "block"
+}
+
+func (m *blockStream) SessionCtx() context.Context {
+	return nil
+}
+
 func (m *blockStream) Write(ctx context.Context, message morpc.Message) error {
+	<-m.ch
+	return moerr.NewStreamClosedNoCtx()
+}
+
+func (m *blockStream) AsyncWrite(message morpc.Message) error {
 	<-m.ch
 	return moerr.NewStreamClosedNoCtx()
 }
@@ -324,8 +343,20 @@ func mockBrokenClientSession() morpc.ClientSession {
 	return &brokenStream{}
 }
 
+func (m *brokenStream) RemoteAddress() string {
+	return "broken"
+}
+
+func (m *brokenStream) SessionCtx() context.Context {
+	return nil
+}
+
 func (m *brokenStream) Write(ctx context.Context, message morpc.Message) error {
 	return moerr.NewStreamClosedNoCtx()
+}
+
+func (cs *brokenStream) AsyncWrite(response morpc.Message) error {
+	return nil
 }
 
 func (m *brokenStream) Close() error {
@@ -356,7 +387,21 @@ func mockNormalClientSession(logger *zap.Logger) morpc.ClientSession {
 	}
 }
 
+func (m *normalStream) RemoteAddress() string {
+	return "normal"
+}
+
+func (m *normalStream) SessionCtx() context.Context {
+	return nil
+}
+
 func (m *normalStream) Write(ctx context.Context, message morpc.Message) error {
+	response := message.(*LogtailResponseSegment)
+	m.logger.Info("write response segment:", zap.String("segment", response.String()))
+	return nil
+}
+
+func (m *normalStream) AsyncWrite(message morpc.Message) error {
 	response := message.(*LogtailResponseSegment)
 	m.logger.Info("write response segment:", zap.String("segment", response.String()))
 	return nil
@@ -421,6 +466,7 @@ func mockMorpcStream(
 
 	return morpcStream{
 		streamID: id,
+		remote:   "mock",
 		limit:    segments.LeastEffectiveCapacity(),
 		logger:   mockMOLogger(),
 		cs:       cs,
@@ -431,7 +477,7 @@ func mockMorpcStream(
 func mockMOLogger() *log.MOLogger {
 	return log.GetServiceLogger(
 		logutil.GetGlobalLogger().Named(LogtailServiceRPCName),
-		metadata.ServiceType_DN,
+		metadata.ServiceType_TN,
 		"uuid",
 	)
 }

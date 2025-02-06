@@ -15,584 +15,352 @@
 package disttae
 
 import (
-	"bytes"
 	"context"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
+	"io"
+	"math/rand"
+	"slices"
+	"sync"
 	"testing"
 
-	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/lni/goutils/leaktest"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
-	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/readutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 	"github.com/stretchr/testify/require"
 )
 
-func makeColExprForTest(idx int32, typ types.T) *plan.Expr {
-	schema := []string{"a", "b", "c", "d"}
-	containerType := typ.ToType()
-	exprType := plan2.MakePlan2Type(&containerType)
-
-	return &plan.Expr{
-		Typ: exprType,
-		Expr: &plan.Expr_Col{
-			Col: &plan.ColRef{
-				RelPos: 0,
-				ColPos: idx,
-				Name:   schema[idx],
-			},
-		},
-	}
-}
-
-func makeFunctionExprForTest(name string, args []*plan.Expr) *plan.Expr {
-	argTypes := make([]types.Type, len(args))
-	for i, arg := range args {
-		argTypes[i] = plan2.MakeTypeByPlan2Expr(arg)
-	}
-
-	funId, returnType, _, _ := function.GetFunctionByName(context.TODO(), name, argTypes)
-
-	return &plan.Expr{
-		Typ: plan2.MakePlan2Type(&returnType),
-		Expr: &plan.Expr_F{
-			F: &plan.Function{
-				Func: &plan.ObjectRef{
-					Obj:     funId,
-					ObjName: name,
-				},
-				Args: args,
-			},
-		},
-	}
-}
-
-func makeZonemapForTest(typ types.T, min any, max any) [64]byte {
-	zm := index.NewZoneMap(typ.ToType())
-	_ = zm.Update(min)
-	_ = zm.Update(max)
-	buf, _ := zm.Marshal()
-
-	var zmBuf [64]byte
-	copy(zmBuf[:], buf[:])
-	return zmBuf
-}
-
-func makeBlockMetaForTest() BlockMeta {
-	return BlockMeta{
-		Zonemap: [][64]byte{
-			makeZonemapForTest(types.T_int64, int64(10), int64(100)),
-			makeZonemapForTest(types.T_int64, int64(20), int64(200)),
-			makeZonemapForTest(types.T_int64, int64(30), int64(300)),
-			makeZonemapForTest(types.T_int64, int64(1), int64(8)),
-		},
-	}
-}
-
-func getTableDefBySchemaAndType(name string, columns []string, schema []string, types []types.Type) *plan.TableDef {
-	columnsMap := make(map[string]struct{})
-	for _, col := range columns {
-		columnsMap[col] = struct{}{}
-	}
-
-	var cols []*plan.ColDef
-	nameToIndex := make(map[string]int32)
-
-	for i, col := range schema {
-		if _, ok := columnsMap[col]; ok {
-			cols = append(cols, &plan.ColDef{
-				Name: col,
-				Typ:  plan2.MakePlan2Type(&types[i]),
-			})
-		}
-		nameToIndex[col] = int32(i)
-	}
-
-	return &plan.TableDef{
-		Name:          name,
-		Cols:          cols,
-		Name2ColIndex: nameToIndex,
-	}
-}
-
-func makeTableDefForTest(columns []string) *plan.TableDef {
-	schema := []string{"a", "b", "c", "d"}
-	types := []types.Type{
-		types.T_int64.ToType(),
-		types.T_int64.ToType(),
-		types.T_int64.ToType(),
-		types.T_int64.ToType(),
-	}
-	return getTableDefBySchemaAndType("t1", columns, schema, types)
-}
-
 func TestBlockMetaMarshal(t *testing.T) {
-	meta := BlockMeta{
-		Info: catalog.BlockInfo{
-			MetaLoc: "test",
-		},
-		Zonemap: [][64]byte{
-			makeZonemapForTest(types.T_int64, int64(10), int64(100)),
-			makeZonemapForTest(types.T_blob, []byte("a"), []byte("h")),
-			// makeZonemapForTest(types.T_varchar, "a", "h"),
-		},
-	}
-	data := blockMarshal(meta)
-	meta0 := blockUnmarshal(data)
-	require.Equal(t, meta, meta0)
+	location := []byte("test")
+	var info objectio.BlockInfo
+	info.SetMetaLocation(location)
+	data := objectio.EncodeBlockInfo(&info)
+	info2 := objectio.DecodeBlockInfo(data)
+	require.Equal(t, info, *info2)
 }
 
-func TestCheckExprIsMonotonic(t *testing.T) {
+func TestCheckExprIsZonemappable(t *testing.T) {
 	type asserts = struct {
 		result bool
 		expr   *plan.Expr
 	}
 	testCases := []asserts{
 		// a > 1  -> true
-		{true, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
+		{true, readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+			readutil.MakeColExprForTest(0, types.T_int64),
 			plan2.MakePlan2Int64ConstExprWithType(10),
 		})},
 		// a >= b -> true
-		{true, makeFunctionExprForTest(">=", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			makeColExprForTest(1, types.T_int64),
+		{true, readutil.MakeFunctionExprForTest(">=", []*plan.Expr{
+			readutil.MakeColExprForTest(0, types.T_int64),
+			readutil.MakeColExprForTest(1, types.T_int64),
 		})},
 		// abs(a) -> false
-		{false, makeFunctionExprForTest("abs", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
+		{false, readutil.MakeFunctionExprForTest("abs", []*plan.Expr{
+			readutil.MakeColExprForTest(0, types.T_int64),
 		})},
 	}
 
-	t.Run("test checkExprIsMonotonic", func(t *testing.T) {
+	t.Run("test checkExprIsZonemappable", func(t *testing.T) {
 		for i, testCase := range testCases {
-			isMonotonic := plan2.CheckExprIsMonotonic(context.TODO(), testCase.expr)
-			if isMonotonic != testCase.result {
-				t.Fatalf("checkExprIsMonotonic testExprs[%d] is different with expected", i)
+			zonemappable := plan2.ExprIsZonemappable(context.TODO(), testCase.expr)
+			if zonemappable != testCase.result {
+				t.Fatalf("checkExprIsZonemappable testExprs[%d] is different with expected", i)
 			}
 		}
 	})
 }
 
-// delete this if TestNeedRead is not skipped anymore
-func TestMakeBlockMeta(t *testing.T) {
-	_ = makeBlockMetaForTest()
-}
-
-func TestNeedRead(t *testing.T) {
-	t.Skip("NeedRead always returns true fot start cn-dn with flushing")
-	type asserts = struct {
-		result  bool
-		columns []string
-		expr    *plan.Expr
-	}
-	blockMeta := makeBlockMetaForTest()
-
-	testCases := []asserts{
-		{true, []string{"a"}, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			plan2.MakePlan2Int64ConstExprWithType(20),
-		})},
-		{false, []string{"a"}, makeFunctionExprForTest("<", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			plan2.MakePlan2Int64ConstExprWithType(-1),
-		})},
-		{false, []string{"a"}, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			plan2.MakePlan2Int64ConstExprWithType(3000000),
-		})},
-		{false, []string{"a", "d"}, makeFunctionExprForTest("<", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			makeColExprForTest(1, types.T_int64),
-		})},
-		{true, []string{"a", "d"}, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			makeColExprForTest(1, types.T_int64),
-		})},
-		// c > (a + d) => true
-		{true, []string{"c", "a", "d"}, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			makeFunctionExprForTest("+", []*plan.Expr{
-				makeColExprForTest(1, types.T_int64),
-				makeColExprForTest(2, types.T_int64),
-			}),
-		})},
-		// (a > b) and (c > d) => true
-		{true, []string{"a", "b", "c", "d"}, makeFunctionExprForTest("and", []*plan.Expr{
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				makeColExprForTest(1, types.T_int64),
-			}),
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(2, types.T_int64),
-				makeColExprForTest(3, types.T_int64),
-			}),
-		})},
-		{true, []string{"a"}, makeFunctionExprForTest("abs", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-		})},
+func TestEvalZonemapFilter(t *testing.T) {
+	m := mpool.MustNewNoFixed(t.Name())
+	proc := testutil.NewProcessWithMPool("", m)
+	type myCase = struct {
+		exprs  []*plan.Expr
+		meta   objectio.BlockObject
+		desc   []string
+		expect []bool
 	}
 
-	t.Run("test needRead", func(t *testing.T) {
-		for i, testCase := range testCases {
-			columnMap, columns, maxCol := plan2.GetColumnsByExpr(testCase.expr, makeTableDefForTest(testCase.columns))
-			result := needRead(context.Background(), testCase.expr, blockMeta, makeTableDefForTest(testCase.columns), columnMap, columns, maxCol, testutil.NewProc())
-			if result != testCase.result {
-				t.Fatalf("test needRead at cases[%d], get result is different with expected", i)
-			}
+	zm0 := index.NewZM(types.T_float64, 0)
+	zm0.Update(float64(-10))
+	zm0.Update(float64(20))
+	zm1 := index.NewZM(types.T_float64, 0)
+	zm1.Update(float64(5))
+	zm1.Update(float64(25))
+	zm2 := index.NewZM(types.T_varchar, 0)
+	zm2.Update([]byte("abc"))
+	zm2.Update([]byte("opq"))
+	zm3 := index.NewZM(types.T_varchar, 0)
+	zm3.Update([]byte("efg"))
+	zm3.Update(index.MaxBytesValue)
+	cases := []myCase{
+		{
+			desc: []string{
+				"a>10", "a>30", "a<=-10", "a<-10", "a+b>60", "a+b<-5", "a-b<-34", "a-b<-35", "a-b<=-35", "a>b",
+				"a>b+15", "a>=b+15", "a>100 or b>10", "a>100 and b<0", "d>xyz", "d<=efg", "d<efg", "c>d", "c<d",
+			},
+			exprs: []*plan.Expr{
+				readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+					readutil.MakeColExprForTest(0, types.T_float64),
+					plan2.MakePlan2Float64ConstExprWithType(10),
+				}),
+				readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+					readutil.MakeColExprForTest(0, types.T_float64),
+					plan2.MakePlan2Float64ConstExprWithType(30),
+				}),
+				readutil.MakeFunctionExprForTest("<=", []*plan.Expr{
+					readutil.MakeColExprForTest(0, types.T_float64),
+					plan2.MakePlan2Float64ConstExprWithType(-10),
+				}),
+				readutil.MakeFunctionExprForTest("<", []*plan.Expr{
+					readutil.MakeColExprForTest(0, types.T_float64),
+					plan2.MakePlan2Float64ConstExprWithType(-10),
+				}),
+				readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+					readutil.MakeFunctionExprForTest("+", []*plan.Expr{
+						readutil.MakeColExprForTest(0, types.T_float64),
+						readutil.MakeColExprForTest(1, types.T_float64),
+					}),
+					plan2.MakePlan2Float64ConstExprWithType(60),
+				}),
+				readutil.MakeFunctionExprForTest("<", []*plan.Expr{
+					readutil.MakeFunctionExprForTest("+", []*plan.Expr{
+						readutil.MakeColExprForTest(0, types.T_float64),
+						readutil.MakeColExprForTest(1, types.T_float64),
+					}),
+					plan2.MakePlan2Float64ConstExprWithType(-5),
+				}),
+				readutil.MakeFunctionExprForTest("<", []*plan.Expr{
+					readutil.MakeFunctionExprForTest("-", []*plan.Expr{
+						readutil.MakeColExprForTest(0, types.T_float64),
+						readutil.MakeColExprForTest(1, types.T_float64),
+					}),
+					plan2.MakePlan2Float64ConstExprWithType(-34),
+				}),
+				readutil.MakeFunctionExprForTest("<", []*plan.Expr{
+					readutil.MakeFunctionExprForTest("-", []*plan.Expr{
+						readutil.MakeColExprForTest(0, types.T_float64),
+						readutil.MakeColExprForTest(1, types.T_float64),
+					}),
+					plan2.MakePlan2Float64ConstExprWithType(-35),
+				}),
+				readutil.MakeFunctionExprForTest("<=", []*plan.Expr{
+					readutil.MakeFunctionExprForTest("-", []*plan.Expr{
+						readutil.MakeColExprForTest(0, types.T_float64),
+						readutil.MakeColExprForTest(1, types.T_float64),
+					}),
+					plan2.MakePlan2Float64ConstExprWithType(-35),
+				}),
+				readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+					readutil.MakeColExprForTest(0, types.T_float64),
+					readutil.MakeColExprForTest(1, types.T_float64),
+				}),
+				readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+					readutil.MakeColExprForTest(0, types.T_float64),
+					readutil.MakeFunctionExprForTest("+", []*plan.Expr{
+						readutil.MakeColExprForTest(1, types.T_float64),
+						plan2.MakePlan2Float64ConstExprWithType(15),
+					}),
+				}),
+				readutil.MakeFunctionExprForTest(">=", []*plan.Expr{
+					readutil.MakeColExprForTest(0, types.T_float64),
+					readutil.MakeFunctionExprForTest("+", []*plan.Expr{
+						readutil.MakeColExprForTest(1, types.T_float64),
+						plan2.MakePlan2Float64ConstExprWithType(15),
+					}),
+				}),
+				readutil.MakeFunctionExprForTest("or", []*plan.Expr{
+					readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+						readutil.MakeColExprForTest(0, types.T_float64),
+						plan2.MakePlan2Float64ConstExprWithType(100),
+					}),
+					readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+						readutil.MakeColExprForTest(1, types.T_float64),
+						plan2.MakePlan2Float64ConstExprWithType(10),
+					}),
+				}),
+				readutil.MakeFunctionExprForTest("and", []*plan.Expr{
+					readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+						readutil.MakeColExprForTest(0, types.T_float64),
+						plan2.MakePlan2Float64ConstExprWithType(100),
+					}),
+					readutil.MakeFunctionExprForTest("<", []*plan.Expr{
+						readutil.MakeColExprForTest(1, types.T_float64),
+						plan2.MakePlan2Float64ConstExprWithType(0),
+					}),
+				}),
+				readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+					readutil.MakeColExprForTest(3, types.T_varchar),
+					plan2.MakePlan2StringConstExprWithType("xyz"),
+				}),
+				readutil.MakeFunctionExprForTest("<=", []*plan.Expr{
+					readutil.MakeColExprForTest(3, types.T_varchar),
+					plan2.MakePlan2StringConstExprWithType("efg"),
+				}),
+				readutil.MakeFunctionExprForTest("<", []*plan.Expr{
+					readutil.MakeColExprForTest(3, types.T_varchar),
+					plan2.MakePlan2StringConstExprWithType("efg"),
+				}),
+				readutil.MakeFunctionExprForTest(">", []*plan.Expr{
+					readutil.MakeColExprForTest(2, types.T_varchar),
+					readutil.MakeColExprForTest(3, types.T_varchar),
+				}),
+				readutil.MakeFunctionExprForTest("<", []*plan.Expr{
+					readutil.MakeColExprForTest(2, types.T_varchar),
+					readutil.MakeColExprForTest(3, types.T_varchar),
+				}),
+			},
+			meta: func() objectio.BlockObject {
+				objDataMeta := objectio.BuildMetaData(1, 4)
+				meta := objDataMeta.GetBlockMeta(0)
+				meta.MustGetColumn(0).SetZoneMap(zm0)
+				meta.MustGetColumn(1).SetZoneMap(zm1)
+				meta.MustGetColumn(2).SetZoneMap(zm2)
+				meta.MustGetColumn(3).SetZoneMap(zm3)
+				return meta
+			}(),
+			expect: []bool{
+				true, false, true, false, false, false, true, false, true, true,
+				false, true, true, false, true, true, false, true, true,
+			},
+		},
+	}
+
+	columnMap := map[int]int{0: 0, 1: 1, 2: 2, 3: 3}
+
+	for _, tc := range cases {
+		for i, expr := range tc.exprs {
+			cnt := plan2.AssignAuxIdForExpr(expr, 0)
+			zms := make([]objectio.ZoneMap, cnt)
+			vecs := make([]*vector.Vector, cnt)
+			zm := colexec.EvaluateFilterByZoneMap(context.Background(), proc, expr, tc.meta, columnMap, zms, vecs)
+			require.Equal(t, tc.expect[i], zm, tc.desc[i])
 		}
-	})
+	}
+	require.Zero(t, m.CurrNB())
 }
 
-func TestGetNonIntPkValueByExpr(t *testing.T) {
-	type asserts = struct {
-		result bool
-		data   any
-		expr   *plan.Expr
-		typ    types.T
+func mockStatsList(t *testing.T, statsCnt int) (statsList []objectio.ObjectStats) {
+	for idx := 0; idx < statsCnt; idx++ {
+		stats := objectio.NewObjectStats()
+		blkCnt := rand.Uint32()%100 + 1
+		require.Nil(t, objectio.SetObjectStatsBlkCnt(stats, blkCnt))
+		require.Nil(t, objectio.SetObjectStatsRowCnt(stats, objectio.BlockMaxRows*(blkCnt-1)+objectio.BlockMaxRows*6/10))
+		require.Nil(t, objectio.SetObjectStatsObjectName(stats, objectio.BuildObjectName(objectio.NewSegmentid(), uint16(blkCnt))))
+		require.Nil(t, objectio.SetObjectStatsExtent(stats, objectio.NewExtent(0, 0, 0, 0)))
+		require.Nil(t, objectio.SetObjectStatsSortKeyZoneMap(stats, index.NewZM(types.T_bool, 1)))
+
+		statsList = append(statsList, *stats)
 	}
 
-	testCases := []asserts{
-		// a > "a"  false   only 'and', '=' function is supported
-		{false, 0, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			plan2.MakePlan2StringConstExprWithType("a"),
-		}), types.T_int64},
-		// a = 100  true
-		{true, int64(100),
-			makeFunctionExprForTest("=", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(100),
-			}), types.T_int64},
-		// b > 10 and a = "abc"  true
-		{true, []byte("abc"),
-			makeFunctionExprForTest("and", []*plan.Expr{
-				makeFunctionExprForTest(">", []*plan.Expr{
-					makeColExprForTest(1, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(10),
-				}),
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2StringConstExprWithType("abc"),
-				}),
-			}), types.T_char},
-	}
-
-	t.Run("test getPkValueByExpr", func(t *testing.T) {
-		for i, testCase := range testCases {
-			result, data := getPkValueByExpr(testCase.expr, "a", testCase.typ)
-			if result != testCase.result {
-				t.Fatalf("test getPkValueByExpr at cases[%d], get result is different with expected", i)
-			}
-			if result {
-				if a, ok := data.([]byte); ok {
-					b := testCase.data.([]byte)
-					if !bytes.Equal(a, b) {
-						t.Fatalf("test getPkValueByExpr at cases[%d], data is not match", i)
-					}
-				} else {
-					if data != testCase.data {
-						t.Fatalf("test getPkValueByExpr at cases[%d], data is not match", i)
-					}
-				}
-			}
-		}
-	})
+	return
 }
 
-func TestComputeRangeByNonIntPk(t *testing.T) {
-	type asserts = struct {
-		result bool
-		data   uint64
-		expr   *plan.Expr
-	}
+func TestForeachBlkInObjStatsList(t *testing.T) {
+	statsList := mockStatsList(t, 100)
 
-	getHash := func(e *plan.Expr) uint64 {
-		_, ret := getConstantExprHashValue(context.TODO(), e, testutil.NewProc())
-		return ret
-	}
+	count := 0
+	ForeachBlkInObjStatsList(false, nil, func(blk objectio.BlockInfo, _ objectio.BlockObject) bool {
+		count++
+		return false
+	}, statsList...)
 
-	testCases := []asserts{
-		// a > "a"  false   only 'and', '=' function is supported
-		{false, 0, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			plan2.MakePlan2StringConstExprWithType("a"),
-		})},
-		// a > coalesce("a")  false,  the second arg must be constant
-		{false, 0, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			makeFunctionExprForTest("coalesce", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2StringConstExprWithType("a"),
-			}),
-		})},
-		// a = "abc"  true
-		{true, getHash(plan2.MakePlan2StringConstExprWithType("abc")),
-			makeFunctionExprForTest("=", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2StringConstExprWithType("abc"),
-			})},
-		// a = "abc" and b > 10  true
-		{true, getHash(plan2.MakePlan2StringConstExprWithType("abc")),
-			makeFunctionExprForTest("and", []*plan.Expr{
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2StringConstExprWithType("abc"),
-				}),
-				makeFunctionExprForTest(">", []*plan.Expr{
-					makeColExprForTest(1, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(10),
-				}),
-			})},
-		// b > 10 and a = "abc"  true
-		{true, getHash(plan2.MakePlan2StringConstExprWithType("abc")),
-			makeFunctionExprForTest("and", []*plan.Expr{
-				makeFunctionExprForTest(">", []*plan.Expr{
-					makeColExprForTest(1, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(10),
-				}),
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2StringConstExprWithType("abc"),
-				}),
-			})},
-		// a = "abc" or b > 10  false
-		{false, 0,
-			makeFunctionExprForTest("or", []*plan.Expr{
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2StringConstExprWithType("abc"),
-				}),
-				makeFunctionExprForTest(">", []*plan.Expr{
-					makeColExprForTest(1, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(10),
-				}),
-			})},
-		// a = "abc" or a > 10  false
-		{false, 0,
-			makeFunctionExprForTest("or", []*plan.Expr{
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2StringConstExprWithType("abc"),
-				}),
-				makeFunctionExprForTest(">", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(10),
-				}),
-			})},
-	}
+	require.Equal(t, count, 1)
 
-	t.Run("test computeRangeByNonIntPk", func(t *testing.T) {
-		for i, testCase := range testCases {
-			result, data := computeRangeByNonIntPk(context.TODO(), testCase.expr, "a", testutil.NewProc())
-			if result != testCase.result {
-				t.Fatalf("test computeRangeByNonIntPk at cases[%d], get result is different with expected", i)
-			}
-			if result {
-				if data != testCase.data {
-					t.Fatalf("test computeRangeByNonIntPk at cases[%d], data is not match", i)
-				}
-			}
-		}
-	})
+	count = 0
+	ForeachBlkInObjStatsList(true, nil, func(blk objectio.BlockInfo, _ objectio.BlockObject) bool {
+		count++
+		return false
+	}, statsList...)
+
+	require.Equal(t, count, len(statsList))
+
+	count = 0
+	ForeachBlkInObjStatsList(true, nil, func(blk objectio.BlockInfo, _ objectio.BlockObject) bool {
+		count++
+		return true
+	}, statsList...)
+
+	objectio.ForeachObjectStats(func(stats *objectio.ObjectStats) bool {
+		count -= int(stats.BlkCnt())
+		return true
+	}, statsList...)
+
+	require.Equal(t, count, 0)
+
+	count = 0
+	ForeachBlkInObjStatsList(false, nil, func(blk objectio.BlockInfo, _ objectio.BlockObject) bool {
+		count++
+		return true
+	}, statsList...)
+
+	objectio.ForeachObjectStats(func(stats *objectio.ObjectStats) bool {
+		count -= int(stats.BlkCnt())
+		return true
+	}, statsList...)
+
+	require.Equal(t, count, 0)
 }
 
-func TestComputeRangeByIntPk(t *testing.T) {
-	type asserts = struct {
-		result bool
-		items  []int64
-		expr   *plan.Expr
+func TestDeletedBlocks_GetDeletedRowIDs(t *testing.T) {
+	delBlks := deletedBlocks{
+		offsets: map[types.Blockid][]int64{},
+	}
+	for i := 0; i < 100; i++ {
+		row := types.RandomRowid()
+		bid, offset := row.Decode()
+
+		delBlks.offsets[*bid] = append(delBlks.offsets[*bid], int64(offset))
 	}
 
-	testCases := []asserts{
-		// a > abs(20)   not support now
-		{false, []int64{21}, makeFunctionExprForTest("like", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			makeFunctionExprForTest("abs", []*plan.Expr{
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-		})},
-		// a > 20
-		{true, []int64{}, makeFunctionExprForTest(">", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			plan2.MakePlan2Int64ConstExprWithType(20),
-		})},
-		// a > 20 and b < 1  is equal a > 20
-		{false, []int64{}, makeFunctionExprForTest("and", []*plan.Expr{
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-			makeFunctionExprForTest("<", []*plan.Expr{
-				makeColExprForTest(1, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(1),
-			}),
-		})},
-		// 1 < b and a > 20   is equal a > 20
-		{false, []int64{}, makeFunctionExprForTest("and", []*plan.Expr{
-			makeFunctionExprForTest("<", []*plan.Expr{
-				plan2.MakePlan2Int64ConstExprWithType(1),
-				makeColExprForTest(1, types.T_int64),
-			}),
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-		})},
-		// a > 20 or b < 1  false.
-		{false, []int64{}, makeFunctionExprForTest("or", []*plan.Expr{
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-			makeFunctionExprForTest("<", []*plan.Expr{
-				makeColExprForTest(1, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(1),
-			}),
-		})},
-		// a = 20
-		{true, []int64{20}, makeFunctionExprForTest("=", []*plan.Expr{
-			makeColExprForTest(0, types.T_int64),
-			plan2.MakePlan2Int64ConstExprWithType(20),
-		})},
-		// a > 20 and a < =25
-		{true, []int64{21, 22, 23, 24, 25}, makeFunctionExprForTest("and", []*plan.Expr{
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-			makeFunctionExprForTest("<=", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(25),
-			}),
-		})},
-		// a > 20 and a <=25 and b > 100   todo： unsupport now。  when compute a <=25 and b > 10, we get items too much.
-		{false, []int64{21, 22, 23, 24, 25}, makeFunctionExprForTest("and", []*plan.Expr{
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-			makeFunctionExprForTest("and", []*plan.Expr{
-				makeFunctionExprForTest("<=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(25),
-				}),
-				makeFunctionExprForTest(">", []*plan.Expr{
-					makeColExprForTest(1, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(100),
-				}),
-			}),
-		})},
-		// a > 20 and a < 10  => empty
-		{false, []int64{}, makeFunctionExprForTest("and", []*plan.Expr{
-			makeFunctionExprForTest(">", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-			makeFunctionExprForTest("<", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(10),
-			}),
-		})},
-		// a < 20 or 100 < a
-		{false, []int64{}, makeFunctionExprForTest("or", []*plan.Expr{
-			makeFunctionExprForTest("<", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(20),
-			}),
-			makeFunctionExprForTest("<", []*plan.Expr{
-				plan2.MakePlan2Int64ConstExprWithType(100),
-				makeColExprForTest(0, types.T_int64),
-			}),
-		})},
-		// a =1 or a = 2 or a=30
-		{true, []int64{2, 1, 30}, makeFunctionExprForTest("or", []*plan.Expr{
-			makeFunctionExprForTest("=", []*plan.Expr{
-				makeColExprForTest(0, types.T_int64),
-				plan2.MakePlan2Int64ConstExprWithType(2),
-			}),
-			makeFunctionExprForTest("or", []*plan.Expr{
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(1),
-				}),
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(30),
-				}),
-			}),
-		})},
-		// (a >5 or a=1) and (a < 8 or a =11) => 1,6,7,11  todo,  now can't compute now
-		{false, []int64{6, 7, 11, 1}, makeFunctionExprForTest("and", []*plan.Expr{
-			makeFunctionExprForTest("or", []*plan.Expr{
-				makeFunctionExprForTest(">", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(5),
-				}),
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(1),
-				}),
-			}),
-			makeFunctionExprForTest("or", []*plan.Expr{
-				makeFunctionExprForTest("<", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(8),
-				}),
-				makeFunctionExprForTest("=", []*plan.Expr{
-					makeColExprForTest(0, types.T_int64),
-					plan2.MakePlan2Int64ConstExprWithType(11),
-				}),
-			}),
-		})},
-	}
+	rowIds := make([]types.Rowid, 0)
 
-	t.Run("test computeRangeByIntPk", func(t *testing.T) {
-		for i, testCase := range testCases {
-			result, data := computeRangeByIntPk(testCase.expr, "a", "")
-			if result != testCase.result {
-				t.Fatalf("test computeRangeByIntPk at cases[%d], get result is different with expected", i)
-			}
-			if result {
-				if len(data.items) != len(testCase.items) {
-					t.Fatalf("test computeRangeByIntPk at cases[%d], data length is not match", i)
-				}
-				for j, val := range testCase.items {
-					if data.items[j] != val {
-						t.Fatalf("test computeRangeByIntPk at cases[%d], data[%d] is not match", i, j)
-					}
-				}
-			}
-		}
+	delBlks.getDeletedRowIDs(func(row *types.Rowid) {
+		rowIds = append(rowIds, *row)
 	})
+
+	for i := range rowIds {
+		bid, offset := rowIds[i].Decode()
+		have, ok := delBlks.offsets[*bid]
+		require.True(t, ok)
+		require.NotEqual(t, 0, len(have))
+
+		x := slices.Index(have, int64(offset))
+		require.NotEqual(t, -1, x)
+	}
 }
 
-// func TestGetListByRange(t *testing.T) {
-// 	type asserts = struct {
-// 		result []DNStore
-// 		list   []DNStore
-// 		r      [][2]int64
-// 	}
+func TestConcurrentExecutor_Run(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	ex := newConcurrentExecutor(3)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ex.Run(ctx)
+	require.Equal(t, 3, ex.GetConcurrency())
 
-// 	testCases := []asserts{
-// 		{[]DNStore{{UUID: "1"}, {UUID: "2"}}, []DNStore{{UUID: "1"}, {UUID: "2"}}, [][2]int64{{14, 32324234234234}}},
-// 		{[]DNStore{{UUID: "1"}}, []DNStore{{UUID: "1"}, {UUID: "2"}}, [][2]int64{{14, 14}}},
-// 	}
+	var wg sync.WaitGroup
+	wg.Add(1)
+	ex.AppendTask(func() error {
+		defer wg.Done()
+		return nil
+	})
 
-// 	t.Run("test getListByRange", func(t *testing.T) {
-// 		for i, testCase := range testCases {
-// 			result := getListByRange(testCase.list, testCase.r)
-// 			if len(result) != len(testCase.result) {
-// 				t.Fatalf("test getListByRange at cases[%d], data length is not match", i)
-// 			}
-// 			/*
-// 				for j, r := range testCase.result {
-// 					if r.UUID != result[j].UUID {
-// 						t.Fatalf("test getListByRange at cases[%d], result[%d] is not match", i, j)
-// 					}
-// 				}
-// 			*/
-// 		}
-// 	})
-// }
+	wg.Add(1)
+	ex.AppendTask(func() error {
+		defer wg.Done()
+		return context.Canceled
+	})
+
+	wg.Add(1)
+	ex.AppendTask(func() error {
+		defer wg.Done()
+		return io.EOF
+	})
+	wg.Wait()
+}

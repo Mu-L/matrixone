@@ -15,15 +15,36 @@
 package stats
 
 import (
+	"sync"
+	"sync/atomic"
+
 	"go.uber.org/zap"
 )
 
+var (
+	SkipPanicONDuplicate atomic.Bool
+)
+
 // Registry holds mapping between FamilyName and Family
-type Registry map[string]*Family
+type Registry struct {
+	sync.RWMutex
+	families map[string]*Family
+}
+
+func NewRegistry() *Registry {
+	return &Registry{
+		families: make(map[string]*Family),
+	}
+}
 
 func (r *Registry) Register(familyName string, opts ...Options) {
+	r.Lock()
+	defer r.Unlock()
 
-	if _, exists := (*r)[familyName]; exists {
+	if _, exists := r.families[familyName]; exists {
+		if SkipPanicONDuplicate.Load() {
+			return
+		}
 		panic("Duplicate Family Name " + familyName)
 	}
 
@@ -32,15 +53,26 @@ func (r *Registry) Register(familyName string, opts ...Options) {
 		optFunc(&initOpts)
 	}
 
-	(*r)[familyName] = &Family{
+	r.families[familyName] = &Family{
 		logExporter: initOpts.logExporter,
 	}
 }
 
+// Unregister deletes the item with familyName from map.
+func (r *Registry) Unregister(familyName string) {
+	r.Lock()
+	defer r.Unlock()
+
+	delete(r.families, familyName)
+}
+
 // ExportLog returns the snapshot of all the Family in the registry
 func (r *Registry) ExportLog() map[string][]zap.Field {
+	r.RLock()
+	defer r.RUnlock()
+
 	families := make(map[string][]zap.Field)
-	for familyName, family := range *r {
+	for familyName, family := range r.families {
 		families[familyName] = family.logExporter.Export()
 	}
 	return families
@@ -64,7 +96,7 @@ func defaultOptions() options {
 }
 
 // DefaultRegistry will be used to register all the MO Dev Stats.
-var DefaultRegistry = Registry{}
+var DefaultRegistry = NewRegistry()
 
 // Register registers stats family to default stats registry
 // familyName is a unique family name for the stats
@@ -72,4 +104,9 @@ var DefaultRegistry = Registry{}
 // Usage: stats.Register("FamilyName", stats.WithLogExporter(customStatsLogExporter))
 func Register(familyName string, opts ...Options) {
 	DefaultRegistry.Register(familyName, opts...)
+}
+
+// Unregister unregisters the family from DefaultRegistry.
+func Unregister(familyName string) {
+	DefaultRegistry.Unregister(familyName)
 }

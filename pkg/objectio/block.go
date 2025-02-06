@@ -15,115 +15,160 @@
 package objectio
 
 import (
-	"bytes"
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"fmt"
+
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 )
 
-// Block is the organizational structure of a batch in objectio
-// Write one batch at a time, and batch and block correspond one-to-one
-type Block struct {
-	// id is the serial number of the block in the object
-	id uint32
+type BlockObject []byte
 
-	// header is the metadata of the block, such as tableid, blockid, column count...
-	header BlockHeader
-
-	// columns is the vector in the batch
-	columns []*ColumnBlock
-
-	// object is a container that can store multiple blocks,
-	// using a fileservice file storage
-	object *Object
-
-	// extent is the location of the block's metadata on the fileservice
-	extent Extent
-
-	// name is the file name or object name of the block
-	name string
-}
-
-func NewBlock(colCnt uint16, object *Object, name string) BlockObject {
-	header := BlockHeader{
-		columnCount: colCnt,
+func NewBlock(seqnums *Seqnums) BlockObject {
+	header := BuildBlockHeader()
+	header.SetColumnCount(uint16(len(seqnums.Seqs)))
+	metaColCnt := seqnums.MetaColCnt
+	header.SetMetaColumnCount(metaColCnt)
+	header.SetMaxSeqnum(seqnums.MaxSeq)
+	blockMeta := BuildBlockMeta(metaColCnt)
+	blockMeta.SetBlockMetaHeader(header)
+	// create redundant columns to make reading O(1)
+	for i := uint16(0); i < metaColCnt; i++ {
+		col := BuildColumnMeta()
+		blockMeta.AddColumnMeta(i, col)
 	}
-	block := &Block{
-		header:  header,
-		object:  object,
-		columns: make([]*ColumnBlock, colCnt),
-		name:    name,
+
+	for i, seq := range seqnums.Seqs {
+		blockMeta.ColumnMeta(seq).setIdx(uint16(i))
 	}
-	for i := range block.columns {
-		block.columns[i] = NewColumnBlock(uint16(i), block.object)
+	return blockMeta
+}
+
+func BuildBlockMeta(count uint16) BlockObject {
+	length := headerLen + uint32(count)*colMetaLen
+	buf := make([]byte, length)
+	meta := BlockObject(buf)
+	return meta
+}
+
+func (bm BlockObject) BlockHeader() BlockHeader {
+	return BlockHeader(bm[:headerLen])
+}
+
+func (bm BlockObject) SetBlockMetaHeader(header BlockHeader) {
+	copy(bm[:headerLen], header)
+}
+
+// ColumnMeta is for internal use only, it didn't consider the block does not
+// contain the seqnum
+func (bm BlockObject) ColumnMeta(seqnum uint16) ColumnMeta {
+	return GetColumnMeta(seqnum, bm)
+}
+
+func (bm BlockObject) AddColumnMeta(idx uint16, col ColumnMeta) {
+	offset := headerLen + uint32(idx)*colMetaLen
+	copy(bm[offset:offset+colMetaLen], col)
+}
+
+func (bm BlockObject) IsEmpty() bool {
+	return len(bm) == 0
+}
+
+func (bm BlockObject) ToColumnZoneMaps(seqnums []uint16) []ZoneMap {
+	maxseq := bm.GetMaxSeqnum()
+	zms := make([]ZoneMap, len(seqnums))
+	for i, idx := range seqnums {
+		if idx >= SEQNUM_UPPER {
+			panic(fmt.Sprintf("do not read special %d", idx))
+		}
+		if idx > maxseq {
+			zms[i] = index.DecodeZM(EmptyZm[:])
+		}
+		column := bm.MustGetColumn(idx)
+		zms[i] = index.DecodeZM(column.ZoneMap())
 	}
-	return block
+	return zms
 }
 
-func (b *Block) GetExtent() Extent {
-	return b.extent
+func (bm BlockObject) GetExtent() Extent {
+	return bm.BlockHeader().MetaLocation()
 }
 
-func (b *Block) GetColumn(idx uint16) (*ColumnBlock, error) {
-	if idx >= uint16(len(b.columns)) {
-		return nil, moerr.NewInternalErrorNoCtx("ObjectIO: bad index: %d, "+
-			"block: %v, column count: %d",
-			idx, b.name,
-			len(b.columns))
+// MustGetColumn is for general use. it return a empty ColumnMeta if the block does not
+// contain the seqnum
+func (bm BlockObject) MustGetColumn(seqnum uint16) ColumnMeta {
+	if seqnum >= bm.BlockHeader().MetaColumnCount() {
+		h := bm.BlockHeader()
+		logutil.Infof("ObjectIO: blk-%d genernate empty ColumnMeta for big seqnum %d, maxseq: %d, column count: %d",
+			h.Sequence(), seqnum, h.MaxSeqnum(), h.MetaColumnCount())
+		return BuildColumnMeta()
 	}
-	return b.columns[idx], nil
+	return bm.ColumnMeta(seqnum)
 }
 
-func (b *Block) GetRows() (uint32, error) {
-	panic(any("implement me"))
+func (bm BlockObject) GetRows() uint32 {
+	return bm.BlockHeader().Rows()
 }
 
-func (b *Block) GetMeta() BlockMeta {
-	return BlockMeta{
-		header: b.header,
-		name:   b.name,
-	}
+func (bm BlockObject) GetMeta() BlockObject {
+	return bm
 }
 
-func (b *Block) GetID() uint32 {
-	return b.id
+func (bm BlockObject) GetID() uint16 {
+	return bm.BlockHeader().Sequence()
 }
 
-func (b *Block) GetColumnCount() uint16 {
-	return b.header.columnCount
+func (bm BlockObject) GetColumnCount() uint16 {
+	return bm.BlockHeader().ColumnCount()
 }
 
-func (b *Block) MarshalMeta() []byte {
-	var (
-		buffer bytes.Buffer
+func (bm BlockObject) GetMetaColumnCount() uint16 {
+	return bm.BlockHeader().MetaColumnCount()
+}
+
+func (bm BlockObject) GetMaxSeqnum() uint16 {
+	return bm.BlockHeader().MaxSeqnum()
+}
+
+func (bm BlockObject) GetBlockID(name ObjectName) *Blockid {
+	segmentId := name.SegmentId()
+	num := name.Num()
+	return NewBlockid(&segmentId, num, bm.BlockHeader().Sequence())
+}
+
+func (bm BlockObject) GenerateBlockInfo(objName ObjectName, sorted bool) BlockInfo {
+	location := BuildLocation(
+		objName,
+		bm.GetExtent(),
+		bm.GetRows(),
+		bm.GetID(),
 	)
-	// write header
-	buffer.Write(b.header.Marshal())
-	// write columns meta
-	for _, column := range b.columns {
-		buffer.Write(column.MarshalMeta())
+
+	sid := location.Name().SegmentId()
+	blkInfo := BlockInfo{
+		BlockID: *NewBlockid(
+			&sid,
+			location.Name().Num(),
+			location.ID()),
 	}
-	return buffer.Bytes()
+	blkInfo.SetMetaLocation(location)
+
+	blkInfo.ObjectFlags |= ObjectFlag_CNCreated
+	if sorted {
+		blkInfo.ObjectFlags |= ObjectFlag_Sorted
+	}
+
+	return blkInfo
 }
 
-func (b *Block) UnmarshalMeta(data []byte, ZMUnmarshalFunc ZoneMapUnmarshalFunc) (uint32, error) {
-	var err error
-	size := uint32(0)
-	b.header = BlockHeader{}
-	b.header.Unmarshal(data)
-	size += HeaderSize
-	data = data[HeaderSize:]
-	b.columns = make([]*ColumnBlock, b.header.columnCount)
-	for i := range b.columns {
-		b.columns[i] = NewColumnBlock(uint16(i), b.object)
-		b.columns[i].meta.zoneMap = ZoneMap{
-			idx:           uint16(i),
-			unmarshalFunc: ZMUnmarshalFunc,
+func SumSizeOfBlocks(blocks []BlockObject) (size, osize uint32) {
+	for _, block := range blocks {
+		meta := block.GetMeta()
+		count := meta.BlockHeader().MetaColumnCount()
+		for i := 0; i < int(count); i++ {
+			col := block.MustGetColumn(uint16(i))
+			size += col.Location().Length()
+			osize += col.Location().OriginSize()
 		}
-		err = b.columns[i].UnmarshalMate(data)
-		if err != nil {
-			return 0, err
-		}
-		size += ColumnMetaSize
-		data = data[ColumnMetaSize:]
 	}
-	return size, err
+	return
 }

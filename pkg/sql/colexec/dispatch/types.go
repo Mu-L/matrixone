@@ -15,38 +15,49 @@
 package dispatch
 
 import (
+	"bytes"
 	"context"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/container/pSpool"
+
 	"github.com/google/uuid"
-	"github.com/matrixorigin/matrixone/pkg/cnservice/cnclient"
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/common/morpc"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/pb/pipeline"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-type WrapperClientSession struct {
-	msgId uint64
-	cs    morpc.ClientSession
-	uuid  uuid.UUID
-	// toAddr string
-	doneCh chan struct{}
-}
+var _ vm.Operator = new(Dispatch)
+
+const (
+	maxMessageSizeToMoRpc = 64 * mpool.MB
+	waitNotifyTimeout     = 45 * time.Second
+
+	SendToAllLocalFunc = iota
+	SendToAllFunc
+	SendToAnyLocalFunc
+	SendToAnyFunc
+	ShuffleToAllFunc
+)
+
 type container struct {
+	sp *pSpool.PipelineSpool
+
 	// the clientsession info for the channel you want to dispatch
-	remoteReceivers []*WrapperClientSession
+	remoteReceivers []*process.WrapCs
+	remoteInfo      process.RemotePipelineInformationChannel
+
 	// sendFunc is the rule you want to send batch
-	sendFunc func(bat *batch.Batch, ap *Argument, proc *process.Process) (bool, error)
-}
+	sendFunc func(bat *batch.Batch, ap *Dispatch, proc *process.Process) (bool, error)
 
-type Argument struct {
-	ctr *container
-
+	// isRemote specify it is a remote receiver or not
+	isRemote bool
 	// prepared specify waiting remote receiver ready or not
 	prepared bool
+	hasData  bool
 
 	// for send-to-any function decide send to which reg
 	sendCnt       int
@@ -54,56 +65,108 @@ type Argument struct {
 	localRegsCnt  int
 	remoteRegsCnt int
 
+	remoteToIdx map[uuid.UUID]int
+
+	batchCnt []int
+	rowCnt   []int
+
+	marshalBuf bytes.Buffer
+}
+
+type Dispatch struct {
+	ctr *container
+
+	// IsSink means this is a Sink Node
+	IsSink bool
+	// RecSink means this is the dispatch operator for `mergeRecursive` pipeline.
+	RecSink bool
+	// RecCTE means this is the dispatch operator for `mergeCTE` pipeline.
+	RecCTE bool
+
+	ShuffleType int32
 	// FuncId means the sendFunc you want to call
 	FuncId int
 	// LocalRegs means the local register you need to send to.
 	LocalRegs []*process.WaitRegister
 	// RemoteRegs specific the remote reg you need to send to.
 	RemoteRegs []colexec.ReceiveInfo
+	// for shuffle dispatch
+	ShuffleRegIdxLocal  []int
+	ShuffleRegIdxRemote []int
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	if arg.FuncId == SendToAllFunc {
-		if !arg.prepared {
-			arg.waitRemoteRegsReady(proc)
-		}
-		for _, r := range arg.ctr.remoteReceivers {
-			timeoutCtx, cancel := context.WithTimeout(context.Background(), time.Second*10000)
-			_ = cancel
-			message := cnclient.AcquireMessage()
-			{
-				message.Id = r.msgId
-				message.Cmd = pipeline.BatchMessage
-				message.Sid = pipeline.MessageEnd
-				message.Uuid = r.uuid[:]
+func (dispatch *Dispatch) GetOperatorBase() *vm.OperatorBase {
+	return &dispatch.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Dispatch](
+		func() *Dispatch {
+			return &Dispatch{}
+		},
+		func(a *Dispatch) {
+			*a = Dispatch{}
+		},
+		reuse.DefaultOptions[Dispatch]().
+			WithEnableChecker(),
+	)
+}
+
+func (dispatch Dispatch) TypeName() string {
+	return opName
+}
+
+func (dispatch *Dispatch) OpType() vm.OpType {
+	return vm.Dispatch
+}
+
+func NewArgument() *Dispatch {
+	return reuse.Alloc[Dispatch](nil)
+}
+
+func (dispatch *Dispatch) Release() {
+	if dispatch != nil {
+		reuse.Free[Dispatch](dispatch, nil)
+	}
+}
+
+func (dispatch *Dispatch) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	if dispatch.ctr != nil {
+		if dispatch.ctr.isRemote {
+			for _, r := range dispatch.ctr.remoteReceivers {
+				r.Err <- err
 			}
-			if pipelineFailed {
-				err := moerr.NewInternalErrorNoCtx("pipeline failed")
-				message.Err = pipeline.EncodedMessageError(timeoutCtx, err)
+
+			uuids := make([]uuid.UUID, 0, len(dispatch.RemoteRegs))
+			for i := range dispatch.RemoteRegs {
+				uuids = append(uuids, dispatch.RemoteRegs[i].Uuid)
 			}
-			r.cs.Write(timeoutCtx, message)
-			close(r.doneCh)
+			colexec.Get().DeleteUuids(uuids)
 		}
 	}
 
-	if pipelineFailed {
-		for i := range arg.LocalRegs {
-			for len(arg.LocalRegs[i].Ch) > 0 {
-				bat := <-arg.LocalRegs[i].Ch
-				if bat == nil {
-					break
-				}
-				bat.Clean(proc.Mp())
-			}
+	// told the local receiver to stop if it is still running.
+	if dispatch.ctr != nil && dispatch.ctr.sp != nil {
+		_, _ = dispatch.ctr.sp.SendBatch(context.TODO(), pSpool.SendToAllLocal, nil, err)
+		for i, reg := range dispatch.LocalRegs {
+			reg.Ch2 <- process.NewPipelineSignalToGetFromSpool(dispatch.ctr.sp, i)
+		}
+
+		dispatch.ctr.sp.Close()
+		dispatch.ctr.sp = nil
+	} else {
+		for _, reg := range dispatch.LocalRegs {
+			reg.Ch2 <- process.NewPipelineSignalToDirectly(nil, err, proc.Mp())
 		}
 	}
+	dispatch.ctr = nil
+}
 
-	for i := range arg.LocalRegs {
-		select {
-		case <-arg.LocalRegs[i].Ctx.Done():
-		case arg.LocalRegs[i].Ch <- nil:
-		}
-		close(arg.LocalRegs[i].Ch)
-	}
+func (dispatch *Dispatch) Free(proc *process.Process, pipelineFailed bool, err error) {
+}
 
+func (dispatch *Dispatch) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }

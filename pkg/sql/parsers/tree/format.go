@@ -26,8 +26,9 @@ type FmtCtx struct {
 	*strings.Builder
 	dialectType dialect.DialectType
 	// quoteString string
-	quoteString       bool
-	singleQuoteString bool
+	quoteString             bool
+	singleQuoteString       bool
+	escapeSingleQuoteString bool
 }
 
 func NewFmtCtx(dialectType dialect.DialectType, opts ...FmtCtxOption) *FmtCtx {
@@ -52,9 +53,16 @@ func WithQuoteString(quote bool) FmtCtxOption {
 		ctx.quoteString = quote
 	})
 }
+
 func WithSingleQuoteString() FmtCtxOption {
 	return FmtCtxOption(func(ctx *FmtCtx) {
 		ctx.singleQuoteString = true
+	})
+}
+
+func WithEscapeSingleQuoteString() FmtCtxOption {
+	return FmtCtxOption(func(ctx *FmtCtx) {
+		ctx.escapeSingleQuoteString = true
 	})
 }
 
@@ -63,12 +71,53 @@ type NodeFormatter interface {
 	Format(ctx *FmtCtx)
 }
 
+// Visitor Design Pattern
+// NodeChecker is abstract tree Node
+type NodeChecker interface {
+	// `Accept` method accepts Visitor to visit itself. Visitor checks the current node
+	// The returned node should replace original node.
+	// The node returned by Accpet should replace the original node.
+	// If OK returns false, it stops accessing other child nodes.
+
+	//	The general implementation logic of the `Accept` method is:
+	//	First, call the Visitor.`Enter` method, and assign the returned `node` to the receiver of the `Accept` method,
+	//	If the returnd `skipChildren` value is true, then it is necessary to stop accessing the receiver's child node
+	//	Otherwise, recursively call the` Accept` of its children nodes,
+	//	Finally, don't forget to call the Visitor's `Exit` method
+	Accept(v Visitor) (node Expr, ok bool)
+}
+
+// Visitor Design Pattern
+// Visitor visits the ast node or sub ast nodes
+type Visitor interface {
+	// Call the 'Enter' method before visiting the children nodes.
+	// The node type returned by the `Enter` method must be the same as the input node type
+	// SkipChildren returning true means that access to child nodes should be skipped.
+	Enter(n Expr) (node Expr, skipChildren bool)
+
+	//`Exit` is called after all children nodes are visited.
+	//The returned node of the `Exit` method is `Expr`, which is of the same type as the input node.
+	//if `Exit` method returns OK as false ,means stop visiting.
+	Exit(n Expr) (node Expr, ok bool)
+}
+
 func String(node NodeFormatter, dialectType dialect.DialectType) string {
 	if node == nil {
 		return "<nil>"
 	}
 
 	ctx := NewFmtCtx(dialectType)
+	node.Format(ctx)
+	return ctx.String()
+}
+
+// StringWithOpts Restore SQL and provide string formatting restore options
+func StringWithOpts(node NodeFormatter, dialectType dialect.DialectType, opts ...FmtCtxOption) string {
+	if node == nil {
+		return "<nil>"
+	}
+
+	ctx := NewFmtCtx(dialectType, opts...)
 	node.Format(ctx)
 	return ctx.String()
 }
@@ -99,6 +148,9 @@ func (ctx *FmtCtx) WriteValue(t P_TYPE, v string) (int, error) {
 	}
 	if ctx.singleQuoteString && t == P_char {
 		return ctx.WriteString(fmt.Sprintf("'%s'", v))
+	}
+	if ctx.escapeSingleQuoteString && t == P_char {
+		return ctx.WriteString(fmt.Sprintf("\\'%s\\'", v))
 	}
 	return ctx.WriteString(v)
 }

@@ -15,13 +15,13 @@
 package testutils
 
 import (
-	"context"
+	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -33,31 +33,10 @@ func WaitExpect(timeout int, expect func() bool) {
 	}
 }
 
-func WaitChTimeout[T any](
-	ctx context.Context,
-	after time.Duration,
-	ch <-chan T,
-	onRecvCheck func(element T, closed bool) (moveOn bool, err error),
-) error {
-	timeout := time.After(after)
-	for {
-		select {
-		case <-timeout:
-			return moerr.NewInternalError(ctx, "timeout")
-		case item, ok := <-ch:
-			moveOn, err := onRecvCheck(item, !ok)
-			if err != nil {
-				return err
-			}
-			if !ok || !moveOn {
-				return nil
-			}
-		}
-	}
-}
-
 func GetDefaultTestPath(module string, t *testing.T) string {
-	return filepath.Join("/tmp", module, t.Name())
+	usr, _ := user.Current()
+	dirName := fmt.Sprintf("%s-ut-workspace", usr.Username)
+	return filepath.Join("/tmp", dirName, module, t.Name())
 }
 
 func MakeDefaultTestPath(module string, t *testing.T) string {

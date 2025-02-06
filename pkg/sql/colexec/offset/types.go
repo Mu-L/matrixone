@@ -14,12 +14,88 @@
 
 package offset
 
-import "github.com/matrixorigin/matrixone/pkg/vm/process"
+import (
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/vm"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
+)
 
-type Argument struct {
-	Seen   uint64 // seen is the number of tuples seen so far
-	Offset uint64
+var _ vm.Operator = new(Offset)
+
+type container struct {
+	seen           uint64 // seen is the number of tuples seen so far
+	offset         uint64
+	offsetExecutor colexec.ExpressionExecutor
+	buf            *batch.Batch
+}
+type Offset struct {
+	ctr        container
+	OffsetExpr *plan.Expr
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
+func (offset *Offset) GetOperatorBase() *vm.OperatorBase {
+	return &offset.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Offset](
+		func() *Offset {
+			return &Offset{}
+		},
+		func(a *Offset) {
+			*a = Offset{}
+		},
+		reuse.DefaultOptions[Offset]().
+			WithEnableChecker(),
+	)
+}
+
+func (offset Offset) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Offset {
+	return reuse.Alloc[Offset](nil)
+}
+
+func (offset *Offset) WithOffset(offsetExpr *plan.Expr) *Offset {
+	offset.OffsetExpr = offsetExpr
+	return offset
+}
+
+func (offset *Offset) Release() {
+	if offset != nil {
+		reuse.Free[Offset](offset, nil)
+	}
+}
+
+func (offset *Offset) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	if offset.ctr.offsetExecutor != nil {
+		offset.ctr.offsetExecutor.ResetForNextQuery()
+	}
+	if offset.ctr.buf != nil {
+		offset.ctr.buf.CleanOnlyData()
+	}
+	offset.ctr.seen = 0
+}
+
+func (offset *Offset) Free(proc *process.Process, pipelineFailed bool, err error) {
+	if offset.ctr.offsetExecutor != nil {
+		offset.ctr.offsetExecutor.Free()
+		offset.ctr.offsetExecutor = nil
+	}
+
+	if offset.ctr.buf != nil {
+		offset.ctr.buf.Clean(proc.GetMPool())
+		offset.ctr.buf = nil
+	}
+}
+
+func (offset *Offset) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }

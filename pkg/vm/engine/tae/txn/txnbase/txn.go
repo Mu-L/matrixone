@@ -15,8 +15,11 @@
 package txnbase
 
 import (
+	"context"
 	"fmt"
+	"runtime/trace"
 	"sync/atomic"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
 
@@ -45,6 +48,7 @@ const (
 )
 
 type OpTxn struct {
+	ctx context.Context
 	Txn txnif.AsyncTxn
 	Op  OpType
 }
@@ -80,8 +84,9 @@ type Txn struct {
 	LSN                      uint64
 	TenantID, UserID, RoleID atomic.Uint32
 	isReplay                 bool
-	PKDedupSkip              txnif.PKDedupSkipScope
+	DedupType                txnif.DedupPolicy
 
+	FreezeFn          func(txnif.AsyncTxn) error
 	PrepareCommitFn   func(txnif.AsyncTxn) error
 	PrepareRollbackFn func(txnif.AsyncTxn) error
 	ApplyCommitFn     func(txnif.AsyncTxn) error
@@ -95,6 +100,18 @@ func NewTxn(mgr *TxnManager, store txnif.TxnStore, txnId []byte, start, snapshot
 	}
 	txn.TxnCtx = NewTxnCtx(txnId, start, snapshot)
 	return txn
+}
+
+func MockTxnReaderWithStartTS(startTS types.TS) *Txn {
+	return &Txn{
+		TxnCtx: &TxnCtx{
+			StartTS: startTS,
+		},
+	}
+}
+
+func MockTxnReaderWithNow() *Txn {
+	return MockTxnReaderWithStartTS(types.BuildTS(time.Now().UTC().UnixNano(), 0))
 }
 
 func NewPersistedTxn(
@@ -118,20 +135,24 @@ func NewPersistedTxn(
 		ApplyCommitFn:     applyCommitFn,
 	}
 }
-func (txn *Txn) GetLsn() uint64 { return txn.LSN }
-func (txn *Txn) IsReplay() bool { return txn.isReplay }
-
-func (txn *Txn) MockIncWriteCnt() int { return txn.Store.IncreateWriteCnt() }
+func (txn *Txn) GetBase() txnif.BaseTxn {
+	return txn
+}
+func (txn *Txn) GetLsn() uint64              { return txn.LSN }
+func (txn *Txn) IsReplay() bool              { return txn.isReplay }
+func (txn *Txn) GetContext() context.Context { return txn.Store.GetContext() }
+func (txn *Txn) MockIncWriteCnt() int        { return txn.Store.IncreateWriteCnt() }
 
 func (txn *Txn) SetError(err error) { txn.Err = err }
 func (txn *Txn) GetError() error    { return txn.Err }
 
+func (txn *Txn) SetFreezeFn(fn func(txnif.AsyncTxn) error)          { txn.FreezeFn = fn }
 func (txn *Txn) SetPrepareCommitFn(fn func(txnif.AsyncTxn) error)   { txn.PrepareCommitFn = fn }
 func (txn *Txn) SetPrepareRollbackFn(fn func(txnif.AsyncTxn) error) { txn.PrepareRollbackFn = fn }
 func (txn *Txn) SetApplyCommitFn(fn func(txnif.AsyncTxn) error)     { txn.ApplyCommitFn = fn }
 func (txn *Txn) SetApplyRollbackFn(fn func(txnif.AsyncTxn) error)   { txn.ApplyRollbackFn = fn }
-func (txn *Txn) SetPKDedupSkip(skip txnif.PKDedupSkipScope)         { txn.PKDedupSkip = skip }
-func (txn *Txn) GetPKDedupSkip() txnif.PKDedupSkipScope             { return txn.PKDedupSkip }
+func (txn *Txn) SetDedupType(dedupType txnif.DedupPolicy)           { txn.DedupType = dedupType }
+func (txn *Txn) GetDedupType() txnif.DedupPolicy                    { return txn.DedupType }
 
 //The state transition of transaction is as follows:
 // 1PC: TxnStateActive--->TxnStatePreparing--->TxnStateCommitted/TxnStateRollbacked
@@ -152,7 +173,7 @@ func (txn *Txn) GetPKDedupSkip() txnif.PKDedupSkipScope             { return txn
 //  1. How to handle the case in which log service timed out?
 //  2. For a 2pc transaction, Rollback message may arrive before Prepare message,
 //     should handle this case by TxnStorage?
-func (txn *Txn) Prepare() (pts types.TS, err error) {
+func (txn *Txn) Prepare(ctx context.Context) (pts types.TS, err error) {
 	if txn.Mgr.GetTxn(txn.GetID()) == nil {
 		logutil.Warn("tae : txn is not found in TxnManager")
 		//txn.Err = ErrTxnNotFound
@@ -166,6 +187,7 @@ func (txn *Txn) Prepare() (pts types.TS, err error) {
 	}
 	txn.Add(1)
 	err = txn.Mgr.OnOpTxn(&OpTxn{
+		ctx: ctx,
 		Txn: txn,
 		Op:  OpPrepare,
 	})
@@ -188,7 +210,7 @@ func (txn *Txn) Prepare() (pts types.TS, err error) {
 // Rollback is used to roll back a 1PC or 2PC transaction.
 // Notice that there may be a such scenario in which a 2PC distributed transaction in ACTIVE
 // will be rollbacked, since Rollback message may arrive before the Prepare message.
-func (txn *Txn) Rollback() (err error) {
+func (txn *Txn) Rollback(ctx context.Context) (err error) {
 	//idempotent check
 	if txn.Mgr.GetTxn(txn.GetID()) == nil {
 		logutil.Warnf("tae : txn %s is not found in TxnManager", txn.GetID())
@@ -201,10 +223,10 @@ func (txn *Txn) Rollback() (err error) {
 	}
 
 	if txn.Is2PC() {
-		return txn.rollback2PC()
+		return txn.rollback2PC(ctx)
 	}
 
-	return txn.rollback1PC()
+	return txn.rollback1PC(ctx)
 }
 
 // Committing is used to record a "committing" status for coordinator.
@@ -225,7 +247,7 @@ func (txn *Txn) doCommitting(inRecovery bool) (err error) {
 	}
 	state := txn.GetTxnState(false)
 	if state != txnif.TxnStatePrepared {
-		return moerr.NewInternalErrorNoCtx(
+		return moerr.NewInternalErrorNoCtxf(
 			"stat not prepared, unexpected txn status : %s",
 			txnif.TxnStrState(state),
 		)
@@ -250,16 +272,20 @@ func (txn *Txn) doCommitting(inRecovery bool) (err error) {
 // Commit is used to commit a 1PC or 2PC transaction running on Coordinator or running on Participant.
 // Notice that the Commit of a 2PC transaction must be success once the Commit message arrives,
 // since Preparing had already succeeded.
-func (txn *Txn) Commit() (err error) {
-	return txn.doCommit(false)
+func (txn *Txn) Commit(ctx context.Context) (err error) {
+	probe := trace.StartRegion(context.Background(), "Commit")
+	defer probe.End()
+
+	err = txn.doCommit(ctx, false)
+	return
 }
 
 // CommitInRecovery is called during recovery
-func (txn *Txn) CommitInRecovery() (err error) {
-	return txn.doCommit(true)
+func (txn *Txn) CommitInRecovery(ctx context.Context) (err error) {
+	return txn.doCommit(ctx, true)
 }
 
-func (txn *Txn) doCommit(inRecovery bool) (err error) {
+func (txn *Txn) doCommit(ctx context.Context, inRecovery bool) (err error) {
 	if txn.Mgr.GetTxn(txn.GetID()) == nil {
 		err = moerr.NewTxnNotFoundNoCtx()
 		return
@@ -274,7 +300,7 @@ func (txn *Txn) doCommit(inRecovery bool) (err error) {
 		return txn.commit2PC(inRecovery)
 	}
 
-	return txn.commit1PC(inRecovery)
+	return txn.commit1PC(ctx, inRecovery)
 }
 
 func (txn *Txn) GetStore() txnif.TxnStore {
@@ -296,6 +322,7 @@ func (txn *Txn) DoneWithErr(err error, isAbort bool) {
 		return
 	}
 	txn.done1PCWithErr(err)
+	txn.GetStore().EndTrace()
 }
 
 func (txn *Txn) PrepareCommit() (err error) {
@@ -310,6 +337,11 @@ func (txn *Txn) PrepareCommit() (err error) {
 
 func (txn *Txn) PreApplyCommit() (err error) {
 	err = txn.Store.PreApplyCommit()
+	return
+}
+
+func (txn *Txn) PrepareWAL() (err error) {
+	err = txn.Store.PrepareWAL()
 	return
 }
 
@@ -348,8 +380,16 @@ func (txn *Txn) ApplyRollback() (err error) {
 	return
 }
 
-func (txn *Txn) PrePrepare() error {
-	return txn.Store.PrePrepare()
+func (txn *Txn) PrePrepare(ctx context.Context) error {
+	return txn.Store.PrePrepare(ctx)
+}
+
+func (txn *Txn) Freeze(ctx context.Context) error {
+	if txn.FreezeFn != nil {
+		err := txn.FreezeFn(txn)
+		return err
+	}
+	return txn.Store.Freeze(ctx)
 }
 
 func (txn *Txn) PrepareRollback() (err error) {
@@ -367,8 +407,8 @@ func (txn *Txn) String() string {
 	return fmt.Sprintf("%s: %v", str, txn.GetError())
 }
 
-func (txn *Txn) WaitPrepared() error {
-	return txn.Store.WaitPrepared()
+func (txn *Txn) WaitPrepared(ctx context.Context) error {
+	return txn.Store.WaitPrepared(ctx)
 }
 
 func (txn *Txn) WaitDone(err error, isAbort bool) error {
@@ -395,7 +435,8 @@ func (txn *Txn) CreateDatabase(name, createSql, datTyp string) (db handle.Databa
 	return
 }
 
-func (txn *Txn) CreateDatabaseWithID(name, createSql, datTyp string, id uint64) (db handle.Database, err error) {
+func (txn *Txn) CreateDatabaseWithCtx(ctx context.Context,
+	name, createSql, datTyp string, id uint64) (db handle.Database, err error) {
 	return
 }
 
@@ -418,6 +459,9 @@ func (txn *Txn) UnsafeGetRelation(dbId, id uint64) (db handle.Relation, err erro
 func (txn *Txn) GetDatabase(name string) (db handle.Database, err error) {
 	return
 }
+func (txn *Txn) GetDatabaseWithCtx(_ context.Context, _ string) (db handle.Database, err error) {
+	return
+}
 
 func (txn *Txn) GetDatabaseByID(id uint64) (db handle.Database, err error) {
 	return
@@ -435,7 +479,7 @@ func (txn *Txn) DatabaseNames() (names []string) {
 	return
 }
 
-func (txn *Txn) LogTxnEntry(dbId, tableId uint64, entry txnif.TxnEntry, readed []*common.ID) (err error) {
+func (txn *Txn) LogTxnEntry(dbId, tableId uint64, entry txnif.TxnEntry, readedObject, readedTombstone []*common.ID) (err error) {
 	return
 }
 

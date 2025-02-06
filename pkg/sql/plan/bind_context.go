@@ -16,6 +16,7 @@ package plan
 
 import (
 	"context"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
@@ -27,21 +28,49 @@ func NewBindContext(builder *QueryBuilder, parent *BindContext) *BindContext {
 	bc := &BindContext{
 		groupByAst:     make(map[string]int32),
 		aggregateByAst: make(map[string]int32),
+		sampleByAst:    make(map[string]int32),
 		projectByExpr:  make(map[string]int32),
-		aliasMap:       make(map[string]int32),
+		windowByAst:    make(map[string]int32),
+		timeByAst:      make(map[string]int32),
+		aliasMap:       make(map[string]*aliasItem),
+		aliasFrequency: make(map[string]int),
 		bindingByTag:   make(map[int32]*Binding),
 		bindingByTable: make(map[string]*Binding),
 		bindingByCol:   make(map[string]*Binding),
+		lower:          1,
 		parent:         parent,
+		boundCtes:      make(map[string]*CTERef),
+		boundViews:     make(map[[2]string]*tree.CreateView),
 	}
+
+	if builder != nil {
+		bc.lower = builder.compCtx.GetLowerCaseTableNames()
+	}
+
 	if parent != nil {
 		bc.defaultDatabase = parent.defaultDatabase
+		bc.cteName = parent.cteName
+		if parent.bindingCte() {
+			bc.cteByName = parent.cteByName
+			bc.cteState = parent.cteState
+		}
+		bc.snapshot = parent.snapshot
 	}
 
 	return bc
 }
 
 func (bc *BindContext) rootTag() int32 {
+	if bc.bindingRecurCte() {
+		return bc.sinkTag
+	} else if bc.resultTag > 0 {
+		return bc.resultTag
+	} else {
+		return bc.projectTag
+	}
+}
+
+func (bc *BindContext) topTag() int32 {
 	if bc.resultTag > 0 {
 		return bc.resultTag
 	} else {
@@ -50,30 +79,81 @@ func (bc *BindContext) rootTag() int32 {
 }
 
 func (bc *BindContext) findCTE(name string) *CTERef {
+	// the cte is masked already, we don't go further
+	if bc.cteState.masked(name) {
+		return nil
+	}
 	if cte, ok := bc.cteByName[name]; ok {
-		return cte
+		if !bc.cteState.masked(name) {
+			return cte
+		}
 	}
 
 	parent := bc.parent
-	for parent != nil && name != parent.cteName {
+	for parent != nil {
+		// the cte is masked already, we don't go further
+		if parent.cteState.masked(name) {
+			break
+		}
 		if cte, ok := parent.cteByName[name]; ok {
-			if _, ok := bc.maskedCTEs[name]; !ok {
+			if !parent.cteState.masked(name) {
 				return cte
 			}
 		}
 
-		bc = parent
-		parent = bc.parent
+		parent = parent.parent
 	}
 
 	return nil
 }
 
+func (bc *BindContext) recordCteInBinding(name string, cte CteBindState) {
+	bc.boundCtes[name] = cte.cte
+	bc.cteState = cte
+}
+
+func (bc *BindContext) cteInBinding(name string) bool {
+	if _, ok := bc.boundCtes[name]; ok {
+		return true
+	}
+	cur := bc.parent
+	for cur != nil {
+		if _, ok := cur.boundCtes[name]; ok {
+			return true
+		}
+		cur = cur.parent
+	}
+	return false
+}
+
+func (bc *BindContext) viewInBinding(schema, name string, view *tree.CreateView) bool {
+	cur := bc
+	pair := [2]string{schema, name}
+	for cur != nil {
+		if _, ok := cur.boundViews[pair]; ok {
+			return true
+		}
+		cur = cur.parent
+	}
+	bc.boundViews[pair] = view
+	return false
+}
+
+func (bc *BindContext) recordViews(views []string) {
+	//go to the top BindContext
+	cur := bc
+	for cur != nil && cur.parent != nil {
+		cur = cur.parent
+	}
+	//save views to the top BindContext
+	if cur != nil {
+		cur.views = append(cur.views, views...)
+	}
+}
+
 func (bc *BindContext) mergeContexts(ctx context.Context, left, right *BindContext) error {
 	left.parent = bc
 	right.parent = bc
-	bc.leftChild = left
-	bc.rightChild = right
 
 	for _, binding := range left.bindings {
 		bc.bindings = append(bc.bindings, binding)
@@ -83,7 +163,7 @@ func (bc *BindContext) mergeContexts(ctx context.Context, left, right *BindConte
 
 	for _, binding := range right.bindings {
 		if _, ok := bc.bindingByTable[binding.table]; ok {
-			return moerr.NewInvalidInput(ctx, "table '%s' specified more than once", binding.table)
+			return moerr.NewInvalidInputf(ctx, "table '%s' specified more than once", binding.table)
 		}
 
 		bc.bindings = append(bc.bindings, binding)
@@ -111,21 +191,21 @@ func (bc *BindContext) mergeContexts(ctx context.Context, left, right *BindConte
 	return nil
 }
 
-func (bc *BindContext) addUsingCol(col string, typ plan.Node_JoinFlag, left, right *BindContext) (*plan.Expr, error) {
+func (bc *BindContext) addUsingCol(col string, typ plan.Node_JoinType, left, right *BindContext) (*plan.Expr, error) {
 	leftBinding, ok := left.bindingByCol[col]
 	if !ok {
-		return nil, moerr.NewInvalidInput(bc.binder.GetContext(), "column '%s' specified in USING clause does not exist in left table", col)
+		return nil, moerr.NewInvalidInputf(bc.binder.GetContext(), "column '%s' specified in USING clause does not exist in left table", col)
 	}
 	if leftBinding == nil {
-		return nil, moerr.NewInvalidInput(bc.binder.GetContext(), "common column '%s' appears more than once in left table", col)
+		return nil, moerr.NewInvalidInputf(bc.binder.GetContext(), "common column '%s' appears more than once in left table", col)
 	}
 
 	rightBinding, ok := right.bindingByCol[col]
 	if !ok {
-		return nil, moerr.NewInvalidInput(bc.binder.GetContext(), "column '%s' specified in USING clause does not exist in right table", col)
+		return nil, moerr.NewInvalidInputf(bc.binder.GetContext(), "column '%s' specified in USING clause does not exist in right table", col)
 	}
 	if rightBinding == nil {
-		return nil, moerr.NewInvalidInput(bc.binder.GetContext(), "common column '%s' appears more than once in right table", col)
+		return nil, moerr.NewInvalidInputf(bc.binder.GetContext(), "common column '%s' appears more than once in right table", col)
 	}
 
 	if typ != plan.Node_RIGHT {
@@ -144,9 +224,9 @@ func (bc *BindContext) addUsingCol(col string, typ plan.Node_JoinFlag, left, rig
 
 	leftPos := leftBinding.colIdByName[col]
 	rightPos := rightBinding.colIdByName[col]
-	expr, err := bindFuncExprImplByPlanExpr(bc.binder.GetContext(), "=", []*plan.Expr{
+	expr, err := BindFuncExprImplByPlanExpr(bc.binder.GetContext(), "=", []*plan.Expr{
 		{
-			Typ: leftBinding.types[leftPos],
+			Typ: *leftBinding.types[leftPos],
 			Expr: &plan.Expr_Col{
 				Col: &plan.ColRef{
 					RelPos: leftBinding.tag,
@@ -155,7 +235,7 @@ func (bc *BindContext) addUsingCol(col string, typ plan.Node_JoinFlag, left, rig
 			},
 		},
 		{
-			Typ: rightBinding.types[rightPos],
+			Typ: *rightBinding.types[rightPos],
 			Expr: &plan.Expr_Col{
 				Col: &plan.ColRef{
 					RelPos: rightBinding.tag,
@@ -168,26 +248,60 @@ func (bc *BindContext) addUsingCol(col string, typ plan.Node_JoinFlag, left, rig
 	return expr, err
 }
 
+func (bc *BindContext) addUsingColForCrossL2(col string, typ plan.Node_JoinType, left, right *BindContext) (*plan.Expr, error) {
+	leftBinding, ok := left.bindingByCol[col]
+	if ok {
+		leftPos := leftBinding.colIdByName[col]
+		return &plan.Expr{
+			Typ: *leftBinding.types[leftPos],
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: leftBinding.tag,
+					ColPos: leftPos,
+				},
+			},
+		}, nil
+	}
+
+	rightBinding, ok := right.bindingByCol[col]
+	if ok {
+		rightPos := rightBinding.colIdByName[col]
+		return &plan.Expr{
+			Typ: *rightBinding.types[rightPos],
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: rightBinding.tag,
+					ColPos: rightPos,
+				},
+			},
+		}, nil
+	}
+	return nil, moerr.NewInvalidInputf(bc.binder.GetContext(), "column '%s' specified in USING clause does not exist in left or right table", col)
+}
+
 func (bc *BindContext) unfoldStar(ctx context.Context, table string, isSysAccount bool) ([]tree.SelectExpr, []string, error) {
 	if len(table) == 0 {
 		// unfold *
 		var exprs []tree.SelectExpr
 		var names []string
 
-		bc.doUnfoldStar(ctx, bc.bindingTree, make(map[string]any), &exprs, &names, isSysAccount)
+		bc.doUnfoldStar(ctx, bc.bindingTree, make(map[string]bool), &exprs, &names, isSysAccount)
 
 		return exprs, names, nil
 	} else {
 		// unfold tbl.*
 		binding, ok := bc.bindingByTable[table]
 		if !ok {
-			return nil, nil, moerr.NewInvalidInput(ctx, "missing FROM-clause entry for table '%s'", table)
+			return nil, nil, moerr.NewInvalidInputf(ctx, "missing FROM-clause entry for table '%s'", table)
 		}
 
 		exprs := make([]tree.SelectExpr, 0)
 		names := make([]string, 0)
 
-		for _, col := range binding.cols {
+		for i, col := range binding.cols {
+			if binding.colIsHidden[i] {
+				continue
+			}
 			if catalog.ContainExternalHidenCol(col) {
 				continue
 			}
@@ -195,7 +309,7 @@ func (bc *BindContext) unfoldStar(ctx context.Context, table string, isSysAccoun
 			if !isSysAccount && binding.isClusterTable && util.IsClusterTableAttribute(col) {
 				continue
 			}
-			expr, _ := tree.NewUnresolvedName(ctx, table, col)
+			expr := tree.NewUnresolvedName(tree.NewCStr(table, bc.lower), tree.NewCStr(col, 1))
 			exprs = append(exprs, tree.SelectExpr{Expr: expr})
 			names = append(names, col)
 		}
@@ -204,12 +318,15 @@ func (bc *BindContext) unfoldStar(ctx context.Context, table string, isSysAccoun
 	}
 }
 
-func (bc *BindContext) doUnfoldStar(ctx context.Context, root *BindingTreeNode, visitedUsingCols map[string]any, exprs *[]tree.SelectExpr, names *[]string, isSysAccount bool) {
+func (bc *BindContext) doUnfoldStar(ctx context.Context, root *BindingTreeNode, visitedUsingCols map[string]bool, exprs *[]tree.SelectExpr, names *[]string, isSysAccount bool) {
 	if root == nil {
 		return
 	}
 	if root.binding != nil {
-		for _, col := range root.binding.cols {
+		for i, col := range root.binding.cols {
+			if root.binding.colIsHidden[i] {
+				continue
+			}
 			if catalog.ContainExternalHidenCol(col) {
 				continue
 			}
@@ -217,8 +334,8 @@ func (bc *BindContext) doUnfoldStar(ctx context.Context, root *BindingTreeNode, 
 			if !isSysAccount && root.binding.isClusterTable && util.IsClusterTableAttribute(col) {
 				continue
 			}
-			if _, ok := visitedUsingCols[col]; !ok {
-				expr, _ := tree.NewUnresolvedName(ctx, root.binding.table, col)
+			if !visitedUsingCols[col] {
+				expr := tree.NewUnresolvedName(tree.NewCStr(root.binding.table, bc.lower), tree.NewCStr(col, 1))
 				*exprs = append(*exprs, tree.SelectExpr{Expr: expr})
 				*names = append(*names, col)
 			}
@@ -237,11 +354,11 @@ func (bc *BindContext) doUnfoldStar(ctx context.Context, root *BindingTreeNode, 
 		if !isSysAccount && root.binding.isClusterTable && util.IsClusterTableAttribute(using.col) {
 			continue
 		}
-		if _, ok := visitedUsingCols[using.col]; !ok {
+		if !visitedUsingCols[using.col] {
 			handledUsingCols = append(handledUsingCols, using.col)
-			visitedUsingCols[using.col] = nil
+			visitedUsingCols[using.col] = true
 
-			expr, _ := tree.NewUnresolvedName(ctx, using.table, using.col)
+			expr := tree.NewUnresolvedName(tree.NewCStr(using.table, bc.lower), tree.NewCStr(using.col, 1))
 			*exprs = append(*exprs, tree.SelectExpr{Expr: expr})
 			*names = append(*names, using.col)
 		}
@@ -255,136 +372,156 @@ func (bc *BindContext) doUnfoldStar(ctx context.Context, root *BindingTreeNode, 
 	}
 }
 
-func (bc *BindContext) qualifyColumnNames(astExpr tree.Expr, selectList tree.SelectExprs, expandAlias bool) (tree.Expr, error) {
+func (bc *BindContext) qualifyColumnNames(astExpr tree.Expr, expandAlias ExpandAliasMode) (tree.Expr, error) {
 	var err error
 
 	switch exprImpl := astExpr.(type) {
 	case *tree.ParenExpr:
-		astExpr, err = bc.qualifyColumnNames(exprImpl.Expr, selectList, expandAlias)
+		astExpr, err = bc.qualifyColumnNames(exprImpl.Expr, expandAlias)
 
 	case *tree.OrExpr:
-		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, selectList, expandAlias)
+		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, selectList, expandAlias)
+		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, expandAlias)
 
 	case *tree.NotExpr:
-		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, selectList, expandAlias)
+		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, expandAlias)
 
 	case *tree.AndExpr:
-		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, selectList, expandAlias)
+		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, selectList, expandAlias)
+		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, expandAlias)
 
 	case *tree.UnaryExpr:
-		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, selectList, expandAlias)
+		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, expandAlias)
 
 	case *tree.BinaryExpr:
-		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, selectList, expandAlias)
+		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, selectList, expandAlias)
+		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, expandAlias)
 
 	case *tree.ComparisonExpr:
-		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, selectList, expandAlias)
+		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, selectList, expandAlias)
+		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, expandAlias)
 
 	case *tree.FuncExpr:
 		for i := range exprImpl.Exprs {
-			exprImpl.Exprs[i], err = bc.qualifyColumnNames(exprImpl.Exprs[i], selectList, expandAlias)
+			exprImpl.Exprs[i], err = bc.qualifyColumnNames(exprImpl.Exprs[i], expandAlias)
 			if err != nil {
 				return nil, err
 			}
 		}
+		if exprImpl.WindowSpec != nil {
+			for i := range exprImpl.WindowSpec.PartitionBy {
+				exprImpl.WindowSpec.PartitionBy[i], err = bc.qualifyColumnNames(exprImpl.WindowSpec.PartitionBy[i], expandAlias)
+				if err != nil {
+					return nil, err
+				}
+			}
+			for i := range exprImpl.WindowSpec.OrderBy {
+				exprImpl.WindowSpec.OrderBy[i].Expr, err = bc.qualifyColumnNames(exprImpl.WindowSpec.OrderBy[i].Expr, expandAlias)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
 
 	case *tree.RangeCond:
-		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, selectList, expandAlias)
+		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		exprImpl.From, err = bc.qualifyColumnNames(exprImpl.From, selectList, expandAlias)
+		exprImpl.From, err = bc.qualifyColumnNames(exprImpl.From, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		exprImpl.To, err = bc.qualifyColumnNames(exprImpl.To, selectList, expandAlias)
+		exprImpl.To, err = bc.qualifyColumnNames(exprImpl.To, expandAlias)
 
 	case *tree.UnresolvedName:
 		if !exprImpl.Star && exprImpl.NumParts == 1 {
-			col := exprImpl.Parts[0]
-			if expandAlias {
-				if colPos, ok := bc.aliasMap[col]; ok {
-					astExpr = selectList[colPos].Expr
-					break
+			col := exprImpl.ColName()
+			if expandAlias == AliasBeforeColumn {
+				if selectItem, ok := bc.aliasMap[col]; ok {
+					return selectItem.astExpr, nil
 				}
 			}
 
 			if binding, ok := bc.bindingByCol[col]; ok {
 				if binding != nil {
 					exprImpl.NumParts = 2
-					exprImpl.Parts[1] = binding.table
+					exprImpl.CStrParts[1] = tree.NewCStr(binding.table, bc.lower)
+					return astExpr, nil
 				} else {
-					return nil, moerr.NewInvalidInput(bc.binder.GetContext(), "ambiguouse column reference to '%s'", col)
+					return nil, moerr.NewInvalidInputf(bc.binder.GetContext(), "ambiguouse column reference to '%s'", exprImpl.ColNameOrigin())
+				}
+			}
+
+			if expandAlias == AliasAfterColumn {
+				if selectItem, ok := bc.aliasMap[col]; ok {
+					return selectItem.astExpr, nil
 				}
 			}
 		}
 
 	case *tree.CastExpr:
-		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, selectList, expandAlias)
+		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, expandAlias)
 
 	case *tree.IsNullExpr:
-		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, selectList, expandAlias)
+		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, expandAlias)
 
 	case *tree.IsNotNullExpr:
-		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, selectList, expandAlias)
+		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, expandAlias)
 
 	case *tree.Tuple:
 		for i := range exprImpl.Exprs {
-			exprImpl.Exprs[i], err = bc.qualifyColumnNames(exprImpl.Exprs[i], selectList, expandAlias)
+			exprImpl.Exprs[i], err = bc.qualifyColumnNames(exprImpl.Exprs[i], expandAlias)
 			if err != nil {
 				return nil, err
 			}
 		}
 
 	case *tree.CaseExpr:
-		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, selectList, expandAlias)
+		exprImpl.Expr, err = bc.qualifyColumnNames(exprImpl.Expr, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
 		for _, when := range exprImpl.Whens {
-			when.Cond, err = bc.qualifyColumnNames(when.Cond, selectList, expandAlias)
+			when.Cond, err = bc.qualifyColumnNames(when.Cond, expandAlias)
 			if err != nil {
 				return nil, err
 			}
 
-			when.Val, err = bc.qualifyColumnNames(when.Val, selectList, expandAlias)
+			when.Val, err = bc.qualifyColumnNames(when.Val, expandAlias)
 			if err != nil {
 				return nil, err
 			}
 		}
 
-		exprImpl.Else, err = bc.qualifyColumnNames(exprImpl.Else, selectList, expandAlias)
+		exprImpl.Else, err = bc.qualifyColumnNames(exprImpl.Else, expandAlias)
 
 	case *tree.XorExpr:
-		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, selectList, expandAlias)
+		exprImpl.Left, err = bc.qualifyColumnNames(exprImpl.Left, expandAlias)
 		if err != nil {
 			return nil, err
 		}
 
-		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, selectList, expandAlias)
+		exprImpl.Right, err = bc.qualifyColumnNames(exprImpl.Right, expandAlias)
 	}
 
 	return astExpr, err

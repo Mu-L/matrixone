@@ -16,100 +16,39 @@ package process
 
 import (
 	"context"
-	"time"
+	"encoding/hex"
+	"fmt"
+	"io"
 
+	"github.com/matrixorigin/matrixone/pkg/common/log"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/incrservice"
 	"github.com/matrixorigin/matrixone/pkg/lockservice"
-	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/partitionservice"
+	"github.com/matrixorigin/matrixone/pkg/pb/lock"
+	qclient "github.com/matrixorigin/matrixone/pkg/queryservice/client"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
-// New creates a new Process.
-// A process stores the execution context.
-func New(
-	ctx context.Context,
-	m *mpool.MPool,
-	txnClient client.TxnClient,
-	txnOperator client.TxnOperator,
-	fileService fileservice.FileService,
-	lockService lockservice.LockService) *Process {
-	return &Process{
-		mp:           m,
-		Ctx:          ctx,
-		TxnClient:    txnClient,
-		TxnOperator:  txnOperator,
-		FileService:  fileService,
-		UnixTime:     time.Now().UnixNano(),
-		LastInsertID: new(uint64),
-		LockService:  lockService,
-	}
-}
-
-func NewWithAnalyze(p *Process, ctx context.Context, regNumber int, anals []*AnalyzeInfo) *Process {
-	proc := NewFromProc(p, ctx, regNumber)
-	proc.AnalInfos = make([]*AnalyzeInfo, len(anals))
-	copy(proc.AnalInfos, anals)
-	return proc
-}
-
-// NewFromProc create a new Process based on another process.
-func NewFromProc(p *Process, ctx context.Context, regNumber int) *Process {
-	proc := new(Process)
-	newctx, cancel := context.WithCancel(ctx)
-	proc.Id = p.Id
-	proc.mp = p.Mp()
-	proc.Lim = p.Lim
-	proc.TxnClient = p.TxnClient
-	proc.TxnOperator = p.TxnOperator
-	proc.AnalInfos = p.AnalInfos
-	proc.SessionInfo = p.SessionInfo
-	proc.FileService = p.FileService
-	proc.UnixTime = p.UnixTime
-	proc.LastInsertID = p.LastInsertID
-	proc.LockService = p.LockService
-
-	// reg and cancel
-	proc.Ctx = newctx
-	proc.Cancel = cancel
-	proc.Reg.MergeReceivers = make([]*WaitRegister, regNumber)
-	for i := 0; i < regNumber; i++ {
-		proc.Reg.MergeReceivers[i] = &WaitRegister{
-			Ctx: newctx,
-			Ch:  make(chan *batch.Batch, 1),
-		}
-	}
-	proc.DispatchNotifyCh = make(chan WrapCs)
-	proc.LoadLocalReader = p.LoadLocalReader
-	return proc
-}
-
-func (wreg *WaitRegister) MarshalBinary() ([]byte, error) {
-	return nil, nil
-}
-
-func (wreg *WaitRegister) UnmarshalBinary(_ []byte) error {
-	return nil
-}
-
-func (proc *Process) MarshalBinary() ([]byte, error) {
-	return nil, nil
-}
-
-func (proc *Process) UnmarshalBinary(_ []byte) error {
-	return nil
-}
+const DefaultBatchSize = 8192
 
 func (proc *Process) QueryId() string {
-	return proc.Id
+	return proc.Base.Id
 }
 
 func (proc *Process) SetQueryId(id string) {
-	proc.Id = id
+	proc.Base.Id = id
 }
 
 // XXX MPOOL
@@ -125,35 +64,85 @@ func (proc *Process) GetMPool() *mpool.MPool {
 	if proc == nil {
 		return xxxProcMp
 	}
-	return proc.mp
+	return proc.Base.mp
 }
 
 func (proc *Process) Mp() *mpool.MPool {
 	return proc.GetMPool()
 }
 
+func (proc *Process) GetService() string {
+	if proc == nil {
+		return ""
+	}
+	if ls := proc.GetLockService(); ls != nil {
+		return ls.GetConfig().ServiceID
+	}
+	return ""
+}
+
+func (proc *Process) GetLim() Limitation {
+	return proc.Base.Lim
+}
+
+func (proc *Process) GetQueryClient() qclient.QueryClient {
+	return proc.Base.QueryClient
+}
+
+func (proc *Process) GetFileService() fileservice.FileService {
+	return proc.Base.FileService
+}
+
+func (proc *Process) GetUnixTime() int64 {
+	return proc.Base.UnixTime
+}
+
+func (proc *Process) GetIncrService() incrservice.AutoIncrementService {
+	return proc.Base.IncrService
+}
+
+func (proc *Process) GetLoadLocalReader() *io.PipeReader {
+	return proc.Base.LoadLocalReader
+}
+
+func (proc *Process) GetLockService() lockservice.LockService {
+	return proc.Base.LockService
+}
+
+func (proc *Process) GetPartitionService() partitionservice.PartitionService {
+	ps := proc.Base.PartitionService
+	if ps == nil {
+		return partitionservice.DisabledService
+	}
+	return ps
+}
+
+func (proc *Process) GetWaitPolicy() lock.WaitPolicy {
+	return proc.Base.WaitPolicy
+}
+
+func (proc *Process) GetHaKeeper() logservice.CNHAKeeperClient {
+	return proc.Base.Hakeeper
+}
+
+func (proc *Process) GetPrepareParams() *vector.Vector {
+	return proc.Base.prepareParams
+}
+
+func (proc *Process) SetPrepareParams(prepareParams *vector.Vector) {
+	proc.Base.prepareParams = prepareParams
+}
+
 func (proc *Process) OperatorOutofMemory(size int64) bool {
 	return proc.Mp().Cap() < size
 }
 
-func (proc *Process) SetInputBatch(bat *batch.Batch) {
-	proc.Reg.InputBatch = bat
-}
-
-func (proc *Process) InputBatch() *batch.Batch {
-	return proc.Reg.InputBatch
-}
-
-func (proc *Process) GetAnalyze(idx int) Analyze {
-	if idx >= len(proc.AnalInfos) {
-		return &analyze{analInfo: nil}
-	}
-	return &analyze{analInfo: proc.AnalInfos[idx], wait: 0}
-}
-
 func (proc *Process) AllocVectorOfRows(typ types.Type, nele int, nsp *nulls.Nulls) (*vector.Vector, error) {
 	vec := vector.NewVec(typ)
-	vec.PreExtend(nele, proc.Mp())
+	err := vec.PreExtend(nele, proc.Mp())
+	if err != nil {
+		return nil, err
+	}
 	vec.SetLength(nele)
 	if nsp != nil {
 		nulls.Set(vec.GetNulls(), nsp)
@@ -161,6 +150,105 @@ func (proc *Process) AllocVectorOfRows(typ types.Type, nele int, nsp *nulls.Null
 	return vec, nil
 }
 
-func (proc *Process) WithSpanContext(sc trace.SpanContext) {
-	proc.Ctx = trace.ContextWithSpanContext(proc.Ctx, sc)
+func (proc *Process) NewBatchFromSrc(src *batch.Batch, preAllocSize int) (*batch.Batch, error) {
+	bat := batch.NewOffHeapWithSize(len(src.Vecs))
+	bat.SetAttributes(src.Attrs)
+	bat.Recursive = src.Recursive
+	for i := range bat.Vecs {
+		v := vector.NewOffHeapVecWithType(*src.Vecs[i].GetType())
+		if v.Capacity() < preAllocSize {
+			err := v.PreExtend(preAllocSize, proc.Mp())
+			if err != nil {
+				return nil, err
+			}
+		}
+		bat.Vecs[i] = v
+	}
+	return bat, nil
+}
+
+// log do logging.
+// just for Info/Error/Warn/Debug/Fatal
+func (proc *Process) log(ctx context.Context, level zapcore.Level, msg string, fields ...zap.Field) {
+	if proc.Base.SessionInfo.LogLevel.Enabled(level) {
+		fields = appendSessionField(fields, proc)
+		fields = appendTraceField(fields, ctx)
+		proc.Base.logger.Log(msg, log.DefaultLogOptions().WithLevel(level).AddCallerSkip(2), fields...)
+	}
+}
+
+func (proc *Process) logf(ctx context.Context, level zapcore.Level, msg string, args ...any) {
+	if proc.Base.SessionInfo.LogLevel.Enabled(level) {
+		fields := make([]zap.Field, 0, 5)
+		fields = appendSessionField(fields, proc)
+		fields = appendTraceField(fields, ctx)
+		proc.Base.logger.Log(fmt.Sprintf(msg, args...), log.DefaultLogOptions().WithLevel(level).AddCallerSkip(2), fields...)
+	}
+}
+
+func (proc *Process) Info(ctx context.Context, msg string, fields ...zap.Field) {
+	proc.log(ctx, zap.InfoLevel, msg, fields...)
+}
+
+func (proc *Process) Error(ctx context.Context, msg string, fields ...zap.Field) {
+	proc.log(ctx, zap.ErrorLevel, msg, fields...)
+}
+
+func (proc *Process) Warn(ctx context.Context, msg string, fields ...zap.Field) {
+	proc.log(ctx, zap.WarnLevel, msg, fields...)
+}
+
+func (proc *Process) Fatal(ctx context.Context, msg string, fields ...zap.Field) {
+	proc.log(ctx, zap.FatalLevel, msg, fields...)
+}
+
+func (proc *Process) Debug(ctx context.Context, msg string, fields ...zap.Field) {
+	proc.log(ctx, zap.DebugLevel, msg, fields...)
+}
+
+func (proc *Process) Infof(ctx context.Context, msg string, args ...any) {
+	proc.logf(ctx, zap.InfoLevel, msg, args...)
+}
+
+func (proc *Process) Errorf(ctx context.Context, msg string, args ...any) {
+	proc.logf(ctx, zap.ErrorLevel, msg, args...)
+}
+
+func (proc *Process) Warnf(ctx context.Context, msg string, args ...any) {
+	proc.logf(ctx, zap.WarnLevel, msg, args...)
+}
+
+func (proc *Process) Fatalf(ctx context.Context, msg string, args ...any) {
+	proc.logf(ctx, zap.FatalLevel, msg, args...)
+}
+
+func (proc *Process) Debugf(ctx context.Context, msg string, args ...any) {
+	proc.logf(ctx, zap.DebugLevel, msg, args...)
+}
+
+// appendSessionField append session id, transaction id and statement id to the fields
+func appendSessionField(fields []zap.Field, proc *Process) []zap.Field {
+	if proc != nil {
+		fields = append(fields, logutil.SessionIdField(proc.Base.SessionInfo.SessionId.String()))
+		if p := proc.GetStmtProfile(); p != nil {
+			fields = append(fields, logutil.StatementIdField(p.stmtId.String()))
+			fields = append(fields, logutil.TxnIdField(hex.EncodeToString(p.txnId[:])))
+		}
+	}
+	return fields
+}
+
+func appendTraceField(fields []zap.Field, ctx context.Context) []zap.Field {
+	if sc := trace.SpanFromContext(ctx).SpanContext(); !sc.IsEmpty() {
+		fields = append(fields, trace.ContextField(ctx))
+	}
+	return fields
+}
+
+func (proc *Process) GetSpillFileService() (fileservice.MutableFileService, error) {
+	local, err := fileservice.Get[fileservice.MutableFileService](proc.Base.FileService, defines.LocalFileServiceName)
+	if err != nil {
+		return nil, err
+	}
+	return fileservice.SubPath(local, defines.SpillFileServiceName).(fileservice.MutableFileService), nil
 }

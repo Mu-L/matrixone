@@ -19,45 +19,59 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"go.uber.org/zap"
 )
 
-func readWriteConfilictCheck(entry catalog.BaseEntry, ts types.TS) (err error) {
-	entry.RLock()
-	defer entry.RUnlock()
-	needWait, txnToWait := entry.GetLatestNodeLocked().NeedWaitCommitting(ts)
+var ErrRWConflict = moerr.NewTxnRWConflictNoCtx()
+
+func readWriteConfilictCheck(entry *catalog.ObjectEntry, ts types.TS, inqueue bool) (err error) {
+	lastNode := entry.GetLatestNode()
+	if !lastNode.HasDropIntent() {
+		return nil
+	}
+	needWait, txnToWait := lastNode.GetLastMVCCNode().NeedWaitCommitting(ts)
 	// TODO:
-	// I don't think we need to wait here any more. `block` and `segment` are
+	// I don't think we need to wait here any more. `block` and `Object` are
 	// local metadata and never be involved in a 2PC txn. So a prepared `block`
 	// will never be rollbacked
 	if needWait {
-		entry.RUnlock()
+		if inqueue {
+			deleteTS := txnToWait.GetPrepareTS()
+			if deleteTS.LT(&ts) {
+				err = ErrRWConflict
+			}
+			return
+		}
 		txnToWait.GetTxnState(true)
-		entry.RLock()
+		lastNode = entry.GetLatestNode()
 	}
-	if entry.DeleteBefore(ts) {
-		err = moerr.NewTxnRWConflictNoCtx()
+	if lastNode.DeleteBefore(ts) {
+		err = ErrRWConflict
 	}
 	return
 }
 
 type warChecker struct {
-	txn         txnif.AsyncTxn
-	catalog     *catalog.Catalog
-	conflictSet map[types.Blockid]bool
-	readSet     map[types.Blockid]*catalog.BlockEntry
-	cache       map[types.Blockid]*catalog.BlockEntry
+	txn     txnif.AsyncTxn
+	catalog *catalog.Catalog
+	//conflictSet is a set of objs which had been deleted and committed.
+	conflictSet map[types.Objectid]bool
+	readSet     map[types.Objectid]*catalog.ObjectEntry
+	cache       map[types.Objectid]*catalog.ObjectEntry
 }
 
 func newWarChecker(txn txnif.AsyncTxn, c *catalog.Catalog) *warChecker {
 	checker := &warChecker{
 		txn:         txn,
 		catalog:     c,
-		conflictSet: make(map[types.Blockid]bool),
-		readSet:     make(map[types.Blockid]*catalog.BlockEntry),
-		cache:       make(map[types.Blockid]*catalog.BlockEntry),
+		conflictSet: make(map[types.Objectid]bool),
+		readSet:     make(map[types.Objectid]*catalog.ObjectEntry),
+		cache:       make(map[types.Objectid]*catalog.ObjectEntry),
 	}
 	return checker
 }
@@ -65,10 +79,10 @@ func newWarChecker(txn txnif.AsyncTxn, c *catalog.Catalog) *warChecker {
 func (checker *warChecker) CacheGet(
 	dbID uint64,
 	tableID uint64,
-	segmentID types.Uuid,
-	blockID types.Blockid) (block *catalog.BlockEntry, err error) {
-	block = checker.cacheGet(blockID)
-	if block != nil {
+	ObjectID *types.Objectid,
+	isTombstone bool) (object *catalog.ObjectEntry, err error) {
+	object = checker.cacheGet(ObjectID)
+	if object != nil {
 		return
 	}
 	db, err := checker.catalog.GetDatabaseByID(dbID)
@@ -79,63 +93,66 @@ func (checker *warChecker) CacheGet(
 	if err != nil {
 		return
 	}
-	segment, err := table.GetSegmentByID(segmentID)
+	object, err = table.GetObjectByID(ObjectID, isTombstone)
 	if err != nil {
 		return
 	}
-	block, err = segment.GetBlockEntryByID(blockID)
-	if err != nil {
-		return
-	}
-	checker.Cache(block)
+	checker.Cache(object)
 	return
 }
 
 func (checker *warChecker) InsertByID(
 	dbID uint64,
 	tableID uint64,
-	segmentID types.Uuid,
-	blockID types.Blockid) {
-	block, err := checker.CacheGet(dbID, tableID, segmentID, blockID)
+	objectID *types.Objectid,
+	isTombstone bool,
+) {
+	obj, err := checker.CacheGet(dbID, tableID, objectID, isTombstone)
 	if err != nil {
 		panic(err)
 	}
-	checker.Insert(block)
+	checker.Insert(obj)
 }
 
-func (checker *warChecker) cacheGet(id types.Blockid) *catalog.BlockEntry {
-	return checker.cache[id]
+func (checker *warChecker) cacheGet(id *objectio.ObjectId) *catalog.ObjectEntry {
+	return checker.cache[*id]
 }
-func (checker *warChecker) Cache(block *catalog.BlockEntry) {
-	checker.cache[block.ID] = block
+func (checker *warChecker) Cache(obj *catalog.ObjectEntry) {
+	checker.cache[*obj.ID()] = obj
 }
 
-func (checker *warChecker) Insert(block *catalog.BlockEntry) {
-	checker.Cache(block)
-	if checker.HasConflict(block.ID) {
-		panic(fmt.Sprintf("cannot add conflicted %s into readset", block.String()))
+func (checker *warChecker) Insert(obj *catalog.ObjectEntry) {
+	checker.Cache(obj)
+	if checker.HasConflict(*obj.ID()) {
+		panic(fmt.Sprintf("cannot add conflicted %s into readset", obj.String()))
 	}
-	checker.readSet[block.ID] = block
+	checker.readSet[*obj.ID()] = obj
 }
 
-func (checker *warChecker) checkOne(id *common.ID, ts types.TS) (err error) {
+func (checker *warChecker) checkOne(id *common.ID, ts types.TS, inqueue bool) (err error) {
 	// defer func() {
 	// 	logutil.Infof("checkOne blk=%s ts=%s err=%v", id.BlockString(), ts.ToString(), err)
 	// }()
-	if checker.HasConflict(id.BlockID) {
-		err = moerr.NewTxnRWConflictNoCtx()
+	if checker.HasConflict(*id.ObjectID()) {
+		err = ErrRWConflict
 		return
 	}
-	entry := checker.readSet[id.BlockID]
+	entry := checker.readSet[*id.ObjectID()]
 	if entry == nil {
 		return
 	}
-	return readWriteConfilictCheck(entry.MetaBaseEntry, ts)
+	return readWriteConfilictCheck(entry, ts, inqueue)
 }
 
 func (checker *warChecker) checkAll(ts types.TS) (err error) {
-	for _, block := range checker.readSet {
-		if err = readWriteConfilictCheck(block.MetaBaseEntry, ts); err != nil {
+	for _, obj := range checker.readSet {
+		if err = readWriteConfilictCheck(obj, ts, true); err != nil {
+			logutil.Error(
+				"Txn-Check-All",
+				zap.Error(err),
+				zap.String("ts", ts.ToString()),
+				zap.String("obj", obj.ID().String()),
+			)
 			return
 		}
 	}
@@ -143,11 +160,11 @@ func (checker *warChecker) checkAll(ts types.TS) (err error) {
 }
 
 func (checker *warChecker) Delete(id *common.ID) {
-	checker.conflictSet[id.BlockID] = true
-	delete(checker.readSet, id.BlockID)
+	checker.conflictSet[*id.ObjectID()] = true
+	delete(checker.readSet, *id.ObjectID())
 }
 
-func (checker *warChecker) HasConflict(id types.Blockid) (y bool) {
+func (checker *warChecker) HasConflict(id types.Objectid) (y bool) {
 	_, y = checker.conflictSet[id]
 	return
 }

@@ -15,8 +15,9 @@
 package frontend
 
 import (
-	"github.com/stretchr/testify/require"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
 
 func Test_BasicGet(t *testing.T) {
@@ -61,13 +62,33 @@ func Test_CleanCache(t *testing.T) {
 	pc.cache("1", nil, nil)
 	pc.cache("2", nil, nil)
 	pc.cache("3", nil, nil)
-	require.True(t, pc.isCached("1"))
+	pc.cache("4", nil, nil)
+	require.False(t, pc.isCached("1"))
 	require.True(t, pc.isCached("2"))
 	require.True(t, pc.isCached("3"))
+	require.True(t, pc.isCached("4"))
 
 	pc.clean()
 
+	require.Nil(t, pc.get("1"))
+	require.Nil(t, pc.get("2"))
+	require.Nil(t, pc.get("3"))
+	require.Nil(t, pc.get("4"))
 	require.False(t, pc.isCached("1"))
 	require.False(t, pc.isCached("2"))
 	require.False(t, pc.isCached("3"))
+	require.False(t, pc.isCached("3"))
+
+	pc.cache("1", nil, nil)
+	pc.cache("2", nil, nil)
+	pc.cache("3", nil, nil)
+	pc.cache("4", nil, nil)
+	require.False(t, pc.isCached("1"))
+	require.True(t, pc.isCached("2"))
+	require.True(t, pc.isCached("3"))
+	require.True(t, pc.isCached("4"))
+	require.Nil(t, pc.get("1"))
+	require.NotNil(t, pc.get("2"))
+	require.NotNil(t, pc.get("3"))
+	require.NotNil(t, pc.get("4"))
 }

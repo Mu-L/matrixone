@@ -159,11 +159,12 @@ drop sequence seq_15;
 drop sequence seq_non;
 
 --prepare
--- @bvt:issue#8724
+create sequence seq_15;
 create sequence seq_16 increment 10 start with 20 no cycle;
 truncate table seq_table_01;
 prepare stmt1 from 'insert into seq_table_01 values(?)';
-set @a_var = nextval('seq15');
+-- first value of seq_15 is 1
+set @a_var = nextval('seq_15');
 execute stmt1 using @a_var;
 select * from seq_table_01;
 execute stmt1 using @a_var;
@@ -171,7 +172,7 @@ select * from seq_table_01;
 execute stmt1 using @a_var;
 select * from seq_table_01;
 drop sequence seq_16;
--- @bvt:issue
+drop sequence seq_15;
 --lastval and setval
 create sequence seq_17 increment 10 start with 20 no cycle;
 select lastval();
@@ -183,3 +184,36 @@ select setval('seq_17',8,false);
 select nextval('seq_17'),currval('seq_17');
 select nextval('seq_17'),currval('seq_17');
 select lastval();
+
+--transaction
+-- @bvt:issue#8890
+begin;
+create sequence seq_18 minvalue 1000;
+select nextval('seq_18');
+-- @session:id=2&user=sys:dump&password=111
+select nextval('seq_18');
+create sequence seq_18;
+-- @session
+select nextval('seq_18');
+commit;
+select nextval('seq_18'),currval('seq_18');
+drop sequence seq_18;
+
+begin;
+create sequence seq_19 minvalue 1000;
+select nextval('seq_19');
+-- @session:id=2&user=sys:dump&password=111
+select nextval('seq_19');
+create sequence seq_19;
+-- @session
+rollback;
+select nextval('seq_19');
+drop sequence seq_19;
+
+start transaction ;
+create sequence seq_20 increment by -10;
+select nextval('seq_20');
+rollback;
+select nextval('seq_20');
+drop sequence seq_20;
+-- @bvt:issue

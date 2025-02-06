@@ -21,40 +21,52 @@ import (
 )
 
 const (
-	defaultRpcMaxMessageSize        = 16 * mpool.KB
-	defaultRpcPayloadCopyBufferSize = 16 * mpool.KB
-	defaultRpcEnableChecksum        = true
-	defaultLogtailCollectInterval   = 50 * time.Millisecond
-	defaultResponseSendTimeout      = 10 * time.Second
-	defaultMaxLogtailFetchFailure   = 5
+	defaultRpcMaxMessageSize      = 16 * mpool.KB
+	defaultRpcEnableChecksum      = true
+	defaultLogtailCollectInterval = 50 * time.Millisecond
+	defaultResponseSendTimeout    = time.Minute
+	defaultRpcStreamPoisonTime    = 5 * time.Second
+	// The default value of PullWorkerPoolSize.
+	defaultPullWorkerPoolSize = 50
 )
 
-type CacheCfg struct {
-	IndexCapacity  uint64 `toml:"index-cache-size"`
-	InsertCapacity uint64 `toml:"insert-cache-size"`
-	TxnCapacity    uint64 `toml:"txn-cache-size"`
-}
-
 type StorageCfg struct {
-	BlockMaxRows     uint32 `toml:"block-max-rows"`
-	SegmentMaxBlocks uint16 `toml:"segment-max-blocks"`
+	BlockMaxRows    uint32 `toml:"block-max-rows"`
+	ObjectMaxBlocks uint16 `toml:"object-max-blocks"`
 }
 
 type CheckpointCfg struct {
 	FlushInterval             time.Duration `toml:"flush-inerterval"`
+	TransferInterval          time.Duration `toml:"transfer-interval"`
+	MetadataCheckInterval     time.Duration `toml:"metadata-check-inerterval"`
 	MinCount                  int64         `toml:"checkpoint-min-count"`
 	ScanInterval              time.Duration `toml:"scan-interval"`
 	IncrementalInterval       time.Duration `toml:"checkpoint-incremental-interval"`
 	GlobalMinCount            int64         `toml:"checkpoint-global-interval"`
+	OverallFlushMemControl    uint64        `toml:"overall-flush-mem-control"`
 	ForceUpdateGlobalInterval bool
 	GlobalVersionInterval     time.Duration
 	GCCheckpointInterval      time.Duration
 	DisableGCCheckpoint       bool
+	ReservedWALEntryCount     uint64
+
+	// only for test
+	// it is used to control the block rows of the checkpoint
+	BlockRows int
+	Size      int
 }
 
 type GCCfg struct {
-	GCTTL          time.Duration
-	ScanGCInterval time.Duration
+	GCTTL             time.Duration `toml:"gc-ttl"`
+	ScanGCInterval    time.Duration `toml:"scan-gc-interval"`
+	DisableGC         bool          `toml:"disable-gc"`
+	CheckGC           bool          `toml:"check-gc"`
+	CacheSize         int           `toml:"cache-size"`
+	GCMergeCount      int           `toml:"gc-merge-count"`
+	GCestimateRows    int           `toml:"gc-estimate-rows"`
+	GCProbility       float64       `toml:"gc-probility"`
+	GCDeleteTimeout   time.Duration `toml:"gc-delete-timeout"`
+	GCDeleteBatchSize int           `toml:"gc-delete-batch-size"`
 }
 
 type CatalogCfg struct {
@@ -71,23 +83,34 @@ type LogtailCfg struct {
 	PageSize int32 `toml:"page-size"`
 }
 
+type MergeConfig struct {
+	CNMergeMemControlHint uint64
+	CNTakeOverAll         bool
+	CNTakeOverExceed      uint64
+	CNStandaloneTake      bool
+	DisableZMBasedMerge   bool
+}
+
 type LogtailServerCfg struct {
-	RpcMaxMessageSize        int64
-	RpcPayloadCopyBufferSize int64
-	RpcEnableChecksum        bool
-	LogtailCollectInterval   time.Duration
-	ResponseSendTimeout      time.Duration
-	MaxLogtailFetchFailure   int
+	RpcMaxMessageSize      int64
+	RpcEnableChecksum      bool
+	RPCStreamPoisonTime    time.Duration
+	LogtailCollectInterval time.Duration
+	ResponseSendTimeout    time.Duration
+	// PullWorkerPoolSize is the size of the pull worker pool.
+	// Means there are x pull workers working at most.
+	// Default value is defaultPullWorkerPoolSize=50.
+	PullWorkerPoolSize int64
 }
 
 func NewDefaultLogtailServerCfg() *LogtailServerCfg {
 	return &LogtailServerCfg{
-		RpcMaxMessageSize:        defaultRpcMaxMessageSize,
-		RpcPayloadCopyBufferSize: defaultRpcPayloadCopyBufferSize,
-		RpcEnableChecksum:        defaultRpcEnableChecksum,
-		LogtailCollectInterval:   defaultLogtailCollectInterval,
-		ResponseSendTimeout:      defaultResponseSendTimeout,
-		MaxLogtailFetchFailure:   defaultMaxLogtailFetchFailure,
+		RpcMaxMessageSize:      defaultRpcMaxMessageSize,
+		RpcEnableChecksum:      defaultRpcEnableChecksum,
+		RPCStreamPoisonTime:    defaultRpcStreamPoisonTime,
+		LogtailCollectInterval: defaultLogtailCollectInterval,
+		ResponseSendTimeout:    defaultResponseSendTimeout,
+		PullWorkerPoolSize:     defaultPullWorkerPoolSize,
 	}
 }
 
@@ -95,8 +118,8 @@ func (l *LogtailServerCfg) Validate() {
 	if l.RpcMaxMessageSize <= 0 {
 		l.RpcMaxMessageSize = defaultRpcMaxMessageSize
 	}
-	if l.RpcPayloadCopyBufferSize <= 0 {
-		l.RpcPayloadCopyBufferSize = defaultRpcPayloadCopyBufferSize
+	if l.RPCStreamPoisonTime <= 0 {
+		l.RPCStreamPoisonTime = defaultRpcStreamPoisonTime
 	}
 	if l.LogtailCollectInterval <= 0 {
 		l.LogtailCollectInterval = defaultLogtailCollectInterval
@@ -104,7 +127,7 @@ func (l *LogtailServerCfg) Validate() {
 	if l.ResponseSendTimeout <= 0 {
 		l.ResponseSendTimeout = defaultResponseSendTimeout
 	}
-	if l.MaxLogtailFetchFailure <= 0 {
-		l.MaxLogtailFetchFailure = defaultMaxLogtailFetchFailure
+	if l.PullWorkerPoolSize <= 0 {
+		l.PullWorkerPoolSize = defaultPullWorkerPoolSize
 	}
 }

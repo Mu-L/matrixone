@@ -21,36 +21,42 @@ option go_package = "github.com/matrixorigin/matrixone/pkg/pb/metadata";
 import "github.com/gogo/protobuf/gogoproto/gogo.proto";
 
 option (gogoproto.goproto_enum_prefix_all) = true;
+option (gogoproto.sizer_all) = false;
+option (gogoproto.protosizer_all) = true;
 
 // ServiceType service type
 enum ServiceType {
   // CN cn service
   CN  = 0;
-  // DN dn service
-  DN  = 1;
+  // TN tn service
+  TN  = 1;
   // LOG log service
   LOG = 2;
+  // Proxy proxy service
+  PROXY = 3;
+  // PYTHON_UDF python udf service
+  PYTHON_UDF = 4;
 }
 
-// DNShardRecord is DN shard metadata describing what is a DN shard. It
-// is internally used by HAKeeper to maintain how many DNs available in
+// TNShardRecord is TN shard metadata describing what is a TN shard. It
+// is internally used by HAKeeper to maintain how many TNs available in
 // the system. 
-message DNShardRecord {
-  // ShardID the id of the DN shard.
+message TNShardRecord {
+  // ShardID the id of the TN shard.
   uint64 ShardID    = 1;
-  // LogShardID a DN corresponds to a unique Shard of LogService.
+  // LogShardID a TN corresponds to a unique Shard of LogService.
   uint64 LogShardID = 2;
 }
 
-// DNShard 
-message DNShard {
-  // DNShard extends DNShardRecord
-  DNShardRecord DNShardRecord = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
-  // ReplicaID only one replica for one DN. The ReplicaID is specified at
-  // the time the DN is created. DN restart ReplicaID will not change, when
-  // a DN is migrated to another node, the ReplicaID will be reset.
+// TNShard 
+message TNShard {
+  // TNShard extends TNShardRecord
+  TNShardRecord TNShardRecord = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
+  // ReplicaID only one replica for one TN. The ReplicaID is specified at
+  // the time the TN is created. TN restart ReplicaID will not change, when
+  // a TN is migrated to another node, the ReplicaID will be reset.
   uint64 ReplicaID  = 2;
-  // Address is DN's external service address.
+  // Address is TN's external service address.
   string Address    = 3;
 }
 
@@ -70,14 +76,16 @@ message LogShard {
   LogShardRecord LogShardRecord = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // ReplicaID is the replica ID of the replica running on the LogStore. 
   uint64 ReplicaID  = 2;
+  // NonVoting indicates if the replica is a non-voting one.
+  bool NonVoting = 3;
 }
 
-// DNStore DN store metadata
-message DNStore {
-  // UUID DNStore uuid id
+// TNStore TN store metadata
+message TNStore {
+  // UUID TNStore uuid id
   string UUID = 1;
-  // Shards DNShards
-  repeated DNShard Shards = 2 [(gogoproto.nullable) = false];
+  // Shards TNShards
+  repeated TNShard Shards = 2 [(gogoproto.nullable) = false];
 }
 
 // LogStore is for the metadata for Log store.
@@ -114,12 +122,24 @@ message CNService {
   string PipelineServiceAddress = 3;
   // SQLAddress is used to provide SQL input.
   string SQLAddress             = 4;
-  // Labels lables on service
-  map<string,string> Labels     = 5 [(gogoproto.nullable) = false];
+  reserved 5;
+  // Labels are labels on CN service.
+  map<string, LabelList> Labels = 6 [(gogoproto.nullable) = false];
+  // WorkState is the work state of CN service.
+  WorkState WorkState           = 7;
+  // QueryAddress is the address of queryservice.QueryService.
+  string QueryAddress           = 8;
+  string ShardServiceAddress    = 9;
+  // CommitID is the git commit ID of the cn node.
+  string CommitID = 10;
+  // CPUTotal is cpu quota from logservicepb.CNStore
+  uint64 CPUTotal = 11;
+  // MemTotal is mem quota from logservicepb.CNStore
+  uint64 MemTotal = 12;
 }
 
-// DNService dn service metadata
-message DNService {
+// TNService tn service metadata
+message TNService {
   // ServiceID service ID
   string ServiceID              = 1;
   // TxnServiceAddress is used to provide txn service
@@ -128,9 +148,26 @@ message DNService {
   string LogTailServiceAddress  = 3;
   // LockServiceAddress lock service address for lock table allocator
   string LockServiceAddress     = 4;
-  // Shards DN shards on service
-  repeated DNShard Shards       = 5 [(gogoproto.nullable) = false];
-  // Labels lables on service
-  map<string,string> Labels     = 6 [(gogoproto.nullable) = false];
+  reserved 5;
+  // Shards TN shards on service
+  repeated TNShard Shards       = 6 [(gogoproto.nullable) = false];
+  // Labels labels on service
+  map<string, LabelList> Labels = 7 [(gogoproto.nullable) = false];
+  // QueryAddress it the address of query service on the tn
+  string          QueryAddress       = 8;
+  string  ShardServiceAddress   = 9;
+}
+
+// LabelList defines the labels on CN store.
+message LabelList {
+  repeated string Labels = 1;
+}
+
+// WorkState is the work state of CN service.
+enum WorkState {
+  Unknown  = 0;
+  Working  = 1;
+  Draining = 2;
+  Drained  = 3;
 }
 

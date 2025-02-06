@@ -15,19 +15,21 @@
 package txnimpl
 
 import (
-	"bytes"
+	"context"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/updates"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
 )
+
+var ErrDebugReplay = moerr.NewInternalErrorNoCtx("debug")
 
 type replayTxnStore struct {
 	txnbase.NoopTxnStore
@@ -36,11 +38,13 @@ type replayTxnStore struct {
 	catalog     *catalog.Catalog
 	dataFactory *tables.DataFactory
 	wal         wal.Driver
+	ctx         context.Context
 }
 
 func MakeReplayTxn(
+	ctx context.Context,
 	mgr *txnbase.TxnManager,
-	ctx *txnbase.TxnCtx,
+	txnCtx *txnbase.TxnCtx,
 	lsn uint64,
 	cmd *txnbase.TxnCmd,
 	observer wal.ReplayObserver,
@@ -53,10 +57,11 @@ func MakeReplayTxn(
 		catalog:     catalog,
 		dataFactory: dataFactory,
 		wal:         wal,
+		ctx:         ctx,
 	}
 	txn := txnbase.NewPersistedTxn(
 		mgr,
-		ctx,
+		txnCtx,
 		store,
 		lsn,
 		store.prepareCommit,
@@ -65,27 +70,19 @@ func MakeReplayTxn(
 		store.applyRollback)
 	return txn
 }
-
+func (store *replayTxnStore) GetContext() context.Context {
+	return store.ctx
+}
 func (store *replayTxnStore) IsReadonly() bool { return false }
 
 func (store *replayTxnStore) prepareCommit(txn txnif.AsyncTxn) (err error) {
 	// PrepareCommit all commands
 	// Check idempotent of each command
 	// Record all idempotent error commands and skip apply|rollback later
-	idxCtx := &wal.Index{LSN: txn.GetLSN()}
-	idxCtx.Size = store.Cmd.CmdSize
-	internalCnt := uint32(0)
 	store.Observer.OnTimeStamp(txn.GetPrepareTS())
-	for i, command := range store.Cmd.Cmds {
+	for _, command := range store.Cmd.Cmds {
 		command.SetReplayTxn(txn)
-		if command.GetType() == CmdAppend {
-			internalCnt++
-			store.prepareCmd(command, nil)
-		} else {
-			idx := idxCtx.Clone()
-			idx.CSN = uint32(i) - internalCnt
-			store.prepareCmd(command, idx)
-		}
+		store.prepareCmd(command)
 	}
 	return
 }
@@ -101,46 +98,65 @@ func (store *replayTxnStore) applyRollback(txn txnif.AsyncTxn) (err error) {
 }
 
 func (store *replayTxnStore) prepareRollback(txn txnif.AsyncTxn) (err error) {
-	panic(moerr.NewInternalErrorNoCtx("cannot prepareRollback rollback replay txn: %s",
+	panic(moerr.NewInternalErrorNoCtxf("cannot prepareRollback rollback replay txn: %s",
 		txn.String()))
 }
 
-func (store *replayTxnStore) prepareCmd(txncmd txnif.TxnCmd, idxCtx *wal.Index) {
-	if idxCtx != nil && idxCtx.Size > 0 {
-		logutil.Debug("", common.OperationField("replay-cmd"),
-			common.OperandField(txncmd.Desc()),
-			common.AnyField("index", idxCtx.String()))
+func (store *replayTxnStore) prepareCmd(txncmd txnif.TxnCmd) {
+	if txncmd.GetType() != txnbase.IOET_WALTxnEntry {
+		common.DoIfDebugEnabled(func() {
+			logutil.Debug(
+				"",
+				common.OperationField("replay-cmd"),
+				common.OperandField(txncmd.Desc()),
+			)
+		})
 	}
-	var err error
 	switch cmd := txncmd.(type) {
-	case *catalog.EntryCommand:
-		store.catalog.ReplayCmd(txncmd, store.dataFactory, idxCtx, store.Observer)
+	case *catalog.EntryCommand[*catalog.EmptyMVCCNode, *catalog.DBNode],
+		*catalog.EntryCommand[*catalog.TableMVCCNode, *catalog.TableNode],
+		*catalog.EntryCommand[*catalog.MetadataMVCCNode, *catalog.ObjectNode],
+		*catalog.EntryCommand[*catalog.ObjectMVCCNode, *catalog.ObjectNode],
+		*catalog.EntryCommand[*catalog.MetadataMVCCNode, *catalog.BlockNode]:
+		store.catalog.ReplayCmd(txncmd, store.dataFactory, store.Observer)
 	case *AppendCmd:
-		store.replayAppendData(cmd, store.Observer)
+		store.replayAppendData(
+			cmd, store.Observer)
 	case *updates.UpdateCmd:
-		store.replayDataCmds(cmd, idxCtx, store.Observer)
-	}
-	if err != nil {
-		panic(err)
+		store.replayDataCmds(
+			cmd, store.Observer)
 	}
 }
 
 func (store *replayTxnStore) replayAppendData(cmd *AppendCmd, observer wal.ReplayObserver) {
 	hasActive := false
+	_, sarg, _ := fault.TriggerFault("replay debug log")
 	for _, info := range cmd.Infos {
-		database, err := store.catalog.GetDatabaseByID(info.GetDBID())
-		if err != nil {
-			panic(err)
-		}
 		id := info.GetDest()
-		blk, err := database.GetBlockEntryByID(id)
+		database, err := store.catalog.GetDatabaseByID(id.DbID)
+		if sarg != "" {
+			err = ErrDebugReplay
+		}
 		if err != nil {
-			panic(err)
+			logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+			if err != ErrDebugReplay {
+				panic(err)
+			}
+		}
+		blk, err := database.GetObjectEntryByID(id, cmd.IsTombstone)
+		if sarg != "" {
+			err = ErrDebugReplay
+		}
+		if err != nil {
+			logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+			if err != ErrDebugReplay {
+				panic(err)
+			}
 		}
 		if !blk.IsActive() {
 			continue
 		}
-		if blk.GetMetaLoc() != "" {
+		if blk.ObjectPersisted() {
 			continue
 		}
 		hasActive = true
@@ -150,120 +166,95 @@ func (store *replayTxnStore) replayAppendData(cmd *AppendCmd, observer wal.Repla
 		return
 	}
 
-	var data *containers.Batch
-
-	for _, subTxnCmd := range cmd.Cmds {
-		switch subCmd := subTxnCmd.(type) {
-		case *txnbase.BatchCmd:
-			data = subCmd.Bat
-		case *txnbase.PointerCmd:
-			batEntry, err := store.wal.LoadEntry(subCmd.Group, subCmd.Lsn)
-			if err != nil {
-				panic(err)
-			}
-			r := bytes.NewBuffer(batEntry.GetPayload())
-			txnCmd, _, err := txnbase.BuildCommandFrom(r)
-			if err != nil {
-				panic(err)
-			}
-			data = txnCmd.(*txnbase.BatchCmd).Bat
-			batEntry.Free()
-		}
-	}
+	data := cmd.Data
 	if data != nil {
 		defer data.Close()
 	}
 
 	for _, info := range cmd.Infos {
-		database, err := store.catalog.GetDatabaseByID(info.GetDBID())
-		if err != nil {
-			panic(err)
-		}
 		id := info.GetDest()
-		blk, err := database.GetBlockEntryByID(id)
+		database, err := store.catalog.GetDatabaseByID(id.DbID)
+		if sarg != "" {
+			err = ErrDebugReplay
+		}
 		if err != nil {
-			panic(err)
+			logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+			if err != ErrDebugReplay {
+				panic(err)
+			}
+		}
+		blk, err := database.GetObjectEntryByID(id, cmd.IsTombstone)
+		if sarg != "" {
+			err = ErrDebugReplay
+		}
+		if err != nil {
+			logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+			if err != ErrDebugReplay {
+				panic(err)
+			}
 		}
 		if !blk.IsActive() {
 			continue
 		}
-		if blk.GetMetaLoc() != "" {
+		if blk.ObjectPersisted() {
 			continue
 		}
 		start := info.GetSrcOff()
 		bat := data.CloneWindow(int(start), int(info.GetSrcLen()))
 		bat.Compact()
 		defer bat.Close()
-		if err = blk.GetBlockData().OnReplayAppendPayload(bat); err != nil {
-			panic(err)
+		if err = blk.GetObjectData().OnReplayAppendPayload(bat); err != nil || sarg != "" {
+			logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+			if sarg == "" {
+				panic(err)
+			}
 		}
 	}
 }
 
-func (store *replayTxnStore) replayDataCmds(cmd *updates.UpdateCmd, idxCtx *wal.Index, observer wal.ReplayObserver) {
+func (store *replayTxnStore) replayDataCmds(cmd *updates.UpdateCmd, observer wal.ReplayObserver) {
 	switch cmd.GetType() {
-	case txnbase.CmdAppend:
-		store.replayAppend(cmd, idxCtx, observer)
-	case txnbase.CmdDelete:
-		store.replayDelete(cmd, idxCtx, observer)
+	case updates.IOET_WALTxnCommand_AppendNode:
+		store.replayAppend(cmd, observer)
+		// case updates.IOET_WALTxnCommand_DeleteNode, updates.IOET_WALTxnCommand_PersistedDeleteNode:
+		// 	store.replayDelete(cmd, observer)
 	}
 }
 
-func (store *replayTxnStore) replayDelete(cmd *updates.UpdateCmd, idxCtx *wal.Index, observer wal.ReplayObserver) {
-	database, err := store.catalog.GetDatabaseByID(cmd.GetDBID())
-	if err != nil {
-		panic(err)
-	}
-	deleteNode := cmd.GetDeleteNode()
-	deleteNode.SetLogIndex(idxCtx)
-	if deleteNode.Is1PC() {
-		if _, err := deleteNode.TxnMVCCNode.ApplyCommit(nil); err != nil {
-			panic(err)
-		}
-	}
-	id := deleteNode.GetID()
-	blk, err := database.GetBlockEntryByID(id)
-	if err != nil {
-		panic(err)
-	}
-	if !blk.IsActive() {
-		observer.OnStaleIndex(idxCtx)
-		return
-	}
-	blkData := blk.GetBlockData()
-	err = blkData.OnReplayDelete(deleteNode)
-	if err != nil {
-		panic(err)
-	}
-
-}
-
-func (store *replayTxnStore) replayAppend(cmd *updates.UpdateCmd, idxCtx *wal.Index, observer wal.ReplayObserver) {
-	database, err := store.catalog.GetDatabaseByID(cmd.GetDBID())
-	if err != nil {
-		panic(err)
-	}
+func (store *replayTxnStore) replayAppend(cmd *updates.UpdateCmd, observer wal.ReplayObserver) {
 	appendNode := cmd.GetAppendNode()
-	appendNode.SetLogIndex(idxCtx)
-	if appendNode.Is1PC() {
-		if _, err := appendNode.TxnMVCCNode.ApplyCommit(nil); err != nil {
+	id := appendNode.GetID()
+	database, err := store.catalog.GetDatabaseByID(id.DbID)
+	_, sarg, _ := fault.TriggerFault("replay debug log")
+	if sarg != "" {
+		err = ErrDebugReplay
+	}
+	if err != nil {
+		logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+		if err != ErrDebugReplay {
 			panic(err)
 		}
 	}
-	id := appendNode.GetID()
-	blk, err := database.GetBlockEntryByID(id)
+	obj, err := database.GetObjectEntryByID(id, cmd.GetAppendNode().IsTombstone())
+	if sarg != "" {
+		err = ErrDebugReplay
+	}
 	if err != nil {
-		panic(err)
+		logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+		if err != ErrDebugReplay {
+			panic(err)
+		}
 	}
-	if !blk.IsActive() {
-		observer.OnStaleIndex(idxCtx)
+	if !obj.IsActive() {
 		return
 	}
-	if blk.GetMetaLoc() != "" {
-		observer.OnStaleIndex(idxCtx)
+	if obj.ObjectPersisted() {
 		return
 	}
-	if err = blk.GetBlockData().OnReplayAppend(appendNode); err != nil {
-		panic(err)
+	if err = obj.GetObjectData().OnReplayAppend(appendNode); err != nil || sarg != "" {
+		logutil.Infof("cmd %v\ncatalog: %v", cmd.String(), store.catalog.SimplePPString(3))
+		if sarg == "" {
+			panic(err)
+		}
 	}
 }

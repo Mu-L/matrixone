@@ -27,7 +27,7 @@ type treeItem struct {
 
 func (item treeItem) isEmpty() bool {
 	return len(item.key) == 0 &&
-		len(item.value.txnID) == 0
+		item.value.isEmpty()
 }
 
 // Less returns true if the item key is less than the other.
@@ -65,8 +65,9 @@ func (k *btreeBasedStorage) Len() int {
 	return k.tree.Len()
 }
 
-func (k *btreeBasedStorage) Delete(key []byte) {
-	k.tree.Delete(treeItem{key: key})
+func (k *btreeBasedStorage) Delete(key []byte) (Lock, bool) {
+	item, ok := k.tree.Delete(treeItem{key: key})
+	return item.value, ok
 }
 
 func (k *btreeBasedStorage) Seek(key []byte) ([]byte, Lock, bool) {
@@ -76,6 +77,38 @@ func (k *btreeBasedStorage) Seek(key []byte) ([]byte, Lock, bool) {
 		return false
 	})
 	return result.key, result.value, !result.isEmpty()
+}
+
+func (k *btreeBasedStorage) Prev(key []byte) ([]byte, Lock, bool) {
+	var result treeItem
+	k.tree.DescendLessOrEqual(treeItem{key: key}, func(item treeItem) bool {
+		if bytes.Equal(item.key, key) {
+			return true
+		}
+		result = item
+		return false
+	})
+	return result.key, result.value, !result.isEmpty()
+}
+
+func (k *btreeBasedStorage) Range(
+	start, end []byte,
+	fn func([]byte, Lock) bool) {
+	if len(end) == 0 {
+		k.tree.AscendGreaterOrEqual(
+			treeItem{key: start},
+			func(item treeItem) bool {
+				return fn(item.key, item.value)
+			})
+		return
+	}
+
+	k.tree.AscendRange(
+		treeItem{key: start},
+		treeItem{key: end},
+		func(item treeItem) bool {
+			return fn(item.key, item.value)
+		})
 }
 
 func (k *btreeBasedStorage) Iter(fn func([]byte, Lock) bool) {

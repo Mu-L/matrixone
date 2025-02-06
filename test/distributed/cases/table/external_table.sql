@@ -55,6 +55,8 @@ drop table if exists table_15;
 drop table if exists table_16;
 drop table if exists ex_table_yccs;
 drop table if exists ex_table_null;
+drop table if exists ex_empty_table;
+drop table if exists join_table;
 
 --覆盖各数值类型正常值,极值，空值
 create external table ex_table_1(num_col1 tinyint,num_col2 smallint,num_col3 int,num_col4 bigint,num_col5 tinyint unsigned,num_col6 smallint unsigned,num_col7 int unsigned,num_col8 bigint unsigned ,num_col9 float(5,3),num_col10 double,num_col11 decimal(38,19)) infile{"filepath"='$resources/external_table_file/ex_table_number.csv'} fields terminated by ',' enclosed by '\"' lines terminated by '\n';
@@ -118,7 +120,7 @@ select * from ex_table_3_4;
 create external table ex_table_3_5(char_1 char(20),char_2 varchar(10),date_1 date,date_2 datetime,date_3 timestamp)infile{"filepath"='$resources/external_table_file/ex_table_3_5.csv'} fields terminated by ',' enclosed by '\"' lines terminated by '\n';
 select * from ex_table_3_5;
 
-create external table ex_table_31(clo1 tinyint default 8,clo2 smallint null,clo3 int not null,clo4 bigint,clo5 tinyint unsigned,clo6 smallint unsigned,clo7 int unsigned,clo8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255),primary key(clo1))infile{"filepath"='$resources/external_table_file/ex_table_3_6.csv'};
+create external table ex_table_31(clo1 tinyint default 8,clo2 smallint null,clo3 int not null,clo4 bigint,clo5 tinyint unsigned,clo6 smallint unsigned,clo7 int unsigned,clo8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255),primary key(clo1))infile{"filepath"='$resources/external_table_file/ex_table_3_6.csv'} fields terminated by ',';
 select clo1,clo2,clo3,clo4,clo5,clo6,clo7,clo8,col9,col10,col11,col12,col13,col15,col16,col17,col18,col19,col20 from ex_table_31;
 
 create external table ex_table_4(clo1 tinyint,clo2 smallint,clo3 int,clo4 bigint,clo5 tinyint unsigned,clo6 smallint unsigned,clo7 int unsigned,clo8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,
@@ -166,7 +168,7 @@ create external table ex_table_13(clo1 tinyint,clo2 smallint,clo3 int,clo4 bigin
 col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255))infile{"filepath"='$resources/external_table_file/ex_table_sep_10.csv'} fields terminated by ',' enclosed by '\"' lines terminated by '\r\n';
 select clo1,clo5,clo7,col12,col13,col16,col17,col18  from ex_table_13;
 --缺省fields terminated ，terminated，ENCLOSED(默认分隔符，封闭符"")
-create external table ex_table_14(clo1 tinyint primary key,clo2 smallint,clo3 int,clo4 bigint,clo5 tinyint unsigned,clo6 smallint unsigned,clo7 int unsigned,clo8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255))infile{"filepath"='$resources/external_table_file/ex_table_sep_10.csv'};
+create external table ex_table_14(clo1 tinyint primary key,clo2 smallint,clo3 int,clo4 bigint,clo5 tinyint unsigned,clo6 smallint unsigned,clo7 int unsigned,clo8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255))infile{"filepath"='$resources/external_table_file/ex_table_sep_10.csv'} fields terminated by ',';
 select clo1,clo5,clo7,col12,col13,col16,col17,col18  from ex_table_14;
 --text
 create external table ex_table_text(char_1 char(20),char_2 varchar(10),date_1 date,date_2 datetime,date_3 timestamp)infile{"filepath"='$resources/external_table_file/ex_table_char.text'} fields terminated by ',' enclosed by '\"' lines terminated by '\n';
@@ -240,6 +242,12 @@ select length(a), length(b), length(c) from t1;
 create external table ex_table_null( col1 int, col2 float, col3 varchar, col4 blob, col6 date, col7 bool )infile{"filepath"='$resources/external_table_file/ex_table_null.csv'} fields terminated by ',' enclosed by '"' lines terminated by '\n' set col3=nullif(col3,'null');
 select max(col3), min(col3) from ex_table_null;
 
+--empty table for join
+create external table ex_empty_table(a int, b int)infile{"filepath"='noexistfile.csv'} fields terminated by ',' enclosed by '"' lines terminated by '\n';
+create table join_table(a int, b int);
+insert into join_table values(1,1), (2,2);
+select * from ex_empty_table join join_table on ex_empty_table.a = join_table.a; 
+
 drop table if exists ex_table_1;
 drop table if exists ex_table_2_1;
 drop table if exists ex_table_2_2;
@@ -297,3 +305,10 @@ drop table if exists ex_table_yccs;
 drop table if exists ex_table_space;
 drop table if exists t1;
 drop table if exists ex_table_null;
+drop table if exists ex_empty_table;
+drop table if exists join_table;
+
+drop table if exists ex_table_t1;
+create external table ex_table_t1(id int) infile{"filepath"=''}fields terminated by ',' enclosed by '\"' lines terminated by '\n';
+select * from ex_table_t1;
+drop table ex_table_t1;

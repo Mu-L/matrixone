@@ -15,8 +15,11 @@
 package defines
 
 import (
+	"context"
 	"math"
 	"sync"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 )
 
 // information from: https://dev.mysql.com/doc/internals/en/com-query-response.html
@@ -70,6 +73,8 @@ func (typ *MysqlType) GetLength(width int32) uint32 {
 		return uint32(width) + 2
 	case MYSQL_TYPE_BOOL:
 		return 1
+	case MYSQL_TYPE_BIT:
+		return uint32(width)
 	case MYSQL_TYPE_TINY:
 		return 8
 	case MYSQL_TYPE_SHORT:
@@ -82,12 +87,12 @@ func (typ *MysqlType) GetLength(width int32) uint32 {
 		if width != 32 && width != 0 {
 			return uint32(width)
 		}
-		return 32
+		return 23
 	case MYSQL_TYPE_DOUBLE:
 		if width != 64 && width != 0 {
 			return uint32(width)
 		}
-		return 64
+		return 53
 	case MYSQL_TYPE_VARCHAR, MYSQL_TYPE_STRING, MYSQL_TYPE_BLOB, MYSQL_TYPE_TEXT:
 		return uint32(width) * 3
 	case MYSQL_TYPE_DATE:
@@ -163,6 +168,47 @@ const (
 type TenantIDKey struct{}
 type UserIDKey struct{}
 type RoleIDKey struct{}
+type NodeIDKey struct{}
+
+func GetAccountId(ctx context.Context) (uint32, error) {
+	if v := ctx.Value(TenantIDKey{}); v != nil {
+		return v.(uint32), nil
+	} else {
+		return 0, moerr.NewInternalError(ctx, "no account id in context")
+	}
+}
+
+func GetUserId(ctx context.Context) uint32 {
+	if v := ctx.Value(UserIDKey{}); v != nil {
+		return v.(uint32)
+	}
+	//zero means root user
+	return 0
+}
+
+func GetRoleId(ctx context.Context) uint32 {
+	if v := ctx.Value(RoleIDKey{}); v != nil {
+		return v.(uint32)
+	}
+	//zero means mo admin role
+	return 0
+}
+
+func AttachAccount(ctx context.Context, accId uint32, userId uint32, roleId uint32) context.Context {
+	return AttachRoleId(AttachUserId(AttachAccountId(ctx, accId), userId), roleId)
+}
+
+func AttachAccountId(ctx context.Context, accId uint32) context.Context {
+	return context.WithValue(ctx, TenantIDKey{}, accId)
+}
+
+func AttachUserId(ctx context.Context, userId uint32) context.Context {
+	return context.WithValue(ctx, UserIDKey{}, userId)
+}
+
+func AttachRoleId(ctx context.Context, roleId uint32) context.Context {
+	return context.WithValue(ctx, RoleIDKey{}, roleId)
+}
 
 // EngineKey use EngineKey{} to get engine from Context
 type EngineKey struct{}
@@ -174,18 +220,44 @@ type DatTypKey struct{}
 // CarryOnCtxKeys defines keys needed to be serialized when pass context through net
 var CarryOnCtxKeys = []any{TenantIDKey{}, UserIDKey{}, RoleIDKey{}}
 
-// TemporaryDN use TemporaryDN to get temporary storage from Context
-type TemporaryDN struct{}
+// TemporaryTN use TemporaryTN to get temporary storage from Context
+type TemporaryTN struct{}
+
+type IsMoLogger struct{}
+
+type SourceScanResKey struct{}
+
+type IgnoreForeignKey struct{}
 
 // Determine if now is a bg sql.
 type BgKey struct{}
 
-// PkCheckByDN whether DN does primary key uniqueness check against transaction's workspace or not.
-type PkCheckByDN struct{}
+// Sp variable scope
+type VarScopeKey struct{}
 
-type AutoIncrCaches struct {
+// Determine if it is a stored procedure
+type InSp struct{}
+
+// PkCheckByTN whether TN does primary key uniqueness check against transaction's workspace or not.
+type PkCheckByTN struct{}
+
+// StartTS is the start timestamp of a statement.
+type StartTS struct{}
+
+// DisableFkCheck is used to disable foreign key check.
+type DisableFkCheck struct{}
+
+type ReaderSummaryKey struct{}
+
+/*
+The autoIncrCacheManager is initialized with a starting CN.
+The autoIncrCacheManager instance of each CN is stored in type service in package cnservice.
+The logic to manipulate the cache is in auto_incr.go
+*/
+type AutoIncrCacheManager struct {
 	Mu             *sync.Mutex
 	AutoIncrCaches map[string]AutoIncrCache
+	MaxSize        uint64
 }
 
 type AutoIncrCache struct {

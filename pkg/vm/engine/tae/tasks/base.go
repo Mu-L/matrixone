@@ -27,6 +27,7 @@ import (
 var WaitableCtx = &Context{Waitable: true}
 
 type Context struct {
+	ID       uint64
 	DoneCB   ops.OpDoneCB
 	Waitable bool
 }
@@ -44,8 +45,14 @@ type BaseTask struct {
 }
 
 func NewBaseTask(impl Task, taskType TaskType, ctx *Context) *BaseTask {
+	var id uint64
+	if ctx != nil && ctx.ID != 0 {
+		id = ctx.ID
+	} else {
+		id = NextTaskId()
+	}
 	task := &BaseTask{
-		id:       NextTaskId(),
+		id:       id,
 		taskType: taskType,
 		impl:     impl,
 	}
@@ -65,7 +72,7 @@ func NewBaseTask(impl Task, taskType TaskType, ctx *Context) *BaseTask {
 		DoneCB: doneCB,
 	}
 	if doneCB == nil {
-		task.Op.ErrorC = make(chan error)
+		task.Op.ErrorC = make(chan error, 1)
 	}
 	return task
 }
@@ -76,7 +83,7 @@ func (task *BaseTask) onDone(_ base.IOp) {
 		common.ErrorField(task.Err))
 }
 func (task *BaseTask) Type() TaskType      { return task.taskType }
-func (task *BaseTask) Cancel() (err error) { panic("todo") }
+func (task *BaseTask) Cancel() (err error) { return nil }
 func (task *BaseTask) ID() uint64          { return task.id }
 func (task *BaseTask) Execute() (err error) {
 	if task.exec != nil {

@@ -14,12 +14,79 @@
 
 package limit
 
-import "github.com/matrixorigin/matrixone/pkg/vm/process"
+import (
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/vm"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
+)
 
-type Argument struct {
-	Seen  uint64 // seen is the number of tuples seen so far
-	Limit uint64
+var _ vm.Operator = new(Limit)
+
+type container struct {
+	seen          uint64 // seen is the number of tuples seen so far
+	limit         uint64
+	limitExecutor colexec.ExpressionExecutor
+}
+type Limit struct {
+	ctr       container
+	LimitExpr *plan.Expr
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
+func (limit *Limit) GetOperatorBase() *vm.OperatorBase {
+	return &limit.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Limit](
+		func() *Limit {
+			return &Limit{}
+		},
+		func(a *Limit) {
+			*a = Limit{}
+		},
+		reuse.DefaultOptions[Limit]().
+			WithEnableChecker(),
+	)
+}
+
+func (limit Limit) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Limit {
+	return reuse.Alloc[Limit](nil)
+}
+
+func (limit *Limit) WithLimit(limitExpr *plan.Expr) *Limit {
+	limit.LimitExpr = limitExpr
+	return limit
+}
+
+func (limit *Limit) Release() {
+	if limit != nil {
+		reuse.Free[Limit](limit, nil)
+	}
+}
+
+func (limit *Limit) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	if limit.ctr.limitExecutor != nil {
+		limit.ctr.limitExecutor.ResetForNextQuery()
+	}
+	limit.ctr.seen = 0
+}
+
+func (limit *Limit) Free(proc *process.Process, pipelineFailed bool, err error) {
+	if limit.ctr.limitExecutor != nil {
+		limit.ctr.limitExecutor.Free()
+		limit.ctr.limitExecutor = nil
+	}
+}
+
+func (limit *Limit) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }

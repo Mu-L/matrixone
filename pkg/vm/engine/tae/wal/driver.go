@@ -16,123 +16,81 @@ package wal
 
 import (
 	"context"
-	"sync"
-	"time"
 
+	storeDriver "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/batchstoredriver"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/logservicedriver"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/sm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/store"
 )
 
-type entryWithInfo struct {
-	e    LogEntry
-	info any
-}
-
-type DriverConfig struct {
-	BatchStoreConfig   *batchstoredriver.StoreCfg
-	CheckpointDuration time.Duration
-}
-
 type walDriver struct {
-	*walInfo
-	sync.RWMutex
 	impl store.Store
-	own  bool
-
-	logInfoQueue sm.Queue
-
-	ckpDuration   time.Duration
-	cancelfn      context.CancelFunc
-	cancelContext context.Context
-	wg            sync.WaitGroup
 }
 
-func NewDriverWithLogservice(factory logservicedriver.LogServiceClientFactory) Driver {
-	ckpDuration := time.Second * 5
+func NewLogserviceDriver(
+	ctx context.Context,
+	factory logservicedriver.LogServiceClientFactory,
+) Driver {
 	impl := store.NewStoreWithLogserviceDriver(factory)
-	driver := NewDriverWithStore(impl, true, ckpDuration)
-	return driver
+	return &walDriver{impl: impl}
 }
 
-func NewDriverWithBatchStore(dir, name string, cfg *DriverConfig) Driver {
-	var batchStoreCfg *batchstoredriver.StoreCfg
-	ckpDuration := time.Second * 5
-	if cfg != nil {
-		batchStoreCfg = cfg.BatchStoreConfig
-		ckpDuration = cfg.CheckpointDuration
-	}
-	impl := store.NewStoreWithBatchStoreDriver(dir, name, batchStoreCfg)
-	driver := NewDriverWithStore(impl, true, ckpDuration)
-	return driver
+func NewBatchStoreDriver(
+	ctx context.Context, dir, name string, cfg *batchstoredriver.StoreCfg,
+) Driver {
+	impl := store.NewStoreWithBatchStoreDriver(dir, name, cfg)
+	return &walDriver{impl: impl}
 }
 
-func NewDriverWithStore(impl store.Store, own bool, ckpDuration time.Duration) Driver {
-	if ckpDuration == 0 {
-		ckpDuration = time.Second
-	}
-	driver := &walDriver{
-		walInfo:     newWalInfo(),
-		impl:        impl,
-		own:         own,
-		wg:          sync.WaitGroup{},
-		ckpDuration: ckpDuration,
-	}
-	driver.logInfoQueue = sm.NewSafeQueue(1000, 1000, driver.onLogInfo)
-	driver.cancelContext, driver.cancelfn = context.WithCancel(context.Background())
-	driver.logInfoQueue.Start()
-	driver.wg.Add(1)
-	return driver
-}
-func (driver *walDriver) Start() {
-	go driver.checkpointTicker()
-}
+func (driver *walDriver) Start() {}
+
 func (driver *walDriver) GetCheckpointed() uint64 {
 	return driver.impl.GetCheckpointed(GroupPrepare)
 }
+
 func (driver *walDriver) replayhandle(handle store.ApplyHandle) store.ApplyHandle {
-	return func(group uint32, commitId uint64, payload []byte, typ uint16, info any) {
-		driver.logEntry(info.(*entry.Info))
-		handle(group, commitId, payload, typ, nil)
+	return func(
+		group uint32,
+		commitId uint64,
+		payload []byte,
+		typ uint16,
+		info any,
+	) storeDriver.ReplayEntryState {
+		return handle(group, commitId, payload, typ, nil)
 	}
 }
-func (driver *walDriver) Replay(handle store.ApplyHandle) error {
-	return driver.impl.Replay(driver.replayhandle(handle))
+
+func (driver *walDriver) Replay(
+	ctx context.Context, handle store.ApplyHandle, modeGetter func() storeDriver.ReplayMode,
+) error {
+	return driver.impl.Replay(ctx, driver.replayhandle(handle), modeGetter)
 }
 
 func (driver *walDriver) GetPenddingCnt() uint64 {
 	return driver.impl.GetPendding(GroupPrepare)
 }
 
-func (driver *walDriver) GetCurrSeqNum() uint64 {
+func (driver *walDriver) GetDSN() uint64 {
 	return driver.impl.GetCurrSeqNum(GroupPrepare)
 }
 
-func (driver *walDriver) LoadEntry(groupID uint32, lsn uint64) (LogEntry, error) {
-	return driver.impl.Load(groupID, lsn)
-}
-
 func (driver *walDriver) AppendEntry(group uint32, e LogEntry) (uint64, error) {
-	id, err := driver.impl.Append(group, e)
-	ent := &entryWithInfo{
-		e:    e,
-		info: e.GetInfo(),
-	}
-	_, err2 := driver.logInfoQueue.Enqueue(ent)
-	if err2 != nil {
-		panic(err)
-	}
+	id, err := driver.impl.AppendEntry(group, e)
 	return id, err
 }
 
 func (driver *walDriver) Close() error {
-	driver.cancelfn()
-	driver.logInfoQueue.Stop()
-	if driver.own {
-		return driver.impl.Close()
-	}
-	driver.wg.Wait()
-	return nil
+	return driver.impl.Close()
+}
+
+func (driver *walDriver) RangeCheckpoint(
+	start, end uint64, files ...string,
+) (e LogEntry, err error) {
+	e, err = driver.impl.RangeCheckpoint(GroupPrepare, start, end, files...)
+	return
+}
+
+// for UT
+func (driver *walDriver) GetTruncated() uint64 {
+	return driver.impl.GetTruncated()
 }

@@ -24,15 +24,19 @@ import (
 // A few allocators for TAE
 var DefaultAllocator *mpool.MPool
 var MutMemAllocator *mpool.MPool
-var CacheAllocator *mpool.MPool
-var LogAllocator *mpool.MPool
+var SmallAllocator *mpool.MPool
+var LogtailAllocator *mpool.MPool
+var CheckpointAllocator *mpool.MPool
+var MergeAllocator *mpool.MPool
+var WorkspaceAllocator *mpool.MPool
+var DebugAllocator *mpool.MPool
 
 // init with zero fixed pool, for test.
 func init() {
 	InitTAEMPool()
 }
 
-// dn service call this during start up, to get a real cached pool.
+// tn service call this during start up, to get a real cached pool.
 var once sync.Once
 
 func InitTAEMPool() {
@@ -44,17 +48,37 @@ func InitTAEMPool() {
 		}
 
 		mpool.DeleteMPool(MutMemAllocator)
-		if MutMemAllocator, err = mpool.NewMPool("tae_immutable", 0, mpool.NoFixed); err != nil {
+		if MutMemAllocator, err = mpool.NewMPool("tae_mutable", 0, mpool.NoFixed); err != nil {
 			panic(err)
 		}
 
-		mpool.DeleteMPool(CacheAllocator)
-		if CacheAllocator, err = mpool.NewMPool("tae_cache", 0, mpool.NoFixed); err != nil {
+		mpool.DeleteMPool(SmallAllocator)
+		if SmallAllocator, err = mpool.NewMPool("tae_small", 0, mpool.NoFixed); err != nil {
 			panic(err)
 		}
 
-		mpool.DeleteMPool(LogAllocator)
-		if LogAllocator, err = mpool.NewMPool("tae_log", 0, mpool.NoFixed); err != nil {
+		mpool.DeleteMPool(LogtailAllocator)
+		if LogtailAllocator, err = mpool.NewMPool("tae_logtail", 0, mpool.NoFixed); err != nil {
+			panic(err)
+		}
+
+		mpool.DeleteMPool(CheckpointAllocator)
+		if CheckpointAllocator, err = mpool.NewMPool("tae_checkpoint", 0, mpool.NoFixed); err != nil {
+			panic(err)
+		}
+
+		mpool.DeleteMPool(MergeAllocator)
+		if MergeAllocator, err = mpool.NewMPool("tae_merge", 0, mpool.NoFixed); err != nil {
+			panic(err)
+		}
+
+		mpool.DeleteMPool(WorkspaceAllocator)
+		if WorkspaceAllocator, err = mpool.NewMPool("tae_workspace", 0, mpool.NoFixed); err != nil {
+			panic(err)
+		}
+
+		mpool.DeleteMPool(DebugAllocator)
+		if DebugAllocator, err = mpool.NewMPool("tae_debug", 0, mpool.NoFixed); err != nil {
 			panic(err)
 		}
 	}

@@ -16,15 +16,15 @@ package taskservice
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sync"
 	"time"
+
+	"github.com/robfig/cron/v3"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/pb/task"
-	"github.com/robfig/cron/v3"
 )
 
 type taskService struct {
@@ -32,17 +32,7 @@ type taskService struct {
 	cronParser cron.Parser
 	rt         runtime.Runtime
 
-	crons struct {
-		sync.Mutex
-
-		started  bool
-		stopping bool
-		stopper  *stopper.Stopper
-		cron     *cron.Cron
-		retryC   chan task.CronTask
-		jobs     map[uint64]*cronJob
-		entryIDs map[uint64]cron.EntryID
-	}
+	crons crons
 }
 
 // NewTaskService create a task service based on a task storage.
@@ -63,15 +53,14 @@ func NewTaskService(
 	}
 }
 
-func (s *taskService) Create(ctx context.Context, value task.TaskMetadata) error {
+func (s *taskService) CreateAsyncTask(ctx context.Context, value task.TaskMetadata) error {
 	for {
 		select {
 		case <-ctx.Done():
-			s.rt.Logger().Error("create task timeout")
-			return errNotReady
+			return errors.Join(ctx.Err(), ErrNotReady)
 		default:
-			if _, err := s.store.Add(ctx, newTaskFromMetadata(value)); err != nil {
-				if err == errNotReady {
+			if _, err := s.store.AddAsyncTask(ctx, newTaskFromMetadata(value)); err != nil {
+				if errors.Is(err, ErrNotReady) {
 					time.Sleep(300 * time.Millisecond)
 					continue
 				}
@@ -83,7 +72,7 @@ func (s *taskService) Create(ctx context.Context, value task.TaskMetadata) error
 }
 
 func (s *taskService) CreateBatch(ctx context.Context, tasks []task.TaskMetadata) error {
-	values := make([]task.Task, 0, len(tasks))
+	values := make([]task.AsyncTask, 0, len(tasks))
 	for _, v := range tasks {
 		values = append(values, newTaskFromMetadata(v))
 	}
@@ -91,11 +80,10 @@ func (s *taskService) CreateBatch(ctx context.Context, tasks []task.TaskMetadata
 	for {
 		select {
 		case <-ctx.Done():
-			s.rt.Logger().Error("create task timeout")
-			return errNotReady
+			return errors.Join(ctx.Err(), ErrNotReady)
 		default:
-			if _, err := s.store.Add(ctx, values...); err != nil {
-				if err == errNotReady {
+			if _, err := s.store.AddAsyncTask(ctx, values...); err != nil {
+				if errors.Is(err, ErrNotReady) {
 					time.Sleep(300 * time.Millisecond)
 					continue
 				}
@@ -126,8 +114,23 @@ func (s *taskService) CreateCronTask(ctx context.Context, value task.TaskMetadat
 	return err
 }
 
-func (s *taskService) Allocate(ctx context.Context, value task.Task, taskRunner string) error {
-	exists, err := s.store.Query(ctx, WithTaskIDCond(EQ, value.ID))
+func (s *taskService) CreateDaemonTask(ctx context.Context, metadata task.TaskMetadata, details *task.Details) error {
+	now := time.Now()
+
+	dt := task.DaemonTask{
+		Metadata:   metadata,
+		TaskType:   details.Type(),
+		TaskStatus: task.TaskStatus_Created,
+		Details:    details,
+		CreateAt:   now,
+		UpdateAt:   now,
+	}
+	_, err := s.store.AddDaemonTask(ctx, dt)
+	return err
+}
+
+func (s *taskService) Allocate(ctx context.Context, value task.AsyncTask, taskRunner string) error {
+	exists, err := s.store.QueryAsyncTask(ctx, WithTaskIDCond(EQ, value.ID))
 	if err != nil {
 		return err
 	}
@@ -151,8 +154,8 @@ func (s *taskService) Allocate(ctx context.Context, value task.Task, taskRunner 
 		return moerr.NewInvalidTask(ctx, taskRunner, value.ID)
 	}
 
-	n, err := s.store.Update(ctx,
-		[]task.Task{old},
+	n, err := s.store.UpdateAsyncTask(ctx,
+		[]task.AsyncTask{old},
 		WithTaskIDCond(EQ, old.ID),
 		WithTaskEpochCond(EQ, old.Epoch-1))
 	if err != nil {
@@ -167,13 +170,13 @@ func (s *taskService) Allocate(ctx context.Context, value task.Task, taskRunner 
 func (s *taskService) Complete(
 	ctx context.Context,
 	taskRunner string,
-	value task.Task,
+	value task.AsyncTask,
 	result task.ExecuteResult) error {
 	value.CompletedAt = time.Now().UnixMilli()
 	value.Status = task.TaskStatus_Completed
 	value.ExecuteResult = &result
-	n, err := s.store.Update(ctx, []task.Task{value},
-		WithTaskStatusCond(EQ, task.TaskStatus_Running),
+	n, err := s.store.UpdateAsyncTask(ctx, []task.AsyncTask{value},
+		WithTaskStatusCond(task.TaskStatus_Running),
 		WithTaskRunnerCond(EQ, taskRunner),
 		WithTaskEpochCond(EQ, value.Epoch))
 	if err != nil {
@@ -185,10 +188,11 @@ func (s *taskService) Complete(
 	return nil
 }
 
-func (s *taskService) Heartbeat(ctx context.Context, value task.Task) error {
+func (s *taskService) Heartbeat(ctx context.Context, value task.AsyncTask) error {
 	value.LastHeartbeat = time.Now().UnixMilli()
-	n, err := s.store.Update(ctx, []task.Task{value},
-		WithTaskStatusCond(EQ, task.TaskStatus_Running),
+	n, err := s.store.UpdateAsyncTask(ctx, []task.AsyncTask{value},
+		WithTaskIDCond(EQ, value.ID),
+		WithTaskStatusCond(task.TaskStatus_Running),
 		WithTaskEpochCond(LE, value.Epoch),
 		WithTaskRunnerCond(EQ, value.TaskRunner))
 	if err != nil {
@@ -200,12 +204,39 @@ func (s *taskService) Heartbeat(ctx context.Context, value task.Task) error {
 	return nil
 }
 
-func (s *taskService) QueryTask(ctx context.Context, conds ...Condition) ([]task.Task, error) {
-	return s.store.Query(ctx, conds...)
+func (s *taskService) QueryAsyncTask(ctx context.Context, conds ...Condition) ([]task.AsyncTask, error) {
+	return s.store.QueryAsyncTask(ctx, conds...)
 }
 
-func (s *taskService) QueryCronTask(ctx context.Context) ([]task.CronTask, error) {
-	return s.store.QueryCronTask(ctx)
+func (s *taskService) QueryCronTask(ctx context.Context, c ...Condition) ([]task.CronTask, error) {
+	return s.store.QueryCronTask(ctx, c...)
+}
+
+func (s *taskService) UpdateDaemonTask(ctx context.Context, tasks []task.DaemonTask, conds ...Condition) (int, error) {
+	return s.store.UpdateDaemonTask(ctx, tasks, conds...)
+}
+
+func (s *taskService) QueryDaemonTask(ctx context.Context, conds ...Condition) ([]task.DaemonTask, error) {
+	return s.store.QueryDaemonTask(ctx, conds...)
+}
+
+func (s *taskService) AddCdcTask(ctx context.Context, metadata task.TaskMetadata, details *task.Details, callback func(context.Context, SqlExecutor) (int, error)) (int, error) {
+	now := time.Now()
+
+	dt := task.DaemonTask{
+		Metadata:   metadata,
+		TaskType:   details.Type(),
+		TaskStatus: task.TaskStatus_Created,
+		Details:    details,
+		CreateAt:   now,
+		UpdateAt:   now,
+	}
+
+	return s.store.AddCdcTask(ctx, dt, callback)
+}
+
+func (s *taskService) UpdateCdcTask(ctx context.Context, targetStatus task.TaskStatus, callback func(context.Context, task.TaskStatus, map[CdcTaskKey]struct{}, SqlExecutor) (int, error), conds ...Condition) (int, error) {
+	return s.store.UpdateCdcTask(ctx, targetStatus, callback, conds...)
 }
 
 func (s *taskService) Close() error {
@@ -215,4 +246,21 @@ func (s *taskService) Close() error {
 
 func (s *taskService) GetStorage() TaskStorage {
 	return s.store
+}
+
+func (s *taskService) HeartbeatDaemonTask(ctx context.Context, t task.DaemonTask) error {
+	t.LastHeartbeat = time.Now().UTC()
+	n, err := s.store.HeartbeatDaemonTask(ctx, []task.DaemonTask{t})
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return moerr.NewInvalidTask(ctx, t.TaskRunner, t.ID)
+	}
+	return nil
+}
+
+func (s *taskService) TruncateCompletedTasks(ctx context.Context) error {
+	_, err := s.store.DeleteAsyncTask(ctx, WithTaskStatusCond(task.TaskStatus_Completed))
+	return err
 }

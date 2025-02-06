@@ -16,69 +16,259 @@ package lockservice
 
 import (
 	"sync"
+
+	"github.com/matrixorigin/matrixone/pkg/common/log"
+	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
 type waiterQueue interface {
-	len() int
+	init(logger *log.MOLogger)
+	close(notify notifyValue)
 	reset()
-	pop() (*waiter, []*waiter)
+
+	// writes methods, only can used in local_lock_table locked methods
+	resetCommittedAt(timestamp.Timestamp)
+	moveTo(to waiterQueue)
 	put(...*waiter)
-	iter(func([]byte) bool)
+	notify(value notifyValue)
+	notifyAll(value notifyValue)
+	first() *waiter
+	removeByTxnID(txnID []byte)
+	beginChange()
+	commitChange()
+	rollbackChange()
+
+	// read methods, can used any where
+	iter(func(*waiter) bool)
+	size() int
 }
 
-func newWaiterQueue() *sliceBasedWaiterQueue {
-	return &sliceBasedWaiterQueue{}
+func newWaiterQueue() waiterQueue {
+	return &sliceBasedWaiterQueue{beginChangeIdx: -1}
 }
 
 type sliceBasedWaiterQueue struct {
 	sync.RWMutex
-	offset  int
-	waiters []*waiter
+	logger         *log.MOLogger
+	beginChangeIdx int
+	waiters        []*waiter
+	keyCommittedAt timestamp.Timestamp
 }
 
-func (q *sliceBasedWaiterQueue) len() int {
-	q.RLock()
-	defer q.RUnlock()
-	return len(q.waiters) - q.offset
+func (q *sliceBasedWaiterQueue) init(
+	logger *log.MOLogger,
+) {
+	q.logger = logger
 }
 
-func (q *sliceBasedWaiterQueue) pop() (*waiter, []*waiter) {
-	if q.len() == 0 {
-		panic("BUG: no waiter in queue")
-	}
+func (q *sliceBasedWaiterQueue) moveTo(to waiterQueue) {
+	q.iter(func(w *waiter) bool {
+		to.put(w)
+		return true
+	})
+}
 
+func (q *sliceBasedWaiterQueue) put(ws ...*waiter) {
 	q.Lock()
 	defer q.Unlock()
-	v := q.waiters[q.offset]
-	q.waiters[q.offset] = nil
-	q.offset++
-	return v, q.waiters[q.offset:]
+	for _, w := range ws {
+		w.ref("sliceBasedWaiterQueue put", q.logger)
+	}
+	q.waiters = append(q.waiters, ws...)
+	v2.TxnLockWaitersTotalHistogram.Observe(float64(len(q.waiters)))
 }
 
-func (q *sliceBasedWaiterQueue) put(w ...*waiter) {
+func (q *sliceBasedWaiterQueue) notifyAll(value notifyValue) {
+	q.Lock()
+	defer q.Unlock()
+
+	// save the max committed ts
+	if value.ts.Less(q.keyCommittedAt) {
+		value.ts = q.keyCommittedAt
+	} else {
+		q.keyCommittedAt = value.ts
+	}
+
+	if len(q.waiters) == 0 {
+		return
+	}
+
+	if q.beginChangeIdx != -1 {
+		panic("BUG: cannot call notify in changing waiter queue")
+	}
+
+	for _, w := range q.waiters {
+		w.notify(value, q.logger)
+		w.close("sliceBasedWaiterQueue notifyAll", q.logger)
+	}
+	q.resetWaitersLocked()
+	v2.TxnLockWaitersTotalHistogram.Observe(float64(len(q.waiters)))
+}
+
+func (q *sliceBasedWaiterQueue) notify(value notifyValue) {
+	q.Lock()
+	defer q.Unlock()
+
+	// save the max committed ts
+	if value.ts.Less(q.keyCommittedAt) {
+		value.ts = q.keyCommittedAt
+	} else {
+		q.keyCommittedAt = value.ts
+	}
+
+	if len(q.waiters) == 0 {
+		return
+	}
+
+	if q.beginChangeIdx != -1 {
+		panic("BUG: cannot call notify in changing waiter queue")
+	}
+
+	skipAt := -1
+	for i, w := range q.waiters {
+		if w.notify(value, q.logger) {
+			break
+		}
+		// already completed
+		w.close("sliceBasedWaiterQueue notify", q.logger)
+		skipAt = i
+		q.waiters[i] = nil
+	}
+	q.waiters = append(q.waiters[:0], q.waiters[skipAt+1:]...)
+	v2.TxnLockWaitersTotalHistogram.Observe(float64(len(q.waiters)))
+}
+
+func (q *sliceBasedWaiterQueue) resetCommittedAt(ts timestamp.Timestamp) {
+	q.Lock()
+	defer q.Unlock()
+	if ts.Greater(q.keyCommittedAt) {
+		q.keyCommittedAt = ts
+	}
+}
+
+func (q *sliceBasedWaiterQueue) removeByTxnID(txnID []byte) {
 	q.Lock()
 	defer q.Unlock()
 	if len(q.waiters) == 0 {
-		q.waiters = w
-	} else {
-		q.waiters = append(q.waiters, w...)
+		return
+	}
+	newWaiters := q.waiters[:0]
+	for _, w := range q.waiters {
+		if w.isTxn(txnID) {
+			w.notify(notifyValue{}, q.logger)
+			w.close("sliceBasedWaiterQueue removeByTxnID", q.logger)
+			continue
+		}
+		newWaiters = append(newWaiters, w)
+	}
+	q.waiters = newWaiters
+	v2.TxnLockWaitersTotalHistogram.Observe(float64(len(q.waiters)))
+}
+
+func (q *sliceBasedWaiterQueue) first() *waiter {
+	var w *waiter
+	q.iter(func(v *waiter) bool {
+		w = v
+		return false
+	})
+	return w
+}
+
+func (q *sliceBasedWaiterQueue) beginChange() {
+	q.Lock()
+	defer q.Unlock()
+
+	if q.beginChangeIdx != -1 {
+		panic("BUG: begin change multiple times")
+	}
+
+	if q.beginChangeIdx == -1 {
+		q.beginChangeIdx = len(q.waiters)
 	}
 }
 
-func (q *sliceBasedWaiterQueue) iter(fn func([]byte) bool) {
+func (q *sliceBasedWaiterQueue) commitChange() {
+	q.Lock()
+	defer q.Unlock()
+	if q.beginChangeIdx == -1 {
+		panic("BUG: invalid beginChangeIdx")
+	}
+
+	q.beginChangeIdx = -1
+}
+
+func (q *sliceBasedWaiterQueue) rollbackChange() {
+	q.Lock()
+	defer q.Unlock()
+
+	if q.beginChangeIdx == -1 {
+		panic("BUG: invalid beginChangeIdx")
+	}
+
+	n := len(q.waiters)
+	for i := q.beginChangeIdx; i < n; i++ {
+		q.waiters[i].close("sliceBasedWaiterQueue rollbackChange", q.logger)
+		q.waiters[i] = nil
+	}
+	q.waiters = q.waiters[:q.beginChangeIdx]
+	q.beginChangeIdx = -1
+	v2.TxnLockWaitersTotalHistogram.Observe(float64(len(q.waiters)))
+}
+
+func (q *sliceBasedWaiterQueue) getCommittedIdx() int {
+	i := len(q.waiters)
+	if q.beginChangeIdx != -1 {
+		i = q.beginChangeIdx
+	}
+	return i
+}
+
+func (q *sliceBasedWaiterQueue) iter(fn func(*waiter) bool) {
 	q.RLock()
 	defer q.RUnlock()
-	n := len(q.waiters)
-	for i := q.offset; i < n; i++ {
-		if !fn(q.waiters[i].txnID) {
+
+	idx := q.getCommittedIdx()
+	for i := 0; i < idx; i++ {
+		if !fn(q.waiters[i]) {
 			return
 		}
 	}
 }
 
+func (q *sliceBasedWaiterQueue) size() int {
+	q.RLock()
+	defer q.RUnlock()
+	return q.getCommittedIdx()
+}
+
 func (q *sliceBasedWaiterQueue) reset() {
 	q.Lock()
 	defer q.Unlock()
+	q.doResetLocked()
+}
+
+func (q *sliceBasedWaiterQueue) close(value notifyValue) {
+	q.Lock()
+	defer q.Unlock()
+	idx := q.getCommittedIdx()
+	for i := 0; i < idx; i++ {
+		w := q.waiters[i]
+		w.notify(value, q.logger)
+		w.close("sliceBasedWaiterQueue close", q.logger)
+	}
+	q.doResetLocked()
+}
+
+func (q *sliceBasedWaiterQueue) doResetLocked() {
+	q.resetWaitersLocked()
+	q.beginChangeIdx = -1
+	q.keyCommittedAt = timestamp.Timestamp{}
+}
+
+func (q *sliceBasedWaiterQueue) resetWaitersLocked() {
+	for i := range q.waiters {
+		q.waiters[i] = nil
+	}
 	q.waiters = q.waiters[:0]
-	q.offset = 0
 }

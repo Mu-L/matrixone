@@ -53,7 +53,7 @@ func TestParseUuid(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			uuid, err := ParseUuid(c.str)
-			t.Log(uuid.ToString())
+			t.Log(uuid.String())
 			if err != nil {
 				t.Error(err)
 			}
@@ -149,7 +149,7 @@ func TestCompareUuid(t *testing.T) {
 		name   string
 		left   string
 		right  string
-		expect int64
+		expect int
 	}{
 		{
 			name:   "test01",

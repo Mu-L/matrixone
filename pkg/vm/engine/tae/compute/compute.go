@@ -16,109 +16,98 @@ package compute
 
 import (
 	"bytes"
+	"sort"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
-
-	"golang.org/x/exp/constraints"
 )
 
-// unused
-// type deleteRange struct {
-// 	pos     uint32
-// 	deleted uint32
-// }
-
-// unused
-// func findDeleteRange(pos uint32, ranges []*deleteRange) *deleteRange {
-// 	left, right := 0, len(ranges)-1
-// 	var mid int
-// 	for left <= right {
-// 		mid = (left + right) / 2
-// 		if ranges[mid].pos < pos {
-// 			left = mid + 1
-// 		} else if ranges[mid].pos > pos {
-// 			right = mid - 1
-// 		} else {
-// 			break
-// 		}
-// 	}
-// 	if mid == 0 && ranges[mid].pos < pos {
-// 		mid = mid + 1
-// 	}
-// 	// logutil.Infof("pos=%d, mid=%d, range.pos=%d,range.deleted=%d", pos, mid, ranges[mid].pos, ranges[mid].deleted)
-// 	return ranges[mid]
-// }
-
-func ShuffleByDeletes(deleteMask, deletes *roaring.Bitmap) (destDelets *roaring.Bitmap) {
-	if deletes == nil || deletes.IsEmpty() {
-		return deleteMask
+func SortAndDedup[T any](
+	vals []T,
+	lessFn func(*T, *T) bool,
+	eqFn func(*T, *T) bool,
+) []T {
+	if len(vals) < 1 {
+		return vals
 	}
-	if deleteMask != nil && !deleteMask.IsEmpty() {
-		delIt := deleteMask.Iterator()
-		destDelets = roaring.New()
-		deleteIt := deletes.Iterator()
-		deleteCnt := uint32(0)
-		for deleteIt.HasNext() {
-			del := deleteIt.Next()
-			for delIt.HasNext() {
-				row := delIt.PeekNext()
-				if row < del {
-					destDelets.Add(row - deleteCnt)
-					delIt.Next()
-				} else if row == del {
-					delIt.Next()
-				} else {
-					break
-				}
-			}
-			deleteCnt++
+	sort.Slice(vals, func(i, j int) bool {
+		return lessFn(&vals[i], &vals[j])
+	})
+	pos := 1
+	for start, end := 1, len(vals); start < end; start++ {
+		if !eqFn(&vals[start], &vals[start-1]) {
+			vals[pos] = vals[start]
+			pos++
 		}
+	}
+	return vals[:pos]
+}
+
+func ShuffleByDeletes(inputDeletes, deletes *nulls.Bitmap) (outDeletes *nulls.Bitmap) {
+	if deletes.IsEmpty() || inputDeletes.IsEmpty() {
+		return inputDeletes
+	}
+	delIt := inputDeletes.GetBitmap().Iterator()
+	outDeletes = nulls.NewWithSize(1)
+	deleteIt := deletes.GetBitmap().Iterator()
+	deleteCnt := uint64(0)
+	for deleteIt.HasNext() {
+		del := deleteIt.Next()
 		for delIt.HasNext() {
-			row := delIt.Next()
-			destDelets.Add(row - deleteCnt)
+			row := delIt.PeekNext()
+			if row < del {
+				outDeletes.Add(row - deleteCnt)
+				delIt.Next()
+			} else if row == del {
+				delIt.Next()
+			} else {
+				break
+			}
 		}
+		deleteCnt++
 	}
-	return destDelets
+	for delIt.HasNext() {
+		row := delIt.Next()
+		outDeletes.Add(row - deleteCnt)
+	}
+
+	return outDeletes
 }
 
-func ShuffleOffset(offset uint32, deletes *roaring.Bitmap) uint32 {
-	if deletes == nil || deletes.IsEmpty() {
-		return offset
-	}
-	end := offset
-	deleteCnt := deletes.Rank(end)
-	for offset+uint32(deleteCnt) > end {
-		end = offset + uint32(deleteCnt)
-		deleteCnt = deletes.Rank(end)
-	}
-	return end
-}
-
-func GetOffsetMapBeforeApplyDeletes(deletes *roaring.Bitmap) []uint32 {
-	if deletes == nil || deletes.IsEmpty() {
-		return nil
-	}
-	prev := -1
-	mapping := make([]uint32, 0)
-	it := deletes.Iterator()
-	for it.HasNext() {
-		delete := it.Next()
-		for i := uint32(prev + 1); i < delete; i++ {
-			mapping = append(mapping, i)
+func GetOffsetOfBytes(
+	data *vector.Vector,
+	val []byte,
+	skipmask *nulls.Bitmap,
+) (offset int, exist bool) {
+	start, end := 0, data.Length()-1
+	var mid int
+	for start <= end {
+		mid = (start + end) / 2
+		res := bytes.Compare(data.GetBytesAt(mid), val)
+		if res > 0 {
+			end = mid - 1
+		} else if res < 0 {
+			start = mid + 1
+		} else {
+			if skipmask != nil && skipmask.Contains(uint64(mid)) {
+				return
+			}
+			offset = mid
+			exist = true
+			return
 		}
-		prev = int(delete)
 	}
-	mapping = append(mapping, uint32(prev)+1)
-	return mapping
+	return
+
 }
 
 func GetOffsetWithFunc[T any](
 	vals []T,
 	val T,
-	compare func(a, b T) int64,
-	skipmask *roaring.Bitmap,
+	compare func(a, b T) int,
+	skipmask *nulls.Bitmap,
 ) (offset int, exist bool) {
 	start, end := 0, len(vals)-1
 	var mid int
@@ -130,7 +119,7 @@ func GetOffsetWithFunc[T any](
 		} else if res < 0 {
 			start = mid + 1
 		} else {
-			if skipmask != nil && skipmask.Contains(uint32(mid)) {
+			if skipmask != nil && skipmask.Contains(uint64(mid)) {
 				return
 			}
 			offset = mid
@@ -141,9 +130,7 @@ func GetOffsetWithFunc[T any](
 	return
 }
 
-func GetOffsetOfOrdered[T types.OrderedT](vs, v any, skipmask *roaring.Bitmap) (offset int, exist bool) {
-	column := vs.([]T)
-	val := v.(T)
+func GetOffsetOfOrdered[T types.OrderedT](column []T, val T, skipmask *nulls.Bitmap) (offset int, exist bool) {
 	start, end := 0, len(column)-1
 	var mid int
 	for start <= end {
@@ -153,7 +140,7 @@ func GetOffsetOfOrdered[T types.OrderedT](vs, v any, skipmask *roaring.Bitmap) (
 		} else if column[mid] < val {
 			start = mid + 1
 		} else {
-			if skipmask != nil && skipmask.Contains(uint32(mid)) {
+			if skipmask != nil && skipmask.Contains(uint64(mid)) {
 				return
 			}
 			offset = mid
@@ -164,80 +151,102 @@ func GetOffsetOfOrdered[T types.OrderedT](vs, v any, skipmask *roaring.Bitmap) (
 	return
 }
 
-func EstimateSize(bat *containers.Batch, offset, length uint32) uint64 {
-	size := uint64(0)
-	for _, vec := range bat.Vecs {
-		colSize := length * uint32(vec.GetType().TypeSize())
-		size += uint64(colSize)
-	}
-	return size
-}
-
-func GetOffsetByVal(data containers.Vector, v any, skipmask *roaring.Bitmap) (offset int, exist bool) {
+func GetOffsetByVal(data containers.Vector, v any, skipmask *nulls.Bitmap) (offset int, exist bool) {
+	vec := data.GetDownstreamVector()
 	switch data.GetType().Oid {
 	case types.T_bool:
-		return GetOffsetWithFunc(data.Slice().([]bool), v.(bool), CompareBool, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[bool](vec)
+		return GetOffsetWithFunc(vs, v.(bool), CompareBool, skipmask)
+	case types.T_bit:
+		vs := vector.MustFixedColNoTypeCheck[uint64](vec)
+		return GetOffsetOfOrdered(vs, v.(uint64), skipmask)
 	case types.T_int8:
-		return GetOffsetOfOrdered[int8](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[int8](vec)
+		return GetOffsetOfOrdered(vs, v.(int8), skipmask)
 	case types.T_int16:
-		return GetOffsetOfOrdered[int16](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[int16](vec)
+		return GetOffsetOfOrdered(vs, v.(int16), skipmask)
 	case types.T_int32:
-		return GetOffsetOfOrdered[int32](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[int32](vec)
+		return GetOffsetOfOrdered(vs, v.(int32), skipmask)
 	case types.T_int64:
-		return GetOffsetOfOrdered[int64](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[int64](vec)
+		return GetOffsetOfOrdered(vs, v.(int64), skipmask)
 	case types.T_uint8:
-		return GetOffsetOfOrdered[uint8](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[uint8](vec)
+		return GetOffsetOfOrdered(vs, v.(uint8), skipmask)
 	case types.T_uint16:
-		return GetOffsetOfOrdered[uint16](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[uint16](vec)
+		return GetOffsetOfOrdered(vs, v.(uint16), skipmask)
 	case types.T_uint32:
-		return GetOffsetOfOrdered[uint32](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[uint32](vec)
+		return GetOffsetOfOrdered(vs, v.(uint32), skipmask)
 	case types.T_uint64:
-		return GetOffsetOfOrdered[uint64](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[uint64](vec)
+		return GetOffsetOfOrdered(vs, v.(uint64), skipmask)
 	case types.T_float32:
-		return GetOffsetOfOrdered[float32](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[float32](vec)
+		return GetOffsetOfOrdered(vs, v.(float32), skipmask)
 	case types.T_float64:
-		return GetOffsetOfOrdered[float64](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[float64](vec)
+		return GetOffsetOfOrdered(vs, v.(float64), skipmask)
 	case types.T_date:
-		return GetOffsetOfOrdered[types.Date](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[types.Date](vec)
+		return GetOffsetOfOrdered(vs, v.(types.Date), skipmask)
 	case types.T_time:
-		return GetOffsetOfOrdered[types.Time](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[types.Time](vec)
+		return GetOffsetOfOrdered(vs, v.(types.Time), skipmask)
 	case types.T_datetime:
-		return GetOffsetOfOrdered[types.Datetime](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[types.Datetime](vec)
+		return GetOffsetOfOrdered(vs, v.(types.Datetime), skipmask)
 	case types.T_timestamp:
-		return GetOffsetOfOrdered[types.Timestamp](data.Slice(), v, skipmask)
+		vs := vector.MustFixedColNoTypeCheck[types.Timestamp](vec)
+		return GetOffsetOfOrdered(vs, v.(types.Timestamp), skipmask)
+	case types.T_enum:
+		vs := vector.MustFixedColNoTypeCheck[types.Enum](vec)
+		return GetOffsetOfOrdered(vs, v.(types.Enum), skipmask)
 	case types.T_decimal64:
+		vs := vector.MustFixedColNoTypeCheck[types.Decimal64](vec)
 		return GetOffsetWithFunc(
-			data.Slice().([]types.Decimal64),
+			vs,
 			v.(types.Decimal64),
 			types.CompareDecimal64,
 			skipmask)
 	case types.T_decimal128:
+		vs := vector.MustFixedColNoTypeCheck[types.Decimal128](vec)
 		return GetOffsetWithFunc(
-			data.Slice().([]types.Decimal128),
+			vs,
 			v.(types.Decimal128),
 			types.CompareDecimal128,
 			skipmask)
 	case types.T_TS:
 		return GetOffsetWithFunc(
-			data.Slice().([]types.TS),
+			vector.MustFixedColNoTypeCheck[types.TS](vec),
 			v.(types.TS),
 			types.CompareTSTSAligned,
 			skipmask)
 	case types.T_Rowid:
 		return GetOffsetWithFunc(
-			data.Slice().([]types.Rowid),
+			vector.MustFixedColNoTypeCheck[types.Rowid](vec),
 			v.(types.Rowid),
 			types.CompareRowidRowidAligned,
 			skipmask)
+	case types.T_Blockid:
+		return GetOffsetWithFunc(
+			vector.MustFixedColNoTypeCheck[types.Blockid](vec),
+			v.(types.Blockid),
+			types.CompareBlockidBlockidAligned,
+			skipmask)
 	case types.T_uuid:
 		return GetOffsetWithFunc(
-			data.Slice().([]types.Uuid),
+			vector.MustFixedColNoTypeCheck[types.Uuid](vec),
 			v.(types.Uuid),
 			types.CompareUuid,
 			skipmask)
 	case types.T_char, types.T_varchar, types.T_blob,
-		types.T_binary, types.T_varbinary, types.T_json, types.T_text:
-		// column := data.Slice().(*containers.Bytes)
+		types.T_binary, types.T_varbinary, types.T_json, types.T_text,
+		types.T_array_float32, types.T_array_float64, types.T_datalink:
+		// data is retrieved from DN vector, hence T_array can be handled here.
 		val := v.([]byte)
 		start, end := 0, data.Length()-1
 		var mid int
@@ -249,7 +258,7 @@ func GetOffsetByVal(data containers.Vector, v any, skipmask *roaring.Bitmap) (of
 			} else if res < 0 {
 				start = mid + 1
 			} else {
-				if skipmask != nil && skipmask.Contains(uint32(mid)) {
+				if skipmask != nil && skipmask.Contains(uint64(mid)) {
 					return
 				}
 				offset = mid
@@ -263,34 +272,44 @@ func GetOffsetByVal(data containers.Vector, v any, skipmask *roaring.Bitmap) (of
 	}
 }
 
-func BinarySearchTs(a []types.TS, x types.TS) int {
-	start, mid, end := 0, 0, len(a)-1
-	for start <= end {
-		mid = (start + end) >> 1
-		switch {
-		case a[mid].Greater(x):
-			end = mid - 1
-		case a[mid].Less(x):
-			start = mid + 1
-		default:
-			return mid
+func GetOrderedMinAndMax[T types.OrderedT](vs ...T) (minv, maxv T) {
+	minv = vs[0]
+	maxv = vs[0]
+	for _, v := range vs[1:] {
+		if v < minv {
+			minv = v
+		}
+		if v > maxv {
+			maxv = v
 		}
 	}
-	return -1
+	return
 }
 
-func BinarySearch[T constraints.Ordered](a []T, x T) int {
-	start, mid, end := 0, 0, len(a)-1
-	for start <= end {
-		mid = (start + end) >> 1
-		switch {
-		case a[mid] > x:
-			end = mid - 1
-		case a[mid] < x:
-			start = mid + 1
-		default:
-			return mid
+func GetDecimal64MinAndMax(vs []types.Decimal64) (minv, maxv types.Decimal64) {
+	minv = vs[0]
+	maxv = vs[0]
+	for _, v := range vs[1:] {
+		if types.CompareDecimal64(v, minv) < 0 {
+			minv = v
+		}
+		if types.CompareDecimal64(v, maxv) > 0 {
+			maxv = v
 		}
 	}
-	return -1
+	return
+}
+
+func GetDecimal128MinAndMax(vs []types.Decimal128) (minv, maxv types.Decimal128) {
+	minv = vs[0]
+	maxv = vs[0]
+	for _, v := range vs[1:] {
+		if types.CompareDecimal128(v, minv) < 0 {
+			minv = v
+		}
+		if types.CompareDecimal128(v, maxv) > 0 {
+			maxv = v
+		}
+	}
+	return
 }

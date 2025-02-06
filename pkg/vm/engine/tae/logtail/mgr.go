@@ -17,6 +17,7 @@ package logtail
 import (
 	"context"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/logtail"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/sm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
@@ -36,7 +38,8 @@ const (
 	LogtailHeartbeatDuration = time.Millisecond * 2
 )
 
-func MockCallback(from, to timestamp.Timestamp, tails ...logtail.TableLogtail) error {
+func MockCallback(from, to timestamp.Timestamp, closeCB func(), tails ...logtail.TableLogtail) error {
+	defer closeCB()
 	if len(tails) == 0 {
 		return nil
 	}
@@ -51,18 +54,18 @@ func MockCallback(from, to timestamp.Timestamp, tails ...logtail.TableLogtail) e
 			}
 		}
 	}
-	logutil.Infof(s)
+	logutil.Info(s)
 	return nil
 }
 
 type callback struct {
-	cb func(from, to timestamp.Timestamp, tails ...logtail.TableLogtail) error
+	cb func(from, to timestamp.Timestamp, closeCB func(), tails ...logtail.TableLogtail) error
 }
 
-func (cb *callback) call(from, to timestamp.Timestamp, tails ...logtail.TableLogtail) error {
+func (cb *callback) call(from, to timestamp.Timestamp, closeCB func(), tails ...logtail.TableLogtail) error {
 	// for debug
 	// MockCallback(from,to,tails...)
-	return cb.cb(from, to, tails...)
+	return cb.cb(from, to, closeCB, tails...)
 }
 
 // Logtail manager holds sorted txn handles. Its main jobs:
@@ -73,24 +76,31 @@ func (cb *callback) call(from, to timestamp.Timestamp, tails ...logtail.TableLog
 type Manager struct {
 	txnbase.NoopCommitListener
 	table     *TxnTable
+	rt        *dbutils.Runtime
 	truncated types.TS
-	now       func() types.TS // now is from TxnManager
+	nowClock  func() types.TS // nowClock is from TxnManager
 
 	previousSaveTS      types.TS
 	logtailCallback     atomic.Pointer[callback]
 	collectLogtailQueue sm.Queue
 	waitCommitQueue     sm.Queue
+	eventOnce           sync.Once
+	nextCompactTS       types.TS
 }
 
-func NewManager(blockSize int, now func() types.TS) *Manager {
+func NewManager(
+	rt *dbutils.Runtime,
+	blockSize int,
+	nowClock func() types.TS) *Manager {
+
 	mgr := &Manager{
+		rt: rt,
 		table: NewTxnTable(
 			blockSize,
-			now,
+			nowClock,
 		),
-		now: now,
+		nowClock: nowClock,
 	}
-	mgr.previousSaveTS = now()
 	mgr.collectLogtailQueue = sm.NewSafeQueue(10000, 100, mgr.onCollectTxnLogtails)
 	mgr.waitCommitQueue = sm.NewSafeQueue(10000, 100, mgr.onWaitTxnCommit)
 
@@ -98,19 +108,24 @@ func NewManager(blockSize int, now func() types.TS) *Manager {
 }
 
 type txnWithLogtails struct {
-	txn   txnif.AsyncTxn
-	tails *[]logtail.TableLogtail
+	txn     txnif.AsyncTxn
+	tails   *[]logtail.TableLogtail
+	closeCB func()
 }
 
 func (mgr *Manager) onCollectTxnLogtails(items ...any) {
-	builder := NewTxnLogtailRespBuilder()
 	for _, item := range items {
 		txn := item.(txnif.AsyncTxn)
-		entries := builder.CollectLogtail(txn)
+		if txn.IsReplay() {
+			continue
+		}
+		builder := NewTxnLogtailRespBuilder(mgr.rt)
+		entries, closeCB := builder.CollectLogtail(txn)
 		txn.GetStore().DoneWaitEvent(1)
 		txnWithLogtails := &txnWithLogtails{
-			txn:   txn,
-			tails: entries,
+			txn:     txn,
+			tails:   entries,
+			closeCB: closeCB,
 		}
 		mgr.waitCommitQueue.Enqueue(txnWithLogtails)
 	}
@@ -128,22 +143,35 @@ func (mgr *Manager) onWaitTxnCommit(items ...any) {
 		mgr.generateLogtailWithTxn(txn)
 	}
 }
+
 func (mgr *Manager) Stop() {
 	mgr.collectLogtailQueue.Stop()
 	mgr.waitCommitQueue.Stop()
 }
 func (mgr *Manager) Start() {
-	mgr.collectLogtailQueue.Start()
 	mgr.waitCommitQueue.Start()
+	mgr.collectLogtailQueue.Start()
 }
 
 func (mgr *Manager) generateLogtailWithTxn(txn *txnWithLogtails) {
 	callback := mgr.logtailCallback.Load()
 	if callback != nil {
 		to := txn.txn.GetPrepareTS()
-		from := mgr.previousSaveTS
+		var from types.TS
+		if mgr.previousSaveTS.IsEmpty() {
+			from = to
+		} else {
+			from = mgr.previousSaveTS
+		}
 		mgr.previousSaveTS = to
-		callback.call(from.ToTimestamp(), to.ToTimestamp(), *txn.tails...)
+		// Send ts in order to initialize waterline of logtail service
+		mgr.eventOnce.Do(func() {
+			logutil.Infof("init waterline to %v", from.ToString())
+			callback.call(from.ToTimestamp(), from.ToTimestamp(), txn.closeCB)
+		})
+		callback.call(from.ToTimestamp(), to.ToTimestamp(), txn.closeCB, *txn.tails...)
+	} else {
+		txn.closeCB()
 	}
 }
 
@@ -155,7 +183,7 @@ func (mgr *Manager) OnEndPrePrepare(txn txnif.AsyncTxn) {
 	}
 	mgr.table.AddTxn(txn)
 }
-func (mgr *Manager) OnEndPreApplyCommit(txn txnif.AsyncTxn) {
+func (mgr *Manager) OnEndPrepareWAL(txn txnif.AsyncTxn) {
 	txn.GetStore().AddWaitEvent(1)
 	mgr.collectLogtailQueue.Enqueue(txn)
 }
@@ -169,34 +197,47 @@ func (mgr *Manager) GetReader(from, to types.TS) *Reader {
 	}
 }
 
-func (mgr *Manager) GCByTS(ctx context.Context, ts types.TS) {
-	if ts.Equal(mgr.truncated) {
+func (mgr *Manager) GetTruncateTS() types.TS {
+	return mgr.truncated
+}
+
+func (mgr *Manager) GCByTS(ctx context.Context, ts types.TS) (updated bool) {
+	if ts.LE(&mgr.truncated) {
 		return
 	}
+	updated = true
 	mgr.truncated = ts
 	cnt := mgr.table.TruncateByTimeStamp(ts)
-	logutil.Info("[logtail] GC", zap.String("ts", ts.ToString()), zap.Int("deleted", cnt))
+	logutil.Info(
+		"GC-Logtail-Table",
+		zap.String("ts", ts.ToString()),
+		zap.Int("deleted-blk", cnt),
+		zap.Int("remaining-blk", mgr.table.BlockCount()),
+	)
+	return
+}
+
+func (mgr *Manager) TryCompactTable() {
+	mgr.nextCompactTS = mgr.table.TryCompact(mgr.nextCompactTS, mgr.rt)
 }
 
 func (mgr *Manager) GetTableOperator(
 	from, to types.TS,
 	catalog *catalog.Catalog,
 	dbID, tableID uint64,
-	scope Scope,
 	visitor catalog.Processor,
 ) *BoundTableOperator {
 	reader := mgr.GetReader(from, to)
 	return NewBoundTableOperator(
 		catalog,
 		reader,
-		scope,
 		dbID,
 		tableID,
 		visitor,
 	)
 }
 
-func (mgr *Manager) RegisterCallback(cb func(from, to timestamp.Timestamp, tails ...logtail.TableLogtail) error) error {
+func (mgr *Manager) RegisterCallback(cb func(from, to timestamp.Timestamp, closeCB func(), tails ...logtail.TableLogtail) error) error {
 	callbackFn := &callback{
 		cb: cb,
 	}

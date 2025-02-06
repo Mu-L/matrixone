@@ -19,7 +19,7 @@ gen_config
 main
 /mo-server
 /mo-service
-/mo-dump
+/mo-debug
 cube*/
 store/
 mo-data/
@@ -27,10 +27,20 @@ node-*-data/
 pkg/catalog/test/
 pkg/config/system_vars.go
 pkg/config/system_vars_test.go
+pkg/udf/pythonservice/pyserver/udf/
+pkg/udf/pythonservice/pyserver/__pycache__/
 path_to_file
 tester-log/
+ut-report/
+**/scratch/
+pkg/util/trace/impl/motrace/pprof/
+**/.tmp.*
 
 # bvt generate files
 test/distributed/resources/into_outfile/outfile_*.csv
 test/distributed/resources/into_outfile_2/outfile_*.csv
 test/distributed/resources/json/export_*.csv
+/protobuf/
+
+# docker compose bvt generate files
+docker-compose-log/

@@ -26,6 +26,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 type PPLevel int8
@@ -35,15 +36,50 @@ const (
 	PPL1
 	PPL2
 	PPL3
+	PPL4
 )
 
-const PrintN = 3
+type ZonemapPrintKind int
+
+const (
+	ZonemapPrintKindNormal ZonemapPrintKind = iota
+	ZonemapPrintKindCompose
+	ZonemapPrintKindHex
+)
+
+const DefaultMaxRowsToPrint = 3
 
 func RepeatStr(str string, times int) string {
 	for i := 0; i < times; i++ {
 		str = fmt.Sprintf("%s\t", str)
 	}
 	return str
+}
+
+func DoIfFatalEnabled(fn func()) {
+	if logutil.GetSkip1Logger().Core().Enabled(zapcore.FatalLevel) {
+		fn()
+	}
+}
+func DoIfErrorEnabled(fn func()) {
+	if logutil.GetSkip1Logger().Core().Enabled(zapcore.ErrorLevel) {
+		fn()
+	}
+}
+func DoIfWarnEnabled(fn func()) {
+	if logutil.GetSkip1Logger().Core().Enabled(zapcore.WarnLevel) {
+		fn()
+	}
+}
+func DoIfInfoEnabled(fn func()) {
+	if logutil.GetSkip1Logger().Core().Enabled(zapcore.InfoLevel) {
+		fn()
+	}
+}
+func DoIfDebugEnabled(fn func()) {
+	if logutil.GetSkip1Logger().Core().Enabled(zapcore.DebugLevel) {
+		fn()
+	}
 }
 
 type opt struct {
@@ -63,8 +99,8 @@ type WithSpecialRowid struct{}
 
 func (w WithSpecialRowid) apply(o *opt) { o.specialRowid = true }
 
-func TypeStringValue(t types.Type, v any, opts ...TypePrintOpt) string {
-	if types.IsNull(v) {
+func TypeStringValue(t types.Type, v any, isNull bool, opts ...TypePrintOpt) string {
+	if isNull {
 		return "null"
 	}
 	opt := &opt{}
@@ -77,8 +113,10 @@ func TypeStringValue(t types.Type, v any, opts ...TypePrintOpt) string {
 		types.T_int64, types.T_uint8, types.T_uint16, types.T_uint32,
 		types.T_uint64, types.T_float32, types.T_float64:
 		return fmt.Sprintf("%v", v)
+	case types.T_bit:
+		return fmt.Sprintf("%v", v)
 	case types.T_char, types.T_varchar,
-		types.T_binary, types.T_varbinary, types.T_text, types.T_blob:
+		types.T_binary, types.T_varbinary, types.T_text, types.T_blob, types.T_datalink:
 		buf := v.([]byte)
 		printable := true
 		for _, c := range buf {
@@ -97,6 +135,11 @@ func TypeStringValue(t types.Type, v any, opts ...TypePrintOpt) string {
 		} else {
 			return fmt.Sprintf("%x", buf)
 		}
+	case types.T_array_float32:
+		// The parent function is mostly used to print the vector content for debugging.
+		return types.BytesToArrayToString[float32](v.([]byte))
+	case types.T_array_float64:
+		return types.BytesToArrayToString[float64](v.([]byte))
 	case types.T_date:
 		val := v.(types.Date)
 		return val.String()
@@ -121,7 +164,7 @@ func TypeStringValue(t types.Type, v any, opts ...TypePrintOpt) string {
 		return j.String()
 	case types.T_uuid:
 		val := v.(types.Uuid)
-		return val.ToString()
+		return val.String()
 	case types.T_TS:
 		val := v.(types.TS)
 		return val.ToString()
@@ -136,12 +179,15 @@ func TypeStringValue(t types.Type, v any, opts ...TypePrintOpt) string {
 	case types.T_Blockid:
 		val := v.(types.Blockid)
 		return val.String()
+	case types.T_enum:
+		val := v.(types.Enum)
+		return fmt.Sprintf("%v", val)
 	default:
 		return fmt.Sprintf("%v", v)
 	}
 }
 
-func vec2Str[T any](vec []T, v *vector.Vector) string {
+func vec2Str[T any](vec []T, v *vector.Vector, opts ...TypePrintOpt) string {
 	var w bytes.Buffer
 	_, _ = w.WriteString(fmt.Sprintf("[%d]: ", v.Length()))
 	first := true
@@ -150,86 +196,119 @@ func vec2Str[T any](vec []T, v *vector.Vector) string {
 			_ = w.WriteByte(',')
 		}
 		if v.GetNulls().Contains(uint64(i)) {
-			_, _ = w.WriteString(TypeStringValue(*v.GetType(), types.Null{}))
+			_, _ = w.WriteString(TypeStringValue(*v.GetType(), nil, true))
 		} else {
-			_, _ = w.WriteString(TypeStringValue(*v.GetType(), vec[i], WithDoNotPrintBin{}))
+			_, _ = w.WriteString(TypeStringValue(*v.GetType(), vec[i], false, opts...))
 		}
 		first = false
 	}
 	return w.String()
 }
 
-func moVec2String(v *vector.Vector, printN int) string {
+func MoVectorToString(v *vector.Vector, printN int, opts ...TypePrintOpt) string {
+	if v == nil || v.Length() == 0 {
+		return "empty vector"
+	}
+	if printN > v.Length() {
+		printN = v.Length()
+	}
 	switch v.GetType().Oid {
 	case types.T_bool:
-		return vec2Str(vector.MustFixedCol[bool](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[bool](v)[:printN], v)
 	case types.T_int8:
-		return vec2Str(vector.MustFixedCol[int8](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[int8](v)[:printN], v)
 	case types.T_int16:
-		return vec2Str(vector.MustFixedCol[int16](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[int16](v)[:printN], v)
 	case types.T_int32:
-		return vec2Str(vector.MustFixedCol[int32](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[int32](v)[:printN], v)
 	case types.T_int64:
-		return vec2Str(vector.MustFixedCol[int64](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[int64](v)[:printN], v)
 	case types.T_uint8:
-		return vec2Str(vector.MustFixedCol[uint8](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[uint8](v)[:printN], v)
 	case types.T_uint16:
-		return vec2Str(vector.MustFixedCol[uint16](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[uint16](v)[:printN], v)
 	case types.T_uint32:
-		return vec2Str(vector.MustFixedCol[uint32](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[uint32](v)[:printN], v)
 	case types.T_uint64:
-		return vec2Str(vector.MustFixedCol[uint64](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[uint64](v)[:printN], v)
 	case types.T_float32:
-		return vec2Str(vector.MustFixedCol[float32](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[float32](v)[:printN], v)
 	case types.T_float64:
-		return vec2Str(vector.MustFixedCol[float64](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[float64](v)[:printN], v)
 	case types.T_date:
-		return vec2Str(vector.MustFixedCol[types.Date](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Date](v)[:printN], v)
 	case types.T_datetime:
-		return vec2Str(vector.MustFixedCol[types.Datetime](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Datetime](v)[:printN], v)
 	case types.T_time:
-		return vec2Str(vector.MustFixedCol[types.Time](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Time](v)[:printN], v)
 	case types.T_timestamp:
-		return vec2Str(vector.MustFixedCol[types.Timestamp](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Timestamp](v)[:printN], v)
+	case types.T_enum:
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Enum](v)[:printN], v)
 	case types.T_decimal64:
-		return vec2Str(vector.MustFixedCol[types.Decimal64](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Decimal64](v)[:printN], v)
 	case types.T_decimal128:
-		return vec2Str(vector.MustFixedCol[types.Decimal128](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Decimal128](v)[:printN], v)
 	case types.T_uuid:
-		return vec2Str(vector.MustFixedCol[types.Uuid](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Uuid](v)[:printN], v)
 	case types.T_TS:
-		return vec2Str(vector.MustFixedCol[types.TS](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.TS](v)[:printN], v)
 	case types.T_Rowid:
-		return vec2Str(vector.MustFixedCol[types.Rowid](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Rowid](v)[:printN], v)
 	case types.T_Blockid:
-		return vec2Str(vector.MustFixedCol[types.Blockid](v)[:printN], v)
+		return vec2Str(vector.MustFixedColWithTypeCheck[types.Blockid](v)[:printN], v)
 	}
 	if v.GetType().IsVarlen() {
-		return vec2Str(vector.MustBytesCol(v)[:printN], v)
+		if !v.HasNull() {
+			return vec2Str(vector.InefficientMustBytesCol(v)[:printN], v, opts...)
+		}
+		vs := make([][]byte, 0, printN)
+		for i := 0; i < printN; i++ {
+			if v.GetNulls().Contains(uint64(i)) {
+				vs = append(vs, nil)
+			} else {
+				vs = append(vs, v.GetBytesAt(i))
+			}
+		}
+		return vec2Str(vs, v, opts...)
 	}
 	return fmt.Sprintf("unkown type vec... %v", *v.GetType())
 }
 
-func PrintMoBatch(moBat *batch.Batch, printN int) string {
-	n := moBat.Length()
-	if n > printN {
-		n = printN
+func MoBatchToString(moBat *batch.Batch, printN int) string {
+	if moBat == nil {
+		return "empty batch"
 	}
+	n := 0
 	buf := new(bytes.Buffer)
 	for i, vec := range moBat.Vecs {
-		fmt.Fprintf(buf, "[%v] = %v\n", moBat.Attrs[i], moVec2String(vec, n))
+		if vec == nil {
+			fmt.Fprintf(buf, "[col%v] = nil\n", i)
+			continue
+		}
+		if n = vec.Length(); n < printN {
+			printN = n
+		}
+		if len(moBat.Attrs) == 0 {
+			fmt.Fprintf(buf, "[col%v] = %v\n", i, MoVectorToString(vec, printN))
+		} else {
+			fmt.Fprintf(buf, "[%v] = %v\n", moBat.Attrs[i], MoVectorToString(vec, printN, WithDoNotPrintBin{}))
+		}
 	}
 	return buf.String()
 }
 
-func PrintApiBatch(apiBat *api.Batch, printN int) string {
+func ApiBatchToString(apiBat *api.Batch, printN int) string {
+	if apiBat == nil {
+		return ""
+	}
 	bat, _ := batch.ProtoBatchToBatch(apiBat)
-	return PrintMoBatch(bat, printN)
+	return MoBatchToString(bat, printN)
 }
 
 func DebugMoBatch(moBat *batch.Batch) string {
 	if !logutil.GetSkip1Logger().Core().Enabled(zap.DebugLevel) {
 		return "not debug level"
 	}
-	return PrintMoBatch(moBat, PrintN)
+	return MoBatchToString(moBat, DefaultMaxRowsToPrint)
 }

@@ -18,11 +18,19 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 )
+
+func init() {
+	// Tips: Op 'time.Local = time.FixedZone(...)' would cause DATA RACE against to time.Now()
+}
 
 func TestNoopTableOptions_FormatDdl(t *testing.T) {
 	type args struct {
@@ -128,7 +136,7 @@ func TestRow_SetFloat64(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			r := tt.fields.Table.GetRow(context.TODO())
 			defer r.Free()
-			r.SetColumnVal(tt.args.col, tt.args.val)
+			r.SetColumnVal(tt.args.col, Float64Field(tt.args.val))
 		})
 	}
 }
@@ -146,17 +154,34 @@ func TestRow_ToStrings(t *testing.T) {
 		{
 			name:   "nil",
 			fields: fields{Table: dummyTable, prepare: func(r *Row) { r.Reset() }},
-			want:   []string{"", "0", "0.0"},
+			want:   []string{"", "0", "0"},
 		},
 		{
 			name: "nil",
 			fields: fields{Table: dummyTable,
 				prepare: func(r *Row) {
-					r.SetColumnVal(dummyStrColumn, "0")
-					r.SetColumnVal(dummyFloat64Column, 1.1)
-					r.SetColumnVal(dummyInt64Column, int64(1))
+					r.SetColumnVal(dummyStrColumn, StringField("0"))
+					r.SetColumnVal(dummyFloat64Column, Float64Field(1.1234567))
+					r.SetColumnVal(dummyInt64Column, Int64Field(1))
 				}},
-			want: []string{"0", "1", "1.1"},
+			want: []string{"0", "1", "1.1234567"},
+		},
+		{
+			name: "json",
+			fields: fields{
+				Table: &Table{
+					Columns: []Column{
+						JsonColumn("json1", ""),
+						JsonColumn("json2", ""),
+						JsonColumn("json3", ""),
+					},
+				},
+				prepare: func(r *Row) {
+					r.SetColumnVal(JsonColumn("json1", ""), StringField(`{"key":"str"}`))
+					r.SetColumnVal(JsonColumn("json2", ""), JsonField(`{"key":"json"}`))
+					r.SetColumnVal(JsonColumn("json3", ""), BytesField([]byte(`{"key":"byte"}`)))
+				}},
+			want: []string{`{"key":"str"}`, `{"key":"json"}`, `{"key":"byte"}`},
 		},
 	}
 	for _, tt := range tests {
@@ -227,7 +252,6 @@ func TestTable_ToCreateSql(t *testing.T) {
 		})
 	}
 }
-
 func TestViewOption_Apply(t *testing.T) {
 	type args struct {
 		view *View
@@ -308,5 +332,125 @@ func TestSetPathBuilder(t *testing.T) {
 		t.Logf("got ErrNotSupported normally")
 	} else {
 		t.Errorf("unexpect err: %v", err)
+	}
+}
+
+func TestColumnField_EncodedDatetime(t *testing.T) {
+	type fields struct {
+		cf ColumnField
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		wantT  time.Time
+		want   string
+	}{
+		{
+			name: "zero",
+			fields: fields{
+				cf: TimeField(ZeroTime),
+			},
+			wantT: ZeroTime,
+			want:  "0001-01-01 00:00:00.000000",
+		},
+		{
+			name: "empty",
+			fields: fields{
+				cf: TimeField(time.Time{}),
+			},
+			wantT: time.Time{},
+			want:  "0001-01-01 00:00:00.000000",
+		},
+		{
+			name: "Unix_Zero",
+			fields: fields{
+				cf: TimeField(time.Unix(0, 0).UTC()),
+			},
+			wantT: time.Unix(0, 0).UTC(),
+			want:  "1970-01-01 00:00:00.000000",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			buf := tt.fields.cf.GetTime()
+			require.Equal(t, tt.wantT, buf)
+			var bbuf [64]byte
+			dst := tt.fields.cf.EncodedDatetime(bbuf[:0])
+			require.Equal(t, tt.want, string(dst))
+		})
+	}
+}
+
+func TestTimeField(t *testing.T) {
+	type args struct {
+		val time.Time
+	}
+	tests := []struct {
+		name string
+		args args
+		want time.Time
+	}{
+		{
+			name: "empty",
+			args: args{},
+			want: time.Time{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := TimeField(tt.args.val)
+			assert.Equalf(t, tt.want, f.GetTime(), "TimeField(%v)", tt.args.val)
+		})
+	}
+}
+
+// BenchmarkTimeField
+//
+// goos: darwin
+// goarch: arm64
+// pkg: github.com/matrixorigin/matrixone/pkg/util/export/table
+// BenchmarkTimeField
+// BenchmarkTimeField/uuid.string
+// BenchmarkTimeField/uuid.string-10         	31779484	        39.32 ns/op
+// BenchmarkTimeField/EncodeUUIDHex
+// BenchmarkTimeField/EncodeUUIDHex-10       	33151078	        37.44 ns/op
+// PASS
+func BenchmarkTimeField(b *testing.B) {
+	type args struct {
+		val [16]byte
+	}
+	benchmarks := []struct {
+		name string
+		args args
+		op   func(val [16]byte)
+	}{
+		{
+			name: "uuid.string",
+			args: args{
+				val: uuid.New(),
+			},
+			op: func(val [16]byte) {
+				_ = uuid.UUID(val).String()
+			},
+		},
+		{
+			name: "EncodeUUIDHex",
+			args: args{
+				val: uuid.New(),
+			},
+			op: func(val [16]byte) {
+				var bytes [36]byte
+				util.EncodeUUIDHex(bytes[:], val[:])
+				_ = string(bytes[:])
+			},
+		},
+	}
+	for _, bm := range benchmarks {
+		b.Run(bm.name, func(b *testing.B) {
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				bm.op(bm.args.val)
+			}
+		})
 	}
 }

@@ -23,12 +23,21 @@ package motrace
 
 import (
 	"context"
-	"github.com/matrixorigin/matrixone/pkg/util/trace"
+	"encoding/hex"
+	"errors"
+	"path"
 	"sync"
 	"time"
 	"unsafe"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/util/export/table"
+	"github.com/matrixorigin/matrixone/pkg/util/profile"
+	"github.com/matrixorigin/matrixone/pkg/util/trace"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
 )
 
 //nolint:revive // revive complains about stutter of `trace.TraceFlags`.
@@ -39,15 +48,38 @@ var _ trace.Tracer = &MOTracer{}
 type MOTracer struct {
 	trace.TracerConfig
 	provider *MOTracerProvider
+
+	mux            sync.Mutex
+	profileBackOff map[string]BackOff
 }
 
-func (t *MOTracer) Start(ctx context.Context, name string, opts ...trace.SpanOption) (context.Context, trace.Span) {
-	if !t.IsEnable() {
+// Start starts a Span and returns it along with a context containing it.
+//
+// The Span is created with the provided name and as a child of any existing
+// span context found in passed context. The created Span will be
+// configured appropriately by any SpanOption passed.
+//
+// Only timeout Span can be recorded, hold in SpanConfig.LongTimeThreshold.
+// There are 4 diff ways to setting threshold value:
+// 1. using default val, which was hold by MOTracerProvider.longSpanTime.
+// 2. using `WithLongTimeThreshold()` SpanOption, that will override the default val.
+// 3. passing the Deadline context, then it will check the Deadline at Span ended instead of checking Threshold.
+// 4. using `WithHungThreshold()` SpanOption, that will override the passed context with context.WithTimeout(ctx, hungThreshold)
+// and create a new work goroutine to check Deadline event.
+//
+// When Span pass timeout threshold or got the deadline event, not only the Span will be recorded,
+// but also trigger profile dump specify by `WithProfileGoroutine()`, `WithProfileHeap()`, `WithProfileThreadCreate()`,
+// `WithProfileAllocs()`, `WithProfileBlock()`, `WithProfileMutex()`, `WithProfileCpuSecs()`, `WithProfileTraceSecs()` SpanOption.
+func (t *MOTracer) Start(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
+	if !t.IsEnable(opts...) {
 		return ctx, trace.NoopSpan{}
 	}
+
 	span := newMOSpan()
-	span.init(name, opts...)
+
 	span.tracer = t
+	span.ctx = ctx
+	span.init(name, opts...)
 
 	parent := trace.SpanFromContext(ctx)
 	psc := parent.SpanContext()
@@ -56,22 +88,111 @@ func (t *MOTracer) Start(ctx context.Context, name string, opts ...trace.SpanOpt
 		span.TraceID, span.SpanID = t.provider.idGenerator.NewIDs()
 		span.Parent = trace.NoopSpan{}
 	} else {
-		span.TraceID, span.SpanID, span.Kind = psc.TraceID, t.provider.idGenerator.NewSpanID(), psc.Kind
+		span.TraceID, span.SpanID = psc.TraceID, t.provider.idGenerator.NewSpanID()
 		span.Parent = parent
+	}
+
+	// handle HungThreshold
+	if threshold := span.SpanConfig.HungThreshold(); threshold > 0 {
+		s := newMOHungSpan(span)
+		return trace.ContextWithSpan(ctx, s), s
 	}
 
 	return trace.ContextWithSpan(ctx, span), span
 }
 
-func (t *MOTracer) Debug(ctx context.Context, name string, opts ...trace.SpanOption) (context.Context, trace.Span) {
+func (t *MOTracer) Debug(ctx context.Context, name string, opts ...trace.SpanStartOption) (context.Context, trace.Span) {
 	if !t.provider.debugMode {
 		return ctx, trace.NoopSpan{}
 	}
 	return t.Start(ctx, name, opts...)
 }
 
-func (t *MOTracer) IsEnable() bool {
-	return t.provider.IsEnable()
+func (t *MOTracer) IsEnable(opts ...trace.SpanStartOption) bool {
+	var cfg trace.SpanConfig
+	for idx := range opts {
+		opts[idx].ApplySpanStart(&cfg)
+	}
+
+	enable := t.provider.IsEnable()
+
+	// check if is this span kind controlled by mo_ctl.
+	if has, state, _ := trace.IsMOCtledSpan(cfg.Kind); has {
+		return enable && state
+	}
+
+	return enable
+}
+
+func (t *MOTracer) GetBackOff(name string, strategy trace.BackOffStrategy, cfg *trace.BackOffConfig) BackOff {
+	key := path.Join(name, strategy.String())
+	t.mux.Lock()
+	defer t.mux.Unlock()
+	b, exist := t.profileBackOff[key]
+	if !exist {
+		switch strategy {
+		case trace.ConstBackOffStrategy:
+			b = NewConstBackoff(cfg.Interval)
+		case trace.NoneBackOffStrategy:
+			fallthrough
+		default:
+			b = NoneBackOff{}
+		}
+		t.profileBackOff[key] = b
+	}
+	return b
+}
+
+var _ trace.Span = (*MOHungSpan)(nil)
+
+type MOHungSpan struct {
+	*MOSpan
+	// quitCtx is used to stop the work goroutine loop().
+	// Because of quitCtx and deadlineCtx are based on init span.ctx, both can be canceled outside span.
+	// So, quitCtx can help to detect this situation, like loop().
+	quitCtx context.Context
+	// quitCancel cancel quitCtx in End()
+	quitCancel context.CancelFunc
+	trigger    *time.Timer
+	stop       func()
+	stopped    bool
+	// mux control doProfile exec order, called in loop and End
+	mux sync.Mutex
+}
+
+func newMOHungSpan(span *MOSpan) *MOHungSpan {
+	ctx, cancel := context.WithTimeoutCause(span.ctx, span.SpanConfig.HungThreshold(), moerr.CauseNewMOHungSpan)
+	span.ctx = ctx
+	s := &MOHungSpan{
+		MOSpan:     span,
+		quitCtx:    ctx,
+		quitCancel: cancel,
+	}
+	s.trigger = time.AfterFunc(s.HungThreshold(), func() {
+		s.mux.Lock()
+		defer s.mux.Unlock()
+		if e := s.quitCtx.Err(); errors.Is(e, context.Canceled) || s.stopped {
+			return
+		}
+		s.doProfile()
+		logutil.Warn("span trigger hung threshold",
+			trace.SpanField(s.SpanContext()),
+			zap.String("span_name", s.Name),
+			zap.Duration("threshold", s.HungThreshold()))
+	})
+	s.stop = func() {
+		s.trigger.Stop()
+		s.quitCancel()
+		s.stopped = true
+	}
+	return s
+}
+
+func (s *MOHungSpan) End(options ...trace.SpanEndOption) {
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	s.stop()
+	s.MOSpan.End(options...)
 }
 
 var _ trace.Span = (*MOSpan)(nil)
@@ -82,22 +203,33 @@ type MOSpan struct {
 	Name      string    `json:"name"`
 	StartTime time.Time `json:"start_time"`
 	EndTime   time.Time `jons:"end_time"`
-	Duration  uint64    `json:"duration"`
+	// Duration
+	Duration time.Duration `json:"duration"`
+	// ExtraFields
+	ExtraFields []zap.Field `json:"extra"`
 
-	tracer *MOTracer `json:"-"`
+	tracer     *MOTracer
+	ctx        context.Context
+	needRecord bool
+
+	doneProfile bool
+	onEnd       []func()
 }
 
 var spanPool = &sync.Pool{New: func() any {
-	return &MOSpan{}
+	return &MOSpan{
+		onEnd: make([]func(), 0, 2), // speedup first append op
+	}
 }}
 
 func newMOSpan() *MOSpan {
 	return spanPool.Get().(*MOSpan)
 }
 
-func (s *MOSpan) init(name string, opts ...trace.SpanOption) {
+func (s *MOSpan) init(name string, opts ...trace.SpanStartOption) {
 	s.Name = name
 	s.StartTime = time.Now()
+	s.LongTimeThreshold = s.tracer.provider.longSpanTime
 	for _, opt := range opts {
 		opt.ApplySpanStart(&s.SpanConfig)
 	}
@@ -107,15 +239,18 @@ func (s *MOSpan) Size() int64 {
 	return int64(unsafe.Sizeof(*s)) + int64(len(s.Name))
 }
 
-var zeroTime = time.Time{}
-
 func (s *MOSpan) Free() {
 	s.SpanConfig.Reset()
 	s.Parent = nil
 	s.Name = ""
 	s.tracer = nil
-	s.StartTime = zeroTime
-	s.EndTime = zeroTime
+	s.ctx = nil
+	s.needRecord = false
+	s.ExtraFields = nil
+	s.StartTime = table.ZeroTime
+	s.EndTime = table.ZeroTime
+	s.doneProfile = false
+	s.onEnd = s.onEnd[:0]
 	spanPool.Put(s)
 }
 
@@ -127,30 +262,219 @@ func (s *MOSpan) GetTable() *table.Table { return spanView.OriginTable }
 
 func (s *MOSpan) FillRow(ctx context.Context, row *table.Row) {
 	row.Reset()
-	row.SetColumnVal(rawItemCol, spanView.Table)
-	row.SetColumnVal(spanIDCol, s.SpanID.String())
-	row.SetColumnVal(traceIDCol, s.TraceID.String())
-	row.SetColumnVal(spanKindCol, s.Kind.String())
-	row.SetColumnVal(parentSpanIDCol, s.Parent.SpanContext().SpanID.String())
-	row.SetColumnVal(nodeUUIDCol, GetNodeResource().NodeUuid)
-	row.SetColumnVal(nodeTypeCol, GetNodeResource().NodeType)
-	row.SetColumnVal(spanNameCol, s.Name)
-	row.SetColumnVal(startTimeCol, s.StartTime)
-	row.SetColumnVal(endTimeCol, s.EndTime)
-	row.SetColumnVal(durationCol, uint64(s.EndTime.Sub(s.StartTime))) // Duration
-	row.SetColumnVal(resourceCol, s.tracer.provider.resource.String())
+	row.SetColumnVal(rawItemCol, table.StringField(spanView.Table))
+	row.SetColumnVal(spanIDCol, table.StringField(hex.EncodeToString(s.SpanID[:])))
+	row.SetColumnVal(traceIDCol, table.UuidField(s.TraceID[:]))
+	row.SetColumnVal(spanKindCol, table.StringField(s.Kind.String()))
+	psc := s.Parent.SpanContext()
+	if psc.SpanID != trace.NilSpanID {
+		row.SetColumnVal(parentSpanIDCol, table.StringField(hex.EncodeToString(psc.SpanID[:])))
+	}
+	row.SetColumnVal(nodeUUIDCol, table.StringField(GetNodeResource().NodeUuid))
+	row.SetColumnVal(nodeTypeCol, table.StringField(GetNodeResource().NodeType))
+	row.SetColumnVal(spanNameCol, table.StringField(s.Name))
+	row.SetColumnVal(startTimeCol, table.TimeField(s.StartTime))
+	row.SetColumnVal(endTimeCol, table.TimeField(s.EndTime))
+	row.SetColumnVal(timestampCol, table.TimeField(s.EndTime))
+	row.SetColumnVal(durationCol, table.Uint64Field(uint64(s.Duration)))
+	row.SetColumnVal(resourceCol, table.StringField(s.tracer.provider.resource.String()))
+
+	// fill extra fields
+	if len(s.ExtraFields) > 0 {
+		encoder := getEncoder()
+		buf, err := encoder.EncodeEntry(zapcore.Entry{}, s.ExtraFields)
+		if err != nil {
+			_ = moerr.ConvertGoError(ctx, err)
+		}
+		if buf != nil {
+			defer buf.Free()
+			row.SetColumnVal(extraCol, table.StringField(buf.String()))
+		}
+	}
 }
 
+// End completes the Span. Span will be recorded if meets the following condition:
+// 1. If set Deadline in ctx, which specified at the MOTracer.Start, just check if encounters the Deadline.
+// 2. If NOT set Deadline, then check condition: MOSpan.Duration >= MOSpan.GetLongTimeThreshold().
 func (s *MOSpan) End(options ...trace.SpanEndOption) {
+	var err error
+	s.EndTime = time.Now()
+	for _, fn := range s.onEnd {
+		fn()
+	}
+
+	s.needRecord, err = s.NeedRecord()
+
+	if !s.needRecord {
+		freeMOSpan(s)
+		return
+	}
+	// apply End option
 	for _, opt := range options {
 		opt.ApplySpanEnd(&s.SpanConfig)
 	}
-	if s.EndTime.IsZero() {
-		s.EndTime = time.Now()
+
+	s.AddExtraFields(s.SpanConfig.Extra...)
+
+	// do profile
+	if s.NeedProfile() {
+		s.doProfile()
 	}
+	// record error info
+	if err != nil {
+		s.ExtraFields = append(s.ExtraFields, zap.Error(err))
+	}
+	// do Collect
 	for _, sp := range s.tracer.provider.spanProcessors {
 		sp.OnEnd(s)
 	}
+}
+
+func (s *MOSpan) doProfileRuntime(ctx context.Context, name string, debug int) {
+	now := time.Now()
+	factory := s.tracer.provider.writerFactory
+	filepath := profile.GetProfileName(name, s.SpanID.String(), now)
+	w := factory.GetWriter(ctx, filepath)
+	err := profile.ProfileRuntime(name, w, debug)
+	if err == nil {
+		err = w.Close()
+	}
+	if err != nil {
+		s.AddExtraFields(zap.String(name, err.Error()))
+	} else {
+		s.AddExtraFields(zap.String(name, filepath))
+	}
+}
+
+func (s *MOSpan) doProfileSystemStatus(ctx context.Context) {
+	if s.SpanConfig.ProfileSystemStatusFn == nil {
+		return
+	}
+	data, err := s.SpanConfig.ProfileSystemStatusFn()
+	if err != nil {
+		s.AddExtraFields(zap.String(profile.STATUS, err.Error()))
+		return
+	}
+	if data == nil {
+		return
+	}
+
+	factory := s.tracer.provider.writerFactory
+	filepath := profile.GetSystemStatusFilePath(s.SpanID.String(), time.Now())
+	logutil.Infof("system status dumped to file %s", filepath)
+	w := factory.GetWriter(ctx, filepath)
+	_, err = w.Write(data)
+	if err == nil {
+		err = w.Close()
+	}
+	if err != nil {
+		s.AddExtraFields(zap.String(profile.STATUS, err.Error()))
+	} else {
+		s.AddExtraFields(zap.String(profile.STATUS, filepath))
+	}
+}
+
+func (s *MOSpan) NeedRecord() (bool, error) {
+	// if the span kind falls in mo_ctl controlled spans, we
+	// hope it ignores the long time threshold set by the tracer and deadline restrictions.
+	// but the threshold set by mo ctl need to be considered
+	if has, state, threshold := trace.IsMOCtledSpan(s.Kind); has {
+		return state && (s.Duration >= threshold), nil
+	}
+	// the default logic that before mo_ctl controlled spans have been introduced
+	deadline, hasDeadline := s.ctx.Deadline()
+	s.Duration = s.EndTime.Sub(s.StartTime)
+	if hasDeadline {
+		if s.EndTime.After(deadline) {
+			return true, s.ctx.Err()
+		}
+	} else {
+		return s.Duration >= s.LongTimeThreshold, nil
+	}
+	return false, nil
+}
+
+// doProfile is sync op.
+func (s *MOSpan) doProfile() {
+	if s.doneProfile {
+		return
+	}
+	if !s.tracer.provider.enableSpanProfile {
+		return
+	}
+	if backoff, cfg := s.BackOffStrategy(); backoff > trace.NoneBackOffStrategy {
+		b := s.tracer.GetBackOff(s.Name, backoff, cfg)
+		if !b.Count() {
+			return
+		}
+	}
+	factory := s.tracer.provider.writerFactory
+	ctx := DefaultContext()
+	// do profile goroutine txt
+	if s.ProfileGoroutine() {
+		s.doProfileRuntime(ctx, profile.GOROUTINE, 2)
+	}
+	// do profile heap pprof
+	if s.ProfileHeap() {
+		s.doProfileRuntime(ctx, profile.HEAP, 0)
+	}
+	// do profile allocs
+	if s.ProfileAllocs() {
+		s.doProfileRuntime(ctx, profile.ALLOCS, 0)
+	}
+	// do profile threadcreate
+	if s.ProfileThreadCreate() {
+		s.doProfileRuntime(ctx, profile.THREADCREATE, 0)
+	}
+	// do profile block
+	if s.ProfileBlock() {
+		s.doProfileRuntime(ctx, profile.BLOCK, 0)
+	}
+	// do profile mutex
+	if s.ProfileMutex() {
+		s.doProfileRuntime(ctx, profile.MUTEX, 0)
+	}
+	// profile cpu should be the last one op, caused by it will sustain few seconds
+	if s.ProfileCpuSecs() > 0 {
+		filepath := profile.GetProfileName(profile.CPU, s.SpanID.String(), s.EndTime)
+		w := factory.GetWriter(ctx, filepath)
+		err := profile.ProfileCPU(w, s.ProfileCpuSecs())
+		if err == nil {
+			err = w.Close()
+		}
+		if err != nil {
+			s.AddExtraFields(zap.String(profile.CPU, err.Error()))
+		} else {
+			s.AddExtraFields(zap.String(profile.CPU, filepath))
+		}
+	}
+	// profile trace is a sync-op, it will sustain few seconds
+	if s.ProfileTraceSecs() > 0 {
+		filepath := profile.GetProfileName(profile.TRACE, s.SpanID.String(), s.EndTime)
+		w := factory.GetWriter(ctx, filepath)
+		err := profile.ProfileTrace(w, s.ProfileTraceSecs())
+		if err == nil {
+			err = w.Close()
+		}
+		if err != nil {
+			s.AddExtraFields(zap.String(profile.TRACE, err.Error()))
+		} else {
+			s.AddExtraFields(zap.String(profile.TRACE, filepath))
+		}
+	}
+	// profile system status.
+	if s.ProfileSystemStatus() {
+		s.doProfileSystemStatus(ctx)
+	}
+	s.doneProfile = true
+}
+
+var freeMOSpan = func(s *MOSpan) {
+	s.Free()
+}
+
+func (s *MOSpan) AddExtraFields(fields ...zap.Field) {
+	s.ExtraFields = append(s.ExtraFields, fields...)
 }
 
 func (s *MOSpan) SpanContext() trace.SpanContext {
@@ -161,8 +485,65 @@ func (s *MOSpan) ParentSpanContext() trace.SpanContext {
 	return s.SpanConfig.Parent.SpanContext()
 }
 
-const timestampFormatter = "2006-01-02 15:04:05.000000"
+var jsonEncoder zapcore.Encoder
+var jsonEncoderInit sync.Once
 
-func Time2DatetimeString(t time.Time) string {
-	return t.Format(timestampFormatter)
+func getEncoder() zapcore.Encoder {
+	jsonEncoderInit.Do(func() {
+		jsonEncoder = zapcore.NewJSONEncoder(zapcore.EncoderConfig{
+			TimeKey:        "",
+			LevelKey:       "",
+			NameKey:        "",
+			CallerKey:      "",
+			FunctionKey:    zapcore.OmitKey,
+			MessageKey:     "",
+			StacktraceKey:  "",
+			SkipLineEnding: true,
+		})
+	})
+	return jsonEncoder.Clone()
 }
+
+type BackOff interface {
+	// Count do the event count
+	// return true, means not in backoff cycle. You can run your code.
+	// return false, means you should skip this time.
+	Count() bool
+}
+
+var _ BackOff = (*ConstBackOff)(nil)
+
+type ConstBackOff struct {
+	mux      sync.Mutex
+	interval time.Duration
+	next     time.Time
+	count    uint64
+}
+
+func (b *ConstBackOff) Count() bool {
+	b.mux.Lock()
+	defer b.mux.Unlock()
+	now := time.Now()
+	if b.check(now) {
+		b.next = now.Add(b.interval)
+		b.count++
+		return true
+	}
+	return false
+}
+
+func (b *ConstBackOff) check(t time.Time) bool {
+	return t.After(b.next)
+}
+
+func NewConstBackoff(interval time.Duration) *ConstBackOff {
+	return &ConstBackOff{interval: interval, next: time.Now(), count: 0}
+}
+
+var _ BackOff = (*NoneBackOff)(nil)
+
+type NoneBackOff struct{}
+
+func (b NoneBackOff) Count() bool { return true }
+
+// fixme implement ExponentialBackOff, you can see https://pkg.go.dev/github.com/cenkalti/backoff/v4#NewExponentialBackOff

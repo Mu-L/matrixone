@@ -16,27 +16,37 @@ package lockservice
 
 import (
 	"bytes"
+	"fmt"
 	"sync"
 
+	"github.com/matrixorigin/matrixone/pkg/common/log"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/lock"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/panjf2000/ants/v2"
 )
 
 var (
-	txnPool = sync.Pool{New: func() any {
-		return &activeTxn{holdLocks: make(map[uint64]*cowSlice)}
-	}}
+	parallelUnlockTables = 2
 )
+
+type tableLockHolder struct {
+	tableKeys  map[uint64]*cowSlice
+	tableBinds map[uint64]pb.LockTable
+}
 
 // activeTxn one goroutine write, multi goroutine read
 type activeTxn struct {
-	sync.RWMutex
-	txnID         []byte
-	txnKey        string
-	fsp           *fixedSlicePool
-	blockedWaiter *waiter
-	holdLocks     map[uint64]*cowSlice
-	remoteService string
+	*sync.RWMutex
+	txnID          []byte
+	txnKey         string
+	fsp            *fixedSlicePool
+	blockedWaiters []*waiter
+	lockHolders    map[uint32]*tableLockHolder
+	remoteService  string
+	deadlockFound  bool
 }
 
 func newActiveTxn(
@@ -44,7 +54,7 @@ func newActiveTxn(
 	txnKey string,
 	fsp *fixedSlicePool,
 	remoteService string) *activeTxn {
-	txn := txnPool.Get().(*activeTxn)
+	txn := reuse.Alloc[activeTxn](nil)
 	txn.Lock()
 	defer txn.Unlock()
 	txn.txnID = txnID
@@ -54,11 +64,38 @@ func newActiveTxn(
 	return txn
 }
 
-func (txn *activeTxn) lockAdded(
-	serviceID string,
+func (txn activeTxn) TypeName() string {
+	return "lockservice.activeTxn"
+}
+
+func (txn *activeTxn) lockRemoved(
+	group uint32,
 	table uint64,
+	removedLocks map[string]struct{}) {
+	h := txn.getHoldLocksLocked(group)
+	v, ok := h.tableKeys[table]
+	if !ok {
+		return
+	}
+	newV, _ := newCowSlice(txn.fsp, nil)
+	s := v.slice()
+	defer s.unref()
+	s.iter(func(v []byte) bool {
+		if _, ok := removedLocks[util.UnsafeBytesToString(v)]; !ok {
+			newV.append([][]byte{v})
+		}
+		return true
+	})
+	v.close()
+	h.tableKeys[table] = newV
+}
+
+func (txn *activeTxn) lockAdded(
+	group uint32,
+	bind pb.LockTable,
 	locks [][]byte,
-	locked bool) {
+	logger *log.MOLogger,
+) error {
 
 	// only in the lockservice node where the transaction was
 	// initiated will it be holds all locks. A remote transaction
@@ -76,101 +113,247 @@ func (txn *activeTxn) lockAdded(
 	//    between the deadlock detection module to query, it will miss
 	//    the lock information. We use mutex to solve it.
 
-	if !locked {
-		txn.Lock()
-		defer txn.Unlock()
-	}
-	defer logTxnLockAdded(serviceID, txn, locks)
-	v, ok := txn.holdLocks[table]
+	defer logTxnLockAdded(logger, txn, locks)
+	h := txn.getHoldLocksLocked(group)
+	v, ok := h.tableKeys[bind.Table]
+	var err error
 	if ok {
-		v.append(locks)
-		return
+		return v.append(locks)
 	}
-	txn.holdLocks[table] = newCowSlice(txn.fsp, locks)
-}
-
-func (txn *activeTxn) close(
-	serviceID string,
-	txnID []byte,
-	commitTS timestamp.Timestamp,
-	lockTableFunc func(uint64) (lockTable, error)) error {
-	txn.Lock()
-	defer txn.Unlock()
-	if !bytes.Equal(txn.txnID, txnID) {
-		return nil
+	cs, err := newCowSlice(txn.fsp, locks)
+	if err != nil {
+		return err
 	}
-
-	logTxnReadyToClose(serviceID, txn)
-	// TODO(fagongzi): parallel unlock
-	for table, cs := range txn.holdLocks {
-		l, err := lockTableFunc(table)
-		if err != nil {
-			// if a remote transaction, then the corresponding locktable should be local
-			// and cannot return an error.
-			//
-			// or a local transaction holds a lock on remote lock table, but can not get the remote
-			// LockTable, it is a bug.
-			panic(err)
-		}
-
-		logTxnUnlockTable(
-			serviceID,
-			txn,
-			table)
-		l.unlock(txn, cs, commitTS)
-		logTxnUnlockTableCompleted(
-			serviceID,
-			txn,
-			table,
-			cs)
-		cs.close()
-		delete(txn.holdLocks, table)
-	}
-	txn.txnID = nil
-	txn.txnKey = ""
-	txn.blockedWaiter = nil
-	txn.remoteService = ""
-	txnPool.Put(txn)
+	h.tableKeys[bind.Table] = cs
+	h.tableBinds[bind.Table] = bind
 	return nil
 }
 
-func (txn *activeTxn) abort(serviceID string, txnID []byte) {
-	txn.RLock()
-	defer txn.RUnlock()
+func (txn *activeTxn) close(
+	txnID []byte,
+	commitTS timestamp.Timestamp,
+	lockTableFunc func(uint32, uint64) (lockTable, error),
+	logger *log.MOLogger,
+	mutations ...pb.ExtraMutation,
+) error {
+	logTxnReadyToClose(logger, txn)
+
+	// cancel all blocked waiters
+	txn.cancelBlocks(logger)
+
+	isRemoteTable := txn.remoteService != ""
+	canSkipTable := func(isRemoteTable bool, l lockTable) bool {
+		if isRemoteTable {
+			if _, ok := l.(*remoteLockTable); ok {
+				return true
+			}
+		}
+		return false
+	}
+
+	n := len(txn.lockHolders)
+	var wg sync.WaitGroup
+	v2.TxnUnlockTableTotalHistogram.Observe(float64(n))
+	for group, h := range txn.lockHolders {
+		for table, cs := range h.tableKeys {
+			l, err := lockTableFunc(group, table)
+			if err != nil {
+				// if a remote transaction, then the corresponding locktable should be local
+				// and cannot return an error.
+				//
+				// or a local transaction holds a lock on remote lock table, but can not get the remote
+				// LockTable, it is a bug.
+				panic(err)
+			}
+			if l == nil || canSkipTable(isRemoteTable, l) {
+				continue
+			}
+
+			fn := func(table uint64, cs *cowSlice, l lockTable) func() {
+				return func() {
+					logTxnUnlockTable(
+						logger,
+						txn,
+						table,
+					)
+					l.unlock(txn, cs, commitTS, mutations...)
+					logTxnUnlockTableCompleted(
+						logger,
+						txn,
+						table,
+						cs,
+					)
+					if n > parallelUnlockTables {
+						wg.Done()
+					}
+				}
+			}
+
+			if n > parallelUnlockTables {
+				wg.Add(1)
+				ants.Submit(fn(table, cs, l))
+			} else {
+				fn(table, cs, l)()
+			}
+		}
+	}
+
+	if n > parallelUnlockTables {
+		wg.Wait()
+	}
+
+	reuse.Free(txn, nil)
+	return nil
+}
+
+func (txn *activeTxn) reset() {
+	for g, h := range txn.lockHolders {
+		for table, cs := range h.tableKeys {
+			cs.close()
+			delete(h.tableKeys, table)
+			delete(h.tableBinds, table)
+		}
+		delete(txn.lockHolders, g)
+	}
+
+	txn.txnID = nil
+	txn.txnKey = ""
+	txn.blockedWaiters = txn.blockedWaiters[:0]
+	txn.remoteService = ""
+	txn.deadlockFound = false
+}
+
+func (txn *activeTxn) abort(
+	waitTxn pb.WaitTxn,
+	err error,
+	logger *log.MOLogger,
+) {
+	// abort is called by deadlock detection, so it is not necessary to lock
+	txn.Lock()
+	defer txn.Unlock()
+
+	logAbortDeadLock(logger, waitTxn, txn)
 
 	// txn already closed
-	if !bytes.Equal(txn.txnID, txnID) {
+	if !bytes.Equal(txn.txnID, waitTxn.TxnID) {
 		return
 	}
 
-	if txn.blockedWaiter == nil {
+	txn.deadlockFound = true
+	if len(txn.blockedWaiters) == 0 {
 		return
 	}
-	txn.blockedWaiter.notify(serviceID, notifyValue{err: ErrDeadLockDetected})
+	for _, w := range txn.blockedWaiters {
+		w.notify(notifyValue{err: err}, logger)
+	}
 }
+
+func (txn *activeTxn) cancelBlocks(
+	logger *log.MOLogger,
+) {
+	for _, w := range txn.blockedWaiters {
+		w.notify(notifyValue{err: ErrTxnNotFound}, logger)
+		w.close("cancelBlocks", logger)
+	}
+}
+
+func (txn *activeTxn) clearBlocked(w *waiter, logger *log.MOLogger) {
+	newBlockedWaiters := txn.blockedWaiters[:0]
+	for _, v := range txn.blockedWaiters {
+		if v != w {
+			newBlockedWaiters = append(newBlockedWaiters, v)
+		} else {
+			w.close("clearBlocked", logger)
+		}
+	}
+	txn.blockedWaiters = newBlockedWaiters
+}
+
+func (txn *activeTxn) closeBlockWaiters(logger *log.MOLogger) {
+	for _, w := range txn.blockedWaiters {
+		w.close("closeBlockWaiters", logger)
+	}
+	txn.blockedWaiters = txn.blockedWaiters[:0]
+}
+
+func (txn *activeTxn) setBlocked(
+	w *waiter,
+	logger *log.MOLogger,
+) {
+	if w == nil {
+		panic("invalid waiter")
+	}
+	if !w.casStatus(ready, blocking, logger) {
+		panic(fmt.Sprintf("invalid waiter status %d, %s", w.getStatus(), w))
+	}
+	w.ref("activeTxn setBlocked", logger)
+	txn.blockedWaiters = append(txn.blockedWaiters, w)
+}
+
+func (txn *activeTxn) isRemoteLocked() bool {
+	return txn.remoteService != ""
+}
+
+func (txn *activeTxn) incLockTableRef(m map[uint32]map[uint64]uint64, serviceID string) {
+	txn.RLock()
+	defer txn.RUnlock()
+	for _, h := range txn.lockHolders {
+		for _, l := range h.tableBinds {
+			if serviceID == l.ServiceID {
+				if _, ok := m[l.Group]; !ok {
+					m[l.Group] = make(map[uint64]uint64, 1024)
+				}
+				m[l.Group][l.Table]++
+			}
+		}
+	}
+}
+
+// ============================================================================================================================
+// the above methods are called in the Lock and Unlock processes, where txn holds the mutex at the beginning of the process.
+// The following methods are called concurrently in processes that are concurrent with the Lock and Unlock processes.
+// ============================================================================================================================
 
 func (txn *activeTxn) fetchWhoWaitingMe(
 	serviceID string,
 	txnID []byte,
-	holder activeTxnHolder,
 	waiters func(pb.WaitTxn) bool,
-	lockTableFunc func(uint64) (lockTable, error)) bool {
+	lockTableFunc func(uint32, uint64) (lockTable, error)) bool {
 	txn.RLock()
-	defer txn.RUnlock()
-
 	// txn already closed
 	if !bytes.Equal(txn.txnID, txnID) {
+		txn.RUnlock()
 		return true
 	}
-
 	// if this is a remote transaction, meaning that all the information is in the
 	// remote, we need to execute the logic.
 	if txn.isRemoteLocked() {
+		txn.RUnlock()
 		panic("can not fetch waiting txn on remote txn")
 	}
 
-	for table, cs := range txn.holdLocks {
-		l, err := lockTableFunc(table)
+	groups := make([]uint32, 0, len(txn.lockHolders))
+	tables := make([]uint64, 0, len(txn.lockHolders))
+	lockKeys := make([]*fixedSlice, 0, len(txn.lockHolders))
+	for g, m := range txn.lockHolders {
+		for table, cs := range m.tableKeys {
+			tables = append(tables, table)
+			lockKeys = append(lockKeys, cs.slice())
+			groups = append(groups, g)
+		}
+	}
+
+	wt := txn.toWaitTxn(serviceID, true)
+	txn.RUnlock()
+
+	defer func() {
+		for _, cs := range lockKeys {
+			cs.unref()
+		}
+	}()
+
+	for idx, table := range tables {
+		l, err := lockTableFunc(groups[idx], table)
 		if err != nil {
 			// if a remote transaction, then the corresponding locktable should be local
 			// and cannot return an error.
@@ -179,48 +362,30 @@ func (txn *activeTxn) fetchWhoWaitingMe(
 			// the remote LockTable, it is a bug.
 			panic(err)
 		}
+		if l == nil {
+			continue
+		}
 
-		locks := cs.slice()
+		locks := lockKeys[idx]
 		hasDeadLock := false
 		locks.iter(func(lockKey []byte) bool {
 			l.getLock(
-				txnID,
 				lockKey,
+				wt,
 				func(lock Lock) {
-					lock.waiter.waiters.iter(func(id []byte) bool {
-						if txn := holder.getActiveTxn(id, false, ""); txn != nil {
-							hasDeadLock = !waiters(txn.toWaitTxn(serviceID, false))
-							return !hasDeadLock
-						}
-						return false
+					lock.waiters.iter(func(w *waiter) bool {
+						hasDeadLock = !waiters(w.txn)
+						return !hasDeadLock
 					})
 				})
 			return !hasDeadLock
 		})
-		locks.unref()
+
 		if hasDeadLock {
 			return false
 		}
 	}
 	return true
-}
-
-func (txn *activeTxn) setBlocked(txnID []byte, w *waiter) {
-	txn.Lock()
-	defer txn.Unlock()
-	// txn already closed
-	if !bytes.Equal(txn.txnID, txnID) {
-		panic("invalid set Blocked")
-	}
-
-	txn.blockedWaiter = w
-	if w != nil {
-		return
-	}
-}
-
-func (txn *activeTxn) isRemoteLocked() bool {
-	return txn.remoteService != ""
 }
 
 func (txn *activeTxn) toWaitTxn(serviceID string, locked bool) pb.WaitTxn {
@@ -234,4 +399,23 @@ func (txn *activeTxn) toWaitTxn(serviceID string, locked bool) pb.WaitTxn {
 		v = serviceID
 	}
 	return pb.WaitTxn{TxnID: txn.txnID, CreatedOn: v}
+}
+
+func (txn *activeTxn) getID() []byte {
+	txn.RLock()
+	defer txn.RUnlock()
+	return txn.txnID
+}
+
+func (txn *activeTxn) getHoldLocksLocked(group uint32) *tableLockHolder {
+	h, ok := txn.lockHolders[group]
+	if ok {
+		return h
+	}
+	h = &tableLockHolder{
+		tableKeys:  make(map[uint64]*cowSlice),
+		tableBinds: make(map[uint64]pb.LockTable),
+	}
+	txn.lockHolders[group] = h
+	return h
 }

@@ -17,9 +17,13 @@ package minus
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/hashmap"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
+
+var _ vm.Operator = new(Minus)
 
 const (
 	buildingHashMap = iota
@@ -27,14 +31,45 @@ const (
 	operatorEnd
 )
 
-type Argument struct {
+type Minus struct {
 	ctr container
 
-	// hash table bucket related information.
-	IBucket, NBucket uint64
+	vm.OperatorBase
+}
+
+func (minus *Minus) GetOperatorBase() *vm.OperatorBase {
+	return &minus.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Minus](
+		func() *Minus {
+			return &Minus{}
+		},
+		func(a *Minus) {
+			*a = Minus{}
+		},
+		reuse.DefaultOptions[Minus]().
+			WithEnableChecker(),
+	)
+}
+
+func (minus Minus) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Minus {
+	return reuse.Alloc[Minus](nil)
+}
+
+func (minus *Minus) Release() {
+	if minus != nil {
+		reuse.Free[Minus](minus, nil)
+	}
 }
 
 type container struct {
+
 	// operator execution stage.
 	state int
 
@@ -45,10 +80,22 @@ type container struct {
 	bat *batch.Batch
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
+func (minus *Minus) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	minus.ctr.state = buildingHashMap
+	if minus.ctr.bat != nil {
+		minus.ctr.bat.CleanOnlyData()
+	}
+	minus.ctr.cleanHashMap()
+}
+
+func (minus *Minus) Free(proc *process.Process, pipelineFailed bool, err error) {
 	mp := proc.Mp()
-	arg.ctr.cleanBatch(mp)
-	arg.ctr.cleanHashMap()
+	minus.ctr.cleanBatch(mp)
+	minus.ctr.cleanHashMap()
+}
+
+func (minus *Minus) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }
 
 func (ctr *container) cleanBatch(mp *mpool.MPool) {

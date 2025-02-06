@@ -22,19 +22,19 @@ package main
 
 import (
 	"context"
+	"net/http"
+	_ "net/http/pprof"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"sync"
+	"time"
+
 	"github.com/matrixorigin/matrixone/pkg/config"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
 	"github.com/matrixorigin/matrixone/pkg/util/metric/mometric"
 	"go.uber.org/zap/zapcore"
-	"net/http"
-	"os"
-	"runtime"
-	"sync"
-	"time"
-
-	_ "net/http/pprof"
-	"runtime/pprof"
 
 	morun "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
@@ -65,7 +65,7 @@ func main() {
 		logutil.Infof("failed open fileservice: %v", err)
 		return
 	}
-	files, err := fs.List(ctx, "/")
+	files, err := fileservice.SortedList(fs.List(ctx, "/"))
 	if err != nil {
 		logutil.Infof("failed list /: %v", err)
 		return
@@ -87,11 +87,9 @@ func main() {
 	ctx, cancel := context.WithCancel(ctx)
 	go traceMemStats(ctx)
 
-	SV := &config.ObservabilityParameters{}
+	SV := config.NewObservabilityParameters()
 	SV.SetDefaultValues("test")
 	SV.MergeCycle.Duration = 5 * time.Minute
-	SV.MergeMaxFileSize = 128
-	SV.MergedExtension = "tae"
 	if err := export.InitMerge(ctx, SV); err != nil {
 		panic(err)
 	}
@@ -102,11 +100,13 @@ func main() {
 		morun.WithClock(clock.NewHLCClock(func() int64 {
 			return time.Now().UTC().UnixNano()
 		}, 0)))
-	morun.SetupProcessLevelRuntime(dr)
-	err = motrace.Init(ctx, motrace.EnableTracer(true))
+	morun.SetupServiceBasedRuntime("", dr)
+	err, _ = motrace.Init(ctx, motrace.EnableTracer(true))
 	if err != nil {
 		panic(err)
 	}
+
+	mergeAll(ctx, fs)
 
 	mergeTable(ctx, fs, motrace.SingleStatementTable)
 	mergeTable(ctx, fs, motrace.SingleRowLogTable)
@@ -117,15 +117,35 @@ func main() {
 	cancel()
 }
 
+func mergeAll(ctx context.Context, fs *fileservice.LocalETLFS) {
+	ctx, span := trace.Start(ctx, "mergeTable")
+	defer span.End()
+	var err error
+	var merge *export.Merge
+	merge, err = export.NewMerge(ctx, "", export.WithTable(motrace.SingleStatementTable), export.WithFileService(fs))
+	if err != nil {
+		logutil.Infof("[%v] failed to NewMerge: %v", "All", err)
+	}
+	err = merge.Main(ctx)
+	if err != nil {
+		logutil.Infof("[%v] failed to merge: %v", "All", err)
+	} else {
+		logutil.Infof("[%v] merge succeed.", "All")
+	}
+
+	writeAllocsProfile("All")
+
+}
+
 func mergeTable(ctx context.Context, fs *fileservice.LocalETLFS, table *table.Table) {
 	var err error
 	ctx, span := trace.Start(ctx, "mergeTable")
 	defer span.End()
-	merge, err := export.NewMerge(ctx, export.WithTable(table), export.WithFileService(fs))
+	merge, err := export.NewMerge(ctx, "", export.WithTable(table), export.WithFileService(fs))
 	logutil.Infof("[%v] create merge task, err: %v", table.GetName(), err)
 	ts, err := time.Parse("2006-01-02 15:04:05", "2023-01-03 00:00:00")
 	logutil.Infof("[%v] create ts: %v, err: %v", table.GetName(), ts, err)
-	err = merge.Main(ctx, ts)
+	err = merge.Main(ctx)
 	if err != nil {
 		logutil.Infof("[%v] failed to merge: %v", table.GetName(), err)
 	} else {

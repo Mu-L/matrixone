@@ -17,12 +17,13 @@ package main
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc/examples/message"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 )
 
 var (
@@ -40,7 +41,7 @@ func main() {
 	}
 
 	bf := morpc.NewGoettyBasedBackendFactory(newCodec())
-	cli, err := morpc.NewClient(bf, morpc.WithClientMaxBackendPerHost(1))
+	cli, err := morpc.NewClient("example-rpc", bf, morpc.WithClientMaxBackendPerHost(1))
 	if err != nil {
 		panic(err)
 	}
@@ -51,16 +52,16 @@ func main() {
 	}
 
 	defer func() {
-		if err := st.Close(); err != nil {
+		if err := st.Close(false); err != nil {
 			panic(err)
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+	ctx, cancel := context.WithTimeoutCause(context.TODO(), time.Second*10, moerr.CauseStreamMain)
 	defer cancel()
 
 	if err := st.Send(ctx, &message.ExampleMessage{MsgID: st.ID(), Content: "first message"}); err != nil {
-		panic(err)
+		panic(moerr.AttachCause(ctx, err))
 	}
 
 	ch, err := st.Receive()
@@ -72,7 +73,7 @@ func main() {
 		if m == nil {
 			return
 		}
-		log.Printf("%s", m.DebugString())
+		logutil.Infof("%s", m.DebugString())
 	}
 }
 
@@ -81,9 +82,10 @@ func startServer() error {
 	if err != nil {
 		return err
 	}
-	s.RegisterRequestHandler(func(ctx context.Context, request morpc.Message, _ uint64, cs morpc.ClientSession) error {
+	s.RegisterRequestHandler(func(ctx context.Context, msg morpc.RPCMessage, _ uint64, cs morpc.ClientSession) error {
 		// send more message back
 		go func() {
+			request := msg.Message
 			for i := 0; i < 10; i++ {
 				if err := cs.Write(ctx, &message.ExampleMessage{MsgID: request.GetID(), Content: fmt.Sprintf("stream-%d", i)}); err != nil {
 					panic(err)
@@ -97,5 +99,5 @@ func startServer() error {
 }
 
 func newCodec() morpc.Codec {
-	return morpc.NewMessageCodec(func() morpc.Message { return &message.ExampleMessage{} })
+	return morpc.NewMessageCodec("", func() morpc.Message { return &message.ExampleMessage{} })
 }

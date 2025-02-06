@@ -15,13 +15,20 @@
 package table
 
 import (
-	"github.com/prashantv/gostub"
 	"reflect"
 	"testing"
 	"time"
 
+	"github.com/prashantv/gostub"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 )
+
+func init() {
+	// Tips: Op 'time.Local = time.FixedZone(...)' would cause DATA RACE against to time.Now()
+}
 
 func TestPathBuilder(t *testing.T) {
 	type field struct {
@@ -51,7 +58,7 @@ func TestPathBuilder(t *testing.T) {
 			args: args{
 				account:  "user",
 				typ:      MergeLogTypeLogs,
-				ts:       time.Unix(0, 0),
+				ts:       time.Unix(0, 0).UTC(),
 				db:       "db",
 				name:     "table",
 				nodeUUID: "123456",
@@ -68,7 +75,7 @@ func TestPathBuilder(t *testing.T) {
 			args: args{
 				account:  "user",
 				typ:      MergeLogTypeLogs,
-				ts:       time.Unix(0, 0),
+				ts:       time.Unix(0, 0).UTC(),
 				db:       "db",
 				name:     "table",
 				nodeUUID: "123456",
@@ -150,13 +157,36 @@ func TestString2Bytes(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if gotRet := String2Bytes(tt.args.s); !reflect.DeepEqual(gotRet, tt.wantRet) {
+			if gotRet := util.UnsafeStringToBytes(tt.args.s); !reflect.DeepEqual(gotRet, tt.wantRet) {
 				t.Errorf("String2Bytes() = %v, want %v", gotRet, tt.wantRet)
 			}
 		})
 	}
 }
 
-func init() {
-	time.Local = time.FixedZone("CST", 0) // set time-zone +0000
+func TestGetExtension(t *testing.T) {
+	type args struct {
+		ext string
+	}
+	tests := []struct {
+		name string
+		args args
+		want string
+	}{
+		{
+			name: CsvExtension,
+			args: args{ext: CsvExtension},
+			want: ".csv",
+		},
+		{
+			name: TaeExtension,
+			args: args{ext: TaeExtension},
+			want: ".tae",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equalf(t, tt.want, GetExtension(tt.args.ext), "GetExtension(%v)", tt.args.ext)
+		})
+	}
 }

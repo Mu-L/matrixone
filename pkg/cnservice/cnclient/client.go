@@ -15,152 +15,17 @@
 package cnclient
 
 import (
-	"context"
-	"sync"
-	"time"
+	"fmt"
 
 	"github.com/fagongzi/goetty/v2"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/pipeline"
-	"github.com/matrixorigin/matrixone/pkg/txn/rpc"
-	"go.uber.org/zap"
 )
 
-// client each node will hold only one client.
-// It is responsible for sending messages to other nodes. and messages were received
-// and handled by cn-server.
-var client *CNClient
-
-func CloseCNClient() error {
-	return client.Close()
-}
-
-func GetStreamSender(backend string) (morpc.Stream, error) {
-	return client.NewStream(backend)
-}
-
-func AcquireMessage() *pipeline.Message {
-	return client.acquireMessage().(*pipeline.Message)
-}
-
-func IsCNClientReady() bool {
-	return client != nil && client.ready
-}
-
-type CNClient struct {
-	localServiceAddress string
-	ready               bool
-	config              *ClientConfig
-	client              morpc.RPCClient
-
-	// pool for send message
-	requestPool *sync.Pool
-}
-
-func (c *CNClient) Send(ctx context.Context, backend string, request morpc.Message) (*morpc.Future, error) {
-	return c.client.Send(ctx, backend, request)
-}
-
-func (c *CNClient) NewStream(backend string) (morpc.Stream, error) {
-	if backend == c.localServiceAddress {
-		runtime.ProcessLevelRuntime().Logger().
-			Fatal("remote run pipeline in local",
-				zap.String("local-address", c.localServiceAddress),
-				zap.String("remote-address", backend))
-	}
-	return c.client.NewStream(backend, true)
-}
-
-func (c *CNClient) Close() error {
-	lock.Lock()
-	defer lock.Unlock()
-	if client == nil || !c.ready {
-		return nil
-	}
-
-	c.ready = false
-	return c.client.Close()
-}
-
-const (
-	dfMaxSenderNumber       = 100000
-	dfConnectTimeout        = 5 * time.Second
-	dfClientReadBufferSize  = 1 << 10
-	dfClientWriteBufferSize = 1 << 10
-)
-
-// ClientConfig a config to init a CNClient
-type ClientConfig struct {
-	// MaxSenderNumber is the max number of backends per host for compute node service.
-	MaxSenderNumber int
-	// TimeOutForEachConnect is the out time for each tcp connect.
-	TimeOutForEachConnect time.Duration
-	// related buffer size.
-	ReadBufferSize  int
-	WriteBufferSize int
-	// RPC rpc config
-	RPC rpc.Config
-}
-
-var (
-	lock sync.Mutex
-)
-
-// TODO: Here it needs to be refactored together with Runtime
-func NewCNClient(
-	localServiceAddress string,
-	cfg *ClientConfig) error {
-	lock.Lock()
-	defer lock.Unlock()
-	if client != nil {
-		return nil
-	}
-
-	var err error
-	cfg.Fill()
-	client = &CNClient{config: cfg, localServiceAddress: localServiceAddress}
-	client.requestPool = &sync.Pool{New: func() any { return &pipeline.Message{} }}
-
-	codec := morpc.NewMessageCodec(client.acquireMessage,
-		morpc.WithCodecMaxBodySize(int(cfg.RPC.MaxMessageSize)))
-	factory := morpc.NewGoettyBasedBackendFactory(codec,
-		morpc.WithBackendGoettyOptions(
-			goetty.WithSessionRWBUfferSize(cfg.ReadBufferSize, cfg.WriteBufferSize),
-			goetty.WithSessionReleaseMsgFunc(func(v any) {
-				m := v.(morpc.RPCMessage)
-				if !m.InternalMessage() {
-					client.releaseMessage(m.Message.(*pipeline.Message))
-				}
-			}),
-		),
-		morpc.WithBackendConnectTimeout(cfg.TimeOutForEachConnect),
-		morpc.WithBackendLogger(logutil.GetGlobalLogger().Named("cn-backend")),
-	)
-
-	client.client, err = morpc.NewClient(factory,
-		morpc.WithClientMaxBackendPerHost(cfg.MaxSenderNumber),
-		morpc.WithClientTag("cn-client"),
-	)
-	client.ready = true
-	return err
-}
-
-func (c *CNClient) acquireMessage() morpc.Message {
-	// TODO: pipeline.Message has many []byte fields, maybe can use PayloadMessage to avoid mem copy.
-	return c.requestPool.Get().(*pipeline.Message)
-}
-
-func (c *CNClient) releaseMessage(m *pipeline.Message) {
-	if c.requestPool != nil {
-		m.Reset()
-		c.requestPool.Put(m)
-	}
-}
-
-// Fill set some default value for client config.
-func (cfg *ClientConfig) Fill() {
+func (cfg *PipelineConfig) fill() {
 	if cfg.MaxSenderNumber <= 0 {
 		cfg.MaxSenderNumber = dfMaxSenderNumber
 	}
@@ -173,4 +38,89 @@ func (cfg *ClientConfig) Fill() {
 	if cfg.TimeOutForEachConnect <= 0 {
 		cfg.TimeOutForEachConnect = dfConnectTimeout
 	}
+}
+
+func GetPipelineClient(
+	sid string,
+) PipelineClient {
+	v, ok := runtime.ServiceRuntime(sid).GetGlobalVariables(runtime.PipelineClient)
+	if !ok {
+		return nil
+	}
+	return v.(PipelineClient)
+}
+
+type pipelineClient struct {
+	localServiceAddress string
+	config              *PipelineConfig
+	client              morpc.RPCClient
+}
+
+func NewPipelineClient(
+	sid string,
+	localServiceAddress string,
+	cfg *PipelineConfig,
+) (PipelineClient, error) {
+	logger := logutil.GetGlobalLogger().Named("cn-backend")
+
+	cfg.fill()
+
+	c := &pipelineClient{
+		localServiceAddress: localServiceAddress,
+		config:              cfg,
+	}
+
+	codec := morpc.NewMessageCodec(
+		sid,
+		func() morpc.Message { return AcquireMessage() },
+		morpc.WithCodecMaxBodySize(int(cfg.RPC.MaxMessageSize)),
+	)
+	factory := morpc.NewGoettyBasedBackendFactory(
+		codec,
+		morpc.WithBackendGoettyOptions(
+			goetty.WithSessionRWBUfferSize(
+				cfg.ReadBufferSize,
+				cfg.WriteBufferSize,
+			),
+			goetty.WithSessionReleaseMsgFunc(
+				func(v any) {
+					m := v.(morpc.RPCMessage)
+					if !m.InternalMessage() {
+						ReleaseMessage(m.Message.(*pipeline.Message))
+					}
+				},
+			),
+		),
+		morpc.WithBackendReadTimeout(defaultRPCTimeout),
+		morpc.WithBackendConnectTimeout(cfg.TimeOutForEachConnect),
+		morpc.WithBackendLogger(logger),
+	)
+
+	cli, err := morpc.NewClient(
+		"pipeline-client",
+		factory,
+		morpc.WithClientMaxBackendPerHost(cfg.MaxSenderNumber),
+		morpc.WithClientLogger(logger),
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	c.client = cli
+	return c, nil
+}
+
+func (c *pipelineClient) NewStream(backend string) (morpc.Stream, error) {
+	if backend == c.localServiceAddress {
+		return nil, moerr.NewInternalErrorNoCtx(fmt.Sprintf("remote run pipeline in local: %s", backend))
+	}
+	return c.client.NewStream(backend, true)
+}
+
+func (c *pipelineClient) Raw() morpc.RPCClient {
+	return c.client
+}
+
+func (c *pipelineClient) Close() error {
+	return c.client.Close()
 }

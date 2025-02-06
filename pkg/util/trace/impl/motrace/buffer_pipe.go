@@ -18,14 +18,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"github.com/matrixorigin/matrixone/pkg/util/trace"
 	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/util/trace"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	bp "github.com/matrixorigin/matrixone/pkg/util/batchpipe"
 	"github.com/matrixorigin/matrixone/pkg/util/export/table"
@@ -53,7 +53,7 @@ type batchETLHandler struct {
 	defaultOpts []BufferOption
 }
 
-func NewBufferPipe2CSVWorker(opt ...BufferOption) bp.PipeImpl[bp.HasName, any] {
+func NewBufferPipe2CSVWorker(opt ...BufferOption) PipeImpl {
 	return &batchETLHandler{opt}
 }
 
@@ -73,7 +73,7 @@ func (t batchETLHandler) NewItemBuffer(name string) bp.ItemBuffer[bp.HasName, an
 	}
 	opts = append(opts, BufferWithGenBatchFunc(f), BufferWithType(name))
 	opts = append(opts, t.defaultOpts...)
-	return NewItemBuffer(opts...)
+	return NewContentBuffer(opts...)
 }
 
 // NewItemBatchHandler implement batchpipe.PipeImpl
@@ -82,7 +82,7 @@ func (t batchETLHandler) NewItemBatchHandler(ctx context.Context) func(b any) {
 	handle := func(b any) {
 		req, ok := b.(table.WriteRequest) // see genETLData
 		if !ok {
-			panic(moerr.NewInternalError(ctx, "batchETLHandler meet unknown type: %v", reflect.ValueOf(b).Type()))
+			panic(moerr.NewInternalErrorf(ctx, "batchETLHandler meet unknown type: %v", reflect.ValueOf(b).Type()))
 		}
 		if _, err := req.Handle(); err != nil {
 			logutil.Error(fmt.Sprintf("[Trace] failed to write. err: %v", err), logutil.NoReportFiled())
@@ -100,10 +100,32 @@ func (t batchETLHandler) NewItemBatchHandler(ctx context.Context) func(b any) {
 				handle(req)
 			}
 		default:
-			panic(moerr.NewNotSupported(ctx, "unknown batch type: %v", reflect.ValueOf(b).Type()))
+			panic(moerr.NewNotSupportedf(ctx, "unknown batch type: %v", reflect.ValueOf(b).Type()))
 		}
 	}
 	return f
+}
+
+func (t batchETLHandler) NewAggregator(ctx context.Context, name string) table.Aggregator {
+	switch name {
+	case MOStatementType, SingleStatementTable.GetName():
+		if !GetTracerProvider().disableStmtAggregation {
+			return NewAggregator(
+				ctx,
+				GetTracerProvider().aggregationWindow,
+				StatementInfoNew,
+				StatementInfoUpdate,
+				StatementInfoFilter,
+			)
+		}
+	case MOErrorType:
+	case MOSpanType:
+	case MOLogType:
+	case MORawLogType:
+	default:
+		logutil.Warnf("batchETLHandler handle new type: %s", name)
+	}
+	return nil
 }
 
 type WriteFactoryConfig struct {
@@ -115,7 +137,19 @@ type WriteFactoryConfig struct {
 func genETLData(ctx context.Context, in []IBuffer2SqlItem, buf *bytes.Buffer, factory table.WriterFactory) any {
 	buf.Reset()
 	if len(in) == 0 {
-		return table.NewRowRequest(nil)
+		return table.NewRowRequest(nil, nil)
+	}
+
+	// Initialize aggregator
+	var aggregator *Aggregator
+	if !GetTracerProvider().disableStmtAggregation {
+		aggregator = NewAggregator(
+			ctx,
+			GetTracerProvider().aggregationWindow,
+			StatementInfoNew,
+			StatementInfoUpdate,
+			StatementInfoFilter,
+		)
 	}
 
 	ts := time.Now()
@@ -129,23 +163,60 @@ func genETLData(ctx context.Context, in []IBuffer2SqlItem, buf *bytes.Buffer, fa
 			if factory == nil {
 				factory = GetTracerProvider().writerFactory
 			}
-			w = factory(ctx, account, row.Table, ts)
+			w = factory.GetRowWriter(ctx, account, row.Table, ts)
 			writerMap[row.GetAccount()] = w
 		}
 		w.WriteRow(row)
+		if check, is := item.(table.NeedAck); is && check.NeedCheckAck() {
+			if writer, support := w.(table.AfterWrite); support {
+				writer.AddAfter(check.GetAckHook())
+			}
+		}
+		row.Free()
 	}
 
 	for _, i := range in {
-		item, ok := i.(table.RowField)
-		if !ok {
-			panic("not MalCsv, dont support output CSV")
+		// Check if the item is a StatementInfo
+		if statementInfo, ok := i.(*StatementInfo); ok && aggregator != nil {
+			// if stmt aggregate, then add it to the aggregator
+			_, err := aggregator.AddItem(statementInfo)
+			if err != nil {
+				item, ok := i.(table.RowField)
+				if !ok {
+					panic("not MalCsv, dont support output CSV")
+				}
+				writeValues(item)
+			}
+		} else {
+			// If not, process as before
+			item, ok := i.(table.RowField)
+			if !ok {
+				panic("not MalCsv, dont support output CSV")
+			}
+			writeValues(item)
 		}
-		writeValues(item)
+	}
+
+	// Get the aggregated results
+	if aggregator != nil {
+		groupedResults := aggregator.GetResults()
+
+		for _, i := range groupedResults {
+
+			// If not, process as before
+			item, ok := i.(table.RowField)
+			if !ok {
+				panic("not MalCsv, dont support output CSV")
+			}
+
+			writeValues(item)
+		}
+		aggregator.Close()
 	}
 
 	reqs := make(table.ExportRequests, 0, len(writerMap))
 	for _, ww := range writerMap {
-		reqs = append(reqs, table.NewRowRequest(ww))
+		reqs = append(reqs, table.NewRowRequest(ww, nil))
 	}
 
 	return reqs
@@ -155,12 +226,16 @@ var _ bp.ItemBuffer[bp.HasName, any] = &itemBuffer{}
 
 // buffer catch item, like trace/log/error, buffer
 type itemBuffer struct {
-	bp.Reminder   // see BufferWithReminder
-	buf           []IBuffer2SqlItem
-	mux           sync.Mutex
+	BufferConfig
+	buf  []IBuffer2SqlItem
+	mux  sync.Mutex
+	size int64 // default: 1 MB
+}
+
+type BufferConfig struct {
+	bp.Reminder          // see BufferWithReminder
 	bufferType    string // see BufferWithType
-	size          int64  // default: 1 MB
-	sizeThreshold int64  // see BufferWithSizeThreshold
+	sizeThreshold int    // see BufferWithSizeThreshold
 
 	filterItemFunc filterItemFunc
 	genBatchFunc   genBatchFunc
@@ -172,16 +247,20 @@ type genBatchFunc func(context.Context, []IBuffer2SqlItem, *bytes.Buffer, table.
 var noopFilterItemFunc = func(IBuffer2SqlItem) {}
 var noopGenBatchSQL = genBatchFunc(func(context.Context, []IBuffer2SqlItem, *bytes.Buffer, table.WriterFactory) any { return "" })
 
+// NewItemBuffer
+// deprecated, pls use NewContentBuffer
 func NewItemBuffer(opts ...BufferOption) *itemBuffer {
 	b := &itemBuffer{
-		Reminder:       bp.NewConstantClock(defaultClock),
-		buf:            make([]IBuffer2SqlItem, 0, 10240),
-		sizeThreshold:  10 * mpool.MB,
-		filterItemFunc: noopFilterItemFunc,
-		genBatchFunc:   noopGenBatchSQL,
+		buf: make([]IBuffer2SqlItem, 0, 10240),
+		BufferConfig: BufferConfig{
+			Reminder:       bp.NewConstantClock(defaultClock),
+			sizeThreshold:  table.DefaultWriterBufferSize,
+			filterItemFunc: noopFilterItemFunc,
+			genBatchFunc:   noopGenBatchSQL,
+		},
 	}
 	for _, opt := range opts {
-		opt.apply(b)
+		opt.apply(&b.BufferConfig)
 	}
 	logutil.Debugf("NewItemBuffer, Reminder next: %v", b.Reminder.RemindNextAfter())
 	if b.genBatchFunc == nil || b.filterItemFunc == nil || b.Reminder == nil {
@@ -227,7 +306,7 @@ func (b *itemBuffer) isEmpty() bool {
 func (b *itemBuffer) ShouldFlush() bool {
 	b.mux.Lock()
 	defer b.mux.Unlock()
-	return b.size > b.sizeThreshold
+	return b.size+thresholdDelta > int64(b.sizeThreshold)
 }
 
 func (b *itemBuffer) Size() int64 {
@@ -252,42 +331,38 @@ func (b *itemBuffer) GetBatch(ctx context.Context, buf *bytes.Buffer) any {
 	return b.genBatchFunc(ctx, b.buf, buf, nil)
 }
 
-type BufferOption interface {
-	apply(*itemBuffer)
-}
+type BufferOption func(*BufferConfig)
 
-type buffer2SqlOptionFunc func(*itemBuffer)
-
-func (f buffer2SqlOptionFunc) apply(b *itemBuffer) {
+func (f BufferOption) apply(b *BufferConfig) {
 	f(b)
 }
 
 func BufferWithReminder(reminder bp.Reminder) BufferOption {
-	return buffer2SqlOptionFunc(func(b *itemBuffer) {
+	return BufferOption(func(b *BufferConfig) {
 		b.Reminder = reminder
 	})
 }
 
 func BufferWithType(name string) BufferOption {
-	return buffer2SqlOptionFunc(func(b *itemBuffer) {
+	return BufferOption(func(b *BufferConfig) {
 		b.bufferType = name
 	})
 }
 
 func BufferWithSizeThreshold(size int64) BufferOption {
-	return buffer2SqlOptionFunc(func(b *itemBuffer) {
-		b.sizeThreshold = size
+	return BufferOption(func(b *BufferConfig) {
+		b.sizeThreshold = int(size)
 	})
 }
 
 func BufferWithFilterItemFunc(f filterItemFunc) BufferOption {
-	return buffer2SqlOptionFunc(func(b *itemBuffer) {
+	return BufferOption(func(b *BufferConfig) {
 		b.filterItemFunc = f
 	})
 }
 
 func BufferWithGenBatchFunc(f genBatchFunc) BufferOption {
-	return buffer2SqlOptionFunc(func(b *itemBuffer) {
+	return BufferOption(func(b *BufferConfig) {
 		b.genBatchFunc = f
 	})
 }

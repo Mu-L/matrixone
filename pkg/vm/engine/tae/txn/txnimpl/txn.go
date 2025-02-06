@@ -15,9 +15,13 @@
 package txnimpl
 
 import (
+	"context"
+
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
@@ -49,8 +53,13 @@ func (txn *txnImpl) CreateDatabase(name, createSql, datTyp string) (db handle.Da
 	return txn.Store.CreateDatabase(name, createSql, datTyp)
 }
 
-func (txn *txnImpl) CreateDatabaseWithID(name, createSql, datTyp string, id uint64) (db handle.Database, err error) {
-	return txn.Store.CreateDatabaseWithID(name, createSql, datTyp, id)
+func (txn *txnImpl) CreateDatabaseWithCtx(ctx context.Context,
+	name, createSql, datTyp string, id uint64) (db handle.Database, err error) {
+	err = txn.bindCtxInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return txn.Store.CreateDatabaseWithID(ctx, name, createSql, datTyp, id)
 }
 
 func (txn *txnImpl) DropDatabase(name string) (db handle.Database, err error) {
@@ -69,6 +78,28 @@ func (txn *txnImpl) UnsafeGetRelation(dbId, id uint64) (rel handle.Relation, err
 	return txn.Store.UnsafeGetRelation(dbId, id)
 }
 
+func (txn *txnImpl) bindCtxInfo(ctx context.Context) (err error) {
+	var tid uint32
+	if ctx == nil {
+		return
+	}
+	tid, err = defines.GetAccountId(ctx)
+	if err != nil {
+		return
+	}
+
+	uid := defines.GetUserId(ctx)
+	rid := defines.GetRoleId(ctx)
+	txn.BindAccessInfo(tid, uid, rid)
+	return err
+}
+func (txn *txnImpl) GetDatabaseWithCtx(ctx context.Context, name string) (db handle.Database, err error) {
+	err = txn.bindCtxInfo(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return txn.Store.GetDatabase(name)
+}
 func (txn *txnImpl) GetDatabase(name string) (db handle.Database, err error) {
 	return txn.Store.GetDatabase(name)
 }
@@ -81,10 +112,14 @@ func (txn *txnImpl) DatabaseNames() (names []string) {
 	return txn.Store.DatabaseNames()
 }
 
-func (txn *txnImpl) LogTxnEntry(dbId, tableId uint64, entry txnif.TxnEntry, readed []*common.ID) (err error) {
-	return txn.Store.LogTxnEntry(dbId, tableId, entry, readed)
+func (txn *txnImpl) LogTxnEntry(dbId, tableId uint64, entry txnif.TxnEntry, readedObject, readedTombstone []*common.ID) (err error) {
+	return txn.Store.LogTxnEntry(dbId, tableId, entry, readedObject, readedTombstone)
 }
 
 func (txn *txnImpl) LogTxnState(sync bool) (logEntry entry.Entry, err error) {
 	return txn.Store.LogTxnState(sync)
+}
+
+func makeWorkspaceVector(typ types.Type) containers.Vector {
+	return containers.MakeVector(typ, common.WorkspaceAllocator)
 }

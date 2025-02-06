@@ -15,8 +15,6 @@
 package compare
 
 import (
-	"bytes"
-
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
@@ -30,6 +28,11 @@ func New(typ types.Type, desc, nullsLast bool) Compare {
 			return newCompare(boolDescCompare, boolCopy[bool], nullsLast)
 		}
 		return newCompare(boolAscCompare, boolCopy[bool], nullsLast)
+	case types.T_bit:
+		if desc {
+			return newCompare(genericDescCompare[uint64], genericCopy[uint64], nullsLast)
+		}
+		return newCompare(genericAscCompare[uint64], genericCopy[uint64], nullsLast)
 	case types.T_int8:
 		if desc {
 			return newCompare(genericDescCompare[int8], genericCopy[int8], nullsLast)
@@ -120,14 +123,32 @@ func New(typ types.Type, desc, nullsLast bool) Compare {
 			return newCompare(rowidDescCompare, rowidCopy, nullsLast)
 		}
 		return newCompare(rowidAscCompare, rowidCopy, nullsLast)
+	case types.T_Blockid:
+		if desc {
+			return newCompare(blockidDescCompare, blockidCopy, nullsLast)
+		}
+		return newCompare(blockidAscCompare, blockidCopy, nullsLast)
 	case types.T_uuid:
 		if desc {
 			return newCompare(uuidDescCompare, uuidCopy, nullsLast)
 		}
 		return newCompare(uuidAscCompare, uuidCopy, nullsLast)
+	case types.T_enum:
+		if desc {
+			return newCompare(genericDescCompare[types.Enum], genericCopy[types.Enum], nullsLast)
+		}
+		return newCompare(genericAscCompare[types.Enum], genericCopy[types.Enum], nullsLast)
 	case types.T_char, types.T_varchar, types.T_blob,
-		types.T_binary, types.T_varbinary, types.T_json, types.T_text:
+		types.T_binary, types.T_varbinary, types.T_json, types.T_text, types.T_datalink:
 		return &strCompare{
+			desc:        desc,
+			nullsLast:   nullsLast,
+			vs:          make([]*vector.Vector, 2),
+			isConstNull: make([]bool, 2),
+		}
+	case types.T_array_float32, types.T_array_float64:
+		//NOTE: Used by merge_order, merge_top, top agg operators.
+		return &arrayCompare{
 			desc:        desc,
 			nullsLast:   nullsLast,
 			vs:          make([]*vector.Vector, 2),
@@ -159,10 +180,14 @@ func uuidAscCompare(x, y types.Uuid) int {
 }
 
 func txntsAscCompare(x, y types.TS) int {
-	return bytes.Compare(x[:], y[:])
+	return x.Compare(&y)
 }
 func rowidAscCompare(x, y types.Rowid) int {
-	return bytes.Compare(x[:], x[:])
+	return x.Compare(&y)
+}
+
+func blockidAscCompare(x, y types.Blockid) int {
+	return x.Compare(&y)
 }
 
 func genericAscCompare[T types.OrderedT](x, y T) int {
@@ -197,10 +222,14 @@ func uuidDescCompare(x, y types.Uuid) int {
 }
 
 func txntsDescCompare(x, y types.TS) int {
-	return bytes.Compare(y[:], x[:])
+	return y.Compare(&x)
 }
 func rowidDescCompare(x, y types.Rowid) int {
-	return bytes.Compare(y[:], x[:])
+	return y.Compare(&x)
+}
+
+func blockidDescCompare(x, y types.Blockid) int {
+	return y.Compare(&x)
 }
 
 func genericDescCompare[T types.OrderedT](x, y T) int {
@@ -236,6 +265,10 @@ func rowidCopy(vecDst, vecSrc []types.Rowid, dst, src int64) {
 	vecDst[dst] = vecSrc[src]
 }
 
+func blockidCopy(vecDst, vecSrc []types.Blockid, dst, src int64) {
+	vecDst[dst] = vecSrc[src]
+}
+
 func genericCopy[T types.OrderedT](vecDst, vecSrc []T, dst, src int64) {
 	vecDst[dst] = vecSrc[src]
 }
@@ -246,6 +279,7 @@ func newCompare[T any](cmp func(T, T) int, cpy func([]T, []T, int64, int64), nul
 		cpy:         cpy,
 		xs:          make([][]T, 2),
 		ns:          make([]*nulls.Nulls, 2),
+		gs:          make([]*nulls.Nulls, 2),
 		vs:          make([]*vector.Vector, 2),
 		isConstNull: make([]bool, 2),
 		nullsLast:   nullsLast,
@@ -261,6 +295,7 @@ func (c *compare[T]) Set(idx int, vec *vector.Vector) {
 	c.ns[idx] = vec.GetNulls()
 	c.xs[idx] = vector.ExpandFixedCol[T](vec)
 	c.isConstNull[idx] = vec.IsConstNull()
+	c.gs[idx] = vec.GetGrouping()
 }
 
 func (c *compare[T]) Compare(veci, vecj int, vi, vj int64) int {

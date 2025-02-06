@@ -16,10 +16,12 @@ package catalog
 
 import (
 	"bytes"
-	"encoding/binary"
+	"cmp"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
+	"unsafe"
 
 	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -34,151 +36,108 @@ type accessInfo struct {
 	CreateAt                 types.Timestamp
 }
 
+const (
+	AccessInfoSize int64 = int64(unsafe.Sizeof(accessInfo{}))
+)
+
+func EncodeAccessInfo(ai *accessInfo) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(ai)), AccessInfoSize)
+}
+
 func (ai *accessInfo) WriteTo(w io.Writer) (n int64, err error) {
-	for _, id := range []uint32{ai.TenantID, ai.UserID, ai.RoleID} {
-		if err = binary.Write(w, binary.BigEndian, id); err != nil {
-			return
-		}
-	}
-	if err = binary.Write(w, binary.BigEndian, int64(ai.CreateAt)); err != nil {
-		return
-	}
-	return 20, nil
+	w.Write(EncodeAccessInfo(ai))
+	return AccessInfoSize, nil
 }
 
 func (ai *accessInfo) ReadFrom(r io.Reader) (n int64, err error) {
-	for _, idPtr := range []*uint32{&ai.TenantID, &ai.UserID, &ai.RoleID} {
-		if err = binary.Read(r, binary.BigEndian, idPtr); err != nil {
-			return
-		}
-	}
-	at := int64(0)
-	if err = binary.Read(r, binary.BigEndian, &at); err != nil {
-		return
-	}
-	ai.CreateAt = types.Timestamp(at)
-	return 20, nil
+	r.Read(EncodeAccessInfo(ai))
+	return AccessInfoSize, nil
 }
 
-func dbVisibilityFn[T *DBEntry](n *common.GenericDLNode[*DBEntry], ts types.TS) (visible, dropped bool) {
+func dbVisibilityFn[T *DBEntry](n *common.GenericDLNode[*DBEntry], txn txnif.TxnReader) (visible, dropped bool, name string) {
 	db := n.GetPayload()
-	visible, dropped = db.GetVisibility(ts)
+	visible, dropped = db.GetVisibility(txn)
 	return
 }
 
 type DBEntry struct {
-	*DBBaseEntry
-	catalog   *Catalog
-	acInfo    accessInfo
-	name      string
-	createSql string
-	fullName  string
-	isSys     bool
-	datType   string
+	ID uint64
+	*BaseEntryImpl[*EmptyMVCCNode]
+	catalog *Catalog
+	*DBNode
+	fullName string
+	isSys    bool
 
-	entries   map[uint64]*common.GenericDLNode[*TableEntry]
+	entries map[uint64]*common.GenericDLNode[*TableEntry]
+	// nameNodes[ABC] is a linked list of all table entries had been once named as ABC
 	nameNodes map[string]*nodeList[*TableEntry]
 	link      *common.GenericSortedDList[*TableEntry]
 
 	nodesMu sync.RWMutex
 }
 
-func compareTableFn(a, b *TableEntry) int {
-	return a.TableBaseEntry.DoCompre(b.TableBaseEntry)
+func (entry *TableEntry) Less(b *TableEntry) int {
+	return cmp.Compare(entry.ID, b.ID)
 }
 
 func NewDBEntryWithID(catalog *Catalog, name string, createSql, datTyp string, id uint64, txn txnif.AsyncTxn) *DBEntry {
-	//id := catalog.NextDB()
-
 	e := &DBEntry{
-		DBBaseEntry: NewDBBaseEntry(id),
-		catalog:     catalog,
-		name:        name,
-		createSql:   createSql,
-		datType:     datTyp,
-		entries:     make(map[uint64]*common.GenericDLNode[*TableEntry]),
-		nameNodes:   make(map[string]*nodeList[*TableEntry]),
-		link:        common.NewGenericSortedDList(compareTableFn),
+		ID: id,
+		BaseEntryImpl: NewBaseEntry(
+			func() *EmptyMVCCNode { return &EmptyMVCCNode{} }),
+		catalog: catalog,
+		DBNode: &DBNode{
+			name:      name,
+			createSql: createSql,
+			datType:   datTyp,
+		},
+		entries:   make(map[uint64]*common.GenericDLNode[*TableEntry]),
+		nameNodes: make(map[string]*nodeList[*TableEntry]),
+		link:      common.NewGenericSortedDList((*TableEntry).Less),
 	}
 	if txn != nil {
 		// Only in unit test, txn can be nil
 		e.acInfo.TenantID = txn.GetTenantID()
 		e.acInfo.UserID, e.acInfo.RoleID = txn.GetUserAndRoleID()
 	}
-	e.CreateWithTxn(txn)
-	e.acInfo.CreateAt = types.CurrentTimestamp()
-	return e
-}
-
-func NewDBEntry(catalog *Catalog, name, createSql, datTyp string, txn txnif.AsyncTxn) *DBEntry {
-	id := catalog.NextDB()
-
-	e := &DBEntry{
-		DBBaseEntry: NewDBBaseEntry(id),
-		catalog:     catalog,
-		name:        name,
-		datType:     datTyp,
-		createSql:   createSql,
-		entries:     make(map[uint64]*common.GenericDLNode[*TableEntry]),
-		nameNodes:   make(map[string]*nodeList[*TableEntry]),
-		link:        common.NewGenericSortedDList(compareTableFn),
-	}
-	if txn != nil {
-		// Only in unit test, txn can be nil
-		e.acInfo.TenantID = txn.GetTenantID()
-		e.acInfo.UserID, e.acInfo.RoleID = txn.GetUserAndRoleID()
-	}
-	e.CreateWithTxn(txn)
-	e.acInfo.CreateAt = types.CurrentTimestamp()
-	return e
-}
-
-func NewDBEntryByTS(catalog *Catalog, name string, ts types.TS) *DBEntry {
-	id := catalog.NextDB()
-
-	e := &DBEntry{
-		DBBaseEntry: NewDBBaseEntry(id),
-		catalog:     catalog,
-		name:        name,
-		entries:     make(map[uint64]*common.GenericDLNode[*TableEntry]),
-		nameNodes:   make(map[string]*nodeList[*TableEntry]),
-		link:        common.NewGenericSortedDList(compareTableFn),
-	}
-	e.CreateWithTS(ts)
+	e.CreateWithTxnLocked(txn, &EmptyMVCCNode{})
 	e.acInfo.CreateAt = types.CurrentTimestamp()
 	return e
 }
 
 func NewSystemDBEntry(catalog *Catalog) *DBEntry {
-	entry := &DBEntry{
-		DBBaseEntry: NewDBBaseEntry(pkgcatalog.MO_CATALOG_ID),
-		catalog:     catalog,
-		name:        pkgcatalog.MO_CATALOG,
-		createSql:   "create database " + pkgcatalog.MO_CATALOG,
-		entries:     make(map[uint64]*common.GenericDLNode[*TableEntry]),
-		nameNodes:   make(map[string]*nodeList[*TableEntry]),
-		link:        common.NewGenericSortedDList(compareTableFn),
-		isSys:       true,
+	entry := NewReplayDBEntry()
+	entry.isSys = true
+	entry.ID = pkgcatalog.MO_CATALOG_ID
+	entry.catalog = catalog
+	entry.DBNode = &DBNode{
+		name:      pkgcatalog.MO_CATALOG,
+		createSql: "create database " + pkgcatalog.MO_CATALOG,
 	}
-	entry.CreateWithTS(types.SystemDBTS)
+	entry.CreateWithTSLocked(types.SystemDBTS, &EmptyMVCCNode{})
 	return entry
 }
 
 func NewReplayDBEntry() *DBEntry {
 	entry := &DBEntry{
-		DBBaseEntry: NewReplayDBBaseEntry(),
-		entries:     make(map[uint64]*common.GenericDLNode[*TableEntry]),
-		nameNodes:   make(map[string]*nodeList[*TableEntry]),
-		link:        common.NewGenericSortedDList(compareTableFn),
+		BaseEntryImpl: NewBaseEntry(func() *EmptyMVCCNode { return &EmptyMVCCNode{} }),
+		entries:       make(map[uint64]*common.GenericDLNode[*TableEntry]),
+		nameNodes:     make(map[string]*nodeList[*TableEntry]),
+		link:          common.NewGenericSortedDList((*TableEntry).Less),
 	}
 	return entry
 }
 
+func (e *DBEntry) GetID() uint64    { return e.ID }
 func (e *DBEntry) IsSystemDB() bool { return e.isSys }
 func (e *DBEntry) CoarseTableCnt() int {
 	e.RLock()
 	defer e.RUnlock()
 	return len(e.entries)
+}
+
+func (e *DBEntry) Less(b *DBEntry) int {
+	return cmp.Compare(e.ID, b.ID)
 }
 
 func (e *DBEntry) GetTenantID() uint32          { return e.acInfo.TenantID }
@@ -207,6 +166,7 @@ func (e *DBEntry) String() string {
 func (e *DBEntry) StringLocked() string {
 	return e.StringWithlevelLocked(common.PPL1)
 }
+
 func (e *DBEntry) StringWithLevel(level common.PPLevel) string {
 	e.RLock()
 	defer e.RUnlock()
@@ -216,9 +176,9 @@ func (e *DBEntry) StringWithLevel(level common.PPLevel) string {
 func (e *DBEntry) StringWithlevelLocked(level common.PPLevel) string {
 	if level <= common.PPL1 {
 		return fmt.Sprintf("DB[%d][name=%s][C@%s,D@%s]",
-			e.DBBaseEntry.ID, e.GetFullName(), e.GetCreatedAt().ToString(), e.GetDeleteAt().ToString())
+			e.ID, e.GetFullName(), e.GetCreatedAtLocked().ToString(), e.GetDeleteAtLocked().ToString())
 	}
-	return fmt.Sprintf("DB%s[name=%s]", e.DBBaseEntry.StringLocked(), e.GetFullName())
+	return fmt.Sprintf("DB%s[name=%s, id=%d]", e.BaseEntryImpl.StringLocked(), e.GetFullName(), e.ID)
 }
 
 func (e *DBEntry) MakeTableIt(reverse bool) *common.GenericSortedDListIt[*TableEntry] {
@@ -242,19 +202,19 @@ func (e *DBEntry) PPString(level common.PPLevel, depth int, prefix string) strin
 	}
 	return w.String()
 }
-
-func (e *DBEntry) GetBlockEntryByID(id *common.ID) (blk *BlockEntry, err error) {
+func (e *DBEntry) AsCommonID() *common.ID {
+	return &common.ID{
+		DbID: e.ID,
+	}
+}
+func (e *DBEntry) GetObjectEntryByID(id *common.ID, isTombstone bool) (obj *ObjectEntry, err error) {
 	e.RLock()
 	table, err := e.GetTableEntryByID(id.TableID)
 	e.RUnlock()
 	if err != nil {
 		return
 	}
-	seg, err := table.GetSegmentByID(id.SegmentID)
-	if err != nil {
-		return
-	}
-	blk, err = seg.GetBlockEntryByID(id.BlockID)
+	obj, err = table.GetObjectByID(id.ObjectID(), isTombstone)
 	return
 }
 
@@ -276,7 +236,7 @@ func (e *DBEntry) GetTableEntryByID(id uint64) (table *TableEntry, err error) {
 func (e *DBEntry) txnGetNodeByName(
 	tenantID uint32,
 	name string,
-	ts types.TS) (*common.GenericDLNode[*TableEntry], error) {
+	txn txnif.TxnReader) (*common.GenericDLNode[*TableEntry], error) {
 	e.RLock()
 	defer e.RUnlock()
 	fullName := genTblFullName(tenantID, name)
@@ -284,11 +244,11 @@ func (e *DBEntry) txnGetNodeByName(
 	if node == nil {
 		return nil, moerr.GetOkExpectedEOB()
 	}
-	return node.TxnGetNodeLocked(ts)
+	return node.TxnGetNodeLocked(txn, name)
 }
 
 func (e *DBEntry) TxnGetTableEntryByName(name string, txn txnif.AsyncTxn) (entry *TableEntry, err error) {
-	n, err := e.txnGetNodeByName(txn.GetTenantID(), name, txn.GetStartTS())
+	n, err := e.txnGetNodeByName(txn.GetTenantID(), name, txn)
 	if err != nil {
 		return
 	}
@@ -299,8 +259,8 @@ func (e *DBEntry) TxnGetTableEntryByName(name string, txn txnif.AsyncTxn) (entry
 func (e *DBEntry) GetTableEntryByName(
 	tenantID uint32,
 	name string,
-	ts types.TS) (entry *TableEntry, err error) {
-	n, err := e.txnGetNodeByName(tenantID, name, ts)
+	txn txnif.TxnReader) (entry *TableEntry, err error) {
+	n, err := e.txnGetNodeByName(tenantID, name, txn)
 	if err != nil {
 		return
 	}
@@ -314,7 +274,7 @@ func (e *DBEntry) TxnGetTableEntryByID(id uint64, txn txnif.AsyncTxn) (entry *Ta
 		return
 	}
 	//check whether visible and dropped.
-	visible, dropped := entry.GetVisibility(txn.GetStartTS())
+	visible, dropped := entry.GetVisibility(txn)
 	if !visible || dropped {
 		return nil, moerr.GetOkExpectedEOB()
 	}
@@ -331,11 +291,11 @@ func (e *DBEntry) TxnGetTableEntryByID(id uint64, txn txnif.AsyncTxn) (entry *Ta
 // 3. Check duplicate/not found.
 // If the entry has already been dropped, return ErrNotFound.
 func (e *DBEntry) DropTableEntry(name string, txn txnif.AsyncTxn) (newEntry bool, deleted *TableEntry, err error) {
-	dn, err := e.txnGetNodeByName(txn.GetTenantID(), name, txn.GetStartTS())
+	tn, err := e.txnGetNodeByName(txn.GetTenantID(), name, txn)
 	if err != nil {
 		return
 	}
-	entry := dn.GetPayload()
+	entry := tn.GetPayload()
 	entry.Lock()
 	defer entry.Unlock()
 	newEntry, err = entry.DropEntryLocked(txn)
@@ -362,47 +322,144 @@ func (e *DBEntry) DropTableEntryByID(id uint64, txn txnif.AsyncTxn) (newEntry bo
 
 func (e *DBEntry) CreateTableEntry(schema *Schema, txn txnif.AsyncTxn, dataFactory TableDataFactory) (created *TableEntry, err error) {
 	e.Lock()
+	defer e.Unlock()
 	created = NewTableEntry(e, schema, txn, dataFactory)
 	err = e.AddEntryLocked(created, txn, false)
-	e.Unlock()
 
 	return created, err
 }
 
 func (e *DBEntry) CreateTableEntryWithTableId(schema *Schema, txn txnif.AsyncTxn, dataFactory TableDataFactory, tableId uint64) (created *TableEntry, err error) {
 	e.Lock()
+	defer e.Unlock()
+	if tableId < pkgcatalog.MO_RESERVED_MAX {
+		return nil, moerr.NewInternalErrorNoCtxf("reserved table ID %d", tableId)
+	}
 	//Deduplicate for tableId
 	if _, exist := e.entries[tableId]; exist {
 		return nil, moerr.GetOkExpectedDup()
 	}
 	created = NewTableEntryWithTableId(e, schema, txn, dataFactory, tableId)
 	err = e.AddEntryLocked(created, txn, false)
-	e.Unlock()
 
 	return created, err
 }
 
+// For test only
+func (e *DBEntry) PrettyNameIndex() string {
+	buf := &bytes.Buffer{}
+	buf.WriteString(fmt.Sprintf("[%d]NameIndex:\n", len(e.nameNodes)))
+	// iterate all nodes in nameNodes, collect node ids to a string
+	ids := make([]uint64, 0)
+	// sort e.nameNodes by name
+	names := make([]string, 0, len(e.nameNodes))
+	for name := range e.nameNodes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		node := e.nameNodes[name]
+		ids = ids[:0]
+		node.ForEachNodes(func(nn *nameNode[*TableEntry]) bool {
+			ids = append(ids, nn.id)
+			return true
+		})
+		buf.WriteString(fmt.Sprintf("  %s: %v\n", name, ids))
+	}
+	return buf.String()
+}
+
+func (e *DBEntry) RenameTableInTxn(old, new string, tid uint64, tenantID uint32, txn txnif.TxnReader, first bool) error {
+	e.Lock()
+	defer e.Unlock()
+	// if alter again and again in the same txn, previous temp name should be deleted.
+	if !first {
+		e.removeNameIndexLocked(genTblFullName(tenantID, old), tid)
+	}
+
+	newFullName := genTblFullName(tenantID, new)
+	if err := e.checkAddNameConflictLocked(new, tid, e.nameNodes[newFullName], txn); err != nil {
+		return err
+	}
+	// make sure every name node has up to one table id. check case alter A -> B -> A
+	e.removeNameIndexLocked(newFullName, tid)
+	// add to the head of linked list
+	e.addNameIndexLocked(newFullName, tid)
+
+	return nil
+}
+
+func (e *DBEntry) addNameIndexLocked(fullname string, tid uint64) {
+	node := e.nameNodes[fullname]
+	if node == nil {
+		nn := newNodeList(e.GetItemNodeByIDLocked,
+			tableVisibilityFn[*TableEntry],
+			&e.nodesMu,
+			fullname)
+		e.nameNodes[fullname] = nn
+		nn.CreateNode(tid)
+	} else {
+		node.CreateNode(tid)
+	}
+}
+
+func (e *DBEntry) removeNameIndexLocked(fullname string, tid uint64) {
+	nn := e.nameNodes[fullname]
+	if nn == nil {
+		return
+	}
+	if _, empty := nn.DeleteNode(tid); empty {
+		delete(e.nameNodes, fullname)
+	}
+}
+
+func (e *DBEntry) RollbackRenameTable(fullname string, tid uint64) {
+	e.Lock()
+	defer e.Unlock()
+	e.removeNameIndexLocked(fullname, tid)
+}
+
 func (e *DBEntry) RemoveEntry(table *TableEntry) (err error) {
-	defer func() {
-		if err == nil {
-			e.catalog.AddTableCnt(-1)
-			e.catalog.AddColumnCnt(-1 * len(table.schema.ColDefs))
-		}
-	}()
 	logutil.Info("[Catalog]", common.OperationField("remove"),
 		common.OperandField(table.String()))
 	e.Lock()
 	defer e.Unlock()
-	if n, ok := e.entries[table.GetID()]; !ok {
+	if n, ok := e.entries[table.ID]; !ok {
 		return moerr.GetOkExpectedEOB()
 	} else {
-		nn := e.nameNodes[table.GetFullName()]
-		nn.DeleteNode(table.GetID())
-		e.link.Delete(n)
-		if nn.Length() == 0 {
-			delete(e.nameNodes, table.GetFullName())
+		table.RLock()
+		defer table.RUnlock()
+		prevname := ""
+		// clean all name because RemoveEntry can be called by GC、
+		table.LoopChainLocked(func(m *MVCCNode[*TableMVCCNode]) bool {
+			if prevname == m.BaseNode.Schema.Name {
+				return true
+			}
+			prevname = m.BaseNode.Schema.Name
+			tenantID := m.BaseNode.Schema.AcInfo.TenantID
+			fullname := genTblFullName(tenantID, prevname)
+			nn := e.nameNodes[fullname]
+			if nn == nil {
+				return true
+			}
+			nn.DeleteNode(table.ID)
+			if nn.Length() == 0 {
+				delete(e.nameNodes, fullname)
+			}
+			return true
+		})
+
+		// When Rollback, the last mvcc has already removed
+		fullname := table.GetFullName()
+		nn := e.nameNodes[fullname]
+		if nn != nil {
+			nn.DeleteNode(table.ID)
+			if nn.Length() == 0 {
+				delete(e.nameNodes, fullname)
+			}
 		}
-		delete(e.entries, table.GetID())
+		e.link.Delete(n)
+		delete(e.entries, table.ID)
 	}
 	return
 }
@@ -419,17 +476,11 @@ func (e *DBEntry) RemoveEntry(table *TableEntry) (err error) {
 // 2.2.2 Check duplicate/not found.
 // If the entry hasn't been dropped, return ErrDuplicate.
 func (e *DBEntry) AddEntryLocked(table *TableEntry, txn txnif.TxnReader, skipDedup bool) (err error) {
-	defer func() {
-		if err == nil {
-			e.catalog.AddTableCnt(1)
-			e.catalog.AddColumnCnt(len(table.schema.ColDefs))
-		}
-	}()
 	fullName := table.GetFullName()
 	nn := e.nameNodes[fullName]
 	if nn == nil {
 		n := e.link.Insert(table)
-		e.entries[table.GetID()] = n
+		e.entries[table.ID] = n
 
 		nn := newNodeList(e.GetItemNodeByIDLocked,
 			tableVisibilityFn[*TableEntry],
@@ -437,36 +488,57 @@ func (e *DBEntry) AddEntryLocked(table *TableEntry, txn txnif.TxnReader, skipDed
 			fullName)
 		e.nameNodes[fullName] = nn
 
-		nn.CreateNode(table.GetID())
+		nn.CreateNode(table.ID)
 	} else {
-		node := nn.GetNode()
 		if !skipDedup {
-			record := node.GetPayload()
-			err = record.PrepareAdd(txn)
+			name := table.GetLastestSchemaLocked(false).Name
+			err = e.checkAddNameConflictLocked(name, table.ID, nn, txn)
 			if err != nil {
 				return
 			}
 		}
 		n := e.link.Insert(table)
-		e.entries[table.GetID()] = n
-		nn.CreateNode(table.GetID())
+		e.entries[table.ID] = n
+		nn.CreateNode(table.ID)
 	}
 	return
 }
 
+func (e *DBEntry) checkAddNameConflictLocked(name string, tid uint64, nn *nodeList[*TableEntry], txn txnif.TxnReader) (err error) {
+	if nn == nil {
+		return nil
+	}
+	node := nn.GetNode()
+	if node == nil {
+		return nil
+	}
+	// check ww conflict
+	tbl := nn.GetNode().GetPayload()
+	// skip the same table entry
+	if tbl.ID == tid {
+		return nil
+	}
+	if err = tbl.ConflictCheck(txn); err != nil {
+		return
+	}
+	// check name dup
+	if txn == nil {
+		// replay checkpoint
+		return nil
+	}
+	if existEntry, _ := nn.TxnGetNodeLocked(txn, name); existEntry != nil {
+		return moerr.GetOkExpectedDup()
+	}
+	return nil
+}
+
 func (e *DBEntry) MakeCommand(id uint32) (txnif.TxnCmd, error) {
-	cmdType := CmdUpdateDatabase
+	cmdType := IOET_WALTxnCommand_Database
 	e.RLock()
 	defer e.RUnlock()
 	return newDBCmd(id, cmdType, e), nil
 }
 
-func (e *DBEntry) Set1PC() {
-	e.GetLatestNodeLocked().Set1PC()
-}
-func (e *DBEntry) Is1PC() bool {
-	return e.GetLatestNodeLocked().Is1PC()
-}
 func (e *DBEntry) GetCatalog() *Catalog { return e.catalog }
 
 func (e *DBEntry) RecurLoop(processor Processor) (err error) {
@@ -484,6 +556,9 @@ func (e *DBEntry) RecurLoop(processor Processor) (err error) {
 		if err = table.RecurLoop(processor); err != nil {
 			return
 		}
+		if err = processor.OnPostTable(table); err != nil {
+			break
+		}
 		tableIt.Next()
 	}
 	if moerr.IsMoErrCode(err, moerr.OkStopCurrRecur) {
@@ -494,11 +569,11 @@ func (e *DBEntry) RecurLoop(processor Processor) (err error) {
 
 func (e *DBEntry) PrepareRollback() (err error) {
 	var isEmpty bool
-	if isEmpty, err = e.DBBaseEntry.PrepareRollback(); err != nil {
+	if isEmpty, err = e.BaseEntryImpl.PrepareRollback(); err != nil {
 		return
 	}
 	if isEmpty {
-		if err = e.catalog.RemoveEntry(e); err != nil {
+		if err = e.catalog.RemoveDBEntry(e); err != nil {
 			return
 		}
 	}
@@ -508,4 +583,17 @@ func (e *DBEntry) PrepareRollback() (err error) {
 // IsActive is coarse API: no consistency check
 func (e *DBEntry) IsActive() bool {
 	return !e.HasDropCommitted()
+}
+
+// only for test
+func MockDBEntryWithAccInfo(accId uint64, dbId uint64) *DBEntry {
+	entry := &DBEntry{
+		ID: dbId,
+	}
+
+	entry.DBNode = &DBNode{}
+	entry.DBNode.acInfo.TenantID = uint32(accId)
+	entry.BaseEntryImpl = NewBaseEntry(func() *EmptyMVCCNode { return &EmptyMVCCNode{} })
+
+	return entry
 }

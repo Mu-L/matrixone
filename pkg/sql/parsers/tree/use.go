@@ -14,6 +14,16 @@
 
 package tree
 
+import "github.com/matrixorigin/matrixone/pkg/common/reuse"
+
+func init() {
+	reuse.CreatePool[Use](
+		func() *Use { return &Use{} },
+		func(u *Use) { u.reset() },
+		reuse.DefaultOptions[Use](), //.
+	) //WithEnableChecker()
+}
+
 type SecondaryRoleType int
 
 const (
@@ -30,6 +40,15 @@ type Use struct {
 	Role              *Role
 }
 
+func NewUse(name *CStr, secondaryRole bool, secondaryRoleType SecondaryRoleType, role *Role) *Use {
+	use := reuse.Alloc[Use](nil)
+	use.Name = name
+	use.SecondaryRole = secondaryRole
+	use.SecondaryRoleType = secondaryRoleType
+	use.Role = role
+	return use
+}
+
 func (node *Use) Format(ctx *FmtCtx) {
 	ctx.WriteString("use")
 	if !node.SecondaryRole {
@@ -38,7 +57,7 @@ func (node *Use) Format(ctx *FmtCtx) {
 			node.Role.Format(ctx)
 		} else if node.Name != nil && !node.Name.Empty() {
 			ctx.WriteByte(' ')
-			ctx.WriteString(node.Name.ToLower())
+			ctx.WriteString(node.Name.Compare())
 		}
 	} else {
 		ctx.WriteString(" secondary role ")
@@ -61,3 +80,19 @@ func (node *Use) GetQueryType() string     { return QueryTypeOth }
 func (node *Use) IsUseRole() bool {
 	return node.SecondaryRole || node.Role != nil
 }
+
+func (node *Use) Free() {
+	reuse.Free[Use](node, nil)
+}
+
+func (node *Use) reset() {
+	// if node.Name != nil {
+	// node.Free()
+	// }
+	if node.Role != nil {
+		node.Role.Free()
+	}
+	*node = Use{}
+}
+
+func (node Use) TypeName() string { return "tree.Use" }

@@ -17,53 +17,33 @@ package vm
 import (
 	"bytes"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func (ins Instruction) MarshalBinary() ([]byte, error) {
-	return nil, nil
-}
-
-func (ins Instruction) UnmarshalBinary(_ []byte) error {
-	return nil
-}
-
-// String range instructions and call each operator's string function to show a query plan
-func String(ins Instructions, buf *bytes.Buffer) {
-	for i, in := range ins {
-		if i > 0 {
+// call each operator's string function to show a query plan
+func String(rootOp Operator, buf *bytes.Buffer) {
+	HandleAllOp(rootOp, func(parentOp Operator, op Operator) error {
+		if op.GetOperatorBase().NumChildren() > 0 {
 			buf.WriteString(" -> ")
 		}
-		stringFunc[in.Op](in.Arg, buf)
-	}
+		op.String(buf)
+		return nil
+	})
 }
 
-// Prepare range instructions and do init work for each operator's argument by calling its prepare function
-func Prepare(ins Instructions, proc *process.Process) error {
-	for _, in := range ins {
-		if err := prepareFunc[in.Op](proc, in.Arg); err != nil {
-			return err
-		}
-	}
-	return nil
+// do init work for each operator by calling its prepare function
+func Prepare(op Operator, proc *process.Process) error {
+	return HandleAllOp(op, func(parentOp Operator, op Operator) error {
+		return op.Prepare(proc)
+	})
 }
 
-func Run(ins Instructions, proc *process.Process) (end bool, err error) {
-	var ok bool
-
-	defer func() {
-		if e := recover(); e != nil {
-			err = moerr.ConvertPanicError(proc.Ctx, e)
+func ModifyOutputOpNodeIdx(rootOp Operator, proc *process.Process) {
+	HandleAllOp(rootOp, func(parentOp Operator, op Operator) error {
+		switch op.OpType() {
+		case Output:
+			op.GetOperatorBase().SetIdx(-1)
 		}
-	}()
-	for _, in := range ins {
-		if ok, err = execFunc[in.Op](in.Idx, proc, in.Arg, in.IsFirst, in.IsLast); err != nil {
-			return ok || end, err
-		}
-		if ok { // ok is true shows that at least one operator has done its work
-			end = true
-		}
-	}
-	return end, err
+		return nil
+	})
 }

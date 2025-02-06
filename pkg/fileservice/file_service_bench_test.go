@@ -17,17 +17,17 @@ package fileservice
 import (
 	"bytes"
 	"context"
-	"io"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-func benchmarkFileService(b *testing.B, newFS func() FileService) {
+func benchmarkFileService(ctx context.Context, b *testing.B, newFS func() FileService) {
 
-	b.Run("Read", func(b *testing.B) {
-		fs := newFS()
+	b.Run("parallel raed", func(b *testing.B) {
 		ctx := context.Background()
+		fs := newFS()
+		defer fs.Close(ctx)
 
 		content := bytes.Repeat([]byte("x"), 16*1024*1024)
 		parts := fixedSplit(content, 512*1024)
@@ -37,9 +37,10 @@ func benchmarkFileService(b *testing.B, newFS func() FileService) {
 		offset := int64(0)
 		for _, part := range parts {
 			writeVector.Entries = append(writeVector.Entries, IOEntry{
-				Offset: offset,
-				Size:   int64(len(part)),
-				Data:   part,
+				Offset:      offset,
+				Size:        int64(len(part)),
+				Data:        part,
+				ToCacheData: CacheOriginalData,
 			})
 			offset += int64(len(part))
 		}
@@ -48,24 +49,30 @@ func benchmarkFileService(b *testing.B, newFS func() FileService) {
 
 		parts2 := fixedSplit(content, 4*1024)
 
+		b.SetBytes(int64(len(content)))
 		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			readVector := &IOVector{
-				FilePath: "foo",
+
+		b.RunParallel(func(pb *testing.PB) {
+
+			for pb.Next() {
+				readVector := &IOVector{
+					FilePath: "foo",
+				}
+				offset := int64(0)
+				for _, part := range parts2 {
+					readVector.Entries = append(readVector.Entries, IOEntry{
+						Offset:      offset,
+						Size:        int64(len(part)),
+						ToCacheData: CacheOriginalData,
+					})
+					offset += int64(len(part))
+				}
+				err := fs.Read(ctx, readVector)
+				assert.Nil(b, err)
+				readVector.Release()
 			}
-			offset = int64(0)
-			for _, part := range parts2 {
-				readVector.Entries = append(readVector.Entries, IOEntry{
-					Offset:        offset,
-					Size:          int64(len(part)),
-					WriterForRead: io.Discard,
-				})
-				offset += int64(len(part))
-			}
-			err = fs.Read(ctx, readVector)
-			b.SetBytes(int64(len(content)))
-			assert.Nil(b, err)
-		}
+
+		})
 
 	})
 

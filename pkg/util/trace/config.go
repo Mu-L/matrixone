@@ -26,10 +26,14 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"io"
+	"sync"
+	"time"
+
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"io"
 )
 
 type TraceID [16]byte
@@ -96,6 +100,13 @@ type SpanContext struct {
 	Kind SpanKind `json:"span_kind"`
 }
 
+func (c *SpanContext) Clone() (sc SpanContext) {
+	copy(sc.TraceID[:], c.TraceID[:])
+	copy(sc.SpanID[:], c.SpanID[:])
+	sc.Kind = c.Kind
+	return
+}
+
 func (c *SpanContext) Size() (n int) {
 	return 24
 }
@@ -159,6 +170,67 @@ func SpanContextWithIDs(tid TraceID, sid SpanID) SpanContext {
 	return SpanContext{TraceID: tid, SpanID: sid, Kind: SpanKindInternal}
 }
 
+type MoCtledState struct {
+	Enable    bool
+	Threshold time.Duration
+}
+
+var MOCtledSpanEnableConfig struct {
+	sync.Mutex
+	NameToKind  map[string]SpanKind
+	KindToState map[SpanKind]*MoCtledState
+}
+
+// InitMOCtledSpan registers all mo_ctl controlled span
+func InitMOCtledSpan() {
+	MOCtledSpanEnableConfig.NameToKind = make(map[string]SpanKind)
+	MOCtledSpanEnableConfig.KindToState = make(map[SpanKind]*MoCtledState)
+
+	// enable or disable the span with time threshold for remote file service operation
+	MOCtledSpanEnableConfig.NameToKind["s3"] = SpanKindRemoteFSVis
+	MOCtledSpanEnableConfig.KindToState[SpanKindRemoteFSVis] = &MoCtledState{false, 0}
+
+	// enable or disable the span with time threshold for Local file service operation
+	MOCtledSpanEnableConfig.NameToKind["local"] = SpanKindLocalFSVis
+	MOCtledSpanEnableConfig.KindToState[SpanKindLocalFSVis] = &MoCtledState{false, 0}
+
+	// enable or disable the span with time threshold for sql statement operation
+	MOCtledSpanEnableConfig.NameToKind["statement"] = SpanKindStatement
+	MOCtledSpanEnableConfig.KindToState[SpanKindStatement] = &MoCtledState{false, 0}
+
+	// enable or disable the span with time threshold for recording some debug log when tn
+	// handles RPC operation, like handleCommit
+	MOCtledSpanEnableConfig.NameToKind["tnrpc"] = SpanKindTNRPCHandle
+	MOCtledSpanEnableConfig.KindToState[SpanKindTNRPCHandle] = &MoCtledState{false, 0}
+}
+
+// IsMOCtledSpan first checks if this kind exists in mo_ctl controlled spans,
+// if it is, return it's current state, or return not exist
+func IsMOCtledSpan(kind SpanKind) (exist bool, enable bool, threshold time.Duration) {
+	MOCtledSpanEnableConfig.Lock()
+	defer MOCtledSpanEnableConfig.Unlock()
+
+	if state, exist := MOCtledSpanEnableConfig.KindToState[kind]; exist {
+		return true, state.Enable, state.Threshold
+	}
+	return false, false, 0
+}
+
+// SetMoCtledSpanState first checks if this kind exists in mo_ctl controlled spans,
+// if it is, reset it's state to the specified and return succeed, or return not succeed
+func SetMoCtledSpanState(name string, enable bool, threshold int64) (succeed bool) {
+	MOCtledSpanEnableConfig.Lock()
+	defer MOCtledSpanEnableConfig.Unlock()
+
+	if kind, ok := MOCtledSpanEnableConfig.NameToKind[name]; ok {
+		MOCtledSpanEnableConfig.KindToState[kind].Enable = enable
+		// convert threshold to ms in time.Duration format
+		MOCtledSpanEnableConfig.KindToState[kind].Threshold = time.Duration(threshold) * time.Millisecond
+		return true
+	}
+	return false
+}
+
 // SpanConfig is a group of options for a Span.
 type SpanConfig struct {
 	SpanContext
@@ -168,6 +240,126 @@ type SpanConfig struct {
 	// remote parent span context should be ignored for security.
 	NewRoot bool `json:"NewRoot"` // WithNewRoot
 	Parent  Span `json:"-"`
+
+	// LongTimeThreshold set by WithLongTimeThreshold
+	LongTimeThreshold time.Duration `json:"-"`
+	// profileFlag mark what profile need to do
+	profileFlag     uint64
+	profileCpuDur   time.Duration // WithProfileCpuSecs
+	profileTraceDur time.Duration // WithProfileTraceSecs
+
+	// hungThreshold set by WithHungThreshold
+	// It will override Span ctx deadline setting, and start a goroutine to check ctx deadline
+	hungThreshold time.Duration
+	Extra         []zap.Field `json:"-"`
+
+	// backOffStrategy set by WithConstBackOff
+	backOffStrategy BackOffStrategy
+	backOffConfig   *BackOffConfig
+
+	// ProfileSystemStatusFn is used to get status information.
+	ProfileSystemStatusFn func() ([]byte, error)
+}
+
+const (
+	ProfileFlagGoroutine = 1 << iota
+	ProfileFlagThreadCreate
+	ProfileFlagHeap
+	ProfileFlagAllocs
+	ProfileFlagBlock
+	ProfileFlagMutex
+	ProfileFlagCpu
+	ProfileFlagTrace
+	ProfileFlagSystemStatus
+)
+
+type BackOffStrategy uint
+
+const (
+	NoneBackOffStrategy BackOffStrategy = 1 << iota
+	ConstBackOffStrategy
+)
+
+var backOff2String = map[BackOffStrategy]string{
+	NoneBackOffStrategy:  "none",
+	ConstBackOffStrategy: "const",
+}
+
+func (s BackOffStrategy) String() string {
+	if val, ok := backOff2String[s]; ok {
+		return val
+	}
+	return "unknown"
+}
+
+func (c *SpanConfig) Reset() {
+	c.SpanContext.Reset()
+	c.NewRoot = false
+	c.Parent = nil
+	c.LongTimeThreshold = 0
+	c.profileFlag = 0
+	c.profileCpuDur = 0
+	c.profileTraceDur = 0
+	c.hungThreshold = 0
+	c.Extra = nil
+}
+
+func (c *SpanConfig) GetLongTimeThreshold() time.Duration {
+	return c.LongTimeThreshold
+}
+
+func (c *SpanConfig) HungThreshold() time.Duration {
+	return c.hungThreshold
+}
+
+// NeedProfile return true if set profileGoroutine, profileHeap, profileCpuDur
+func (c *SpanConfig) NeedProfile() bool {
+	return c.profileFlag > 0
+}
+
+// ProfileGoroutine return the value set by WithProfileGoroutine
+func (c *SpanConfig) ProfileGoroutine() bool {
+	return c.profileFlag&ProfileFlagGoroutine > 0
+}
+
+// ProfileHeap return the value set by WithProfileHeap
+func (c *SpanConfig) ProfileHeap() bool {
+	return c.profileFlag&ProfileFlagHeap > 0
+}
+
+func (c *SpanConfig) ProfileThreadCreate() bool {
+	return c.profileFlag&ProfileFlagThreadCreate > 0
+}
+
+func (c *SpanConfig) ProfileAllocs() bool {
+	return c.profileFlag&ProfileFlagAllocs > 0
+}
+
+func (c *SpanConfig) ProfileBlock() bool {
+	return c.profileFlag&ProfileFlagBlock > 0
+}
+
+func (c *SpanConfig) ProfileMutex() bool {
+	return c.profileFlag&ProfileFlagMutex > 0
+}
+
+// ProfileCpuSecs return the value set by WithProfileCpuSecs
+func (c *SpanConfig) ProfileCpuSecs() time.Duration {
+	return c.profileCpuDur
+}
+
+// ProfileTraceSecs return the value set by WithProfileTraceSecs
+func (c *SpanConfig) ProfileTraceSecs() time.Duration {
+	return c.profileTraceDur
+}
+
+// ProfileSystemStatus return the value set by WithProfileSystemStatus.
+func (c *SpanConfig) ProfileSystemStatus() bool {
+	return c.profileFlag&ProfileFlagSystemStatus > 0
+}
+
+func (c *SpanConfig) BackOffStrategy() (BackOffStrategy, *BackOffConfig) {
+	return c.backOffStrategy, c.backOffConfig
 }
 
 // SpanStartOption applies an option to a SpanConfig. These options are applicable
@@ -196,15 +388,137 @@ func (f spanOptionFunc) ApplySpanStart(cfg *SpanConfig) {
 	f(cfg)
 }
 
-func WithNewRoot(newRoot bool) spanOptionFunc {
+func WithNewRoot(newRoot bool) SpanStartOption {
 	return spanOptionFunc(func(cfg *SpanConfig) {
 		cfg.NewRoot = newRoot
 	})
 }
 
-func WithKind(kind SpanKind) spanOptionFunc {
+func WithKind(kind SpanKind) SpanStartOption {
 	return spanOptionFunc(func(cfg *SpanConfig) {
 		cfg.Kind = kind
+	})
+}
+
+// WithLongTimeThreshold set timeout threshold. Span.End will check the Span duration value.
+func WithLongTimeThreshold(d time.Duration) SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.LongTimeThreshold = d
+	})
+}
+
+// WithHungThreshold please be careful to using this option.
+// It will create a new goroutine to check hung deadline while calling Tracer.Start().
+func WithHungThreshold(d time.Duration) SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.hungThreshold = d
+	})
+}
+
+// WithProfileGoroutine requests dump pprof/mutex. It will trigger profile.ProfileGoroutine() in Span.End().
+// More details in MOSpan.doProfile.
+func WithProfileGoroutine() SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagGoroutine
+	})
+}
+
+// WithProfileHeap requests dump pprof/heap. It will trigger profile.ProfileHeap() in Span.End().
+// More details in MOSpan.doProfile.
+func WithProfileHeap() SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagHeap
+	})
+}
+
+// WithProfileThreadCreate requests dump pprof/ThreadCreate. It will trigger profile.ProfileRuntime(profile.THREADCREATE, ...) or profile.ProfileThreadcreate() in Span.End().
+// More details in MOSpan.doProfile.
+func WithProfileThreadCreate() SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagThreadCreate
+	})
+}
+
+// WithProfileAllocs requests dump pprof/allocs. It will trigger profile.ProfileAllocs() in Span.End().
+// more details in MOSpan.doProfile.
+func WithProfileAllocs() SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagAllocs
+	})
+}
+
+// WithProfileBlock  requests dump pprof/block. It will trigger profile.ProfileBlock() in Span.End().
+// More details in MOSpan.doProfile.
+func WithProfileBlock() SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagBlock
+	})
+}
+
+// WithProfileMutex  requests dump pprof/mutex. It will trigger profile.ProfileMutex() in Span.End().
+// More details in MOSpan.doProfile.
+func WithProfileMutex() SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagMutex
+	})
+}
+
+// WithProfileCpuSecs requests dump pprof/cpu, and specify the time to profile.
+// Please carefully to set this value, it is a sync profile.ProfileCPU() op.
+// More details in MOSpan.doProfile.
+func WithProfileCpuSecs(d time.Duration) SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagCpu
+		cfg.profileCpuDur = d
+	})
+}
+
+// WithProfileSystemStatus requests dump system status. It will trigger SystemStatus() in Span.End().
+// More details in MOSpan.doProfile.
+func WithProfileSystemStatus(f func() ([]byte, error)) SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagSystemStatus
+		cfg.ProfileSystemStatusFn = f
+	})
+}
+
+// WithProfileTraceSecs requests dump pprof/trace, and specify the time to profile.
+// Please carefully to use, it is a sync profile.ProfileTrace() op
+// More details in MOSpan.doProfile.
+func WithProfileTraceSecs(d time.Duration) SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.profileFlag |= ProfileFlagTrace
+		cfg.profileTraceDur = d
+	})
+}
+
+func WithFSReadWriteExtra(fileName string, status error, size int64) SpanEndOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.Extra = append(cfg.Extra,
+			zap.String("name", fileName),
+			zap.String("status", fmt.Sprintf("%v", status)),
+			zap.Int64("size", size))
+	})
+}
+
+func WithStatementExtra(txnID uuid.UUID, stmID uuid.UUID, stm string) SpanEndOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.Extra = append(cfg.Extra,
+			zap.String("txn_id", txnID.String()),
+			zap.String("statement_id", stmID.String()),
+			zap.String("statement", stm),
+		)
+	})
+}
+
+// WithConstBackOff set the const interval duration
+// if interval = 0, means no backoff
+func WithConstBackOff(interval time.Duration) SpanStartOption {
+	return spanOptionFunc(func(cfg *SpanConfig) {
+		cfg.backOffStrategy = ConstBackOffStrategy
+		cfg.backOffConfig = &BackOffConfig{
+			Interval: interval,
+		}
 	})
 }
 
@@ -255,6 +569,17 @@ const (
 	// SpanKindSession is a SpanKind for a Span that represents the operation
 	// start from session
 	SpanKindSession SpanKind = 3
+	// SpanKindRemoteFSVis is a SpanKind for a Span that needs to collect info of
+	// remote object operation
+	SpanKindRemoteFSVis SpanKind = 4
+	// SpanKindLocalFSVis is a SpanKind for a Span that needs to collect info of
+	// local object operation
+	SpanKindLocalFSVis SpanKind = 5
+
+	// SpanKindTNRPCHandle is a SpanKind for TN service to control
+	// the enable or disable of debug logs recording when it handles the RPC requests, like HandleCommit.
+	// not for trace or span for now
+	SpanKindTNRPCHandle SpanKind = 6
 )
 
 func (k SpanKind) String() string {
@@ -267,6 +592,12 @@ func (k SpanKind) String() string {
 		return "remote"
 	case SpanKindSession:
 		return "session"
+	case SpanKindRemoteFSVis:
+		return "remoteFSOperation"
+	case SpanKindLocalFSVis:
+		return "localFSOperation"
+	case SpanKindTNRPCHandle:
+		return "tnRPCHandle"
 	default:
 		return "unknown"
 	}
@@ -304,7 +635,7 @@ func (tf TraceFlags) IsSampled() bool {
 	return tf&FlagsSampled == FlagsSampled
 }
 
-// WithSampled sets the sampling bit in a new copy of the TraceFlags.
+// WithSampled sets the sampling a bit in a new copy of the TraceFlags.
 func (tf TraceFlags) WithSampled(sampled bool) TraceFlags { // nolint:revive  // sampled is not a control flag.
 	if sampled {
 		return tf | FlagsSampled
@@ -316,4 +647,8 @@ func (tf TraceFlags) WithSampled(sampled bool) TraceFlags { // nolint:revive  //
 // String returns the hex string representation form of TraceFlags.
 func (tf TraceFlags) String() string {
 	return hex.EncodeToString([]byte{byte(tf)}[:])
+}
+
+type BackOffConfig struct {
+	Interval time.Duration // for ConstBackoff
 }

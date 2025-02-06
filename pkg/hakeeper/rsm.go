@@ -21,6 +21,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/lni/dragonboat/v4/logger"
@@ -57,6 +58,7 @@ const (
 	headerSize                    = pb.HeaderSize
 )
 
+type IndexQuery struct{}
 type StateQuery struct{}
 type ScheduleCommandQuery struct{ UUID string }
 type ClusterDetailsQuery struct{ Cfg Config }
@@ -70,12 +72,21 @@ func parseCmdTag(cmd []byte) pb.HAKeeperUpdateType {
 	return pb.HAKeeperUpdateType(binaryEnc.Uint32(cmd))
 }
 
-func GetInitialClusterRequestCmd(numOfLogShards uint64,
-	numOfDNShards uint64, numOfLogReplicas uint64) []byte {
+func GetInitialClusterRequestCmd(
+	numOfLogShards uint64,
+	numOfTNShards uint64,
+	numOfLogReplicas uint64,
+	nextID uint64,
+	nextIDByKey map[string]uint64,
+	nonVotingLocality map[string]string,
+) []byte {
 	req := pb.InitialClusterRequest{
-		NumOfLogShards:   numOfLogShards,
-		NumOfDNShards:    numOfDNShards,
-		NumOfLogReplicas: numOfLogReplicas,
+		NumOfLogShards:    numOfLogShards,
+		NumOfTNShards:     numOfTNShards,
+		NumOfLogReplicas:  numOfLogReplicas,
+		NextID:            nextID,
+		NextIDByKey:       nextIDByKey,
+		NonVotingLocality: nonVotingLocality,
 	}
 	payload, err := req.Marshal()
 	if err != nil {
@@ -116,7 +127,7 @@ func GetUpdateCommandsCmd(term uint64, cmds []pb.ScheduleCommand) []byte {
 		Term:     term,
 		Commands: cmds,
 	}
-	data := make([]byte, headerSize+b.Size())
+	data := make([]byte, headerSize+b.ProtoSize())
 	binaryEnc.PutUint32(data, uint32(pb.ScheduleCommandUpdate))
 	if _, err := b.MarshalTo(data[headerSize:]); err != nil {
 		panic(err)
@@ -148,6 +159,85 @@ func parseAllocateIDCmd(cmd []byte) pb.CNAllocateID {
 	return result
 }
 
+func parseUpdateCNLabelCmd(cmd []byte) pb.CNStoreLabel {
+	if parseCmdTag(cmd) != pb.UpdateCNLabel {
+		panic("not a SetCNLabel cmd")
+	}
+	payload := cmd[headerSize:]
+	var result pb.CNStoreLabel
+	if err := result.Unmarshal(payload); err != nil {
+		panic(err)
+	}
+	return result
+}
+
+func parseUpdateCNWorkStateCmd(cmd []byte) pb.CNWorkState {
+	if parseCmdTag(cmd) != pb.UpdateCNWorkState {
+		panic("not a SetCNWorkState cmd")
+	}
+	payload := cmd[headerSize:]
+	var result pb.CNWorkState
+	if err := result.Unmarshal(payload); err != nil {
+		panic(err)
+	}
+	return result
+}
+
+func parsePatchCNStoreCmd(cmd []byte) pb.CNStateLabel {
+	if parseCmdTag(cmd) != pb.PatchCNStore {
+		panic("not a PatchCNStore cmd")
+	}
+	payload := cmd[headerSize:]
+	var result pb.CNStateLabel
+	if err := result.Unmarshal(payload); err != nil {
+		panic(err)
+	}
+	return result
+}
+
+func parseDeleteCNStoreCmd(cmd []byte) pb.DeleteCNStore {
+	if parseCmdTag(cmd) != pb.RemoveCNStore {
+		panic("not a RemoveCNStore cmd")
+	}
+	payload := cmd[headerSize:]
+	var result pb.DeleteCNStore
+	if err := result.Unmarshal(payload); err != nil {
+		panic(err)
+	}
+	return result
+}
+
+func parseUpdateNonVotingReplicaNumCmd(cmd []byte) uint64 {
+	if parseCmdTag(cmd) != pb.UpdateNonVotingReplicaNum {
+		panic("not a UpdateNonVotingReplicaNum cmd")
+	}
+	return binaryEnc.Uint64(cmd[headerSize:])
+}
+
+func parseUpdateNonVotingLocalityCmd(cmd []byte) pb.Locality {
+	if parseCmdTag(cmd) != pb.UpdateNonVotingLocality {
+		panic("not a UpdateNonVotingLocality cmd")
+	}
+	payload := cmd[headerSize:]
+	var locality pb.Locality
+	if err := locality.Unmarshal(payload); err != nil {
+		panic(err)
+	}
+	return locality
+}
+
+func parseLogShardUpdateCmd(cmd []byte) pb.AddLogShard {
+	if parseCmdTag(cmd) != pb.LogShardUpdate {
+		panic("not a LogShardUpdate cmd")
+	}
+	payload := cmd[headerSize:]
+	var addLogShard pb.AddLogShard
+	if err := addLogShard.Unmarshal(payload); err != nil {
+		panic(err)
+	}
+	return addLogShard
+}
+
 func GetSetStateCmd(state pb.HAKeeperState) []byte {
 	cmd := make([]byte, headerSize+4)
 	binaryEnc.PutUint32(cmd, uint32(pb.SetStateUpdate))
@@ -163,7 +253,7 @@ func GetSetTaskSchedulerStateCmd(state pb.TaskSchedulerState) []byte {
 }
 
 func GetTaskTableUserCmd(user pb.TaskTableUser) []byte {
-	cmd := make([]byte, headerSize+user.Size())
+	cmd := make([]byte, headerSize+user.ProtoSize())
 	binaryEnc.PutUint32(cmd, uint32(pb.SetTaskTableUserUpdate))
 	if _, err := user.MarshalTo(cmd[headerSize:]); err != nil {
 		panic(err)
@@ -185,8 +275,28 @@ func GetCNStoreHeartbeatCmd(data []byte) []byte {
 	return getHeartbeatCmd(data, pb.CNHeartbeatUpdate)
 }
 
-func GetDNStoreHeartbeatCmd(data []byte) []byte {
-	return getHeartbeatCmd(data, pb.DNHeartbeatUpdate)
+func GetTNStoreHeartbeatCmd(data []byte) []byte {
+	return getHeartbeatCmd(data, pb.TNHeartbeatUpdate)
+}
+
+func GetProxyHeartbeatCmd(data []byte) []byte {
+	return getHeartbeatCmd(data, pb.ProxyHeartbeatUpdate)
+}
+
+func GetUpdateNonVotingReplicaNumCmd(num uint64) []byte {
+	cmd := make([]byte, headerSize+8)
+	binaryEnc.PutUint32(cmd, uint32(pb.UpdateNonVotingReplicaNum))
+	binaryEnc.PutUint64(cmd[headerSize:], num)
+	return cmd
+}
+
+func GetUpdateNonVotingLocality(locality pb.Locality) []byte {
+	cmd := make([]byte, headerSize+locality.ProtoSize())
+	binaryEnc.PutUint32(cmd, uint32(pb.UpdateNonVotingLocality))
+	if _, err := locality.MarshalTo(cmd[headerSize:]); err != nil {
+		panic(err)
+	}
+	return cmd
 }
 
 func getHeartbeatCmd(data []byte, tag pb.HAKeeperUpdateType) []byte {
@@ -197,7 +307,7 @@ func getHeartbeatCmd(data []byte, tag pb.HAKeeperUpdateType) []byte {
 }
 
 func GetAllocateIDCmd(allocID pb.CNAllocateID) []byte {
-	cmd := make([]byte, headerSize+allocID.Size())
+	cmd := make([]byte, headerSize+allocID.ProtoSize())
 	binaryEnc.PutUint32(cmd, uint32(pb.GetIDUpdate))
 	if _, err := allocID.MarshalTo(cmd[headerSize:]); err != nil {
 		panic(err)
@@ -205,9 +315,54 @@ func GetAllocateIDCmd(allocID pb.CNAllocateID) []byte {
 	return cmd
 }
 
+func GetUpdateCNLabelCmd(label pb.CNStoreLabel) []byte {
+	cmd := make([]byte, headerSize+label.ProtoSize())
+	binaryEnc.PutUint32(cmd, uint32(pb.UpdateCNLabel))
+	if _, err := label.MarshalTo(cmd[headerSize:]); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
+func GetUpdateCNWorkStateCmd(state pb.CNWorkState) []byte {
+	cmd := make([]byte, headerSize+state.ProtoSize())
+	binaryEnc.PutUint32(cmd, uint32(pb.UpdateCNWorkState))
+	if _, err := state.MarshalTo(cmd[headerSize:]); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
+func GetPatchCNStoreCmd(stateLabel pb.CNStateLabel) []byte {
+	cmd := make([]byte, headerSize+stateLabel.ProtoSize())
+	binaryEnc.PutUint32(cmd, uint32(pb.PatchCNStore))
+	if _, err := stateLabel.MarshalTo(cmd[headerSize:]); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
+func GetDeleteCNStoreCmd(cnStore pb.DeleteCNStore) []byte {
+	cmd := make([]byte, headerSize+cnStore.ProtoSize())
+	binaryEnc.PutUint32(cmd, uint32(pb.RemoveCNStore))
+	if _, err := cnStore.MarshalTo(cmd[headerSize:]); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
+func GetAddLogShardCmd(addLogShard pb.AddLogShard) []byte {
+	cmd := make([]byte, headerSize+addLogShard.ProtoSize())
+	binaryEnc.PutUint32(cmd, uint32(pb.LogShardUpdate))
+	if _, err := addLogShard.MarshalTo(cmd[headerSize:]); err != nil {
+		panic(err)
+	}
+	return cmd
+}
+
 func NewStateMachine(shardID uint64, replicaID uint64) sm.IStateMachine {
 	if shardID != DefaultHAKeeperShardID {
-		panic(moerr.NewInvalidInputNoCtx("HAKeeper shard ID %d does not match DefaultHAKeeperShardID %d", shardID, DefaultHAKeeperShardID))
+		panic(moerr.NewInvalidInputNoCtxf("HAKeeper shard ID %d does not match DefaultHAKeeperShardID %d", shardID, DefaultHAKeeperShardID))
 	}
 	return &stateMachine{
 		replicaID: replicaID,
@@ -261,6 +416,10 @@ func (s *stateMachine) handleUpdateCommandsCmd(cmd []byte) sm.Result {
 			s.handleDeleteCNCmd(c.UUID)
 			continue
 		}
+		if c.DeleteProxyStore != nil {
+			s.handleDeleteProxyCmd(c.UUID)
+			continue
+		}
 		l, ok := s.state.ScheduleCommands[c.UUID]
 		if !ok {
 			l = pb.CommandBatch{
@@ -298,13 +457,13 @@ func (s *stateMachine) handleCNHeartbeat(cmd []byte) sm.Result {
 	return s.getCommandBatch(hb.UUID)
 }
 
-func (s *stateMachine) handleDNHeartbeat(cmd []byte) sm.Result {
+func (s *stateMachine) handleTNHeartbeat(cmd []byte) sm.Result {
 	data := parseHeartbeatCmd(cmd)
-	var hb pb.DNStoreHeartbeat
+	var hb pb.TNStoreHeartbeat
 	if err := hb.Unmarshal(data); err != nil {
 		panic(err)
 	}
-	s.state.DNState.Update(hb, s.state.Tick)
+	s.state.TNState.Update(hb, s.state.Tick)
 	return s.getCommandBatch(hb.UUID)
 }
 
@@ -425,7 +584,89 @@ func (s *stateMachine) handleTaskTableUserCmd(cmd []byte) sm.Result {
 }
 
 func (s *stateMachine) handleDeleteCNCmd(uuid string) sm.Result {
-	delete(s.state.CNState.Stores, uuid)
+	deletedTimeout := time.Hour * 24 * 7
+	var pos int
+	for _, store := range s.state.DeletedStores {
+		if time.Now().UnixNano()-store.DownTime > int64(deletedTimeout) {
+			pos++
+		}
+	}
+	s.state.DeletedStores = s.state.DeletedStores[pos:]
+	if store, ok := s.state.CNState.Stores[uuid]; ok {
+		delete(s.state.CNState.Stores, uuid)
+		var addr string
+		addrItems := strings.Split(store.SQLAddress, ":")
+		if len(addrItems) > 1 {
+			addr = addrItems[0]
+		}
+		s.state.DeletedStores = append(s.state.DeletedStores, pb.DeletedStore{
+			UUID:      uuid,
+			StoreType: "CN",
+			Address:   addr,
+			UpTime:    store.UpTime,
+			DownTime:  time.Now().UnixNano(),
+		})
+	}
+	return sm.Result{}
+}
+
+func (s *stateMachine) handleDeleteProxyCmd(uuid string) sm.Result {
+	delete(s.state.ProxyState.Stores, uuid)
+	return sm.Result{}
+}
+
+func (s *stateMachine) handleProxyHeartbeat(cmd []byte) sm.Result {
+	data := parseHeartbeatCmd(cmd)
+	var hb pb.ProxyHeartbeat
+	if err := hb.Unmarshal(data); err != nil {
+		panic(err)
+	}
+	s.state.ProxyState.Update(hb, s.state.Tick)
+	return s.getCommandBatch(hb.UUID)
+}
+
+func (s *stateMachine) handleUpdateNonVotingReplicaNum(cmd []byte) sm.Result {
+	s.state.NonVotingReplicaNum = parseUpdateNonVotingReplicaNumCmd(cmd)
+	return sm.Result{}
+}
+
+func (s *stateMachine) handleUpdateNonVotingLocality(cmd []byte) sm.Result {
+	locality := parseUpdateNonVotingLocalityCmd(cmd)
+	for k, v := range locality.Value {
+		if v == "" {
+			delete(locality.Value, k)
+		}
+	}
+	s.state.NonVotingLocality = locality
+	return sm.Result{}
+}
+
+func (s *stateMachine) handleLogShardUpdate(cmd []byte) sm.Result {
+	addLogShard := parseLogShardUpdateCmd(cmd)
+	_, ok := s.state.LogState.Shards[addLogShard.ShardID]
+	if !ok {
+		s.state.LogState.Shards[addLogShard.ShardID] = pb.LogShardInfo{
+			ShardID: addLogShard.ShardID,
+		}
+		var exists bool
+		var numOfLogReplicas uint64
+		for _, logShardRec := range s.state.ClusterInfo.LogShards {
+			numOfLogReplicas = logShardRec.NumberOfReplicas
+			if logShardRec.ShardID == addLogShard.ShardID {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			s.state.ClusterInfo.LogShards = append(
+				s.state.ClusterInfo.LogShards,
+				metadata.LogShardRecord{
+					ShardID:          addLogShard.ShardID,
+					NumberOfReplicas: numOfLogReplicas,
+				},
+			)
+		}
+	}
 	return sm.Result{}
 }
 
@@ -437,11 +678,17 @@ func (s *stateMachine) handleInitialClusterRequestCmd(cmd []byte) sm.Result {
 		return result
 	}
 	req := parseInitialClusterRequestCmd(cmd)
-	if req.NumOfLogShards != req.NumOfDNShards {
-		panic("DN:Log 1:1 mode is the only supported mode")
+
+	// The number of TN shard should only be 1.
+	// There is one corresponding Log shard with that TN shard.
+	// If there is more than one Log shard, to be exact, two Log shards,
+	// the second one is used to save data related with S3. The data in
+	// the second shard comes from the first one, but only related with S3.
+	if req.NumOfTNShards != 1 {
+		panic("only support 1 dn shards")
 	}
 
-	dnShards := make([]metadata.DNShardRecord, 0)
+	tnShards := make([]metadata.TNShardRecord, 0, 1)
 	logShards := make([]metadata.LogShardRecord, 0)
 	// HAKeeper shard is assigned ShardID 0
 	rec := metadata.LogShardRecord{
@@ -451,6 +698,7 @@ func (s *stateMachine) handleInitialClusterRequestCmd(cmd []byte) sm.Result {
 	logShards = append(logShards, rec)
 
 	s.state.NextID++
+	tnShardAppended := false
 	for i := uint64(0); i < req.NumOfLogShards; i++ {
 		rec := metadata.LogShardRecord{
 			ShardID:          s.state.NextID,
@@ -459,15 +707,20 @@ func (s *stateMachine) handleInitialClusterRequestCmd(cmd []byte) sm.Result {
 		s.state.NextID++
 		logShards = append(logShards, rec)
 
-		drec := metadata.DNShardRecord{
+		if tnShardAppended {
+			continue
+		}
+
+		drec := metadata.TNShardRecord{
 			ShardID:    s.state.NextID,
 			LogShardID: rec.ShardID,
 		}
 		s.state.NextID++
-		dnShards = append(dnShards, drec)
+		tnShards = append(tnShards, drec)
+		tnShardAppended = true
 	}
 	s.state.ClusterInfo = pb.ClusterInfo{
-		DNShards:  dnShards,
+		TNShards:  tnShards,
 		LogShards: logShards,
 	}
 
@@ -475,7 +728,16 @@ func (s *stateMachine) handleInitialClusterRequestCmd(cmd []byte) sm.Result {
 	if s.state.NextID > K8SIDRangeStart {
 		panic("too many IDs assigned during initial cluster request")
 	}
-	s.state.NextID = K8SIDRangeEnd
+	if req.NextID > K8SIDRangeEnd {
+		s.state.NextID = req.NextID
+	} else {
+		s.state.NextID = K8SIDRangeEnd
+	}
+	if len(req.NextIDByKey) > 0 {
+		s.state.NextIDByKey = req.NextIDByKey
+	}
+
+	s.state.NonVotingLocality.Value = req.NonVotingLocality
 
 	plog.Infof("initial cluster set, HAKeeper is in BOOTSTRAPPING state")
 	s.state.State = pb.HAKeeperBootstrapping
@@ -492,9 +754,10 @@ func (s *stateMachine) Update(e sm.Entry) (sm.Result, error) {
 	// TODO: we need to make sure InitialClusterRequestCmd is the
 	// first user cmd added to the Raft log
 	cmd := e.Cmd
+	s.state.Index = e.Index
 	switch parseCmdTag(cmd) {
-	case pb.DNHeartbeatUpdate:
-		return s.handleDNHeartbeat(cmd), nil
+	case pb.TNHeartbeatUpdate:
+		return s.handleTNHeartbeat(cmd), nil
 	case pb.CNHeartbeatUpdate:
 		return s.handleCNHeartbeat(cmd), nil
 	case pb.LogHeartbeatUpdate:
@@ -516,21 +779,42 @@ func (s *stateMachine) Update(e sm.Entry) (sm.Result, error) {
 	case pb.SetTaskTableUserUpdate:
 		s.assertState()
 		return s.handleTaskTableUserCmd(cmd), nil
+	case pb.UpdateCNLabel:
+		return s.handleUpdateCNLabel(cmd), nil
+	case pb.UpdateCNWorkState:
+		return s.handleUpdateCNWorkState(cmd), nil
+	case pb.PatchCNStore:
+		return s.handlePatchCNStore(cmd), nil
+	case pb.RemoveCNStore:
+		return s.handleDeleteCNCmd(parseDeleteCNStoreCmd(cmd).StoreID), nil
+	case pb.ProxyHeartbeatUpdate:
+		return s.handleProxyHeartbeat(cmd), nil
+	case pb.UpdateNonVotingReplicaNum:
+		return s.handleUpdateNonVotingReplicaNum(cmd), nil
+	case pb.UpdateNonVotingLocality:
+		return s.handleUpdateNonVotingLocality(cmd), nil
+	case pb.LogShardUpdate:
+		return s.handleLogShardUpdate(cmd), nil
 	default:
-		panic(moerr.NewInvalidInputNoCtx("unknown haKeeper cmd '%v'", cmd))
+		panic(moerr.NewInvalidInputNoCtxf("unknown haKeeper cmd '%v'", cmd))
 	}
 }
 
 func (s *stateMachine) handleStateQuery() interface{} {
 	internal := &pb.CheckerState{
-		Tick:               s.state.Tick,
-		ClusterInfo:        s.state.ClusterInfo,
-		DNState:            s.state.DNState,
-		LogState:           s.state.LogState,
-		CNState:            s.state.CNState,
-		State:              s.state.State,
-		TaskSchedulerState: s.state.TaskSchedulerState,
-		TaskTableUser:      s.state.TaskTableUser,
+		Tick:                s.state.Tick,
+		ClusterInfo:         s.state.ClusterInfo,
+		TNState:             s.state.TNState,
+		LogState:            s.state.LogState,
+		CNState:             s.state.CNState,
+		ProxyState:          s.state.ProxyState,
+		State:               s.state.State,
+		TaskSchedulerState:  s.state.TaskSchedulerState,
+		TaskTableUser:       s.state.TaskTableUser,
+		NextId:              s.state.NextID,
+		NextIDByKey:         s.state.NextIDByKey,
+		NonVotingReplicaNum: s.state.NonVotingReplicaNum,
+		NonVotingLocality:   s.state.NonVotingLocality,
 	}
 	copied := deepcopy.Copy(internal)
 	result, ok := copied.(*pb.CheckerState)
@@ -550,9 +834,10 @@ func (s *stateMachine) handleScheduleCommandQuery(uuid string) *pb.CommandBatch 
 func (s *stateMachine) handleClusterDetailsQuery(cfg Config) *pb.ClusterDetails {
 	cfg.Fill()
 	cd := &pb.ClusterDetails{
-		CNStores:  make([]pb.CNStore, 0, len(s.state.CNState.Stores)),
-		DNStores:  make([]pb.DNStore, 0, len(s.state.DNState.Stores)),
-		LogStores: make([]pb.LogStore, 0, len(s.state.LogState.Stores)),
+		CNStores:    make([]pb.CNStore, 0, len(s.state.CNState.Stores)),
+		TNStores:    make([]pb.TNStore, 0, len(s.state.TNState.Stores)),
+		LogStores:   make([]pb.LogStore, 0, len(s.state.LogState.Stores)),
+		ProxyStores: make([]pb.ProxyStore, 0, len(s.state.ProxyState.Stores)),
 	}
 	for uuid, info := range s.state.CNState.Stores {
 		state := pb.NormalState
@@ -560,21 +845,29 @@ func (s *stateMachine) handleClusterDetailsQuery(cfg Config) *pb.ClusterDetails 
 			state = pb.TimeoutState
 		}
 		n := pb.CNStore{
-			UUID:               uuid,
-			Tick:               info.Tick,
-			ServiceAddress:     info.ServiceAddress,
-			SQLAddress:         info.SQLAddress,
-			LockServiceAddress: info.LockServiceAddress,
-			State:              state,
+			UUID:                uuid,
+			Tick:                info.Tick,
+			ServiceAddress:      info.ServiceAddress,
+			SQLAddress:          info.SQLAddress,
+			LockServiceAddress:  info.LockServiceAddress,
+			ShardServiceAddress: info.ShardServiceAddress,
+			State:               state,
+			WorkState:           info.WorkState,
+			Labels:              info.Labels,
+			QueryAddress:        info.QueryAddress,
+			ConfigData:          info.ConfigData,
+			Resource:            info.Resource,
+			UpTime:              info.UpTime,
+			CommitID:            info.CommitID,
 		}
 		cd.CNStores = append(cd.CNStores, n)
 	}
-	for uuid, info := range s.state.DNState.Stores {
+	for uuid, info := range s.state.TNState.Stores {
 		state := pb.NormalState
-		if cfg.DNStoreExpired(info.Tick, s.state.Tick) {
+		if cfg.TNStoreExpired(info.Tick, s.state.Tick) {
 			state = pb.TimeoutState
 		}
-		n := pb.DNStore{
+		n := pb.TNStore{
 			UUID:                 uuid,
 			Tick:                 info.Tick,
 			State:                state,
@@ -582,8 +875,11 @@ func (s *stateMachine) handleClusterDetailsQuery(cfg Config) *pb.ClusterDetails 
 			Shards:               info.Shards,
 			LogtailServerAddress: info.LogtailServerAddress,
 			LockServiceAddress:   info.LockServiceAddress,
+			ShardServiceAddress:  info.ShardServiceAddress,
+			ConfigData:           info.ConfigData,
+			QueryAddress:         info.QueryAddress,
 		}
-		cd.DNStores = append(cd.DNStores, n)
+		cd.TNStores = append(cd.TNStores, n)
 	}
 	for uuid, info := range s.state.LogState.Stores {
 		state := pb.NormalState
@@ -596,10 +892,44 @@ func (s *stateMachine) handleClusterDetailsQuery(cfg Config) *pb.ClusterDetails 
 			State:          state,
 			ServiceAddress: info.ServiceAddress,
 			Replicas:       info.Replicas,
+			ConfigData:     info.ConfigData,
+			Locality:       info.Locality,
 		}
 		cd.LogStores = append(cd.LogStores, n)
 	}
+	for uuid, info := range s.state.ProxyState.Stores {
+		cd.ProxyStores = append(cd.ProxyStores, pb.ProxyStore{
+			UUID:          uuid,
+			Tick:          info.Tick,
+			ListenAddress: info.ListenAddress,
+			ConfigData:    info.ConfigData,
+		})
+	}
+	for _, store := range s.state.DeletedStores {
+		cd.DeletedStores = append(cd.DeletedStores, pb.DeletedStore{
+			UUID:      store.UUID,
+			StoreType: store.StoreType,
+			Address:   store.Address,
+			UpTime:    store.UpTime,
+			DownTime:  store.DownTime,
+		})
+	}
 	return cd
+}
+
+func (s *stateMachine) handleUpdateCNLabel(cmd []byte) sm.Result {
+	s.state.CNState.UpdateLabel(parseUpdateCNLabelCmd(cmd))
+	return sm.Result{}
+}
+
+func (s *stateMachine) handleUpdateCNWorkState(cmd []byte) sm.Result {
+	s.state.CNState.UpdateWorkState(parseUpdateCNWorkStateCmd(cmd))
+	return sm.Result{}
+}
+
+func (s *stateMachine) handlePatchCNStore(cmd []byte) sm.Result {
+	s.state.CNState.PatchCNStore(parsePatchCNStoreCmd(cmd))
+	return sm.Result{}
 }
 
 func (s *stateMachine) Lookup(query interface{}) (interface{}, error) {
@@ -609,6 +939,8 @@ func (s *stateMachine) Lookup(query interface{}) (interface{}, error) {
 		return s.handleScheduleCommandQuery(q.UUID), nil
 	} else if q, ok := query.(*ClusterDetailsQuery); ok {
 		return s.handleClusterDetailsQuery(q.Cfg), nil
+	} else if _, ok := query.(*IndexQuery); ok {
+		return s.state.Index, nil
 	}
 	panic("unknown query type")
 }
@@ -616,7 +948,7 @@ func (s *stateMachine) Lookup(query interface{}) (interface{}, error) {
 func (s *stateMachine) SaveSnapshot(w io.Writer,
 	_ sm.ISnapshotFileCollection, _ <-chan struct{}) error {
 	// FIXME: memory recycling when necessary
-	data := make([]byte, s.state.Size())
+	data := make([]byte, s.state.ProtoSize())
 	n, err := s.state.MarshalToSizedBuffer(data)
 	if err != nil {
 		return err

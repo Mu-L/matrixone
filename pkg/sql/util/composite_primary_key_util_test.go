@@ -15,6 +15,7 @@
 package util
 
 import (
+	crand "crypto/rand"
 	"math"
 	"math/rand"
 	"reflect"
@@ -167,7 +168,7 @@ func TestFillCompositePKeyBatch(t *testing.T) {
 	bat, pkeyDef, valueCount := MakeBatch(columnSize, rowCount, proc.Mp())
 	err := FillCompositeKeyBatch(bat, catalog.CPrimaryKeyColName, pkeyDef.Names, proc)
 	require.Equal(t, err, nil)
-	bs := vector.MustBytesCol(bat.Vecs[len(bat.Vecs)-1])
+	bs := vector.InefficientMustBytesCol(bat.Vecs[len(bat.Vecs)-1])
 	tuples := make([]types.Tuple, 0)
 	for i := 0; i < len(bs); i++ {
 		tuple, err := types.Unpack(bs[i])
@@ -199,7 +200,7 @@ func MakeBatch(columnSize int, rowCount int, mp *mpool.MPool) (*batch.Batch, *pl
 			keys = append(keys, strconv.Itoa(i))
 		}
 	}
-	bat := batch.New(true, attrs)
+	bat := batch.New(attrs)
 	valueCount := make(map[[2]int]interface{})
 	for i := 0; i < columnSize; i++ {
 		bat.Vecs[i] = vector.NewVec(randType().ToType())
@@ -210,6 +211,7 @@ func MakeBatch(columnSize int, rowCount int, mp *mpool.MPool) (*batch.Batch, *pl
 		PkeyColName: catalog.CPrimaryKeyColName,
 		Names:       keys,
 	}
+	bat.SetRowCount(rowCount)
 	return bat, primaryKeyDef, valueCount
 }
 
@@ -475,6 +477,6 @@ func randDecimal128() types.Decimal128 {
 
 func randStringType() []byte {
 	b := make([]byte, 1024)
-	rand.Read(b)
+	crand.Read(b)
 	return b
 }

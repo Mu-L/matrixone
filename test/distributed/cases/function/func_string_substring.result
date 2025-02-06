@@ -71,20 +71,17 @@ select substring('hello', 4294967297, 1);
 substring(hello, 4294967297, 1)
 
 select substring('hello', -18446744073709551615, 1);
-substring(hello, -18446744073709551615, 1)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551615'
 select substring('hello', 18446744073709551615, 1);
-invalid argument function substring(str, start, lenth), bad value 18446744073709551615
+Data truncation: data out of range: data type int64, value '18446744073709551615'
 select substring('hello', -18446744073709551616, 1);
-substring(hello, -18446744073709551616, 1)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551616'
 select substring('hello', 18446744073709551616, 1);
-invalid argument function substring(str, start, lenth), bad value 1.8446744073709552e+19
+Data truncation: data out of range: data type int64, value '18446744073709551616'
 select substring('hello', -18446744073709551617, 1);
-substring(hello, -18446744073709551617, 1)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551617'
 select substring('hello', 18446744073709551617, 1);
-invalid argument function substring(str, start, lenth), bad value 1.8446744073709552e+19
+Data truncation: data out of range: data type int64, value '18446744073709551617'
 select substring('hello', 1, -1);
 substring(hello, 1, -1)
 
@@ -107,20 +104,17 @@ select substring('hello', 1, 4294967297);
 substring(hello, 1, 4294967297)
 hello
 select substring('hello', 1, -18446744073709551615);
-substring(hello, 1, -18446744073709551615)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551615'
 select substring('hello', 1, 18446744073709551615);
-invalid argument function substring(str, start, lenth), bad value 18446744073709551615
+Data truncation: data out of range: data type int64, value '18446744073709551615'
 select substring('hello', 1, -18446744073709551616);
-substring(hello, 1, -18446744073709551616)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551616'
 select substring('hello', 1, 18446744073709551616);
-invalid argument function substring(str, start, lenth), bad value 1.8446744073709552e+19
+Data truncation: data out of range: data type int64, value '18446744073709551616'
 select substring('hello', 1, -18446744073709551617);
-substring(hello, 1, -18446744073709551617)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551617'
 select substring('hello', 1, 18446744073709551617);
-invalid argument function substring(str, start, lenth), bad value 1.8446744073709552e+19
+Data truncation: data out of range: data type int64, value '18446744073709551617'
 select substring('hello', -1, -1);
 substring(hello, -1, -1)
 
@@ -143,20 +137,17 @@ select substring('hello', 4294967297, 4294967297);
 substring(hello, 4294967297, 4294967297)
 
 select substring('hello', -18446744073709551615, -18446744073709551615);
-substring(hello, -18446744073709551615, -18446744073709551615)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551615'
 select substring('hello', 18446744073709551615, 18446744073709551615);
-invalid argument function substring(str, start, lenth), bad value 18446744073709551615
+Data truncation: data out of range: data type int64, value '18446744073709551615'
 select substring('hello', -18446744073709551616, -18446744073709551616);
-substring(hello, -18446744073709551616, -18446744073709551616)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551616'
 select substring('hello', 18446744073709551616, 18446744073709551616);
-invalid argument function substring(str, start, lenth), bad value 1.8446744073709552e+19
+Data truncation: data out of range: data type int64, value '18446744073709551616'
 select substring('hello', -18446744073709551617, -18446744073709551617);
-substring(hello, -18446744073709551617, -18446744073709551617)
-
+Data truncation: data out of range: data type int64, value '-18446744073709551617'
 select substring('hello', 18446744073709551617, 18446744073709551617);
-invalid argument function substring(str, start, lenth), bad value 1.8446744073709552e+19
+Data truncation: data out of range: data type int64, value '18446744073709551617'
 SELECT SUBSTRING('Sakila' FROM -4 FOR 2);
 substring(Sakila, -4, 2)
 ki
@@ -171,8 +162,14 @@ substring(abc, cast(2 as int unsigned))
 bc
 create table t1(f1 varchar(255));
 insert into t1 values ("123"),("456");
+select substring(f1,1,1) from t1 group by substring(f1,1,1);
+substirng(f1, 1, 1)
+1
+4
 select substring(f1,1,1) from t1 group by 1;
-SQL syntax error: column "t1.f1" must appear in the GROUP BY clause or be used in an aggregate function
+substirng(f1, 1, 1)
+1
+4
 drop table t1;
 SELECT '1' IN ('1', SUBSTRING(-9223372036854775809, 1));
 1 in (1, substring(-9223372036854775809, 1))

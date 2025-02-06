@@ -16,62 +16,113 @@ package testutil
 
 import (
 	"context"
+	"encoding/binary"
 	"math/rand"
 	"strconv"
 	"time"
-	"unsafe"
 
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/incrservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	"github.com/matrixorigin/matrixone/pkg/queryservice/client"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func NewProcess() *process.Process {
-	mp := mpool.MustNewZeroNoFixed()
-	return NewProcessWithMPool(mp)
+type ProcOptions func(proc *process.Process)
+
+func WithMPool(pool *mpool.MPool) ProcOptions {
+	return func(proc *process.Process) {
+		proc.SetMPool(pool)
+	}
 }
 
-func NewProcessWithMPool(mp *mpool.MPool) *process.Process {
-	proc := process.New(
-		context.Background(),
+func WithFileService(fs fileservice.FileService) ProcOptions {
+	return func(proc *process.Process) {
+		if proc.GetFileService() != nil {
+			proc.GetFileService().Close(proc.Ctx)
+		}
+		proc.SetFileService(fs)
+	}
+}
+
+func WithQueryClient(queryClient client.QueryClient) ProcOptions {
+	return func(proc *process.Process) {
+		proc.Base.QueryClient = queryClient
+	}
+}
+
+func NewProcess(opts ...ProcOptions) *process.Process {
+	mp := mpool.MustNewZeroNoFixed()
+	proc := NewProcessWithMPool("", mp)
+	for _, opt := range opts {
+		opt(proc)
+	}
+	return proc
+}
+
+func SetupAutoIncrService(sid string) {
+	rt := runtime.ServiceRuntime(sid)
+	if rt == nil {
+		rt = runtime.DefaultRuntime()
+		runtime.SetupServiceBasedRuntime(sid, rt)
+	}
+	rt.SetGlobalVariables(
+		runtime.AutoIncrementService,
+		incrservice.NewIncrService(
+			"",
+			incrservice.NewMemStore(),
+			incrservice.Config{}))
+}
+
+func NewProcessWithMPool(sid string, mp *mpool.MPool) *process.Process {
+	SetupAutoIncrService(sid)
+	ctx := defines.AttachAccountId(context.Background(), catalog.System_Account)
+	proc := process.NewTopProcess(
+		ctx,
 		mp,
 		nil, // no txn client can be set
 		nil, // no txn operator can be set
 		NewFS(),
 		nil,
+		nil,
+		nil,
+		nil,
+		nil,
 	)
-	proc.Lim.Size = 1 << 20
-	proc.Lim.BatchRows = 1 << 20
-	proc.Lim.BatchSize = 1 << 20
-	proc.Lim.ReaderSize = 1 << 20
-	proc.SessionInfo.TimeZone = time.Local
+	proc.Base.Lim.Size = 1 << 20
+	proc.Base.Lim.BatchRows = 1 << 20
+	proc.Base.Lim.BatchSize = 1 << 20
+	proc.Base.Lim.ReaderSize = 1 << 20
+	proc.Base.SessionInfo.TimeZone = time.Local
+
 	return proc
 }
 
 var NewProc = NewProcess
 
 func NewFS() *fileservice.FileServices {
-	local, err := fileservice.NewMemoryFS(defines.LocalFileServiceName)
+	local, err := fileservice.NewMemoryFS(defines.LocalFileServiceName, fileservice.DisabledCacheConfig, nil)
 	if err != nil {
 		panic(err)
 	}
-	s3, err := fileservice.NewMemoryFS(defines.SharedFileServiceName)
+	s3, err := fileservice.NewMemoryFS(defines.SharedFileServiceName, fileservice.DisabledCacheConfig, nil)
 	if err != nil {
 		panic(err)
 	}
-	etl, err := fileservice.NewMemoryFS(defines.ETLFileServiceName)
+	etl, err := fileservice.NewMemoryFS(defines.ETLFileServiceName, fileservice.DisabledCacheConfig, nil)
 	if err != nil {
 		panic(err)
 	}
 	fs, err := fileservice.NewFileServices(
-		"local",
+		"",
 		local,
 		s3,
 		etl,
@@ -82,22 +133,39 @@ func NewFS() *fileservice.FileServices {
 	return fs
 }
 
+func NewSharedFS() fileservice.FileService {
+	fs, err := fileservice.NewMemoryFS(defines.SharedFileServiceName, fileservice.DisabledCacheConfig, nil)
+	if err != nil {
+		panic(err)
+	}
+	return fs
+}
+
+func NewETLFS() fileservice.FileService {
+	fs, err := fileservice.NewMemoryFS(defines.ETLFileServiceName, fileservice.DisabledCacheConfig, nil)
+	if err != nil {
+		panic(err)
+	}
+	return fs
+}
+
 func NewBatch(ts []types.Type, random bool, n int, m *mpool.MPool) *batch.Batch {
 	bat := batch.NewWithSize(len(ts))
-	bat.InitZsOne(n)
+	bat.SetRowCount(n)
 	for i := range bat.Vecs {
 		bat.Vecs[i] = NewVector(n, ts[i], m, random, nil)
-		nulls.New(bat.Vecs[i].GetNulls(), n)
+		// XXX do we need to init nulls here?   can we be lazy?
+		bat.Vecs[i].GetNulls().InitWithSize(n)
 	}
 	return bat
 }
 
 func NewBatchWithNulls(ts []types.Type, random bool, n int, m *mpool.MPool) *batch.Batch {
 	bat := batch.NewWithSize(len(ts))
-	bat.InitZsOne(n)
+	bat.SetRowCount(n)
 	for i := range bat.Vecs {
 		bat.Vecs[i] = NewVector(n, ts[i], m, random, nil)
-		nulls.New(bat.Vecs[i].GetNulls(), n)
+		bat.Vecs[i].GetNulls().InitWithSize(n)
 		nsp := bat.Vecs[i].GetNulls()
 		for j := 0; j < n; j++ {
 			if j%2 == 0 {
@@ -111,11 +179,7 @@ func NewBatchWithNulls(ts []types.Type, random bool, n int, m *mpool.MPool) *bat
 func NewBatchWithVectors(vs []*vector.Vector, zs []int64) *batch.Batch {
 	bat := batch.NewWithSize(len(vs))
 	if len(vs) > 0 {
-		l := vs[0].Length()
-		if zs == nil {
-			zs = MakeBatchZs(l, false)
-		}
-		bat.Zs = append([]int64{}, zs...)
+		bat.SetRowCount(vs[0].Length())
 		bat.Vecs = vs
 	}
 	return bat
@@ -128,6 +192,11 @@ func NewVector(n int, typ types.Type, m *mpool.MPool, random bool, Values interf
 			return NewBoolVector(n, typ, m, random, vs)
 		}
 		return NewBoolVector(n, typ, m, random, nil)
+	case types.T_bit:
+		if vs, ok := Values.([]uint64); ok {
+			return NewUInt64Vector(n, typ, m, random, vs)
+		}
+		return NewUInt64Vector(n, typ, m, random, nil)
 	case types.T_int8:
 		if vs, ok := Values.([]int8); ok {
 			return NewInt8Vector(n, typ, m, random, vs)
@@ -209,11 +278,21 @@ func NewVector(n int, typ types.Type, m *mpool.MPool, random bool, Values interf
 		}
 		return NewDecimal128Vector(n, typ, m, random, nil)
 	case types.T_char, types.T_varchar,
-		types.T_binary, types.T_varbinary, types.T_blob, types.T_text:
+		types.T_binary, types.T_varbinary, types.T_blob, types.T_text, types.T_datalink:
 		if vs, ok := Values.([]string); ok {
 			return NewStringVector(n, typ, m, random, vs)
 		}
 		return NewStringVector(n, typ, m, random, nil)
+	case types.T_array_float32:
+		if vs, ok := Values.([][]float32); ok {
+			return NewArrayVector[float32](n, typ, m, random, vs)
+		}
+		return NewArrayVector[float32](n, typ, m, random, nil)
+	case types.T_array_float64:
+		if vs, ok := Values.([][]float64); ok {
+			return NewArrayVector[float64](n, typ, m, random, vs)
+		}
+		return NewArrayVector[float64](n, typ, m, random, nil)
 	case types.T_json:
 		if vs, ok := Values.([]string); ok {
 			return NewJsonVector(n, typ, m, random, vs)
@@ -229,8 +308,18 @@ func NewVector(n int, typ types.Type, m *mpool.MPool, random bool, Values interf
 			return NewRowidVector(n, typ, m, random, vs)
 		}
 		return NewRowidVector(n, typ, m, random, nil)
+	case types.T_Blockid:
+		if vs, ok := Values.([]types.Blockid); ok {
+			return NewBlockidVector(n, typ, m, random, vs)
+		}
+		return NewBlockidVector(n, typ, m, random, nil)
+	case types.T_enum:
+		if vs, ok := Values.([]uint16); ok {
+			return NewUInt16Vector(n, typ, m, random, vs)
+		}
+		return NewUInt16Vector(n, typ, m, random, nil)
 	default:
-		panic(moerr.NewInternalErrorNoCtx("unsupport vector's type '%v", typ))
+		panic(moerr.NewInternalErrorNoCtxf("unsupport vector's type '%v", typ))
 	}
 }
 
@@ -269,10 +358,37 @@ func NewRowidVector(n int, typ types.Type, m *mpool.MPool, _ bool, vs []types.Ro
 		return vec
 	}
 	for i := 0; i < n; i++ {
-		var rowId [2]int64
+		var rowId types.Rowid
+		binary.LittleEndian.PutUint64(
+			rowId[types.RowidSize/2:types.RowidSize/2+8],
+			uint64(i),
+		)
+		if err := vector.AppendFixed(vec, rowId, false, m); err != nil {
+			vec.Free(m)
+			return nil
+		}
+	}
+	return vec
+}
 
-		rowId[1] = int64(i)
-		if err := vector.AppendFixed(vec, *(*types.Rowid)(unsafe.Pointer(&rowId[0])), false, m); err != nil {
+func NewBlockidVector(n int, typ types.Type, m *mpool.MPool, _ bool, vs []types.Blockid) *vector.Vector {
+	vec := vector.NewVec(typ)
+	if vs != nil {
+		for i := range vs {
+			if err := vector.AppendFixed(vec, vs[i], false, m); err != nil {
+				vec.Free(m)
+				return nil
+			}
+		}
+		return vec
+	}
+	for i := 0; i < n; i++ {
+		var blockId types.Blockid
+		binary.LittleEndian.PutUint64(
+			blockId[types.BlockidSize/2:types.BlockidSize/2+8],
+			uint64(i),
+		)
+		if err := vector.AppendFixed(vec, blockId, false, m); err != nil {
 			vec.Free(m)
 			return nil
 		}
@@ -679,6 +795,30 @@ func NewTimeVector(n int, typ types.Type, m *mpool.MPool, random bool, vs []stri
 	return vec
 }
 
+func NewEnumVector(n int, typ types.Type, m *mpool.MPool, random bool, vs []uint16) *vector.Vector {
+	vec := vector.NewVec(typ)
+	if vs != nil {
+		for i := range vs {
+			if err := vector.AppendFixed(vec, types.Enum(vs[i]), false, m); err != nil {
+				vec.Free(m)
+				return nil
+			}
+		}
+		return vec
+	}
+	for i := 1; i <= n; i++ {
+		v := i
+		if random {
+			v = rand.Int()
+		}
+		if err := vector.AppendFixed(vec, types.Enum(v), false, m); err != nil {
+			vec.Free(m)
+			return nil
+		}
+	}
+	return vec
+}
+
 func NewDatetimeVector(n int, typ types.Type, m *mpool.MPool, random bool, vs []string) *vector.Vector {
 	vec := vector.NewVec(typ)
 	if vs != nil {
@@ -757,4 +897,35 @@ func NewStringVector(n int, typ types.Type, m *mpool.MPool, random bool, vs []st
 		}
 	}
 	return vec
+}
+
+func NewArrayVector[T types.RealNumbers](n int, typ types.Type, m *mpool.MPool, random bool, vs [][]T) *vector.Vector {
+	vec := vector.NewVec(typ)
+	if vs != nil {
+		for i := range vs {
+			if err := vector.AppendArray[T](vec, vs[i], false, m); err != nil {
+				vec.Free(m)
+				return nil
+			}
+		}
+		return vec
+	}
+	for i := 0; i < n; i++ {
+		v := i
+		if random {
+			v = rand.Int()
+		}
+		if err := vector.AppendArray[T](vec, []T{T(v), T(v + 1)}, false, m); err != nil {
+			vec.Free(m)
+			return nil
+		}
+	}
+	return vec
+}
+
+func NewRegMsg(bat *batch.Batch) *process.RegisterMessage {
+	return &process.RegisterMessage{
+		Batch: bat,
+		Err:   nil,
+	}
 }

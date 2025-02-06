@@ -23,6 +23,10 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/lockservice"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
@@ -34,8 +38,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/txn/rpc"
 	"github.com/matrixorigin/matrixone/pkg/txn/storage"
 	"github.com/matrixorigin/matrixone/pkg/txn/storage/mem"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 )
 
 // NewTestTxnService create a test TxnService for test
@@ -54,7 +56,7 @@ func NewTestTxnServiceWithAllocator(
 	sender rpc.TxnSender,
 	clock clock.Clock,
 	allocator lockservice.LockTableAllocator) TxnService {
-	return NewTestTxnServiceWithLogAndZombieAndLockTabkeAllocator(
+	return NewTestTxnServiceWithLogAndZombieAndLockTableAllocator(
 		t,
 		shard,
 		sender,
@@ -88,7 +90,7 @@ func NewTestTxnServiceWithLogAndZombie(
 	clock clock.Clock,
 	log logservice.Client,
 	zombie time.Duration) TxnService {
-	return NewTestTxnServiceWithLogAndZombieAndLockTabkeAllocator(
+	return NewTestTxnServiceWithLogAndZombieAndLockTableAllocator(
 		t,
 		shard,
 		sender,
@@ -99,26 +101,30 @@ func NewTestTxnServiceWithLogAndZombie(
 	)
 }
 
-// NewTestTxnServiceWithLogAndZombieAndLockTabkeAllocator is similar to NewTestTxnService, but with more args
-func NewTestTxnServiceWithLogAndZombieAndLockTabkeAllocator(
+// NewTestTxnServiceWithLogAndZombieAndLockTableAllocator is similar to NewTestTxnService, but with more args
+func NewTestTxnServiceWithLogAndZombieAndLockTableAllocator(
 	t *testing.T,
 	shard uint64,
 	sender rpc.TxnSender,
 	clock clock.Clock,
 	log logservice.Client,
 	zombie time.Duration,
-	allocator lockservice.LockTableAllocator) TxnService {
+	allocator lockservice.LockTableAllocator,
+) TxnService {
 	rt := runtime.NewRuntime(
-		metadata.ServiceType_DN,
+		metadata.ServiceType_TN,
 		"dn-uuid",
 		logutil.GetPanicLoggerWithLevel(zapcore.DebugLevel).With(zap.String("case", t.Name())),
 		runtime.WithClock(clock))
-	return NewTxnService(rt,
-		NewTestDNShard(shard),
+	runtime.SetupServiceBasedRuntime("dn-uuid", rt)
+	return NewTxnService(
+		"dn-uuid",
+		NewTestTNShard(shard),
 		NewTestTxnStorage(log, clock),
 		sender,
 		zombie,
-		allocator).(*service)
+		allocator,
+	).(*service)
 }
 
 // NewTestTxnStorage create a TxnStorage used to recovery tests
@@ -129,10 +135,10 @@ func NewTestTxnStorage(log logservice.Client, clock clock.Clock) storage.TxnStor
 	return mem.NewKVTxnStorage(1, log, clock)
 }
 
-// NewTestDNShard create a test DNShard
-func NewTestDNShard(id uint64) metadata.DNShard {
-	return metadata.DNShard{
-		DNShardRecord: metadata.DNShardRecord{
+// NewTestTNShard create a test DNShard
+func NewTestTNShard(id uint64) metadata.TNShard {
+	return metadata.TNShard{
+		TNShardRecord: metadata.TNShardRecord{
 			ShardID:    id,
 			LogShardID: id,
 		},
@@ -163,6 +169,7 @@ type TestSender struct {
 		sync.Mutex
 		cancels []context.CancelFunc
 	}
+	action string
 }
 
 // NewTestSender create test TxnSender
@@ -184,8 +191,8 @@ func (s *TestSender) AddTxnService(ts TxnService) {
 	s.router[s.getRouteKey(txn.TxnMethod_Rollback, ts.Shard())] = ts.Rollback
 	s.router[s.getRouteKey(txn.TxnMethod_Prepare, ts.Shard())] = ts.Prepare
 	s.router[s.getRouteKey(txn.TxnMethod_GetStatus, ts.Shard())] = ts.GetStatus
-	s.router[s.getRouteKey(txn.TxnMethod_CommitDNShard, ts.Shard())] = ts.CommitDNShard
-	s.router[s.getRouteKey(txn.TxnMethod_RollbackDNShard, ts.Shard())] = ts.RollbackDNShard
+	s.router[s.getRouteKey(txn.TxnMethod_CommitTNShard, ts.Shard())] = ts.CommitTNShard
+	s.router[s.getRouteKey(txn.TxnMethod_RollbackTNShard, ts.Shard())] = ts.RollbackTNShard
 	s.router[s.getRouteKey(txn.TxnMethod_DEBUG, ts.Shard())] = ts.Debug
 }
 
@@ -195,7 +202,11 @@ func (s *TestSender) setFilter(filter func(*txn.TxnRequest) bool) {
 
 // Send TxnSender send
 func (s *TestSender) Send(ctx context.Context, requests []txn.TxnRequest) (*rpc.SendResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	if s.action == "return_err_and_reset" {
+		s.action = ""
+		return nil, moerr.NewInternalErrorNoCtx("return error")
+	}
+	ctx, cancel := context.WithTimeoutCause(ctx, time.Minute, moerr.CauseTestSenderSend)
 	s.mu.Lock()
 	s.mu.cancels = append(s.mu.cancels, cancel)
 	s.mu.Unlock()
@@ -207,9 +218,9 @@ func (s *TestSender) Send(ctx context.Context, requests []txn.TxnRequest) (*rpc.
 		}
 
 		resp := txn.TxnResponse{}
-		h := s.router[s.getRouteKey(req.Method, req.GetTargetDN())]
+		h := s.router[s.getRouteKey(req.Method, req.GetTargetTN())]
 		if err := h(ctx, &req, &resp); err != nil {
-			return nil, err
+			return nil, moerr.AttachCause(ctx, err)
 		}
 		responses = append(responses, resp)
 	}
@@ -226,7 +237,7 @@ func (s *TestSender) Close() error {
 	return nil
 }
 
-func (s *TestSender) getRouteKey(method txn.TxnMethod, shard metadata.DNShard) string {
+func (s *TestSender) getRouteKey(method txn.TxnMethod, shard metadata.TNShard) string {
 	return fmt.Sprintf("%d-%s", shard.ShardID, method.String())
 }
 
@@ -239,7 +250,7 @@ func NewTestTxn(txnID byte, ts int64, shards ...uint64) txn.TxnMeta {
 		SnapshotTS: NewTestTimestamp(ts),
 	}
 	for _, shard := range shards {
-		txnMeta.DNShards = append(txnMeta.DNShards, NewTestDNShard(shard))
+		txnMeta.TNShards = append(txnMeta.TNShards, NewTestTNShard(shard))
 	}
 	return txnMeta
 }
@@ -256,7 +267,7 @@ func NewTestWriteRequest(k byte, wTxn txn.TxnMeta, toShard uint64) txn.TxnReques
 	value := GetTestValue(k, wTxn)
 	req := mem.NewSetTxnRequest([][]byte{key}, [][]byte{value})
 	req.Txn = wTxn
-	req.CNRequest.Target = NewTestDNShard(toShard)
+	req.CNRequest.Target = NewTestTNShard(toShard)
 	return req
 }
 
@@ -265,7 +276,7 @@ func NewTestReadRequest(k byte, rTxn txn.TxnMeta, toShard uint64) txn.TxnRequest
 	key := GetTestKey(k)
 	req := mem.NewGetTxnRequest([][]byte{key})
 	req.Txn = rTxn
-	req.CNRequest.Target = NewTestDNShard(toShard)
+	req.CNRequest.Target = NewTestTNShard(toShard)
 	return req
 }
 
@@ -281,10 +292,10 @@ func NewTestCommitRequest(wTxn txn.TxnMeta) txn.TxnRequest {
 // NewTestCommitShardRequest create a commit DNShard request
 func NewTestCommitShardRequest(wTxn txn.TxnMeta) txn.TxnRequest {
 	return txn.TxnRequest{
-		Method: txn.TxnMethod_CommitDNShard,
+		Method: txn.TxnMethod_CommitTNShard,
 		Txn:    wTxn,
-		CommitDNShardRequest: &txn.TxnCommitDNShardRequest{
-			DNShard: wTxn.DNShards[0],
+		CommitTNShardRequest: &txn.TxnCommitTNShardRequest{
+			TNShard: wTxn.TNShards[0],
 		},
 	}
 }
@@ -292,10 +303,10 @@ func NewTestCommitShardRequest(wTxn txn.TxnMeta) txn.TxnRequest {
 // NewTestRollbackShardRequest create a rollback DNShard request
 func NewTestRollbackShardRequest(wTxn txn.TxnMeta) txn.TxnRequest {
 	return txn.TxnRequest{
-		Method: txn.TxnMethod_RollbackDNShard,
+		Method: txn.TxnMethod_RollbackTNShard,
 		Txn:    wTxn,
-		RollbackDNShardRequest: &txn.TxnRollbackDNShardRequest{
-			DNShard: wTxn.DNShards[0],
+		RollbackTNShardRequest: &txn.TxnRollbackTNShardRequest{
+			TNShard: wTxn.TNShards[0],
 		},
 	}
 }
@@ -315,7 +326,7 @@ func NewTestPrepareRequest(wTxn txn.TxnMeta, shard uint64) txn.TxnRequest {
 		Method: txn.TxnMethod_Prepare,
 		Txn:    wTxn,
 		PrepareRequest: &txn.TxnPrepareRequest{
-			DNShard: NewTestDNShard(shard),
+			TNShard: NewTestTNShard(shard),
 		},
 	}
 }
@@ -326,7 +337,7 @@ func NewTestGetStatusRequest(wTxn txn.TxnMeta, shard uint64) txn.TxnRequest {
 		Method: txn.TxnMethod_GetStatus,
 		Txn:    wTxn,
 		GetStatusRequest: &txn.TxnGetStatusRequest{
-			DNShard: NewTestDNShard(shard),
+			TNShard: NewTestTNShard(shard),
 		},
 	}
 }

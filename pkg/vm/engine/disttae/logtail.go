@@ -16,51 +16,94 @@ package disttae
 
 import (
 	"context"
+	"time"
+
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/cache"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/logtailreplay"
 )
 
 func consumeEntry(
 	ctx context.Context,
-	primaryIdx int,
+	primarySeqnum int,
 	engine *Engine,
-	state *PartitionState,
+	cache *cache.CatalogCache,
+	state *logtailreplay.PartitionState,
 	e *api.Entry,
+	isSub bool,
 ) error {
+	// for test only.
+	if engine.skipConsume {
+		return nil
+	}
+	start := time.Now()
+	defer func() {
+		v2.LogtailUpdatePartitonConsumeLogtailOneEntryDurationHistogram.Observe(time.Since(start).Seconds())
+	}()
 
-	packer, put := engine.packerPool.Get()
-	defer put()
-	state.HandleLogtailEntry(ctx, e, primaryIdx, packer)
+	var packer *types.Packer
+	put := engine.packerPool.Get(&packer)
+	defer put.Put()
 
-	if isMetaTable(e.TableName) {
+	if state != nil {
+		t0 := time.Now()
+		state.HandleLogtailEntry(ctx, engine.fs, e, primarySeqnum, packer, engine.mp)
+		v2.LogtailUpdatePartitonConsumeLogtailOneEntryLogtailReplayDurationHistogram.Observe(time.Since(t0).Seconds())
+	}
+
+	// Try to handle the memory records of the three tables
+	if !catalog.IsSystemTable(e.TableId) || logtailreplay.IsMetaEntry(e.TableName) || e.EntryType == api.Entry_DataObject || e.EntryType == api.Entry_TombstoneObject {
 		return nil
 	}
 
+	if engine.PushClient().dcaTryDelay(isSub, func() { applyToCatalogCache(cache, e) }) {
+		return nil
+	}
+
+	applyToCatalogCache(cache, e)
+	return nil
+}
+
+func applyToCatalogCache(cache *cache.CatalogCache, e *api.Entry) {
+	t0 := time.Now()
 	if e.EntryType == api.Entry_Insert {
 		switch e.TableId {
 		case catalog.MO_TABLES_ID:
 			bat, _ := batch.ProtoBatchToBatch(e.Bat)
-			engine.catalog.InsertTable(bat)
+			if cache != nil {
+				cache.InsertTable(bat)
+			}
 		case catalog.MO_DATABASE_ID:
 			bat, _ := batch.ProtoBatchToBatch(e.Bat)
-			engine.catalog.InsertDatabase(bat)
+			if cache != nil {
+				cache.InsertDatabase(bat)
+			}
 		case catalog.MO_COLUMNS_ID:
 			bat, _ := batch.ProtoBatchToBatch(e.Bat)
-			engine.catalog.InsertColumns(bat)
+			if cache != nil {
+				cache.InsertColumns(bat)
+			}
 		}
-		return nil
+		v2.LogtailUpdatePartitonConsumeLogtailOneEntryUpdateCatalogCacheDurationHistogram.Observe(time.Since(t0).Seconds())
+		return
 	}
 
 	switch e.TableId {
 	case catalog.MO_TABLES_ID:
-		bat, _ := batch.ProtoBatchToBatch(e.Bat)
-		engine.catalog.DeleteTable(bat)
+		if cache != nil && !logtailreplay.IsTransferredDels(e.TableName) {
+			bat, _ := batch.ProtoBatchToBatch(e.Bat)
+			cache.DeleteTable(bat)
+		}
 	case catalog.MO_DATABASE_ID:
-		bat, _ := batch.ProtoBatchToBatch(e.Bat)
-		engine.catalog.DeleteDatabase(bat)
+		if cache != nil && !logtailreplay.IsTransferredDels(e.TableName) {
+			bat, _ := batch.ProtoBatchToBatch(e.Bat)
+			cache.DeleteDatabase(bat)
+		}
 	}
-
-	return nil
+	v2.LogtailUpdatePartitonConsumeLogtailOneEntryUpdateCatalogCacheDurationHistogram.Observe(time.Since(t0).Seconds())
 }

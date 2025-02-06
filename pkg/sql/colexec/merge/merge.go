@@ -16,67 +16,57 @@ package merge
 
 import (
 	"bytes"
-	"reflect"
-	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(_ any, buf *bytes.Buffer) {
-	buf.WriteString(" union all ")
+const opName = "merge"
+
+func (merge *Merge) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(": union all ")
 }
 
-func Prepare(proc *process.Process, arg any) error {
-	ap := arg.(*Argument)
-	ap.ctr = new(container)
-	ap.ctr.receiverListener = make([]reflect.SelectCase, len(proc.Reg.MergeReceivers))
-	for i, mr := range proc.Reg.MergeReceivers {
-		ap.ctr.receiverListener[i] = reflect.SelectCase{
-			Dir:  reflect.SelectRecv,
-			Chan: reflect.ValueOf(mr.Ch),
-		}
+func (merge *Merge) OpType() vm.OpType {
+	return vm.Merge
+}
+
+func (merge *Merge) Prepare(proc *process.Process) error {
+	if merge.OpAnalyzer == nil {
+		merge.OpAnalyzer = process.NewAnalyzer(merge.GetIdx(), merge.IsFirst, merge.IsLast, "merge")
+	} else {
+		merge.OpAnalyzer.Reset()
 	}
 
-	ap.ctr.aliveMergeReceiver = len(proc.Reg.MergeReceivers)
+	if merge.Partial {
+		merge.ctr.receiver = process.InitPipelineSignalReceiver(proc.Ctx, proc.Reg.MergeReceivers[merge.StartIDX:merge.EndIDX])
+	} else {
+		merge.ctr.receiver = process.InitPipelineSignalReceiver(proc.Ctx, proc.Reg.MergeReceivers)
+	}
 	return nil
 }
 
-func Call(idx int, proc *process.Process, arg any, isFirst bool, isLast bool) (bool, error) {
-	anal := proc.GetAnalyze(idx)
-	anal.Start()
-	defer anal.Stop()
-	ap := arg.(*Argument)
-	ctr := ap.ctr
+func (merge *Merge) Call(proc *process.Process) (vm.CallResult, error) {
+	analyzer := merge.OpAnalyzer
 
+	var info error
+	result := vm.NewCallResult()
 	for {
-		if ctr.aliveMergeReceiver == 0 {
-			proc.SetInputBatch(nil)
-			return true, nil
+		result.Batch, info = merge.ctr.receiver.GetNextBatch(analyzer)
+		if info != nil {
+			return vm.CancelResult, info
 		}
 
-		start := time.Now()
-		chosen, value, ok := reflect.Select(ctr.receiverListener)
-		if !ok {
-			logutil.Errorf("pipeline closed unexpectedly")
-			return true, nil
+		if result.Batch == nil {
+			result.Status = vm.ExecStop
+			return result, nil
 		}
-		anal.WaitStop(start)
-
-		pointer := value.UnsafePointer()
-		bat := (*batch.Batch)(pointer)
-		if bat == nil {
-			ctr.receiverListener = append(ctr.receiverListener[:chosen], ctr.receiverListener[chosen+1:]...)
-			ctr.aliveMergeReceiver--
+		if merge.SinkScan && result.Batch.Last() {
 			continue
 		}
-		if bat.Length() == 0 {
-			continue
-		}
-		anal.Input(bat, isFirst)
-		anal.Output(bat, isLast)
-		proc.SetInputBatch(bat)
-		return false, nil
+		break
 	}
+
+	return result, nil
 }

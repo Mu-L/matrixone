@@ -16,16 +16,22 @@ package fileservice
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"sync"
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestMemCacheLeak(t *testing.T) {
 	ctx := context.Background()
+	var counter perfcounter.CounterSet
+	ctx = perfcounter.WithCounterSet(ctx, &counter)
 
-	fs, err := NewMemoryFS("test")
+	fs, err := NewMemoryFS("test", DisabledCacheConfig, nil)
 	assert.Nil(t, err)
 	err = fs.Write(ctx, IOVector{
 		FilePath: "foo",
@@ -38,47 +44,234 @@ func TestMemCacheLeak(t *testing.T) {
 	})
 	assert.Nil(t, err)
 
-	m := NewMemCache(WithLRU(4))
+	size := int64(128)
+	m := NewMemCache(fscache.ConstCapacity(size), nil, nil, "")
+	defer m.Close(ctx)
+
+	newReadVec := func() *IOVector {
+		vec := &IOVector{
+			FilePath: "foo",
+			Entries: []IOEntry{
+				{
+					Size: 3,
+					ToCacheData: func(ctx context.Context, reader io.Reader, data []byte, allocator CacheDataAllocator) (fscache.Data, error) {
+						cacheData := allocator.CopyToCacheData(ctx, []byte{42})
+						return cacheData, nil
+					},
+				},
+			},
+		}
+		return vec
+	}
+
+	vec := newReadVec()
+	err = m.Read(ctx, vec)
+	assert.Nil(t, err)
+	vec.Release()
+
+	vec = newReadVec()
+	err = fs.Read(ctx, vec)
+	assert.Nil(t, err)
+	err = m.Update(ctx, vec, false)
+	assert.Nil(t, err)
+	vec.Release()
+
+	assert.Equal(t, int64(1), m.cache.Used())
+	assert.Equal(t, int64(1), m.cache.Capacity()-m.cache.Available())
+	assert.Equal(t, int64(size-1), m.cache.Available())
+
+	// read from cache
+	newReadVec = func() *IOVector {
+		vec := &IOVector{
+			FilePath: "foo",
+			Entries: []IOEntry{
+				{
+					Size: 3,
+					ToCacheData: func(ctx context.Context, reader io.Reader, data []byte, allocator CacheDataAllocator) (fscache.Data, error) {
+						cacheData := allocator.CopyToCacheData(ctx, []byte{42})
+						return cacheData, nil
+					},
+				},
+			},
+		}
+		return vec
+	}
+	vec = newReadVec()
+	err = m.Read(ctx, vec)
+	assert.Nil(t, err)
+	vec.Release()
+
+	vec = newReadVec()
+	err = fs.Read(ctx, vec)
+	assert.Nil(t, err)
+	err = m.Update(ctx, vec, false)
+	assert.Nil(t, err)
+	vec.Release()
+
+	assert.Equal(t, int64(1), m.cache.Capacity()-m.cache.Available())
+	assert.Equal(t, int64(size)-1, m.cache.Available())
+	assert.Equal(t, int64(1), m.cache.Used())
+
+}
+
+// TestHighConcurrency this test is to mainly test concurrency issue in objectCache
+// and dataOverlap-checker.
+func TestHighConcurrency(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemCache(fscache.ConstCapacity(2), nil, nil, "")
+	defer m.Close(ctx)
+
+	n := 10
+
+	var vecArr []*IOVector
+	for i := 0; i < n; i++ {
+		vecArr = append(vecArr,
+			&IOVector{
+				FilePath: fmt.Sprintf("key%d", i),
+				Entries: []IOEntry{
+					{
+						Size: 4,
+						Data: []byte(fmt.Sprintf("val%d", i)),
+					},
+				},
+			},
+		)
+	}
+
+	// n go-routines are spun.
+	wg := sync.WaitGroup{}
+	wg.Add(n)
+
+	for i := 0; i < n; i++ {
+		// each go-routine tries to insert vecArr[i] for 10 times
+		// these updates should invoke postSet and postEvict inside objectCache.
+		// Since postSet and postEvict are guarded by objectCache mutex, this test
+		// should not throw concurrency related panics.
+		go func(idx int) {
+			for j := 0; j < 10; j++ {
+				_ = m.Update(ctx, vecArr[idx], false)
+			}
+			wg.Done()
+		}(i)
+	}
+	wg.Wait()
+}
+
+func BenchmarkMemoryCacheUpdate(b *testing.B) {
+	ctx := context.Background()
+
+	cache := NewMemCache(
+		fscache.ConstCapacity(1024),
+		nil,
+		nil,
+		"",
+	)
+	defer cache.Flush(ctx)
+
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for i := 0; pb.Next(); i++ {
+			vec := &IOVector{
+				FilePath: fmt.Sprintf("%d", i),
+				Entries: []IOEntry{
+					{
+						Data:       []byte("a"),
+						Size:       1,
+						CachedData: DefaultCacheDataAllocator().AllocateCacheData(ctx, 1),
+					},
+				},
+			}
+			if err := cache.Update(ctx, vec, false); err != nil {
+				b.Fatal(err)
+			}
+			vec.Release()
+		}
+	})
+
+}
+
+func BenchmarkMemoryCacheRead(b *testing.B) {
+	ctx := context.Background()
+
+	cache := NewMemCache(
+		fscache.ConstCapacity(1024),
+		nil,
+		nil,
+		"",
+	)
+	defer cache.Flush(ctx)
 
 	vec := &IOVector{
 		FilePath: "foo",
 		Entries: []IOEntry{
 			{
-				Size: 3,
-				ToObject: func(reader io.Reader, data []byte) (any, int64, error) {
-					return 42, 1, nil
-				},
+				Data:       []byte("a"),
+				Size:       1,
+				CachedData: DefaultCacheDataAllocator().AllocateCacheData(ctx, 1),
 			},
 		},
 	}
-	err = m.Read(ctx, vec)
-	assert.Nil(t, err)
-	err = fs.Read(ctx, vec)
-	assert.Nil(t, err)
-	err = m.Update(ctx, vec, false)
-	assert.Nil(t, err)
-	assert.Equal(t, int64(1), m.objCache.Size())
-	assert.Equal(t, int64(1), vec.Entries[0].ObjectSize)
+	if err := cache.Update(ctx, vec, false); err != nil {
+		b.Fatal(err)
+	}
+	vec.Release()
 
-	// read from cache
-	vec = &IOVector{
-		FilePath: "foo",
-		Entries: []IOEntry{
-			{
-				Size: 3,
-				ToObject: func(reader io.Reader, data []byte) (any, int64, error) {
-					return 42, 1, nil
+	b.ResetTimer()
+
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			vec := &IOVector{
+				FilePath: "foo",
+				Entries: []IOEntry{
+					{
+						Size:        1,
+						ToCacheData: CacheOriginalData,
+					},
 				},
-			},
-		},
+			}
+			if err := cache.Read(ctx, vec); err != nil {
+				b.Fatal(err)
+			}
+			vec.Release()
+		}
+	})
+
+}
+
+func TestMemoryCacheGlobalSizeHint(t *testing.T) {
+	ctx := context.Background()
+
+	cache := NewMemCache(
+		fscache.ConstCapacity(1<<20),
+		nil,
+		nil,
+		"test",
+	)
+	defer cache.Close(ctx)
+
+	ch := make(chan int64, 1)
+	cache.Evict(ctx, ch)
+	n := <-ch
+	if n > 1<<20 {
+		t.Fatalf("got %v", n)
 	}
-	err = m.Read(ctx, vec)
-	assert.Nil(t, err)
-	err = fs.Read(ctx, vec)
-	assert.Nil(t, err)
-	err = m.Update(ctx, vec, false)
-	assert.Nil(t, err)
-	assert.Equal(t, int64(1), m.objCache.Size())
-	assert.Equal(t, int64(1), vec.Entries[0].ObjectSize)
+
+	// shrink
+	GlobalMemoryCacheSizeHint.Store(1 << 10)
+	defer GlobalMemoryCacheSizeHint.Store(0)
+	cache.Evict(ctx, ch)
+	n = <-ch
+	if n > 1<<10 {
+		t.Fatalf("got %v", n)
+	}
+
+	// shrink
+	GlobalMemoryCacheSizeHint.Store(1 << 9)
+	defer GlobalMemoryCacheSizeHint.Store(0)
+	ret := EvictMemoryCaches(ctx)
+	if ret["test"] > 1<<9 {
+		t.Fatalf("got %v", ret)
+	}
 
 }

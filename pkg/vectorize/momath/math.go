@@ -17,8 +17,9 @@ package momath
 import (
 	"math"
 
+	"golang.org/x/exp/constraints"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/container/vector"
 )
 
 func Acos(v float64) (float64, error) {
@@ -32,19 +33,6 @@ func Acos(v float64) (float64, error) {
 
 func Atan(v float64) (float64, error) {
 	return math.Atan(v), nil
-}
-
-func AtanWithTwoArg(firstArg, secondArg, result *vector.Vector) error {
-	firstCol := vector.MustFixedCol[float64](firstArg)
-	secondCol := vector.MustFixedCol[float64](secondArg)
-	resCol := vector.MustFixedCol[float64](result)
-	for i, v := range firstCol {
-		if v == 0 {
-			return moerr.NewInvalidArgNoCtx("Atan first input", 0)
-		}
-		resCol[i] = math.Atan(secondCol[i] / v)
-	}
-	return nil
 }
 
 func Cos(v float64) (float64, error) {
@@ -63,11 +51,35 @@ func Exp(v float64) (float64, error) {
 	return math.Exp(v), nil
 }
 
+func Sqrt(v float64) (float64, error) {
+	if v < 0 {
+		return 0, moerr.NewInvalidArgNoCtx("Sqrt", v)
+	} else {
+		return math.Sqrt(v), nil
+	}
+}
+
 func Ln(v float64) (float64, error) {
 	if v <= 0 {
 		return 0, moerr.NewInvalidArgNoCtx("ln", v)
 	} else {
 		return math.Log(v), nil
+	}
+}
+
+func Log2(v float64) (float64, error) {
+	if v <= 0 {
+		return 0, moerr.NewInvalidArgNoCtx("log2", v)
+	} else {
+		return math.Log2(v), nil
+	}
+}
+
+func Lg(v float64) (float64, error) {
+	if v <= 0 {
+		return 0, moerr.NewInvalidArgNoCtx("log10", v)
+	} else {
+		return math.Log10(v), nil
 	}
 }
 
@@ -78,11 +90,25 @@ func Sin(v float64) (float64, error) {
 func Sinh(v float64) (float64, error) {
 	r := math.Sinh(v)
 	if math.IsInf(r, 0) {
-		return 0, moerr.NewOutOfRangeNoCtx("float64", "DOUBLE value is out of range in 'sinh(%v)'", v)
+		return 0, moerr.NewOutOfRangeNoCtxf("float64", "DOUBLE value is out of range in 'sinh(%v)'", v)
 	}
 	return r, nil
 }
 
 func Tan(v float64) (float64, error) {
 	return math.Tan(v), nil
+}
+
+func AbsSigned[T constraints.Signed | constraints.Float](v T) (T, error) {
+	//NOTE: AbsSigned specifically deals with int and float and not uint.
+	// If we have uint, we return the value as such.
+	if v < 0 {
+		v = -v
+	}
+	if v < 0 {
+		// This could occur for int8 (-128 to 127)
+		// If the v is -128 and if we multiply by -1 = 128, which is out of range of int8. It could give a -ve value for such case.
+		return 0, moerr.NewOutOfRangeNoCtxf("int", "'%v'", v)
+	}
+	return v, nil
 }

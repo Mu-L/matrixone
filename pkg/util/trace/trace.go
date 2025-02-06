@@ -26,11 +26,12 @@ import (
 	"sync/atomic"
 )
 
-func Start(ctx context.Context, spanName string, opts ...SpanOption) (context.Context, Span) {
+// Start starts a default span entity
+func Start(ctx context.Context, spanName string, opts ...SpanStartOption) (context.Context, Span) {
 	return DefaultTracer().Start(ctx, spanName, opts...)
 }
 
-func Debug(ctx context.Context, spanName string, opts ...SpanOption) (context.Context, Span) {
+func Debug(ctx context.Context, spanName string, opts ...SpanStartOption) (context.Context, Span) {
 	return DefaultTracer().Debug(ctx, spanName, opts...)
 }
 
@@ -39,22 +40,29 @@ func Generate(ctx context.Context) context.Context {
 	return ctx
 }
 
-func IsEnable() bool {
-	return DefaultTracer().IsEnable()
+func IsEnable(opts ...SpanStartOption) bool {
+	return DefaultTracer().IsEnable(opts...)
 }
 
 var gTracerHolder atomic.Value
+
+type ITracerHolder interface {
+	GetTracer() Tracer
+}
 
 type tracerHolder struct {
 	tracer Tracer
 }
 
+func (h *tracerHolder) GetTracer() Tracer { return h.tracer }
+
 func SetDefaultTracer(tracer Tracer) {
-	gTracerHolder.Store(&tracerHolder{tracer: tracer})
+	var holder ITracerHolder = &tracerHolder{tracer: tracer}
+	gTracerHolder.Store(holder)
 }
 
 func DefaultTracer() Tracer {
-	return gTracerHolder.Load().(*tracerHolder).tracer
+	return gTracerHolder.Load().(ITracerHolder).GetTracer()
 }
 
 func init() {

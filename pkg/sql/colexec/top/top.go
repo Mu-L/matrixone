@@ -21,112 +21,184 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/compare"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
+	"github.com/matrixorigin/matrixone/pkg/vm/message"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(arg any, buf *bytes.Buffer) {
-	ap := arg.(*Argument)
-	buf.WriteString("top([")
-	for i, f := range ap.Fs {
+const opName = "top"
+
+func (top *Top) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(": top([")
+	for i, f := range top.Fs {
 		if i > 0 {
 			buf.WriteString(", ")
 		}
 		buf.WriteString(f.String())
 	}
-	buf.WriteString(fmt.Sprintf("], %v)", ap.Limit))
+	fmt.Fprintf(buf, "], %v)", top.Limit)
 }
 
-func Prepare(_ *process.Process, arg any) error {
-	ap := arg.(*Argument)
-	ap.ctr = new(container)
-	if ap.Limit > 1024 {
-		ap.ctr.sels = make([]int64, 0, 1024)
+func (top *Top) OpType() vm.OpType {
+	return vm.Top
+}
+
+func (top *Top) Prepare(proc *process.Process) (err error) {
+	if top.OpAnalyzer == nil {
+		top.OpAnalyzer = process.NewAnalyzer(top.GetIdx(), top.IsFirst, top.IsLast, "top")
 	} else {
-		ap.ctr.sels = make([]int64, 0, ap.Limit)
+		top.OpAnalyzer.Reset()
 	}
-	ap.ctr.poses = make([]int32, 0, len(ap.Fs))
-	return nil
-}
 
-func Call(idx int, proc *process.Process, arg any, isFirst bool, isLast bool) (bool, error) {
-	ap := arg.(*Argument)
-	ctr := ap.ctr
-	anal := proc.GetAnalyze(idx)
-	anal.Start()
-	defer anal.Stop()
-	for {
-		switch ctr.state {
-		case Build:
-			bat := proc.InputBatch()
-			if bat == nil {
-				ctr.state = Eval
-				continue
-			}
-			if len(bat.Zs) == 0 {
-				return false, nil
-			}
-			if ap.Limit == 0 {
-				bat.Clean(proc.Mp())
-				proc.SetInputBatch(nil)
-				return true, nil
-			}
-			err := ctr.build(ap, bat, proc, anal)
-			if err != nil {
-				ap.Free(proc, true)
-			}
-			return false, err
-
-		case Eval:
-			if ctr.bat == nil {
-				proc.SetInputBatch(nil)
-				return true, nil
-			}
-			err := ctr.eval(ap.Limit, proc)
-			ap.Free(proc, err != nil)
-			return err == nil, err
-		}
-	}
-}
-
-func (ctr *container) build(ap *Argument, bat *batch.Batch, proc *process.Process, analyze process.Analyze) error {
-	ctr.n = len(bat.Vecs)
-	ctr.poses = ctr.poses[:0]
-	for _, f := range ap.Fs {
-		vec, err := colexec.EvalExpr(bat, proc, f.Expr)
+	// limit executor
+	if top.ctr.limitExecutor == nil {
+		top.ctr.limitExecutor, err = colexec.NewExpressionExecutor(proc, top.Limit)
 		if err != nil {
 			return err
 		}
-		flg := true
-		for i := range bat.Vecs {
-			if bat.Vecs[i] == vec {
-				flg = false
-				ctr.poses = append(ctr.poses, int32(i))
-				break
-			}
-		}
-		if flg {
-			ctr.poses = append(ctr.poses, int32(len(bat.Vecs)))
-			bat.Vecs = append(bat.Vecs, vec)
-		} else {
-			if vec != nil {
-				analyze.Alloc(int64(vec.Size()))
+	}
+	vec, err := top.ctr.limitExecutor.Eval(proc, []*batch.Batch{batch.EmptyForConstFoldBatch}, nil)
+	if err != nil {
+		return err
+	}
+	top.ctr.limit = vector.MustFixedColWithTypeCheck[uint64](vec)[0]
+
+	if top.ctr.limit > 1024 {
+		top.ctr.sels = make([]int64, 0, 1024)
+	} else {
+		top.ctr.sels = make([]int64, 0, top.ctr.limit)
+	}
+	top.ctr.poses = make([]int32, 0, len(top.Fs))
+
+	if len(top.ctr.executorsForOrderColumn) != len(top.Fs) {
+		top.ctr.executorsForOrderColumn = make([]colexec.ExpressionExecutor, len(top.Fs))
+		for i := range top.ctr.executorsForOrderColumn {
+			top.ctr.executorsForOrderColumn[i], err = colexec.NewExpressionExecutor(proc, top.Fs[i].Expr)
+			if err != nil {
+				return err
 			}
 		}
 	}
-	if ctr.bat == nil {
+
+	typ := top.Fs[0].Expr.Typ
+	if top.TopValueTag > 0 {
+		top.ctr.desc = top.Fs[0].Flag&plan.OrderBySpec_DESC != 0
+		top.ctr.topValueZM = objectio.NewZM(types.T(typ.Id), typ.Scale)
+	}
+
+	return nil
+}
+
+func (top *Top) Call(proc *process.Process) (vm.CallResult, error) {
+	analyzer := top.OpAnalyzer
+
+	if top.ctr.limit == 0 {
+		result := vm.NewCallResult()
+		result.Status = vm.ExecStop
+		return result, nil
+	}
+
+	if top.ctr.state == vm.Build {
+		for {
+			result, err := vm.ChildrenCall(top.GetChildren(0), proc, analyzer)
+			if err != nil {
+				return result, err
+			}
+			bat := result.Batch
+
+			if bat == nil {
+				top.ctr.state = vm.Eval
+				break
+			}
+			if bat.IsEmpty() {
+				continue
+			}
+
+			//because ctr.build will change input batch(append new Vector)
+			if top.ctr.buildBat == nil {
+				top.ctr.n = len(bat.Vecs)
+				top.ctr.buildBat = batch.NewWithSize(top.ctr.n)
+			} else {
+				top.ctr.buildBat.Vecs = top.ctr.buildBat.Vecs[:len(bat.Vecs)]
+			}
+			top.ctr.buildBat.Recursive = bat.Recursive
+			top.ctr.buildBat.ShuffleIDX = bat.ShuffleIDX
+			top.ctr.buildBat.Attrs = bat.Attrs
+			top.ctr.buildBat.Aggs = bat.Aggs
+			copy(top.ctr.buildBat.Vecs, bat.Vecs)
+			top.ctr.buildBat.SetRowCount(bat.RowCount())
+
+			err = top.ctr.build(top, top.ctr.buildBat, proc)
+			if err != nil {
+				return result, err
+			}
+			if top.TopValueTag > 0 && top.updateTopValueZM() {
+				message.SendMessage(message.TopValueMessage{TopValueZM: top.ctr.topValueZM, Tag: top.TopValueTag}, proc.GetMessageBoard())
+			}
+		}
+	}
+
+	result := vm.NewCallResult()
+	if top.ctr.state == vm.Eval {
+		top.ctr.state = vm.End
+		if top.ctr.bat != nil {
+			err := top.ctr.eval(top.ctr.limit, proc, &result)
+			if err != nil {
+				return result, err
+			}
+		}
+		return result, nil
+	}
+
+	if top.ctr.state == vm.End {
+		return vm.CancelResult, nil
+	}
+
+	panic("bug")
+}
+
+func (ctr *container) build(ap *Top, bat *batch.Batch, proc *process.Process) error {
+	ctr.poses = ctr.poses[:0]
+	for i := range ap.Fs {
+		vec, err := ctr.executorsForOrderColumn[i].Eval(proc, []*batch.Batch{bat}, nil)
+		if err != nil {
+			return err
+		}
+		aNewOrderColumn := true
+		for j := range bat.Vecs {
+			if bat.Vecs[j] == vec {
+				aNewOrderColumn = false
+				ctr.poses = append(ctr.poses, int32(j))
+				break
+			}
+		}
+		if aNewOrderColumn {
+			ctr.poses = append(ctr.poses, int32(len(bat.Vecs)))
+			bat.Vecs = append(bat.Vecs, vec)
+		}
+	}
+
+	if len(ctr.cmps) == 0 {
 		mp := make(map[int]int)
 		for i, pos := range ctr.poses {
 			mp[int(pos)] = i
 		}
-		ctr.bat = batch.NewWithSize(len(bat.Vecs))
-		for i, vec := range bat.Vecs {
-			ctr.bat.Vecs[i] = vector.NewVec(*vec.GetType())
+
+		if ctr.bat == nil {
+			ctr.bat = batch.NewWithSize(len(bat.Vecs))
+			for i, vec := range bat.Vecs {
+				ctr.bat.Vecs[i] = vector.NewVec(*vec.GetType())
+			}
 		}
-		ctr.cmps = make([]compare.Compare, len(bat.Vecs))
-		for i := range ctr.cmps {
+
+		for i := 0; i < len(bat.Vecs); i++ {
 			var desc, nullsLast bool
 			if pos, ok := mp[i]; ok {
 				desc = ap.Fs[pos].Flag&plan.OrderBySpec_DESC != 0
@@ -138,20 +210,24 @@ func (ctr *container) build(ap *Argument, bat *batch.Batch, proc *process.Proces
 					nullsLast = desc
 				}
 			}
-			ctr.cmps[i] = compare.New(*bat.Vecs[i].GetType(), desc, nullsLast)
+			ctr.cmps = append(
+				ctr.cmps,
+				compare.New(*bat.Vecs[i].GetType(), desc, nullsLast),
+			)
 		}
+
 	}
-	defer bat.Clean(proc.Mp())
-	proc.Reg.InputBatch = &batch.Batch{}
-	return ctr.processBatch(ap.Limit, bat, proc)
+
+	err := ctr.processBatch(ap.ctr.limit, bat, proc)
+	return err
 }
 
-func (ctr *container) processBatch(limit int64, bat *batch.Batch, proc *process.Process) error {
+func (ctr *container) processBatch(limit uint64, bat *batch.Batch, proc *process.Process) error {
 	var start int64
 
-	length := int64(len(bat.Zs))
-	if n := int64(len(ctr.sels)); n < limit {
-		start = limit - n
+	length := int64(bat.RowCount())
+	if n := uint64(len(ctr.sels)); n < limit {
+		start = int64(limit - n)
 		if start > length {
 			start = length
 		}
@@ -161,10 +237,11 @@ func (ctr *container) processBatch(limit int64, bat *batch.Batch, proc *process.
 					return err
 				}
 			}
-			ctr.sels = append(ctr.sels, n)
-			ctr.bat.Zs = append(ctr.bat.Zs, bat.Zs[i])
+			ctr.sels = append(ctr.sels, int64(n))
 			n++
 		}
+		ctr.bat.AddRowCount(int(start))
+
 		if n == limit {
 			ctr.sort()
 		}
@@ -183,7 +260,6 @@ func (ctr *container) processBatch(limit int64, bat *batch.Batch, proc *process.
 				if err := cmp.Copy(1, 0, i, ctr.sels[0], proc); err != nil {
 					return err
 				}
-				ctr.bat.Zs[0] = bat.Zs[i]
 			}
 			heap.Fix(ctr, 0)
 		}
@@ -191,8 +267,8 @@ func (ctr *container) processBatch(limit int64, bat *batch.Batch, proc *process.
 	return nil
 }
 
-func (ctr *container) eval(limit int64, proc *process.Process) error {
-	if int64(len(ctr.sels)) < limit {
+func (ctr *container) eval(limit uint64, proc *process.Process, result *vm.CallResult) error {
+	if uint64(len(ctr.sels)) < limit {
 		ctr.sort()
 	}
 	for i, cmp := range ctr.cmps {
@@ -209,9 +285,7 @@ func (ctr *container) eval(limit int64, proc *process.Process) error {
 		ctr.bat.Vecs[i].Free(proc.Mp())
 	}
 	ctr.bat.Vecs = ctr.bat.Vecs[:ctr.n]
-	ctr.bat.ExpandNulls()
-	proc.Reg.InputBatch = ctr.bat
-	ctr.bat = nil
+	result.Batch = ctr.bat
 	return nil
 }
 
@@ -221,4 +295,93 @@ func (ctr *container) sort() {
 		cmp.Set(0, ctr.bat.Vecs[i])
 	}
 	heap.Init(ctr)
+}
+
+func (top *Top) updateTopValueZM() bool {
+	v, ok := top.getTopValue()
+	if !ok {
+		return false
+	}
+	zm := top.ctr.topValueZM
+	if !zm.IsInited() {
+		index.UpdateZM(zm, v)
+		return true
+	}
+	newZM := objectio.NewZM(zm.GetType(), zm.GetScale())
+	index.UpdateZM(newZM, v)
+	if top.ctr.desc && newZM.CompareMax(zm) > 0 {
+		top.ctr.topValueZM = newZM
+		return true
+	}
+	if !top.ctr.desc && newZM.CompareMin(zm) < 0 {
+		top.ctr.topValueZM = newZM
+		return true
+	}
+	return false
+}
+
+func (top *Top) getTopValue() ([]byte, bool) {
+	// not enough items in the heap.
+	if uint64(len(top.ctr.sels)) < top.ctr.limit {
+		return nil, false
+	}
+	x := int(top.ctr.sels[0])
+	vec := top.ctr.cmps[top.ctr.poses[0]].Vector()
+	if vec.GetType().IsVarlen() {
+		return vec.GetBytesAt(x), true
+	}
+	switch vec.GetType().Oid {
+	case types.T_int8:
+		v := vector.GetFixedAtNoTypeCheck[int8](vec, x)
+		return types.EncodeInt8(&v), true
+	case types.T_int16:
+		v := vector.GetFixedAtNoTypeCheck[int16](vec, x)
+		return types.EncodeInt16(&v), true
+	case types.T_int32:
+		v := vector.GetFixedAtNoTypeCheck[int32](vec, x)
+		return types.EncodeInt32(&v), true
+	case types.T_int64:
+		v := vector.GetFixedAtNoTypeCheck[int64](vec, x)
+		return types.EncodeInt64(&v), true
+	case types.T_uint8:
+		v := vector.GetFixedAtNoTypeCheck[uint8](vec, x)
+		return types.EncodeUint8(&v), true
+	case types.T_uint16:
+		v := vector.GetFixedAtNoTypeCheck[uint16](vec, x)
+		return types.EncodeUint16(&v), true
+	case types.T_uint32:
+		v := vector.GetFixedAtNoTypeCheck[uint32](vec, x)
+		return types.EncodeUint32(&v), true
+	case types.T_uint64:
+		v := vector.GetFixedAtNoTypeCheck[uint64](vec, x)
+		return types.EncodeUint64(&v), true
+	case types.T_float32:
+		v := vector.GetFixedAtNoTypeCheck[float32](vec, x)
+		return types.EncodeFloat32(&v), true
+	case types.T_float64:
+		v := vector.GetFixedAtNoTypeCheck[float64](vec, x)
+		return types.EncodeFloat64(&v), true
+	case types.T_date:
+		v := vector.GetFixedAtNoTypeCheck[types.Date](vec, x)
+		return types.EncodeDate(&v), true
+	case types.T_datetime:
+		v := vector.GetFixedAtNoTypeCheck[types.Datetime](vec, x)
+		return types.EncodeDatetime(&v), true
+	case types.T_timestamp:
+		v := vector.GetFixedAtNoTypeCheck[types.Timestamp](vec, x)
+		return types.EncodeTimestamp(&v), true
+	case types.T_time:
+		v := vector.GetFixedAtNoTypeCheck[types.Time](vec, x)
+		return types.EncodeTime(&v), true
+	case types.T_decimal64:
+		v := vector.GetFixedAtNoTypeCheck[types.Decimal64](vec, x)
+		return types.EncodeDecimal64(&v), true
+	case types.T_decimal128:
+		v := vector.GetFixedAtNoTypeCheck[types.Decimal128](vec, x)
+		return types.EncodeDecimal128(&v), true
+	case types.T_enum:
+		v := vector.GetFixedAtNoTypeCheck[types.Enum](vec, x)
+		return types.EncodeEnum(&v), true
+	}
+	return nil, false
 }

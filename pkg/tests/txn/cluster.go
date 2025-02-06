@@ -20,14 +20,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/tests/service"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 )
 
 var (
@@ -43,9 +45,9 @@ type cluster struct {
 }
 
 // NewCluster new txn testing cluster based on the service.Cluster
-func NewCluster(t *testing.T, options service.Options) (Cluster, error) {
+func NewCluster(ctx context.Context, t *testing.T, options service.Options) (Cluster, error) {
 	logger := logutil.GetPanicLoggerWithLevel(zap.DebugLevel)
-	env, err := service.NewCluster(t, options.WithLogger(logger))
+	env, err := service.NewCluster(ctx, t, options.WithLogger(logger))
 	if err != nil {
 		return nil, err
 	}
@@ -68,11 +70,11 @@ func (c *cluster) Start() {
 		assert.FailNow(c.t, fmt.Sprintf("start testing cluster failed, %v", err))
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+	ctx, cancel := context.WithTimeoutCause(context.Background(), defaultTestTimeout, moerr.CauseClusterStart)
 	defer cancel()
 	c.env.WaitHAKeeperState(ctx, logservice.HAKeeperRunning)
 	c.env.WaitHAKeeperLeader(ctx)
-	c.env.WaitDNShardsReported(ctx)
+	c.env.WaitTNShardsReported(ctx)
 }
 
 func (c *cluster) Stop() {
@@ -88,7 +90,7 @@ func (c *cluster) Env() service.Cluster {
 }
 
 func (c *cluster) NewClient() Client {
-	cli, err := newSQLClient(c.logger, c.env)
+	cli, err := newSQLClient(c.env)
 	require.NoError(c.t, err)
 	return cli
 }

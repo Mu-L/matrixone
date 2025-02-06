@@ -48,11 +48,11 @@ func init() {
 	}
 }
 
-func (builder *QueryBuilder) buildGenerateSeries(tbl *tree.TableFunction, ctx *BindContext, exprs []*plan.Expr, childId int32) int32 {
+func (builder *QueryBuilder) buildGenerateSeries(tbl *tree.TableFunction, ctx *BindContext, exprs []*plan.Expr, children []int32) int32 {
 	var retsIdx int
-	if types.IsInteger(types.T(exprs[0].Typ.Id)) {
+	if types.T(exprs[0].Typ.Id).IsInteger() {
 		retsIdx = 0
-	} else if types.IsDateRelate(types.T(exprs[0].Typ.Id)) {
+	} else if types.T(exprs[0].Typ.Id).IsDateRelate() {
 		retsIdx = 1
 	} else {
 		retsIdx = 2
@@ -69,7 +69,7 @@ func (builder *QueryBuilder) buildGenerateSeries(tbl *tree.TableFunction, ctx *B
 			Cols: GSColDefs[retsIdx],
 		},
 		BindingTags:     []int32{builder.genNewTag()},
-		Children:        []int32{childId},
+		Children:        children,
 		TblFuncExprList: exprs,
 	}
 	return builder.appendNode(node, ctx)

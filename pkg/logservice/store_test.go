@@ -16,10 +16,13 @@ package logservice
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/util/toml"
 
 	"github.com/google/uuid"
 	"github.com/lni/dragonboat/v4"
@@ -31,6 +34,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
+	"github.com/matrixorigin/matrixone/pkg/pb/task"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -42,7 +46,7 @@ func TestMain(m *testing.M) {
 		Format: "console",
 	})
 
-	runtime.SetupProcessLevelRuntime(runtime.NewRuntime(metadata.ServiceType_LOG, "test", logutil.GetGlobalLogger()))
+	runtime.SetupServiceBasedRuntime("", runtime.NewRuntime(metadata.ServiceType_LOG, "test", logutil.GetGlobalLogger()))
 	m.Run()
 }
 
@@ -51,12 +55,10 @@ var (
 )
 
 func TestNodeHostConfig(t *testing.T) {
-	cfg := Config{
-		DeploymentID: 1234,
-		DataDir:      "lalala",
-	}
-	cfg.Fill()
-	nhConfig := getNodeHostConfig(cfg)
+	cfg := DefaultConfig()
+	cfg.DeploymentID = 1234
+	cfg.DataDir = "lalala"
+	nhConfig := getNodeHostConfig(cfg, nil)
 	assert.Equal(t, cfg.DeploymentID, nhConfig.DeploymentID)
 	assert.Equal(t, cfg.DataDir, nhConfig.NodeHostDir)
 	assert.True(t, nhConfig.AddressByNodeHostID)
@@ -69,24 +71,43 @@ func TestRaftConfig(t *testing.T) {
 }
 
 func getStoreTestConfig() Config {
-	cfg := Config{
-		UUID:                uuid.New().String(),
-		RTTMillisecond:      10,
-		GossipAddress:       testGossipAddress,
-		GossipSeedAddresses: []string{testGossipAddress, dummyGossipSeedAddress},
-		DeploymentID:        1,
-		FS:                  vfs.NewStrictMem(),
-		UseTeeLogDB:         true,
-	}
-	cfg.Fill()
+	cfg := DefaultConfig()
+	cfg.UUID = uuid.New().String()
+	cfg.RTTMillisecond = 10
+	cfg.RaftAddress = getTestRaftAddress()
+	cfg.GossipPort = getTestGossipPort()
+	testGossipAddress := getTestGossipAddress(cfg.GossipPort)
+	dummyGossipSeedAddress := getDummyGossipSeedAddress()
+	cfg.GossipSeedAddresses = []string{testGossipAddress, dummyGossipSeedAddress}
+	cfg.LogServicePort = getTestServicePort()
+	cfg.DeploymentID = 1
+	cfg.FS = vfs.NewStrictMem()
+	cfg.UseTeeLogDB = false
+
+	runtime.RunTest(
+		"",
+		func(rt runtime.Runtime) {
+			runtime.SetupServiceBasedRuntime(cfg.UUID, rt)
+		},
+	)
 	return cfg
 }
 
 func TestStoreCanBeCreatedAndClosed(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := getStoreTestConfig()
+	var cfg Config
+	genCfg := func() Config {
+		cfg = getStoreTestConfig()
+		return cfg
+	}
 	defer vfs.ReportLeakedFD(cfg.FS, t)
-	store, err := newLogStore(cfg, nil, runtime.DefaultRuntime())
+	store, err := newLogStoreWithRetry(
+		genCfg,
+		nil,
+		nil,
+		runtime.DefaultRuntime(),
+		nil,
+	)
 	assert.NoError(t, err)
 	runtime.DefaultRuntime().Logger().Info("1")
 	defer func() {
@@ -95,8 +116,56 @@ func TestStoreCanBeCreatedAndClosed(t *testing.T) {
 	runtime.DefaultRuntime().Logger().Info("2")
 }
 
-func getTestStore(cfg Config, startLogReplica bool, taskService taskservice.TaskService) (*store, error) {
-	store, err := newLogStore(cfg, func() taskservice.TaskService { return taskService }, runtime.DefaultRuntime())
+func TestNewStoreRetry(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+	cfg0 := getStoreTestConfig()
+	genCfg0 := func() Config {
+		return cfg0
+	}
+	defer vfs.ReportLeakedFD(cfg0.FS, t)
+	store0, err := newLogStoreWithRetry(
+		genCfg0,
+		nil,
+		nil,
+		runtime.DefaultRuntime(),
+		nil,
+	)
+	assert.NoError(t, err)
+	defer func() {
+		assert.NoError(t, store0.close())
+	}()
+
+	var cfg Config
+	first := true
+	genCfg := func() Config {
+		if first {
+			first = false
+			return cfg0
+		} else {
+			cfg = getStoreTestConfig()
+			return cfg
+		}
+	}
+	defer vfs.ReportLeakedFD(cfg.FS, t)
+	store1, err := newLogStoreWithRetry(
+		genCfg,
+		nil,
+		nil,
+		runtime.DefaultRuntime(),
+		nil,
+	)
+	assert.NoError(t, err)
+	assert.NoError(t, store1.close())
+}
+
+func getTestStore(genCfg func() Config, startLogReplica bool, taskService taskservice.TaskService) (*store, error) {
+	store, err := newLogStoreWithRetry(
+		genCfg,
+		func() taskservice.TaskService { return taskService },
+		nil,
+		runtime.DefaultRuntime(),
+		newFS(),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -113,9 +182,19 @@ func getTestStore(cfg Config, startLogReplica bool, taskService taskservice.Task
 
 func TestHAKeeperCanBeStarted(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := getStoreTestConfig()
+	var cfg Config
+	genCfg := func() Config {
+		cfg = getStoreTestConfig()
+		return cfg
+	}
 	defer vfs.ReportLeakedFD(cfg.FS, t)
-	store, err := newLogStore(cfg, nil, runtime.DefaultRuntime())
+	store, err := newLogStoreWithRetry(
+		genCfg,
+		nil,
+		nil,
+		runtime.DefaultRuntime(),
+		nil,
+	)
 	assert.NoError(t, err)
 	peers := make(map[uint64]dragonboat.Target)
 	peers[2] = store.nh.ID()
@@ -128,9 +207,13 @@ func TestHAKeeperCanBeStarted(t *testing.T) {
 
 func TestStateMachineCanBeStarted(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := getStoreTestConfig()
+	var cfg Config
+	genCfg := func() Config {
+		cfg = getStoreTestConfig()
+		return cfg
+	}
 	defer vfs.ReportLeakedFD(cfg.FS, t)
-	store, err := getTestStore(cfg, true, nil)
+	store, err := getTestStore(genCfg, true, nil)
 	assert.NoError(t, err)
 	defer func() {
 		assert.NoError(t, store.close())
@@ -140,9 +223,13 @@ func TestStateMachineCanBeStarted(t *testing.T) {
 
 func TestReplicaCanBeStopped(t *testing.T) {
 	defer leaktest.AfterTest(t)()
-	cfg := getStoreTestConfig()
+	var cfg Config
+	genCfg := func() Config {
+		cfg = getStoreTestConfig()
+		return cfg
+	}
 	defer vfs.ReportLeakedFD(cfg.FS, t)
-	store, err := getTestStore(cfg, true, nil)
+	store, err := getTestStore(genCfg, true, nil)
 	assert.NoError(t, err)
 	defer func() {
 		assert.NoError(t, store.close())
@@ -154,9 +241,13 @@ func TestReplicaCanBeStopped(t *testing.T) {
 
 func runStoreTest(t *testing.T, fn func(*testing.T, *store)) {
 	defer leaktest.AfterTest(t)()
-	cfg := getStoreTestConfig()
+	var cfg Config
+	genCfg := func() Config {
+		cfg = getStoreTestConfig()
+		return cfg
+	}
 	defer vfs.ReportLeakedFD(cfg.FS, t)
-	store, err := getTestStore(cfg, true, nil)
+	store, err := getTestStore(genCfg, true, nil)
 	assert.NoError(t, err)
 	defer func() {
 		assert.NoError(t, store.close())
@@ -176,7 +267,7 @@ func TestGetOrExtendLease(t *testing.T) {
 	fn := func(t *testing.T, store *store) {
 		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
 		defer cancel()
-		assert.NoError(t, store.getOrExtendDNLease(ctx, 1, 100))
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
 	}
 	runStoreTest(t, fn)
 }
@@ -185,26 +276,11 @@ func TestAppendLog(t *testing.T) {
 	fn := func(t *testing.T, store *store) {
 		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
 		defer cancel()
-		assert.NoError(t, store.getOrExtendDNLease(ctx, 1, 100))
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
 		cmd := getTestUserEntry()
 		lsn, err := store.append(ctx, 1, cmd)
 		assert.NoError(t, err)
 		assert.Equal(t, uint64(4), lsn)
-	}
-	runStoreTest(t, fn)
-}
-
-func TestAppendLogIsRejectedForMismatchedLeaseHolderID(t *testing.T) {
-	fn := func(t *testing.T, store *store) {
-		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
-		defer cancel()
-		assert.NoError(t, store.getOrExtendDNLease(ctx, 1, 100))
-		cmd := make([]byte, headerSize+8+8)
-		binaryEnc.PutUint32(cmd, uint32(pb.UserEntryUpdate))
-		binaryEnc.PutUint64(cmd[headerSize:], 101)
-		binaryEnc.PutUint64(cmd[headerSize+8:], 1234567890)
-		_, err := store.append(ctx, 1, cmd)
-		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrNotLeaseHolder))
 	}
 	runStoreTest(t, fn)
 }
@@ -227,7 +303,7 @@ func TestTruncateLog(t *testing.T) {
 	fn := func(t *testing.T, store *store) {
 		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
 		defer cancel()
-		assert.NoError(t, store.getOrExtendDNLease(ctx, 1, 100))
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
 		cmd := getTestUserEntry()
 		_, err := store.append(ctx, 1, cmd)
 		assert.NoError(t, err)
@@ -245,7 +321,7 @@ func TestGetTruncatedIndex(t *testing.T) {
 		index, err := store.getTruncatedLsn(ctx, 1)
 		assert.Equal(t, uint64(0), index)
 		assert.NoError(t, err)
-		assert.NoError(t, store.getOrExtendDNLease(ctx, 1, 100))
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
 		cmd := getTestUserEntry()
 		_, err = store.append(ctx, 1, cmd)
 		assert.NoError(t, err)
@@ -261,7 +337,7 @@ func TestQueryLog(t *testing.T) {
 	fn := func(t *testing.T, store *store) {
 		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
 		defer cancel()
-		assert.NoError(t, store.getOrExtendDNLease(ctx, 1, 100))
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
 		cmd := getTestUserEntry()
 		_, err := store.append(ctx, 1, cmd)
 		assert.NoError(t, err)
@@ -295,6 +371,120 @@ func TestQueryLog(t *testing.T) {
 		assert.Equal(t, entries[0].Data, cmd)
 	}
 	runStoreTest(t, fn)
+}
+
+func proceedHAKeeperToRunning(t *testing.T, store *store) {
+	state, err := store.getCheckerState()
+	assert.NoError(t, err)
+	assert.Equal(t, pb.HAKeeperCreated, state.State)
+
+	nextIDByKey := map[string]uint64{"a": 1, "b": 2}
+	err = store.setInitialClusterInfo(
+		1,
+		1,
+		1,
+		hakeeper.K8SIDRangeEnd+10,
+		nextIDByKey,
+		nil,
+	)
+	assert.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	hb := store.getHeartbeatMessage()
+	_, err = store.addLogStoreHeartbeat(ctx, hb)
+	assert.NoError(t, err)
+
+	state, err = store.getCheckerState()
+	assert.NoError(t, err)
+	assert.Equal(t, pb.HAKeeperBootstrapping, state.State)
+	assert.Equal(t, hakeeper.K8SIDRangeEnd+10, state.NextId)
+	assert.Equal(t, nextIDByKey, state.NextIDByKey)
+
+	_, term, err := store.isLeaderHAKeeper()
+	assert.NoError(t, err)
+
+	store.bootstrap(term, state)
+	state, err = store.getCheckerState()
+
+	assert.NoError(t, err)
+	assert.Equal(t, pb.HAKeeperBootstrapCommandsReceived, state.State)
+
+	cmd, err := store.getCommandBatch(ctx, store.id())
+	require.NoError(t, err)
+	require.Equal(t, 1, len(cmd.Commands))
+	assert.True(t, cmd.Commands[0].Bootstrapping)
+
+	// handle startReplica to make sure logHeartbeat msg contain shards info,
+	// which used in store.checkBootstrap to determine if all log shards ready
+	service := &Service{store: store}
+	service.handleStartReplica(cmd.Commands[0])
+
+	for state.State != pb.HAKeeperRunning && store.bootstrapCheckCycles > 0 {
+		func() {
+			ctx, cancel = context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+
+			_, err = store.addLogStoreHeartbeat(ctx, store.getHeartbeatMessage())
+			assert.NoError(t, err)
+
+			store.checkBootstrap(state)
+			state, err = store.getCheckerState()
+			assert.NoError(t, err)
+
+			time.Sleep(time.Millisecond * 100)
+		}()
+	}
+
+	assert.Equal(t, pb.HAKeeperRunning, state.State)
+}
+
+// test if the tickerForTaskSchedule can push forward these routine
+func TestTickerForTaskSchedule(t *testing.T) {
+	fn := func(t *testing.T, store *store, taskService taskservice.TaskService) {
+
+		tickerCxt, tickerCancel := context.WithCancel(context.Background())
+		defer tickerCancel()
+
+		//do task schedule background
+		go store.tickerForTaskSchedule(tickerCxt, time.Millisecond*10)
+
+		// making hakeeper state proceeds to running before test task schedule
+		proceedHAKeeperToRunning(t, store)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+
+		err := taskService.CreateAsyncTask(ctx, task.TaskMetadata{ID: "1234"})
+		assert.NoError(t, err)
+
+		cnUUID := uuid.New().String()
+		cmd := pb.CNStoreHeartbeat{UUID: cnUUID}
+		_, err = store.addCNStoreHeartbeat(ctx, cmd)
+		assert.NoError(t, err)
+
+		ticker := time.NewTicker(time.Millisecond * 100)
+		defer ticker.Stop()
+		timeout := time.NewTimer(time.Second * 10)
+		defer timeout.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				tasks, err := taskService.QueryAsyncTask(ctx, taskservice.WithTaskRunnerCond(taskservice.EQ, cnUUID))
+				assert.NoError(t, err)
+				if len(tasks) == 1 {
+					return
+				}
+
+			case <-timeout.C:
+				panic("task schedule timeout")
+			}
+		}
+
+	}
+
+	runHakeeperTaskServiceTest(t, fn)
 }
 
 func TestHAKeeperTick(t *testing.T) {
@@ -388,12 +578,18 @@ func TestAddHeartbeat(t *testing.T) {
 		_, err = store.addCNStoreHeartbeat(ctx, cnMsg)
 		assert.NoError(t, err)
 
-		dnMsg := pb.DNStoreHeartbeat{
+		tnMsg := pb.TNStoreHeartbeat{
 			UUID:   store.id(),
-			Shards: make([]pb.DNShardInfo, 0),
+			Shards: make([]pb.TNShardInfo, 0),
 		}
-		dnMsg.Shards = append(dnMsg.Shards, pb.DNShardInfo{ShardID: 2, ReplicaID: 3})
-		_, err = store.addDNStoreHeartbeat(ctx, dnMsg)
+		tnMsg.Shards = append(tnMsg.Shards, pb.TNShardInfo{ShardID: 2, ReplicaID: 3})
+		_, err = store.addTNStoreHeartbeat(ctx, tnMsg)
+		assert.NoError(t, err)
+
+		proxyMsg := pb.ProxyHeartbeat{
+			UUID: store.id(),
+		}
+		_, err = store.addProxyHeartbeat(ctx, proxyMsg)
 		assert.NoError(t, err)
 	}
 	runStoreTest(t, fn)
@@ -402,6 +598,14 @@ func TestAddHeartbeat(t *testing.T) {
 func TestAddReplicaRejectedForInvalidCCI(t *testing.T) {
 	fn := func(t *testing.T, store *store) {
 		err := store.addReplica(1, 100, uuid.New().String(), 0)
+		assert.Equal(t, dragonboat.ErrRejected, err)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestAddNonVotingReplicaRejectedForInvalidCCI(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		err := store.addNonVotingReplica(1, 100, uuid.New().String(), 0)
 		assert.Equal(t, dragonboat.ErrRejected, err)
 	}
 	runStoreTest(t, fn)
@@ -429,34 +633,55 @@ func TestAddReplica(t *testing.T) {
 	runStoreTest(t, fn)
 }
 
-func getTestStores() (*store, *store, error) {
-	cfg1 := Config{
-		FS:                  vfs.NewStrictMem(),
-		DeploymentID:        1,
-		RTTMillisecond:      5,
-		DataDir:             "data-1",
-		ServiceAddress:      "127.0.0.1:9001",
-		RaftAddress:         "127.0.0.1:9002",
-		GossipAddress:       "127.0.0.1:9011",
-		GossipSeedAddresses: []string{"127.0.0.1:9011", "127.0.0.1:9012"},
+func TestAddNonVotingReplica(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		for {
+			_, _, ok, err := store.nh.GetLeaderID(1)
+			require.NoError(t, err)
+			if ok {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		m, err := store.nh.SyncGetShardMembership(ctx, 1)
+		require.NoError(t, err)
+		err = store.addNonVotingReplica(1, 100, uuid.New().String(), m.ConfigChangeID)
+		assert.NoError(t, err)
+		hb := store.getHeartbeatMessage()
+		assert.Equal(t, 1, len(hb.Replicas[0].Replicas))
+		assert.Equal(t, 1, len(hb.Replicas[0].NonVotingReplicas))
 	}
-	cfg1.Fill()
-	store1, err := newLogStore(cfg1, nil, runtime.DefaultRuntime())
+	runStoreTest(t, fn)
+}
+
+func getTestStores() (*store, *store, error) {
+	cfg1 := DefaultConfig()
+	cfg1.UUID = uuid.NewString()
+	cfg1.FS = vfs.NewStrictMem()
+	cfg1.DeploymentID = 1
+	cfg1.RTTMillisecond = 5
+	cfg1.DataDir = "data-1"
+	cfg1.LogServicePort = 9001
+	cfg1.RaftPort = 9002
+	cfg1.GossipPort = 9011
+	cfg1.GossipSeedAddresses = []string{"127.0.0.1:9011", "127.0.0.1:9012"}
+	store1, err := newLogStore(cfg1, nil, nil, runtime.DefaultRuntime(), nil)
 	if err != nil {
 		return nil, nil, err
 	}
-	cfg2 := Config{
-		FS:                  vfs.NewStrictMem(),
-		DeploymentID:        1,
-		RTTMillisecond:      5,
-		DataDir:             "data-1",
-		ServiceAddress:      "127.0.0.1:9006",
-		RaftAddress:         "127.0.0.1:9007",
-		GossipAddress:       "127.0.0.1:9012",
-		GossipSeedAddresses: []string{"127.0.0.1:9011", "127.0.0.1:9012"},
-	}
-	cfg2.Fill()
-	store2, err := newLogStore(cfg2, nil, runtime.DefaultRuntime())
+	cfg2 := DefaultConfig()
+	cfg2.UUID = uuid.NewString()
+	cfg2.FS = vfs.NewStrictMem()
+	cfg2.DeploymentID = 1
+	cfg2.RTTMillisecond = 5
+	cfg2.DataDir = "data-1"
+	cfg2.LogServicePort = 9006
+	cfg2.RaftPort = 9007
+	cfg2.GossipPort = 9012
+	cfg2.GossipSeedAddresses = []string{"127.0.0.1:9011", "127.0.0.1:9012"}
+	store2, err := newLogStore(cfg2, nil, nil, runtime.DefaultRuntime(), nil)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -552,6 +777,20 @@ func hasReplica(s *store, shardID uint64, replicaID uint64) bool {
 	return false
 }
 
+func hasNonVotingReplica(s *store, shardID uint64, replicaID uint64) bool {
+	hb := s.getHeartbeatMessage()
+	for _, info := range hb.Replicas {
+		if info.ShardID == shardID {
+			for r := range info.NonVotingReplicas {
+				if r == replicaID {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func mustHaveReplica(t *testing.T,
 	s *store, shardID uint64, replicaID uint64) {
 	for i := 0; i < 100; i++ {
@@ -561,4 +800,582 @@ func mustHaveReplica(t *testing.T,
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("failed to locate the replica")
+}
+
+func mustHaveNonVotingReplica(t *testing.T,
+	s *store, shardID uint64, replicaID uint64) {
+	for i := 0; i < 100; i++ {
+		if hasNonVotingReplica(s, shardID, replicaID) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("failed to locate the replica")
+}
+
+func TestUpdateCNLabel(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		peers := make(map[uint64]dragonboat.Target)
+		peers[1] = store.id()
+		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		uuid := "uuid1"
+		label := pb.CNStoreLabel{
+			UUID: uuid,
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+				"role":    {Labels: []string{"1", "2"}},
+			},
+		}
+		err := store.updateCNLabel(ctx, label)
+		assert.EqualError(t, err, fmt.Sprintf("internal error: CN [%s] does not exist", uuid))
+
+		// begin heartbeat to add CN store.
+		hb := pb.CNStoreHeartbeat{
+			UUID: uuid,
+		}
+		_, err = store.addCNStoreHeartbeat(ctx, hb)
+		assert.NoError(t, err)
+
+		label = pb.CNStoreLabel{
+			UUID: uuid,
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+				"role":    {Labels: []string{"1", "2"}},
+			},
+		}
+		err = store.updateCNLabel(ctx, label)
+		assert.NoError(t, err)
+
+		state, err := store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 := state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		labels1, ok2 := info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		labels2, ok3 := info.Labels["role"]
+		assert.True(t, ok3)
+		assert.Equal(t, labels2.Labels, []string{"1", "2"})
+
+		label = pb.CNStoreLabel{
+			UUID: uuid,
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+			},
+		}
+		err = store.updateCNLabel(ctx, label)
+		assert.NoError(t, err)
+
+		state, err = store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 = state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		labels1, ok2 = info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		_, ok3 = info.Labels["role"]
+		assert.False(t, ok3)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestUpdateCNWorkState(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		peers := make(map[uint64]dragonboat.Target)
+		peers[1] = store.id()
+		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		uuid := "uuid1"
+		workState := pb.CNWorkState{
+			UUID:  uuid,
+			State: metadata.WorkState_Working,
+		}
+		err := store.updateCNWorkState(ctx, workState)
+		assert.EqualError(t, err, fmt.Sprintf("internal error: CN [%s] does not exist", uuid))
+
+		// begin heartbeat to add CN store.
+		hb := pb.CNStoreHeartbeat{
+			UUID: uuid,
+		}
+		_, err = store.addCNStoreHeartbeat(ctx, hb)
+		assert.NoError(t, err)
+
+		err = store.updateCNWorkState(ctx, workState)
+		assert.NoError(t, err)
+
+		state, err := store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 := state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		assert.Equal(t, metadata.WorkState_Working, info.WorkState)
+
+		workState = pb.CNWorkState{
+			UUID:  uuid,
+			State: metadata.WorkState_Draining,
+		}
+		err = store.updateCNWorkState(ctx, workState)
+		assert.NoError(t, err)
+
+		state, err = store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 = state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		assert.Equal(t, metadata.WorkState_Draining, info.WorkState)
+
+		workState = pb.CNWorkState{
+			UUID:  uuid,
+			State: metadata.WorkState_Working,
+		}
+		err = store.updateCNWorkState(ctx, workState)
+		assert.NoError(t, err)
+
+		state, err = store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 = state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		assert.Equal(t, metadata.WorkState_Working, info.WorkState)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestPatchCNStore(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		peers := make(map[uint64]dragonboat.Target)
+		peers[1] = store.id()
+		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		uuid := "uuid1"
+		stateLabel := pb.CNStateLabel{
+			UUID:  uuid,
+			State: metadata.WorkState_Working,
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+				"role":    {Labels: []string{"1", "2"}},
+			},
+		}
+		err := store.patchCNStore(ctx, stateLabel)
+		assert.EqualError(t, err, fmt.Sprintf("internal error: CN [%s] does not exist", uuid))
+
+		// begin heartbeat to add CN store.
+		hb := pb.CNStoreHeartbeat{
+			UUID: uuid,
+		}
+		_, err = store.addCNStoreHeartbeat(ctx, hb)
+		assert.NoError(t, err)
+
+		err = store.patchCNStore(ctx, stateLabel)
+		assert.NoError(t, err)
+
+		state, err := store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 := state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		assert.Equal(t, metadata.WorkState_Working, info.WorkState)
+		labels1, ok2 := info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		labels2, ok3 := info.Labels["role"]
+		assert.True(t, ok3)
+		assert.Equal(t, labels2.Labels, []string{"1", "2"})
+
+		stateLabel = pb.CNStateLabel{
+			UUID:  uuid,
+			State: metadata.WorkState_Draining,
+		}
+		err = store.patchCNStore(ctx, stateLabel)
+		assert.NoError(t, err)
+
+		state, err = store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 = state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		assert.Equal(t, metadata.WorkState_Draining, info.WorkState)
+		labels1, ok2 = info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		labels2, ok3 = info.Labels["role"]
+		assert.True(t, ok3)
+		assert.Equal(t, labels2.Labels, []string{"1", "2"})
+
+		stateLabel = pb.CNStateLabel{
+			UUID: uuid,
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+			},
+		}
+		err = store.patchCNStore(ctx, stateLabel)
+		assert.NoError(t, err)
+
+		state, err = store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		info, ok1 = state.CNState.Stores[uuid]
+		assert.True(t, ok1)
+		assert.Equal(t, metadata.WorkState_Working, info.WorkState)
+		labels1, ok2 = info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		_, ok3 = info.Labels["role"]
+		assert.False(t, ok3)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestDeleteCNStore(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		peers := make(map[uint64]dragonboat.Target)
+		peers[1] = store.id()
+		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+
+		uuid := "uuid1"
+		hb := pb.CNStoreHeartbeat{
+			UUID: uuid,
+		}
+		_, err := store.addCNStoreHeartbeat(ctx, hb)
+		assert.NoError(t, err)
+		state, err := store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		assert.Equal(t, 1, len(state.CNState.Stores))
+		_, ok := state.CNState.Stores[uuid]
+		assert.Equal(t, true, ok)
+
+		cnStore := pb.DeleteCNStore{
+			StoreID: uuid,
+		}
+		err = store.deleteCNStore(ctx, cnStore)
+		assert.NoError(t, err)
+
+		state, err = store.getCheckerState()
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		assert.NoError(t, err)
+		assert.NotEmpty(t, state)
+		assert.Equal(t, 0, len(state.CNState.Stores))
+	}
+	runStoreTest(t, fn)
+}
+
+func TestManagedHAKeeperClient_UpdateNonVotingReplicaNum(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		peers := make(map[uint64]dragonboat.Target)
+		peers[1] = store.id()
+		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+		defer cancel()
+		var num uint64 = 5
+		err := store.updateNonVotingReplicaNum(ctx, num)
+		assert.NoError(t, err)
+
+		state, err := store.getCheckerState()
+		assert.NoError(t, err)
+		assert.Equal(t, num, state.NonVotingReplicaNum)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestManagedHAKeeperClient_UpdateNonVotingLocality(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		peers := make(map[uint64]dragonboat.Target)
+		peers[1] = store.id()
+		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+		defer cancel()
+		locality := pb.Locality{
+			Value: map[string]string{
+				"k1": "v1",
+				"k2": "v2",
+			},
+		}
+		err := store.updateNonVotingLocality(ctx, locality)
+		assert.NoError(t, err)
+
+		state, err := store.getCheckerState()
+		assert.NoError(t, err)
+		assert.Equal(t, locality, state.NonVotingLocality)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestGetLatestLsn(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+		defer cancel()
+		index, err := store.getLatestLsn(ctx, 1)
+		assert.Equal(t, uint64(0), index)
+		assert.NoError(t, err)
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
+		cmd := getTestUserEntry()
+		_, err = store.append(ctx, 1, cmd)
+		assert.NoError(t, err)
+		index, err = store.getLatestLsn(ctx, 1)
+		assert.Equal(t, uint64(4), index)
+		assert.NoError(t, err)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestRequiredLsn(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+		defer cancel()
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
+		cmd := getTestUserEntry()
+		func() {
+			ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout*5)
+			defer cancel()
+			for i := 0; i < 10; i++ {
+				_, err := store.append(ctx, 1, cmd)
+				assert.NoError(t, err)
+			}
+		}()
+		assert.NoError(t, store.setRequiredLsn(ctx, 1, 8))
+		lsn, err := store.getRequiredLsn(ctx, 1)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(8), lsn)
+
+		assert.NoError(t, store.setRequiredLsn(ctx, 1, 800))
+		lsn, err = store.getRequiredLsn(ctx, 1)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(800), lsn)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestGetLeaderID(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+		defer cancel()
+		assert.NoError(t, store.getOrExtendTNLease(ctx, 1, 100))
+		leaderID, err := store.leaderID(1)
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(2), leaderID)
+	}
+	runStoreTest(t, fn)
+}
+
+func TestAddLogShard(t *testing.T) {
+	fn := func(t *testing.T, store *store) {
+		peers := make(map[uint64]dragonboat.Target)
+		peers[1] = store.id()
+		assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+		defer cancel()
+
+		assert.NoError(t, store.addLogShard(ctx, pb.AddLogShard{
+			ShardID: 1,
+		}))
+		state, err := store.getCheckerState()
+		assert.NoError(t, err)
+		assert.Equal(t, 1, len(state.LogState.Shards))
+	}
+	runStoreTest(t, fn)
+}
+
+func TestCheckHealth(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	checkFn := func(startHAKeeper, heartbeat, tickTimeout, ok bool) func(*testing.T, *store) {
+		return func(t *testing.T, store *store) {
+			store.cfg.HAKeeperConfig.LogStoreTimeout = toml.Duration{Duration: time.Second * 2}
+			if startHAKeeper {
+				peers := make(map[uint64]dragonboat.Target)
+				peers[1] = store.id()
+				assert.NoError(t, store.startHAKeeperReplica(1, peers, false))
+				store.hakeeperTick()
+				if heartbeat {
+					ctx, cancel := context.WithTimeout(context.Background(), time.Second*2)
+					defer cancel()
+					_, err := store.addLogStoreHeartbeat(ctx, store.getHeartbeatMessage())
+					assert.NoError(t, err)
+				}
+				if tickTimeout {
+					for i := 0; i < 30; i++ {
+						store.hakeeperTick()
+					}
+				}
+			}
+
+			ticker := time.NewTicker(time.Millisecond * 100)
+			defer ticker.Stop()
+			timer := time.NewTimer(time.Second * 1)
+			defer timer.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := store.checkHealth(1); err != nil {
+						t.Logf("check health failed: %v", err)
+					} else {
+						t.Log("check health successfully")
+						return
+					}
+
+				case <-timer.C:
+					if ok {
+						t.Fatal("check health timed out")
+					} else {
+						t.Log("check health timed out")
+					}
+					return
+				}
+			}
+		}
+	}
+
+	t.Run("hakeeper not start", func(t *testing.T) {
+		var cfg Config
+		genCfg := func() Config {
+			cfg = getStoreTestConfig()
+			return cfg
+		}
+		defer vfs.ReportLeakedFD(cfg.FS, t)
+		store, err := getTestStore(genCfg, false, nil)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, store.close())
+		}()
+		checkFn(false, true, false, false)(t, store)
+	})
+
+	t.Run("log store no heartbeat", func(t *testing.T) {
+		var cfg Config
+		genCfg := func() Config {
+			cfg = getStoreTestConfig()
+			return cfg
+		}
+		defer vfs.ReportLeakedFD(cfg.FS, t)
+		store, err := getTestStore(genCfg, false, nil)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, store.close())
+		}()
+		checkFn(true, false, false, false)(t, store)
+	})
+
+	t.Run("tick timeout", func(t *testing.T) {
+		var cfg Config
+		genCfg := func() Config {
+			cfg = getStoreTestConfig()
+			return cfg
+		}
+		defer vfs.ReportLeakedFD(cfg.FS, t)
+		store, err := getTestStore(genCfg, false, nil)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, store.close())
+		}()
+		checkFn(true, true, true, false)(t, store)
+	})
+
+	t.Run("replica not start", func(t *testing.T) {
+		var cfg Config
+		genCfg := func() Config {
+			cfg = getStoreTestConfig()
+			return cfg
+		}
+		defer vfs.ReportLeakedFD(cfg.FS, t)
+		store, err := getTestStore(genCfg, false, nil)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, store.close())
+		}()
+		checkFn(true, true, false, false)(t, store)
+	})
+
+	t.Run("ok", func(t *testing.T) {
+		runStoreTest(t, checkFn(true, true, false, true))
+	})
+}
+
+func TestQueryLogLsn(t *testing.T) {
+	orig := defaultLogDBMaxLogFileSize
+	defaultLogDBMaxLogFileSize = 500
+	defaultArchiverEnabled = true
+	defer func() {
+		defaultArchiverEnabled = false
+		defaultLogDBMaxLogFileSize = orig
+	}()
+	fn := func(t *testing.T, store *store) {
+		ctx, cancel := context.WithTimeout(context.Background(), testIOTimeout)
+		defer cancel()
+		for i := 0; i < 50; i++ {
+			data := make([]byte, 8)
+			cmd := getTestAppendCmd(100, data)
+			lsn, err := store.append(ctx, 1, cmd)
+			assert.NoError(t, err)
+			assert.Equal(t, uint64(3+i), lsn)
+		}
+		searchTime := time.Now()
+		for i := 0; i < 50; i++ {
+			data := make([]byte, 8)
+			cmd := getTestAppendCmd(100, data)
+			lsn, err := store.append(ctx, 1, cmd)
+			assert.NoError(t, err)
+			assert.Equal(t, uint64(53+i), lsn)
+		}
+
+		_, err := store.queryLogLsn(ctx, 1, time.Now())
+		assert.Error(t, err)
+
+		lsn, err := store.getLatestLsn(ctx, 1)
+		assert.NoError(t, err)
+		t.Logf("lastest lsn is: %d", lsn)
+
+		opts := dragonboat.SnapshotOption{
+			OverrideCompactionOverhead: true,
+			CompactionIndex:            lsn - 1,
+		}
+		_, err = store.nh.SyncRequestSnapshot(ctx, 1, opts)
+		assert.NoError(t, err)
+
+		timeout := time.NewTimer(time.Second * 5)
+		defer timeout.Stop()
+		tick := time.NewTicker(time.Millisecond * 10)
+		defer tick.Stop()
+		var readLsn uint64
+	FOR:
+		for {
+			select {
+			case <-timeout.C:
+				panic("the lsn is not valid")
+
+			case <-tick.C:
+				lsn, err := store.queryLogLsn(ctx, 1, searchTime)
+				if err == nil && lsn > 0 {
+					t.Logf("lsn is %d", lsn)
+					readLsn = lsn
+					break FOR
+				}
+			}
+		}
+
+		records, lsn, err1 := store.queryLog(ctx, 1, readLsn-10, math.MaxUint64)
+		assert.NoError(t, err1)
+		assert.Equal(t, readLsn-10, lsn)
+		require.NotEqual(t, 0, len(records))
+	}
+	runStoreTest(t, fn)
 }

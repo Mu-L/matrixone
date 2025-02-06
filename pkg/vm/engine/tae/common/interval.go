@@ -17,13 +17,21 @@ package common
 import (
 	"fmt"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 )
 
 type ClosedInterval struct {
 	Start, End uint64
+}
+
+const (
+	CloseIntervalSize int64 = int64(unsafe.Sizeof(ClosedInterval{}))
+)
+
+func EncodeCloseInterval(i *ClosedInterval) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(i)), CloseIntervalSize)
 }
 
 func (i *ClosedInterval) String() string {
@@ -37,7 +45,7 @@ func (i *ClosedInterval) Append(id uint64) error {
 		return nil
 	}
 	if id != i.End+1 {
-		logutil.Infof("invalid interval %v %v", i, id)
+		// logutil.Debugf("invalid interval %v %v", i, id)
 		return moerr.NewInternalErrorNoCtx("invalid interval")
 	}
 	i.End = id
@@ -49,6 +57,13 @@ func (i *ClosedInterval) Contains(o ClosedInterval) bool {
 		return false
 	}
 	return i.Start <= o.Start && i.End >= o.End
+}
+
+func (i *ClosedInterval) Uint64Contains(start, end uint64) bool {
+	if i == nil {
+		return false
+	}
+	return i.Start <= start && i.End >= end
 }
 
 func (i *ClosedInterval) TryMerge(o ClosedInterval) bool {

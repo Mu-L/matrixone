@@ -11,773 +11,772 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package disttae
 
 import (
 	"bytes"
 	"context"
-	"math"
-	"sort"
-	"strings"
+	"errors"
+	"fmt"
+	"reflect"
 
-	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"go.uber.org/zap"
 
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/clusterservice"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
-	"github.com/matrixorigin/matrixone/pkg/pb/api"
-	"github.com/matrixorigin/matrixone/pkg/pb/plan"
-	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
-	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
-	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
-	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
+	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	"github.com/matrixorigin/matrixone/pkg/pb/txn"
+	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/logtailreplay"
 )
 
-const (
-	HASH_VALUE_FUN string = "hash_value"
-	MAX_RANGE_SIZE int64  = 200
-)
-
-func fetchZonemapAndRowsFromBlockInfo(
-	ctx context.Context,
-	idxs []uint16,
-	blockInfo catalog.BlockInfo,
-	fs fileservice.FileService,
-	m *mpool.MPool) ([][64]byte, uint32, error) {
-	_, _, extent, rows, err := blockio.DecodeLocation(blockInfo.MetaLoc)
-	if err != nil {
-		return nil, 0, err
-	}
-	zonemapList := make([][64]byte, len(idxs))
-
-	// raed s3
-	reader, err := blockio.NewObjectReader(fs, blockInfo.MetaLoc)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	obs, err := reader.LoadZoneMaps(ctx, idxs, []uint32{extent.Id()}, m)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	for i := range idxs {
-		bytes := obs[0][i].GetBuf()
-		copy(zonemapList[i][:], bytes[:])
-	}
-
-	return zonemapList, rows, nil
-}
-
-func getZonemapDataFromMeta(columns []int, meta BlockMeta, tableDef *plan.TableDef) ([][2]any, []uint8, error) {
-	dataLength := len(columns)
-	datas := make([][2]any, dataLength)
-	dataTypes := make([]uint8, dataLength)
-
-	for i := 0; i < dataLength; i++ {
-		idx := columns[i]
-		dataTypes[i] = uint8(tableDef.Cols[idx].Typ.Id)
-		typ := types.T(dataTypes[i]).ToType()
-
-		zm := index.NewZoneMap(typ)
-		err := zm.Unmarshal(meta.Zonemap[idx][:])
-		if err != nil {
-			return nil, nil, err
+func LinearSearchOffsetByValFactory(pk *vector.Vector) func(*vector.Vector) []int64 {
+	mp := make(map[any]bool)
+	switch pk.GetType().Oid {
+	case types.T_bool:
+		vs := vector.MustFixedColNoTypeCheck[bool](pk)
+		for _, v := range vs {
+			mp[v] = true
 		}
-
-		min := zm.GetMin()
-		max := zm.GetMax()
-		if min == nil || max == nil {
-			return nil, nil, nil
+	case types.T_bit:
+		vs := vector.MustFixedColNoTypeCheck[uint64](pk)
+		for _, v := range vs {
+			mp[v] = true
 		}
-		datas[i] = [2]any{min, max}
-	}
-
-	return datas, dataTypes, nil
-}
-
-func getConstantExprHashValue(ctx context.Context, constExpr *plan.Expr, proc *process.Process) (bool, uint64) {
-	args := []*plan.Expr{constExpr}
-	argTypes := []types.Type{types.T(constExpr.Typ.Id).ToType()}
-	funId, returnType, _, _ := function.GetFunctionByName(ctx, HASH_VALUE_FUN, argTypes)
-	funExpr := &plan.Expr{
-		Typ: plan2.MakePlan2Type(&returnType),
-		Expr: &plan.Expr_F{
-			F: &plan.Function{
-				Func: &plan.ObjectRef{
-					Obj:     funId,
-					ObjName: HASH_VALUE_FUN,
-				},
-				Args: args,
-			},
-		},
-	}
-
-	bat := batch.NewWithSize(0)
-	bat.Zs = []int64{1}
-	ret, err := colexec.EvalExpr(bat, proc, funExpr)
-	if err != nil {
-		return false, 0
-	}
-	list := vector.MustFixedCol[int64](ret)
-	return true, uint64(list[0])
-}
-
-func compPkCol(colName string, pkName string) bool {
-	dotIdx := strings.Index(colName, ".")
-	colName = colName[dotIdx+1:]
-	return colName == pkName
-}
-
-func getPkExpr(expr *plan.Expr, pkName string) (bool, *plan.Expr) {
-	switch exprImpl := expr.Expr.(type) {
-	case *plan.Expr_F:
-		funName := exprImpl.F.Func.ObjName
-		switch funName {
-		case "and":
-			canCompute, pkBytes := getPkExpr(exprImpl.F.Args[0], pkName)
-			if canCompute {
-				return canCompute, pkBytes
-			}
-			return getPkExpr(exprImpl.F.Args[1], pkName)
-
-		case "=":
-			switch leftExpr := exprImpl.F.Args[0].Expr.(type) {
-			case *plan.Expr_C:
-				if rightExpr, ok := exprImpl.F.Args[1].Expr.(*plan.Expr_Col); ok {
-					if compPkCol(rightExpr.Col.Name, pkName) {
-						return true, exprImpl.F.Args[0]
-					}
-				}
-
-			case *plan.Expr_Col:
-				if compPkCol(leftExpr.Col.Name, pkName) {
-					if _, ok := exprImpl.F.Args[1].Expr.(*plan.Expr_C); ok {
-						return true, exprImpl.F.Args[1]
-					}
-				}
-			}
-
-			return false, nil
-
-		default:
-			return false, nil
-		}
-	}
-
-	return false, nil
-}
-
-func getPkValueByExpr(expr *plan.Expr, pkName string, oid types.T) (bool, any) {
-	canCompute, valExpr := getPkExpr(expr, pkName)
-	if !canCompute {
-		return canCompute, nil
-	}
-	switch val := valExpr.Expr.(*plan.Expr_C).C.Value.(type) {
-	case *plan.Const_I8Val:
-		return transferIval(val.I8Val, oid)
-	case *plan.Const_I16Val:
-		return transferIval(val.I16Val, oid)
-	case *plan.Const_I32Val:
-		return transferIval(val.I32Val, oid)
-	case *plan.Const_I64Val:
-		return transferIval(val.I64Val, oid)
-	case *plan.Const_Dval:
-		return transferDval(val.Dval, oid)
-	case *plan.Const_Sval:
-		return transferSval(val.Sval, oid)
-	case *plan.Const_Bval:
-		return transferBval(val.Bval, oid)
-	case *plan.Const_U8Val:
-		return transferUval(val.U8Val, oid)
-	case *plan.Const_U16Val:
-		return transferUval(val.U16Val, oid)
-	case *plan.Const_U32Val:
-		return transferUval(val.U32Val, oid)
-	case *plan.Const_U64Val:
-		return transferUval(val.U64Val, oid)
-	case *plan.Const_Fval:
-		return transferFval(val.Fval, oid)
-	case *plan.Const_Dateval:
-		return transferDateval(val.Dateval, oid)
-	case *plan.Const_Timeval:
-		return transferTimeval(val.Timeval, oid)
-	case *plan.Const_Datetimeval:
-		return transferDatetimeval(val.Datetimeval, oid)
-	case *plan.Const_Decimal64Val:
-		return transferDecimal64val(val.Decimal64Val.A, oid)
-	case *plan.Const_Decimal128Val:
-		return transferDecimal128val(val.Decimal128Val.A, val.Decimal128Val.B, oid)
-	case *plan.Const_Timestampval:
-		return transferTimestampval(val.Timestampval, oid)
-	case *plan.Const_Jsonval:
-		return transferSval(val.Jsonval, oid)
-	}
-	return false, nil
-}
-
-// computeRangeByNonIntPk compute NonIntPk range Expr
-// only support function :["and", "="]
-// support eg: pk="a",  pk="a" and noPk > 200
-// unsupport eg: pk>"a", pk=otherFun("a"),  pk="a" or noPk > 200,
-func computeRangeByNonIntPk(ctx context.Context, expr *plan.Expr, pkName string, proc *process.Process) (bool, uint64) {
-	canCompute, valExpr := getPkExpr(expr, pkName)
-	if !canCompute {
-		return canCompute, 0
-	}
-	ok, pkHashValue := getConstantExprHashValue(ctx, valExpr, proc)
-	if !ok {
-		return false, 0
-	}
-	return true, pkHashValue
-}
-
-// computeRangeByIntPk compute primaryKey range by Expr
-// only under the following conditions：
-// 1、function named ["and", "or", ">", "<", ">=", "<=", "="]
-// 2、if function name is not "and", "or".  then one arg is column, the other is constant
-func computeRangeByIntPk(expr *plan.Expr, pkName string, parentFun string) (bool, *pkRange) {
-	type argType int
-	var typeConstant argType = 0
-	var typeColumn argType = 1
-	var leftArg argType
-	var leftConstant, rightConstat int64
-	var ok bool
-
-	getConstant := func(e *plan.Expr_C) (bool, int64) {
-		switch val := e.C.Value.(type) {
-		case *plan.Const_I8Val:
-			return true, int64(val.I8Val)
-		case *plan.Const_I16Val:
-			return true, int64(val.I16Val)
-		case *plan.Const_I32Val:
-			return true, int64(val.I32Val)
-		case *plan.Const_I64Val:
-			return true, val.I64Val
-		case *plan.Const_U8Val:
-			return true, int64(val.U8Val)
-		case *plan.Const_U16Val:
-			return true, int64(val.U16Val)
-		case *plan.Const_U32Val:
-			return true, int64(val.U32Val)
-		case *plan.Const_U64Val:
-			if val.U64Val > uint64(math.MaxInt64) {
-				return false, 0
-			}
-			return true, int64(val.U64Val)
-		}
-		return false, 0
-	}
-
-	switch exprImpl := expr.Expr.(type) {
-	case *plan.Expr_F:
-		funName := exprImpl.F.Func.ObjName
-		switch funName {
-		case "and", "or":
-			canCompute, leftRange := computeRangeByIntPk(exprImpl.F.Args[0], pkName, funName)
-			if !canCompute {
-				return canCompute, nil
-			}
-
-			canCompute, rightRange := computeRangeByIntPk(exprImpl.F.Args[1], pkName, funName)
-			if !canCompute {
-				return canCompute, nil
-			}
-
-			if funName == "and" {
-				return _computeAnd(leftRange, rightRange)
-			} else {
-				return _computeOr(leftRange, rightRange)
-			}
-
-		case ">", "<", ">=", "<=", "=":
-			switch subExpr := exprImpl.F.Args[0].Expr.(type) {
-			case *plan.Expr_C:
-				ok, leftConstant = getConstant(subExpr)
-				if !ok {
-					return false, nil
-				}
-				leftArg = typeConstant
-
-			case *plan.Expr_Col:
-				if !compPkCol(subExpr.Col.Name, pkName) {
-					// if  pk > 10 and noPk < 10.  we just use pk > 10
-					if parentFun == "and" {
-						return true, &pkRange{
-							isRange: false,
-						}
-					}
-					// if pk > 10 or noPk < 10,   we use all list
-					return false, nil
-				}
-				leftArg = typeColumn
-
-			default:
-				return false, nil
-			}
-
-			switch subExpr := exprImpl.F.Args[1].Expr.(type) {
-			case *plan.Expr_C:
-				if leftArg == typeColumn {
-					ok, rightConstat = getConstant(subExpr)
-					if !ok {
-						return false, nil
-					}
-					switch funName {
-					case ">":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{rightConstat + 1, math.MaxInt64},
-						}
-					case ">=":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{rightConstat, math.MaxInt64},
-						}
-					case "<":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{math.MinInt64, rightConstat - 1},
-						}
-					case "<=":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{math.MinInt64, rightConstat},
-						}
-					case "=":
-						return true, &pkRange{
-							isRange: false,
-							items:   []int64{rightConstat},
-						}
-					}
-					return false, nil
-				}
-			case *plan.Expr_Col:
-				if !compPkCol(subExpr.Col.Name, pkName) {
-					// if  pk > 10 and noPk < 10.  we just use pk > 10
-					if parentFun == "and" {
-						return true, &pkRange{
-							isRange: false,
-						}
-					}
-					// if pk > 10 or noPk < 10,   we use all list
-					return false, nil
-				}
-
-				if leftArg == typeConstant {
-					switch funName {
-					case ">":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{math.MinInt64, leftConstant - 1},
-						}
-					case ">=":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{math.MinInt64, leftConstant},
-						}
-					case "<":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{leftConstant + 1, math.MaxInt64},
-						}
-					case "<=":
-						return true, &pkRange{
-							isRange: true,
-							ranges:  []int64{leftConstant, math.MaxInt64},
-						}
-					case "=":
-						return true, &pkRange{
-							isRange: false,
-							items:   []int64{leftConstant},
-						}
-					}
-					return false, nil
-				}
-			}
-		}
-	}
-
-	return false, nil
-}
-
-func _computeOr(left *pkRange, right *pkRange) (bool, *pkRange) {
-	result := &pkRange{
-		isRange: false,
-		items:   []int64{},
-	}
-
-	compute := func(left []int64, right []int64) [][]int64 {
-		min := left[0]
-		max := left[1]
-		if min > right[1] {
-			// eg: a > 10 or a < 2
-			return [][]int64{left, right}
-		} else if max < right[0] {
-			// eg: a < 2 or a > 10
-			return [][]int64{left, right}
-		} else {
-			// eg: a > 2 or a < 10
-			// a > 2 or a > 10
-			// a > 2 or a = -2
-			if right[0] < min {
-				min = right[0]
-			}
-			if right[1] > max {
-				max = right[1]
-			}
-			return [][]int64{{min, max}}
-		}
-	}
-
-	if !left.isRange {
-		if !right.isRange {
-			result.items = append(left.items, right.items...)
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		} else {
-			r := right.ranges
-			if r[0] == math.MinInt64 || r[1] == math.MaxInt64 || r[1]-r[0] > MAX_RANGE_SIZE {
-				return false, nil
-			}
-			result.items = append(result.items, left.items...)
-			for i := right.ranges[0]; i <= right.ranges[1]; i++ {
-				result.items = append(result.items, i)
-			}
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		}
-	} else {
-		if !right.isRange {
-			r := left.ranges
-			if r[0] == math.MinInt64 || r[1] == math.MaxInt64 || r[1]-r[0] > MAX_RANGE_SIZE {
-				return false, nil
-			}
-			result.items = append(result.items, right.items...)
-			for i := left.ranges[0]; i <= left.ranges[1]; i++ {
-				result.items = append(result.items, i)
-			}
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		} else {
-			newRange := compute(left.ranges, right.ranges)
-			for _, r := range newRange {
-				if r[0] == math.MinInt64 || r[1] == math.MaxInt64 || r[1]-r[0] > MAX_RANGE_SIZE {
-					return false, nil
-				}
-				for i := r[0]; i <= r[1]; i++ {
-					result.items = append(result.items, i)
-				}
-			}
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		}
-	}
-}
-
-func _computeAnd(left *pkRange, right *pkRange) (bool, *pkRange) {
-	result := &pkRange{
-		isRange: false,
-		items:   []int64{},
-	}
-
-	compute := func(left []int64, right []int64) (bool, []int64) {
-		min := left[0]
-		max := left[1]
-
-		if min > right[1] {
-			// eg: a > 10 and a < 2
-			return false, left
-		} else if max < right[0] {
-			// eg: a < 2 and a > 10
-			return false, left
-		} else {
-			// eg: a > 2 and a < 10
-			// a > 2 and a > 10
-			// a > 2 and a = -2
-			if right[0] > min {
-				min = right[0]
-			}
-			if right[1] < max {
-				max = right[1]
-			}
-			return true, []int64{min, max}
-		}
-	}
-
-	if !left.isRange {
-		if !right.isRange {
-			result.items = append(left.items, right.items...)
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		} else {
-			r := right.ranges
-			if r[0] == math.MinInt64 || r[1] == math.MaxInt64 || r[1]-r[0] > MAX_RANGE_SIZE {
-				return false, nil
-			}
-			result.items = append(result.items, left.items...)
-			for i := right.ranges[0]; i <= right.ranges[1]; i++ {
-				result.items = append(result.items, i)
-			}
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		}
-	} else {
-		if !right.isRange {
-			r := left.ranges
-			if r[0] == math.MinInt64 || r[1] == math.MaxInt64 || r[1]-r[0] > MAX_RANGE_SIZE {
-				return false, nil
-			}
-			result.items = append(result.items, right.items...)
-			for i := left.ranges[0]; i <= left.ranges[1]; i++ {
-				result.items = append(result.items, i)
-			}
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		} else {
-			ok, r := compute(left.ranges, right.ranges)
-			if !ok {
-				return false, nil
-			}
-			if r[0] == math.MinInt64 || r[1] == math.MaxInt64 || r[1]-r[0] > MAX_RANGE_SIZE {
-				return false, nil
-			}
-			for i := r[0]; i <= r[1]; i++ {
-				result.items = append(result.items, i)
-			}
-			return len(result.items) < int(MAX_RANGE_SIZE), result
-		}
-	}
-}
-
-/*
-func getHashValue(buf []byte) uint64 {
-	buf = append([]byte{0}, buf...)
-	var states [3]uint64
-	if l := len(buf); l < 16 {
-		buf = append(buf, hashtable.StrKeyPadding[l:]...)
-	}
-	hashtable.BytesBatchGenHashStates(&buf, &states, 1)
-	return states[0]
-}
-
-func getListByItems[T DNStore](list []T, items []int64) []int {
-	fullList := func() []int {
-		dnList := make([]int, len(list))
-		for i := range list {
-			dnList[i] = i
-		}
-		return dnList
-	}
-
-	listLen := uint64(len(list))
-	if listLen == 1 {
-		return []int{0}
-	}
-
-	if len(items) == 0 || int64(len(items)) > MAX_RANGE_SIZE {
-		return fullList()
-	}
-
-	listMap := make(map[uint64]struct{})
-	for _, item := range items {
-		keys := make([]byte, 8)
-		binary.LittleEndian.PutUint64(keys, uint64(item))
-		val := getHashValue(keys)
-		modVal := val % listLen
-		listMap[modVal] = struct{}{}
-		if len(listMap) == int(listLen) {
-			return fullList()
-		}
-	}
-	dnList := make([]int, len(listMap))
-	i := 0
-	for idx := range listMap {
-		dnList[i] = int(idx)
-		i++
-	}
-	return dnList
-}
-*/
-
-// func getListByRange[T DNStore](list []T, pkRange [][2]int64) []int {
-// 	fullList := func() []int {
-// 		dnList := make([]int, len(list))
-// 		for i := range list {
-// 			dnList[i] = i
-// 		}
-// 		return dnList
-// 	}
-// 	listLen := uint64(len(list))
-// 	if listLen == 1 || len(pkRange) == 0 {
-// 		return []int{0}
-// 	}
-
-// 	listMap := make(map[uint64]struct{})
-// 	for _, r := range pkRange {
-// 		if r[1]-r[0] > MAX_RANGE_SIZE {
-// 			return fullList()
-// 		}
-// 		for i := r[0]; i <= r[1]; i++ {
-// 			keys := make([]byte, 8)
-// 			binary.LittleEndian.PutUint64(keys, uint64(i))
-// 			val := getHashValue(keys)
-// 			modVal := val % listLen
-// 			listMap[modVal] = struct{}{}
-// 			if len(listMap) == int(listLen) {
-// 				return fullList()
-// 			}
-// 		}
-// 	}
-// 	dnList := make([]int, len(listMap))
-// 	i := 0
-// 	for idx := range listMap {
-// 		dnList[i] = int(idx)
-// 		i++
-// 	}
-// 	return dnList
-// }
-
-func findRowByPkValue(vec *vector.Vector, v any) int {
-	switch vec.GetType().Oid {
 	case types.T_int8:
-		rows := vector.MustFixedCol[int8](vec)
-		val := v.(int8)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
+		vs := vector.MustFixedColNoTypeCheck[int8](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_int16:
-		rows := vector.MustFixedCol[int16](vec)
-		val := v.(int16)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
+		vs := vector.MustFixedColNoTypeCheck[int16](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_int32:
-		rows := vector.MustFixedCol[int32](vec)
-		val := v.(int32)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
+		vs := vector.MustFixedColNoTypeCheck[int32](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_int64:
-		rows := vector.MustFixedCol[int64](vec)
-		val := v.(int64)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
+		vs := vector.MustFixedColNoTypeCheck[int64](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_uint8:
-		rows := vector.MustFixedCol[uint8](vec)
-		val := v.(uint8)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
+		vs := vector.MustFixedColNoTypeCheck[uint8](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_uint16:
-		rows := vector.MustFixedCol[uint16](vec)
-		val := v.(uint16)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
+		vs := vector.MustFixedColNoTypeCheck[uint16](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_uint32:
-		rows := vector.MustFixedCol[uint32](vec)
-		val := v.(uint32)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
+		vs := vector.MustFixedColNoTypeCheck[uint32](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_uint64:
-		rows := vector.MustFixedCol[uint64](vec)
-		val := v.(uint64)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
-	case types.T_float32:
-		rows := vector.MustFixedCol[float32](vec)
-		val := v.(float32)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
-	case types.T_float64:
-		rows := vector.MustFixedCol[float64](vec)
-		val := v.(float64)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
-	case types.T_date:
-		rows := vector.MustFixedCol[types.Date](vec)
-		val := v.(types.Date)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
-	case types.T_time:
-		rows := vector.MustFixedCol[types.Time](vec)
-		val := v.(types.Time)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
-	case types.T_datetime:
-		rows := vector.MustFixedCol[types.Datetime](vec)
-		val := v.(types.Datetime)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
-	case types.T_timestamp:
-		rows := vector.MustFixedCol[types.Timestamp](vec)
-		val := v.(types.Timestamp)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx] >= val
-		})
-	case types.T_uuid:
-		rows := vector.MustFixedCol[types.Uuid](vec)
-		val := v.(types.Uuid)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx].Ge(val)
-		})
+		vs := vector.MustFixedColNoTypeCheck[uint64](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_decimal64:
-		rows := vector.MustFixedCol[types.Decimal64](vec)
-		val := v.(types.Decimal64)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx].Compare(val) >= 0
-		})
+		vs := vector.MustFixedColNoTypeCheck[types.Decimal64](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
 	case types.T_decimal128:
-		rows := vector.MustFixedCol[types.Decimal128](vec)
-		val := v.(types.Decimal128)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			return rows[idx].Compare(val) >= 0
-		})
-	case types.T_char, types.T_text,
-		types.T_binary, types.T_varbinary, types.T_varchar, types.T_json, types.T_blob:
-		// rows := vector.MustStrCols(vec)
-		// val := string(v.([]byte))
-		// return sort.SearchStrings(rows, val)
-		val := v.([]byte)
-		area := vec.GetArea()
-		varlenas := vector.MustFixedCol[types.Varlena](vec)
-		return sort.Search(vec.Length(), func(idx int) bool {
-			colVal := varlenas[idx].GetByteSlice(area)
-			return bytes.Compare(colVal, val) >= 0
-		})
+		vs := vector.MustFixedColNoTypeCheck[types.Decimal128](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_uuid:
+		vs := vector.MustFixedColNoTypeCheck[types.Uuid](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_float32:
+		vs := vector.MustFixedColNoTypeCheck[float32](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_float64:
+		vs := vector.MustFixedColNoTypeCheck[float64](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_date:
+		vs := vector.MustFixedColNoTypeCheck[types.Date](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_timestamp:
+		vs := vector.MustFixedColNoTypeCheck[types.Timestamp](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_time:
+		vs := vector.MustFixedColNoTypeCheck[types.Time](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_datetime:
+		vs := vector.MustFixedColNoTypeCheck[types.Datetime](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_enum:
+		vs := vector.MustFixedColNoTypeCheck[types.Enum](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_TS:
+		vs := vector.MustFixedColNoTypeCheck[types.TS](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_Rowid:
+		vs := vector.MustFixedColNoTypeCheck[types.Rowid](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_Blockid:
+		vs := vector.MustFixedColNoTypeCheck[types.Blockid](pk)
+		for _, v := range vs {
+			mp[v] = true
+		}
+	case types.T_char, types.T_varchar, types.T_json,
+		types.T_binary, types.T_varbinary, types.T_blob, types.T_text, types.T_datalink:
+		if pk.IsConst() {
+			for i := 0; i < pk.Length(); i++ {
+				v := pk.UnsafeGetStringAt(i)
+				mp[v] = true
+			}
+		} else {
+			vs := vector.MustFixedColNoTypeCheck[types.Varlena](pk)
+			area := pk.GetArea()
+			for i := 0; i < len(vs); i++ {
+				v := vs[i].UnsafeGetString(area)
+				mp[v] = true
+			}
+		}
+	case types.T_array_float32:
+		for i := 0; i < pk.Length(); i++ {
+			v := types.ArrayToString[float32](vector.GetArrayAt[float32](pk, i))
+			mp[v] = true
+		}
+	case types.T_array_float64:
+		for i := 0; i < pk.Length(); i++ {
+			v := types.ArrayToString[float64](vector.GetArrayAt[float64](pk, i))
+			mp[v] = true
+		}
+	default:
+		panic(moerr.NewInternalErrorNoCtxf("%s not supported", pk.GetType().String()))
 	}
 
-	return -1
+	return func(vec *vector.Vector) []int64 {
+		var sels []int64
+		switch vec.GetType().Oid {
+		case types.T_bool:
+			vs := vector.MustFixedColNoTypeCheck[bool](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_bit:
+			vs := vector.MustFixedColNoTypeCheck[uint64](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_int8:
+			vs := vector.MustFixedColNoTypeCheck[int8](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_int16:
+			vs := vector.MustFixedColNoTypeCheck[int16](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_int32:
+			vs := vector.MustFixedColNoTypeCheck[int32](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_int64:
+			vs := vector.MustFixedColNoTypeCheck[int64](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_uint8:
+			vs := vector.MustFixedColNoTypeCheck[uint8](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_uint16:
+			vs := vector.MustFixedColNoTypeCheck[uint16](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_uint32:
+			vs := vector.MustFixedColNoTypeCheck[uint32](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_uint64:
+			vs := vector.MustFixedColNoTypeCheck[uint64](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_decimal64:
+			vs := vector.MustFixedColNoTypeCheck[types.Decimal64](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_decimal128:
+			vs := vector.MustFixedColNoTypeCheck[types.Decimal128](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_uuid:
+			vs := vector.MustFixedColNoTypeCheck[types.Uuid](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_float32:
+			vs := vector.MustFixedColNoTypeCheck[float32](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_float64:
+			vs := vector.MustFixedColNoTypeCheck[float64](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_date:
+			vs := vector.MustFixedColNoTypeCheck[types.Date](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_timestamp:
+			vs := vector.MustFixedColNoTypeCheck[types.Timestamp](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_time:
+			vs := vector.MustFixedColNoTypeCheck[types.Time](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_datetime:
+			vs := vector.MustFixedColNoTypeCheck[types.Datetime](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_enum:
+			vs := vector.MustFixedColNoTypeCheck[types.Enum](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_TS:
+			vs := vector.MustFixedColNoTypeCheck[types.TS](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_Rowid:
+			vs := vector.MustFixedColNoTypeCheck[types.Rowid](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_Blockid:
+			vs := vector.MustFixedColNoTypeCheck[types.Blockid](vec)
+			for i, v := range vs {
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_char, types.T_varchar, types.T_json,
+			types.T_binary, types.T_varbinary, types.T_blob, types.T_text, types.T_datalink:
+			if pk.IsConst() {
+				for i := 0; i < pk.Length(); i++ {
+					v := pk.UnsafeGetStringAt(i)
+					if mp[v] {
+						sels = append(sels, int64(i))
+					}
+				}
+			} else {
+				vs := vector.MustFixedColNoTypeCheck[types.Varlena](pk)
+				area := pk.GetArea()
+				for i := 0; i < len(vs); i++ {
+					v := vs[i].UnsafeGetString(area)
+					if mp[v] {
+						sels = append(sels, int64(i))
+					}
+				}
+			}
+		case types.T_array_float32:
+			for i := 0; i < vec.Length(); i++ {
+				v := types.ArrayToString[float32](vector.GetArrayAt[float32](vec, i))
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		case types.T_array_float64:
+			for i := 0; i < vec.Length(); i++ {
+				v := types.ArrayToString[float64](vector.GetArrayAt[float64](vec, i))
+				if mp[v] {
+					sels = append(sels, int64(i))
+				}
+			}
+		default:
+			panic(moerr.NewInternalErrorNoCtxf("%s not supported", vec.GetType().String()))
+		}
+		return sels
+	}
 }
 
-func mustVectorFromProto(v *api.Vector) *vector.Vector {
-	ret, err := vector.ProtoVectorToVector(v)
+// ListTnService gets all tn service in the cluster
+func ListTnService(
+	service string,
+	appendFn func(service *metadata.TNService),
+) {
+	mc := clusterservice.GetMOCluster(service)
+	mc.GetTNService(clusterservice.NewSelector(), func(tn metadata.TNService) bool {
+		if appendFn != nil {
+			appendFn(&tn)
+		}
+		return true
+	})
+}
+
+func ForeachBlkInObjStatsList(
+	next bool,
+	dataMeta objectio.ObjectDataMeta,
+	onBlock func(blk objectio.BlockInfo, blkMeta objectio.BlockObject) bool,
+	objects ...objectio.ObjectStats,
+) {
+	stop := false
+	objCnt := len(objects)
+
+	for idx := 0; idx < objCnt && !stop; idx++ {
+		iter := NewStatsBlkIter(&objects[idx], dataMeta)
+		pos := uint32(0)
+		for iter.Next() {
+			blk := iter.Entry()
+			var meta objectio.BlockObject
+			if !dataMeta.IsEmpty() {
+				meta = dataMeta.GetBlockMeta(pos)
+			}
+			pos++
+			if !onBlock(blk, meta) {
+				stop = true
+				break
+			}
+		}
+
+		if stop && next {
+			stop = false
+		}
+	}
+}
+
+type StatsBlkIter struct {
+	name       objectio.ObjectName
+	extent     objectio.Extent
+	blkCnt     uint16
+	totalRows  uint32
+	cur        int
+	accRows    uint32
+	curBlkRows uint32
+	meta       objectio.ObjectDataMeta
+}
+
+func NewStatsBlkIter(stats *objectio.ObjectStats, meta objectio.ObjectDataMeta) *StatsBlkIter {
+	return &StatsBlkIter{
+		name:       stats.ObjectName(),
+		blkCnt:     uint16(stats.BlkCnt()),
+		extent:     stats.Extent(),
+		cur:        -1,
+		accRows:    0,
+		totalRows:  stats.Rows(),
+		curBlkRows: objectio.BlockMaxRows,
+		meta:       meta,
+	}
+}
+
+func (i *StatsBlkIter) Next() bool {
+	if i.cur >= 0 {
+		i.accRows += i.curBlkRows
+	}
+	i.cur++
+	return i.cur < int(i.blkCnt)
+}
+
+func (i *StatsBlkIter) Entry() objectio.BlockInfo {
+	if i.cur == -1 {
+		i.cur = 0
+	}
+
+	// assume that all blks have BlockMaxRows, except the last one
+	if i.meta.IsEmpty() {
+		if i.cur == int(i.blkCnt-1) {
+			i.curBlkRows = i.totalRows - i.accRows
+		}
+	} else {
+		i.curBlkRows = i.meta.GetBlockMeta(uint32(i.cur)).GetRows()
+	}
+
+	var blk objectio.BlockInfo
+	objectio.BuildLocationTo(i.name, i.extent, i.curBlkRows, uint16(i.cur), blk.MetaLoc[:])
+	objectio.BuildObjectBlockidTo(i.name, uint16(i.cur), blk.BlockID[:])
+
+	return blk
+}
+
+func ForeachCommittedObjects(
+	createObjs map[objectio.ObjectNameShort]struct{},
+	delObjs map[objectio.ObjectNameShort]struct{},
+	p *logtailreplay.PartitionState,
+	onObj func(info objectio.ObjectEntry) error) (err error) {
+	for obj := range createObjs {
+		if objInfo, ok := p.GetObject(obj); ok {
+			if err = onObj(objInfo); err != nil {
+				return
+			}
+		}
+	}
+	for obj := range delObjs {
+		if objInfo, ok := p.GetObject(obj); ok {
+			if err = onObj(objInfo); err != nil {
+				return
+			}
+		}
+	}
+	return nil
+
+}
+
+func ForeachTombstoneObject(
+	ts types.TS,
+	onTombstone func(tombstone objectio.ObjectEntry) (next bool, err error),
+	pState *logtailreplay.PartitionState,
+) error {
+	iter, err := pState.NewObjectsIter(ts, true, true)
 	if err != nil {
-		panic(err)
+		return err
 	}
-	return ret
+	defer iter.Close()
+
+	for iter.Next() {
+		obj := iter.Entry()
+		if next, err := onTombstone(obj); !next || err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
-func mustVectorToProto(v *vector.Vector) *api.Vector {
-	ret, err := vector.VectorToProtoVector(v)
+func ForeachSnapshotObjects(
+	ts timestamp.Timestamp,
+	onObject func(obj objectio.ObjectEntry, isCommitted bool) error,
+	tableSnapshot *logtailreplay.PartitionState,
+	extraCommitted []objectio.ObjectStats,
+	uncommitted ...objectio.ObjectStats,
+) (err error) {
+	// process all uncommitted objects first
+	for _, obj := range uncommitted {
+		info := objectio.ObjectEntry{
+			ObjectStats: obj,
+		}
+		if err = onObject(info, false); err != nil {
+			return
+		}
+	}
+	// process all uncommitted objects first
+	for _, obj := range extraCommitted {
+		info := objectio.ObjectEntry{
+			ObjectStats: obj,
+		}
+		if err = onObject(info, true); err != nil {
+			return
+		}
+	}
+
+	// process all committed objects
+	if tableSnapshot == nil {
+		return
+	}
+
+	iter, err := tableSnapshot.NewObjectsIter(types.TimestampToTS(ts), true, false)
 	if err != nil {
-		panic(err)
+		return
 	}
-	return ret
+	defer iter.Close()
+	for iter.Next() {
+		obj := iter.Entry()
+		if err = onObject(obj, true); err != nil {
+			return
+		}
+	}
+	return
 }
 
-func logDebugf(txnMeta txn.TxnMeta, msg string, infos ...interface{}) {
-	if logutil.GetSkip1Logger().Core().Enabled(zap.DebugLevel) {
-		infos = append(infos, txnMeta.DebugString())
-		logutil.Debugf(msg+" %s", infos...)
+func ConstructObjStatsByLoadObjMeta(
+	ctx context.Context,
+	metaLoc objectio.Location,
+	fs fileservice.FileService,
+) (stats objectio.ObjectStats, dataMeta objectio.ObjectDataMeta, err error) {
+
+	// 1. load object meta
+	var meta objectio.ObjectMeta
+	if meta, err = objectio.FastLoadObjectMeta(ctx, &metaLoc, false, fs); err != nil {
+		logutil.Error("fast load object meta failed when split object stats. ", zap.Error(err))
+		return
 	}
+	dataMeta = meta.MustDataMeta()
+
+	// 2. construct an object stats
+	objectio.SetObjectStatsObjectName(&stats, metaLoc.Name())
+	objectio.SetObjectStatsExtent(&stats, metaLoc.Extent())
+	objectio.SetObjectStatsBlkCnt(&stats, dataMeta.BlockCount())
+
+	sortKeyIdx := dataMeta.BlockHeader().SortKey()
+	objectio.SetObjectStatsSortKeyZoneMap(&stats, dataMeta.MustGetColumn(sortKeyIdx).ZoneMap())
+
+	totalRows := uint32(0)
+	for idx := uint32(0); idx < dataMeta.BlockCount(); idx++ {
+		totalRows += dataMeta.GetBlockMeta(idx).GetRows()
+	}
+
+	objectio.SetObjectStatsRowCnt(&stats, totalRows)
+
+	return
+}
+
+// txnIsValid
+// if the workspace is nil or txnOp is aborted, it returns error
+func txnIsValid(txnOp client.TxnOperator) (*Transaction, error) {
+	if txnOp == nil {
+		return nil, moerr.NewInternalErrorNoCtx("txnOp is nil")
+	}
+	ws := txnOp.GetWorkspace()
+	if ws == nil {
+		return nil, moerr.NewInternalErrorNoCtx("txn workspace is nil")
+	}
+	var wsTxn *Transaction
+	var ok bool
+	if wsTxn, ok = ws.(*Transaction); ok {
+		if wsTxn == nil {
+			return nil, moerr.NewTxnClosedNoCtx(txnOp.Txn().ID)
+		}
+	}
+	//if it is not the Transaction instance, only check the txnOp
+	if txnOp.Status() == txn.TxnStatus_Aborted {
+		return nil, moerr.NewTxnClosedNoCtx(txnOp.Txn().ID)
+	}
+	return wsTxn, nil
+}
+
+func CheckTxnIsValid(txnOp client.TxnOperator) (err error) {
+	_, err = txnIsValid(txnOp)
+	return err
+}
+
+// concurrentTask is the task that runs in the concurrent executor.
+type concurrentTask func() error
+
+// ConcurrentExecutor is an interface that runs tasks concurrently.
+type ConcurrentExecutor interface {
+	// AppendTask append the concurrent task to the exuecutor.
+	AppendTask(concurrentTask)
+	// Run starts receive task to execute.
+	Run(context.Context)
+	// GetConcurrency returns the concurrency of this executor.
+	GetConcurrency() int
+}
+
+type concurrentExecutor struct {
+	// concurrency is the concurrency to run the tasks at the same time.
+	concurrency int
+	// task contains all the tasks needed to run.
+	tasks chan concurrentTask
+}
+
+func newConcurrentExecutor(concurrency int) ConcurrentExecutor {
+	return &concurrentExecutor{
+		concurrency: concurrency,
+		tasks:       make(chan concurrentTask, 2048),
+	}
+}
+
+// AppendTask implements the ConcurrentExecutor interface.
+func (e *concurrentExecutor) AppendTask(t concurrentTask) {
+	e.tasks <- t
+}
+
+// Run implements the ConcurrentExecutor interface.
+func (e *concurrentExecutor) Run(ctx context.Context) {
+	for i := 0; i < e.concurrency; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+
+				case t := <-e.tasks:
+					if err := t(); err != nil {
+						if !errors.Is(err, context.Canceled) {
+							logutil.Errorf("failed to execute task: %v", err)
+						}
+					}
+				}
+			}
+		}()
+	}
+}
+
+// GetConcurrency implements the ConcurrentExecutor interface.
+func (e *concurrentExecutor) GetConcurrency() int {
+	return e.concurrency
+}
+
+func stringifySlice(req any, f func(any) string) string {
+	buf := &bytes.Buffer{}
+	v := reflect.ValueOf(req)
+	buf.WriteRune('[')
+	if v.Kind() == reflect.Slice {
+		for i := 0; i < v.Len(); i++ {
+			if i > 0 {
+				buf.WriteRune(',')
+			}
+			buf.WriteString(f(v.Index(i).Interface()))
+		}
+	}
+	buf.WriteRune(']')
+	buf.WriteString(fmt.Sprintf("[%d]", v.Len()))
+	return buf.String()
+}
+
+func stringifyMap(req any, f func(any, any) string) string {
+	buf := &bytes.Buffer{}
+	v := reflect.ValueOf(req)
+	buf.WriteRune('{')
+	if v.Kind() == reflect.Map {
+		keys := v.MapKeys()
+		for i, key := range keys {
+			if i > 0 {
+				buf.WriteRune(',')
+			}
+			buf.WriteString(f(key.Interface(), v.MapIndex(key).Interface()))
+		}
+	}
+	buf.WriteRune('}')
+	buf.WriteString(fmt.Sprintf("[%d]", v.Len()))
+	return buf.String()
+}
+
+func execReadSql(ctx context.Context, op client.TxnOperator, sql string, disableLog bool) (executor.Result, error) {
+	// copy from compile.go runSqlWithResult
+	service := op.GetWorkspace().(*Transaction).proc.GetService()
+	v, ok := moruntime.ServiceRuntime(service).GetGlobalVariables(moruntime.InternalSQLExecutor)
+	if !ok {
+		panic(fmt.Sprintf("missing sql executor in service %q", service))
+	}
+	exec := v.(executor.SQLExecutor)
+	proc := op.GetWorkspace().(*Transaction).proc
+	opts := executor.Options{}.
+		WithDisableIncrStatement().
+		WithTxn(op).
+		WithTimeZone(proc.GetSessionInfo().TimeZone)
+	if disableLog {
+		opts = opts.WithStatementOption(executor.StatementOption{}.WithDisableLog())
+	}
+	return exec.Exec(ctx, sql, opts)
+}
+
+func fillTsVecForSysTableQueryBatch(bat *batch.Batch, ts types.TS, m *mpool.MPool) error {
+	tsvec := vector.NewVec(types.T_TS.ToType())
+	for i := 0; i < bat.RowCount(); i++ {
+		if err := vector.AppendFixed(tsvec, ts, false, m); err != nil {
+			tsvec.Free(m)
+			return err
+		}
+	}
+	bat.Vecs = append([]*vector.Vector{bat.Vecs[0] /*rowid*/, tsvec}, bat.Vecs[1:]...)
+	return nil
+}
+
+func isColumnsBatchPerfectlySplitted(bs []*batch.Batch) bool {
+	tidIdx := 1 /*rowid*/ + catalog.MO_COLUMNS_ATT_RELNAME_ID_IDX
+	if len(bs) <= 1 {
+		return true
+	}
+	prevTableId := vector.GetFixedAtNoTypeCheck[uint64](bs[0].Vecs[tidIdx], bs[0].RowCount()-1)
+	for _, b := range bs[1:] {
+		firstId := vector.GetFixedAtNoTypeCheck[uint64](b.Vecs[tidIdx], 0)
+		if firstId == prevTableId {
+			return false
+		}
+		prevTableId = vector.GetFixedAtNoTypeCheck[uint64](b.Vecs[tidIdx], b.RowCount()-1)
+	}
+	return true
 }

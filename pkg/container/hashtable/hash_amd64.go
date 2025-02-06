@@ -21,7 +21,6 @@ import (
 )
 
 func crc32Int64BatchHash(data unsafe.Pointer, hashes *uint64, length int)
-func crc32Int64CellBatchHash(data unsafe.Pointer, hashes *uint64, length int)
 
 func aesBytesBatchGenHashStates(data *[]byte, states *[3]uint64, length int)
 func aesInt192BatchGenHashStates(data *[3]uint64, states *[3]uint64, length int)
@@ -29,15 +28,14 @@ func aesInt256BatchGenHashStates(data *[4]uint64, states *[3]uint64, length int)
 func aesInt320BatchGenHashStates(data *[5]uint64, states *[3]uint64, length int)
 
 func init() {
-	if cpu.X86.HasSSE42 {
+	if cpu.X86.HasAVX {
 		Int64BatchHash = crc32Int64BatchHash
-		Int64CellBatchHash = crc32Int64CellBatchHash
-	}
 
-	if cpu.X86.HasAES {
-		BytesBatchGenHashStates = aesBytesBatchGenHashStates
-		Int192BatchGenHashStates = aesInt192BatchGenHashStates
-		Int256BatchGenHashStates = aesInt256BatchGenHashStates
-		Int320BatchGenHashStates = aesInt320BatchGenHashStates
+		if cpu.X86.HasAES {
+			BytesBatchGenHashStates = aesBytesBatchGenHashStates
+			Int192BatchGenHashStates = aesInt192BatchGenHashStates
+			Int256BatchGenHashStates = aesInt256BatchGenHashStates
+			Int320BatchGenHashStates = aesInt320BatchGenHashStates
+		}
 	}
 }

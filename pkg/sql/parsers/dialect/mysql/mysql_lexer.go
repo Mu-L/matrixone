@@ -19,26 +19,88 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 )
 
+type MySQLParser struct {
+	scanner Scanner
+	lexer   Lexer
+	// use this will save some memory allocation
+	// parser  yyParserImpl
+}
+
+func (p *MySQLParser) Parse(ctx context.Context, sql string, lower int64) ([]tree.Statement, error) {
+	p.scanner.setSql(sql)
+	p.lexer.setScanner(&p.scanner, lower)
+
+	/*
+		The following can potentially save some memory allocation, but it exposes too much
+		of yyParser internals, which is really yacc's business, not ours.
+		I don't think it's worth it.
+
+		p.parser.yySymType = &yySymType{}
+		for i := 0; i < len(p.parser.stack); i++ {
+			p.parser.stack[i] = yySymType{}
+		}
+		p.parser.char = 0
+	*/
+
+	if yyParse(&p.lexer) != 0 {
+		for _, s := range p.lexer.stmts {
+			s.Free()
+		}
+		return nil, p.lexer.scanner.LastError
+	}
+	if len(p.lexer.stmts) == 0 {
+		/**
+		For CORNER CASE like:
+
+		mysql> -- MySQL dump 10.13  Distrib 8.1.0, for macos11.7 (arm64)
+
+		the input will be stripped to empty string, and the parser will return 0 stmts.
+		but, the mysql server responds ok to the client.
+		so, we return an EmptyStmt that does nothing beside responding ok.
+		*/
+		return []tree.Statement{&tree.EmptyStmt{}}, nil
+	}
+	return p.lexer.stmts, nil
+}
+
 func Parse(ctx context.Context, sql string, lower int64) ([]tree.Statement, error) {
 	lexer := NewLexer(dialect.MYSQL, sql, lower)
+	defer PutScanner(lexer.scanner)
 	if yyParse(lexer) != 0 {
+		for _, s := range lexer.stmts {
+			s.Free()
+		}
 		return nil, lexer.scanner.LastError
 	}
 	if len(lexer.stmts) == 0 {
-		return nil, moerr.NewParseError(ctx, "Query was empty")
+		/**
+		For CORNER CASE like:
+
+		mysql> -- MySQL dump 10.13  Distrib 8.1.0, for macos11.7 (arm64)
+
+		the input will be stripped to empty string, and the parser will return 0 stmts.
+		but, the mysql server responds ok to the client.
+		so, we return an EmptyStmt that does nothing beside responding ok.
+		*/
+		return []tree.Statement{&tree.EmptyStmt{}}, nil
 	}
 	return lexer.stmts, nil
 }
 
 func ParseOne(ctx context.Context, sql string, lower int64) (tree.Statement, error) {
 	lexer := NewLexer(dialect.MYSQL, sql, lower)
+	defer PutScanner(lexer.scanner)
 	if yyParse(lexer) != 0 {
+		for _, s := range lexer.stmts {
+			s.Free()
+		}
 		return nil, lexer.scanner.LastError
 	}
 	if len(lexer.stmts) != 1 {
@@ -62,6 +124,13 @@ func NewLexer(dialectType dialect.DialectType, sql string, lower int64) *Lexer {
 	}
 }
 
+func (l *Lexer) setScanner(s *Scanner, lower int64) {
+	l.scanner = s
+	l.stmts = nil
+	l.paramIndex = 0
+	l.lower = lower
+}
+
 func (l *Lexer) GetParamIndex() int {
 	l.paramIndex = l.paramIndex + 1
 	return l.paramIndex
@@ -76,17 +145,24 @@ func (l *Lexer) Lex(lval *yySymType) int {
 		return l.toInt(lval, str)
 	case FLOAT:
 		return l.toFloat(lval, str)
-	case HEX:
-		return l.toHex(lval, str)
-	case HEXNUM:
-		return l.toHexNum(lval, str)
-	case BIT_LITERAL:
-		return l.toBit(lval, str)
 	}
 
 	lval.str = str
 	return typ
 }
+
+func (l *Lexer) GetDbOrTblName(origin string) string {
+	if l.lower == 1 {
+		return strings.ToLower(origin)
+	}
+	return origin
+}
+
+func (l *Lexer) GetDbOrTblNameCStr(origin string) *tree.CStr {
+	return tree.NewCStr(origin, l.lower)
+}
+
+var CaseInsensitiveDbs = []string{"information_schema", "mysql"}
 
 func (l *Lexer) Error(err string) {
 	errMsg := fmt.Sprintf("You have an error in your SQL syntax; check the manual that corresponds to your MatrixOne server version for the right syntax to use. %s", err)
@@ -129,59 +205,4 @@ func (l *Lexer) toFloat(lval *yySymType, str string) int {
 	}
 	lval.item = fval
 	return FLOAT
-}
-
-func (l *Lexer) toHex(lval *yySymType, str string) int {
-	return HEX
-}
-
-// don't transfer 0xXXX to int,uint, all string([]byte),for example
-// 0x0616161 will be ' aaa'
-func (l *Lexer) toHexNum(lval *yySymType, str string) int {
-	// it won't be err, no need to process
-	// ival, err := strconv.ParseUint(str[2:], 16, 64)
-	// if err != nil {
-	// 	// TODO: toDecimal()
-	// 	//l.scanner.LastError = err
-	// 	lval.item = str
-	// 	return HEXNUM
-	// }
-	// switch {
-	// case ival <= math.MaxInt64:
-	// 	lval.item = int64(ival)
-	// default:
-	// 	lval.item = ival
-	// }
-	// lval.str = str
-	lval.str = str
-	return HEXNUM
-}
-
-func (l *Lexer) toBit(lval *yySymType, str string) int {
-	var (
-		ival uint64
-		err  error
-	)
-	if len(str) < 2 {
-		ival, err = strconv.ParseUint(str, 2, 64)
-	} else if str[1] == 'b' {
-		ival, err = strconv.ParseUint(str[2:], 2, 64)
-	} else {
-		ival, err = strconv.ParseUint(str, 2, 64)
-	}
-
-	if err != nil {
-		// TODO: toDecimal()
-		//l.scanner.LastError = err
-		lval.item = str
-		return BIT_LITERAL
-	}
-	switch {
-	case ival <= math.MaxInt64:
-		lval.item = int64(ival)
-	default:
-		lval.item = ival
-	}
-	lval.str = str
-	return BIT_LITERAL
 }

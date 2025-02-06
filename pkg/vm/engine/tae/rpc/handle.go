@@ -15,48 +15,59 @@
 package rpc
 
 import (
-	"bytes"
 	"context"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio"
+	"fmt"
 	"os"
-	"sync"
+	"reflect"
+	"regexp"
+	"runtime"
+	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-
-	"github.com/google/shlex"
-	"github.com/matrixorigin/matrixone/pkg/catalog"
+	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
-	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/util/fault"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
-	catalog2 "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/cmd_util"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/rpchandle"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/moengine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
-
 	"go.uber.org/zap"
 )
 
-// TODO::GC the abandoned txn.
+const (
+	MAX_ALLOWED_TXN_LATENCY = time.Millisecond * 300
+	MAX_TXN_COMMIT_LATENCY  = time.Minute * 2
+)
+
 type Handle struct {
-	eng moengine.TxnEngine
-	mu  struct {
-		sync.RWMutex
-		//map txn id to txnContext.
-		txnCtxs map[string]*txnContext
-	}
+	db *db.DB
+	// only used for UT
+	txnCtxs *common.Map[string, *txnContext]
+	//GCJob   *tasks.CancelableJob
+
+	interceptMatchRegexp atomic.Pointer[regexp.Regexp]
 }
 
 var _ rpchandle.Handler = (*Handle)(nil)
@@ -64,103 +75,504 @@ var _ rpchandle.Handler = (*Handle)(nil)
 type txnContext struct {
 	//createAt is used to GC the abandoned txn.
 	createAt time.Time
+	deadline time.Time
 	meta     txn.TxnMeta
 	reqs     []any
-	//the table to create by this txn.
-	toCreate map[uint64]*catalog2.Schema
 }
 
-func (h *Handle) GetTxnEngine() moengine.TxnEngine {
-	return h.eng
+//#region Open
+
+func openTAE(ctx context.Context, targetDir string, opt *options.Options) (tae *db.DB, err error) {
+	if targetDir != "" {
+		mask := syscall.Umask(0)
+		if err := os.MkdirAll(targetDir, os.FileMode(0755)); err != nil {
+			syscall.Umask(mask)
+			logutil.Infof("Recreate dir error:%v", err)
+			return nil, err
+		}
+		syscall.Umask(mask)
+		tae, err = db.Open(ctx, targetDir+"/tae", opt)
+		if err != nil {
+			logutil.Warnf("Open tae failed. error:%v", err)
+			return nil, err
+		}
+		return tae, nil
+	}
+
+	tae, err = db.Open(ctx, targetDir, opt)
+	if err != nil {
+		logutil.Warnf("Open tae failed. error:%v", err)
+		return nil, err
+	}
+	return
 }
 
-func NewTAEHandle(path string, opt *options.Options) *Handle {
+func NewTAEHandle(ctx context.Context, path string, opt *options.Options) *Handle {
 	if path == "" {
 		path = "./store"
 	}
-	tae, err := openTAE(path, opt)
+	tae, err := openTAE(ctx, path, opt)
 	if err != nil {
 		panic(err)
 	}
 
 	h := &Handle{
-		eng: moengine.NewEngine(tae),
+		db: tae,
 	}
-	h.mu.txnCtxs = make(map[string]*txnContext)
+
+	h.txnCtxs = common.NewMap[string, *txnContext](runtime.GOMAXPROCS(0))
+	h.interceptMatchRegexp.Store(regexp.MustCompile(`.*bmsql_stock.*`))
+
 	return h
 }
 
-func (h *Handle) HandleCommit(
+//#endregion Open
+
+//#region Handle Operations
+
+func (h *Handle) GetDB() *db.DB {
+	return h.db
+}
+
+func (h *Handle) IsInterceptTable(name string) bool {
+	printMatchRegexp := h.getInterceptMatchRegexp()
+	if printMatchRegexp == nil {
+		return false
+	}
+	return printMatchRegexp.MatchString(name)
+}
+
+func (h *Handle) getInterceptMatchRegexp() *regexp.Regexp {
+	return h.interceptMatchRegexp.Load()
+}
+
+func (h *Handle) UpdateInterceptMatchRegexp(name string) {
+	if name == "" {
+		h.interceptMatchRegexp.Store(nil)
+		return
+	}
+	h.interceptMatchRegexp.Store(regexp.MustCompile(fmt.Sprintf(`.*%s.*`, name)))
+}
+
+func (h *Handle) CacheTxnRequest(
 	ctx context.Context,
-	meta txn.TxnMeta) (cts timestamp.Timestamp, err error) {
-	h.mu.RLock()
-	txnCtx, ok := h.mu.txnCtxs[string(meta.GetID())]
-	h.mu.RUnlock()
-	logutil.Infof("HandleCommit start : %X\n",
-		string(meta.GetID()))
-	defer func() {
-		logutil.Infof("HandleCommit end : %X\n",
-			string(meta.GetID()))
-	}()
-	//Handle precommit-write command for 1PC
-	var txn moengine.Txn
-	if ok {
-		for _, e := range txnCtx.reqs {
-			switch req := e.(type) {
-			case *db.CreateDatabaseReq:
-				err = h.HandleCreateDatabase(
-					ctx,
-					meta,
-					req,
-					&db.CreateDatabaseResp{},
-				)
-			case *db.CreateRelationReq:
-				err = h.HandleCreateRelation(
-					ctx,
-					meta,
-					req,
-					&db.CreateRelationResp{},
-				)
-			case *db.DropDatabaseReq:
-				err = h.HandleDropDatabase(
-					ctx,
-					meta,
-					req,
-					&db.DropDatabaseResp{},
-				)
-			case *db.DropOrTruncateRelationReq:
-				err = h.HandleDropOrTruncateRelation(
-					ctx,
-					meta,
-					req,
-					&db.DropOrTruncateRelationResp{},
-				)
-			case *db.UpdateConstraintReq:
-				err = h.HandleUpdateConstraint(
-					ctx,
-					meta,
-					req,
-					&db.UpdateConstraintResp{},
-				)
-			case *db.WriteReq:
-				err = h.HandleWrite(
-					ctx,
-					meta,
-					req,
-					&db.WriteResp{},
-				)
-			default:
-				panic(moerr.NewNYI(ctx, "Pls implement me"))
+	meta txn.TxnMeta,
+	req any) (err error) {
+	txnCtx, ok := h.txnCtxs.Load(util.UnsafeBytesToString(meta.GetID()))
+	if !ok {
+		now := time.Now()
+		txnCtx = &txnContext{
+			createAt: now,
+			deadline: now.Add(MAX_TXN_COMMIT_LATENCY),
+			meta:     meta,
+		}
+		h.txnCtxs.Store(util.UnsafeBytesToString(meta.GetID()), txnCtx)
+	}
+	v := reflect.ValueOf(req)
+	if v.Kind() == reflect.Slice {
+		for i := 0; i < v.Len(); i++ {
+			txnCtx.reqs = append(txnCtx.reqs, v.Index(i).Interface())
+		}
+	} else {
+		txnCtx.reqs = append(txnCtx.reqs, req)
+	}
+	return nil
+}
+
+func (h *Handle) tryLockMergeForBulkDelete(reqs []any, txn txnif.AsyncTxn) (releaseF []func(), err error) {
+	delM := make(map[uint64]*struct {
+		dbID uint64
+		rows uint64
+	})
+	for _, e := range reqs {
+		if req, ok := e.(*cmd_util.WriteReq); ok && req.Type == cmd_util.EntryDelete {
+			if req.FileName == "" && req.Batch == nil {
+				continue
 			}
-			//Need to roll back the txn.
-			if err != nil {
-				txn, _ = h.eng.GetTxnByID(meta.GetID())
-				txn.Rollback()
-				return
+
+			delM[req.TableID] = &struct {
+				dbID uint64
+				rows uint64
+			}{dbID: req.DatabaseId, rows: 0}
+
+			if req.FileName != "" {
+				for _, stats := range req.TombstoneStats {
+					delM[req.TableID].rows += uint64(stats.Rows())
+				}
+			}
+			if req.Batch != nil {
+				delM[req.TableID].rows += uint64(req.Batch.RowCount())
 			}
 		}
 	}
-	txn, err = h.eng.GetTxnByID(meta.GetID())
+
+	for id, info := range delM {
+		if info.rows <= h.db.Opts.BulkTomestoneTxnThreshold {
+			continue
+		}
+
+		dbHandle, err := txn.GetDatabaseByID(info.dbID)
+		if err != nil {
+			return nil, err
+		}
+
+		relation, err := dbHandle.GetRelationByID(id)
+		if err != nil {
+			return nil, err
+		}
+
+		err = h.db.MergeScheduler.StopMerge(relation.GetMeta().(*catalog.TableEntry), true)
+		if err != nil {
+			return nil, err
+		}
+		logutil.Info("LockMerge Bulk Delete",
+			zap.Uint64("tid", id), zap.Uint64("rows", info.rows), zap.String("txn", txn.String()))
+		release := func() {
+			err = h.db.MergeScheduler.StartMerge(id, true)
+			if err != nil {
+				return
+			}
+			logutil.Info("LockMerge Bulk Delete Committed",
+				zap.Uint64("tid", id), zap.Uint64("rows", info.rows), zap.String("txn", txn.String()))
+		}
+		releaseF = append(releaseF, release)
+	}
+
+	return
+}
+
+type txnCommitRequestsIter struct {
+	cursor         int
+	curNorReq      *api.PrecommitWriteCmd
+	commitRequests *txn.TxnCommitRequest
+
+	// cache requests only used in ut
+	cached []any
+}
+
+func (h *Handle) newTxnCommitRequestsIter(
+	cr *txn.TxnCommitRequest,
+	meta txn.TxnMeta,
+) *txnCommitRequestsIter {
+
+	// in the normal commit processes, the new logic won't cache the write requests anymore.
+	// however, there exist massive ut code that verified the preCommit-commit 2PC logic,
+	// which cached the write requests in the preCommit call.
+	// to keep that, there also leave the commiting code of the cached requests un-changed, but only for ut.
+	if cr == nil {
+		// for now, only test will into this logic
+		key := util.UnsafeBytesToString(meta.GetID())
+		txnCtx, ok := h.txnCtxs.Load(key)
+		if !ok {
+			// no requests
+			return nil
+		}
+
+		defer h.txnCtxs.Delete(key)
+
+		return &txnCommitRequestsIter{
+			cursor:         0,
+			cached:         txnCtx.reqs,
+			commitRequests: nil,
+		}
+
+	} else {
+		return &txnCommitRequestsIter{
+			cursor:         0,
+			cached:         nil,
+			commitRequests: cr,
+		}
+	}
+}
+
+func (cri *txnCommitRequestsIter) Next() bool {
+	if cri.commitRequests == nil {
+		return cri.cursor < len(cri.cached)
+	}
+	return cri.cursor < len(cri.commitRequests.Payload)
+}
+
+func (cri *txnCommitRequestsIter) Entry() (entry any, err error) {
+
+	if cri.commitRequests == nil {
+		entry = cri.cached[cri.cursor]
+		cri.cursor++
+		return
+	}
+
+	cnReq := cri.commitRequests.Payload[cri.cursor].CNRequest
+
+	if cri.curNorReq == nil {
+		cri.curNorReq = new(api.PrecommitWriteCmd)
+	}
+
+	if len(cri.curNorReq.EntryList) == 0 {
+		if err = cri.curNorReq.UnmarshalBinary(cnReq.Payload); err != nil {
+			return
+		}
+	}
+
+	entry, cri.curNorReq.EntryList, err = pkgcatalog.ParseEntryList(cri.curNorReq.EntryList)
+	if len(cri.curNorReq.EntryList) == 0 {
+		cri.cursor++
+	}
+
+	return
+}
+
+func (h *Handle) handleRequests(
+	ctx context.Context,
+	txn txnif.AsyncTxn,
+	commitRequests *txn.TxnCommitRequest,
+	response *txn.TxnResponse,
+	txnMeta txn.TxnMeta,
+) (releaseF []func(), hasDDL bool, err error) {
+
+	var (
+		entry any
+
+		iter *txnCommitRequestsIter
+
+		inMemoryInsertRows        int
+		persistedMemoryInsertRows int
+		inMemoryTombstoneRows     int
+		persistedTombstoneRows    int
+	)
+
+	if iter = h.newTxnCommitRequestsIter(commitRequests, txnMeta); iter == nil {
+		return
+	}
+
+	for iter.Next() {
+		if entry, err = iter.Entry(); err != nil {
+			return
+		}
+
+		switch req := entry.(type) {
+		case *pkgcatalog.CreateDatabaseReq:
+			hasDDL = true
+			err = h.HandleCreateDatabase(ctx, txn, req)
+		case *pkgcatalog.DropDatabaseReq:
+			hasDDL = true
+			err = h.HandleDropDatabase(ctx, txn, req)
+		case *pkgcatalog.CreateTableReq:
+			hasDDL = true
+			err = h.HandleCreateRelation(ctx, txn, req)
+		case *pkgcatalog.DropTableReq:
+			hasDDL = true
+			err = h.HandleDropRelation(ctx, txn, req)
+		case *api.AlterTableReq:
+			hasDDL = true
+			err = h.HandleAlterTable(ctx, txn, req)
+		case []*api.AlterTableReq:
+			hasDDL = true
+			for _, r := range req {
+				if err = h.HandleAlterTable(ctx, txn, r); err != nil {
+					return
+				}
+			}
+
+		case *cmd_util.WriteReq, *api.Entry:
+			var wr *cmd_util.WriteReq
+			if ae, ok := req.(*api.Entry); ok {
+				wr = h.apiEntryToWriteEntry(ctx, txnMeta, ae, true)
+			} else {
+				wr = req.(*cmd_util.WriteReq)
+			}
+
+			if wr.Type == cmd_util.EntryDelete {
+				var f []func()
+				if f, err = h.tryLockMergeForBulkDelete([]any{req}, txn); err != nil {
+					logutil.Warn("failed to lock merging", zap.Error(err))
+					return
+				}
+
+				releaseF = append(releaseF, f...)
+			}
+
+			var r1, r2, r3, r4 int
+			r1, r2, r3, r4, err = h.HandleWrite(ctx, txn, wr)
+			if err == nil {
+				inMemoryInsertRows += r1
+				persistedMemoryInsertRows += r2
+				inMemoryTombstoneRows += r3
+				persistedTombstoneRows += r4
+			}
+
+		default:
+			err = moerr.NewNotSupportedf(ctx, "unknown txn request type: %T", req)
+		}
+
+		//Need to roll back the txn.
+		if err != nil {
+			txn.Rollback(ctx)
+			return
+		}
+	}
+	if inMemoryInsertRows+inMemoryTombstoneRows+persistedTombstoneRows+persistedMemoryInsertRows > 100000 {
+		logutil.Info(
+			"BIG-COMMIT-TRACE-LOG",
+			zap.Int("in-memory-rows", inMemoryInsertRows),
+			zap.Int("persisted-rows", persistedMemoryInsertRows),
+			zap.Int("in-memory-tombstones", inMemoryTombstoneRows),
+			zap.Int("persisted-tombstones", persistedTombstoneRows),
+			zap.String("txn", txn.String()),
+		)
+	}
+	return
+}
+
+//#endregion
+
+//#region Impl TxnStorage interface
+//order by call frequency
+
+func (h *Handle) apiEntryToWriteEntry(
+	ctx context.Context,
+	meta txn.TxnMeta,
+	pe *api.Entry,
+	prefetch bool,
+) *cmd_util.WriteReq {
+
+	moBat, err := batch.ProtoBatchToBatch(pe.GetBat())
+	if err != nil {
+		panic(err)
+	}
+	req := &cmd_util.WriteReq{
+		Type:         cmd_util.EntryType(pe.EntryType),
+		DatabaseId:   pe.GetDatabaseId(),
+		TableID:      pe.GetTableId(),
+		DatabaseName: pe.GetDatabaseName(),
+		TableName:    pe.GetTableName(),
+		FileName:     pe.GetFileName(),
+		Batch:        moBat,
+		PkCheck:      cmd_util.PKCheckType(pe.GetPkCheckByTn()),
+	}
+
+	if req.FileName != "" {
+		col := req.Batch.Vecs[0]
+		for i := 0; i < req.Batch.RowCount(); i++ {
+			stats := objectio.ObjectStats(col.GetBytesAt(i))
+			if req.Type == cmd_util.EntryInsert {
+				req.DataObjectStats = append(req.DataObjectStats, stats)
+			} else {
+				req.TombstoneStats = append(req.TombstoneStats, stats)
+			}
+		}
+	}
+
+	if prefetch {
+		if req.Type == cmd_util.EntryDelete {
+			if err = h.prefetchDeleteRowID(ctx, req, &meta); err != nil {
+				return nil
+			}
+		} else {
+			if err = h.prefetchMetadata(ctx, req, &meta); err != nil {
+				return nil
+			}
+		}
+	}
+
+	return req
+}
+
+// HandlePreCommitWrite impls TxnStorage:Write
+// only ut call this
+func (h *Handle) HandlePreCommitWrite(
+	ctx context.Context,
+	meta txn.TxnMeta,
+	req *api.PrecommitWriteCmd,
+	_ *api.TNStringResponse /*no response*/) (err error) {
+	var e any
+	es := req.EntryList
+	for len(es) > 0 {
+		e, es, err = pkgcatalog.ParseEntryList(es)
+		if err != nil {
+			reqsStr := "emtpy"
+			if txnCtx, ok := h.txnCtxs.Load(util.UnsafeBytesToString(meta.GetID())); ok {
+				reqsStr = pkgcatalog.ShowReqs(txnCtx.reqs)
+			}
+			logutil.Errorf("ParseEntryList failed. error:%v, cached reqs:%v", err, reqsStr)
+			return err
+		}
+		switch cmds := e.(type) {
+		case *pkgcatalog.CreateDatabaseReq, *pkgcatalog.CreateTableReq,
+			*pkgcatalog.DropDatabaseReq, *pkgcatalog.DropTableReq,
+			[]*api.AlterTableReq:
+			if err = h.CacheTxnRequest(ctx, meta, cmds); err != nil {
+				return err
+			}
+		case *api.Entry:
+			//Handle DML
+			wr := h.apiEntryToWriteEntry(ctx, meta, e.(*api.Entry), false)
+			if err = h.CacheTxnRequest(ctx, meta, wr); err != nil {
+				return err
+			}
+		default:
+			return moerr.NewNYIf(ctx, "pre commit write type: %T", cmds)
+		}
+	}
+	//evaluate all the txn requests.
+	return h.TryPrefetchTxn(ctx, &meta)
+}
+
+// HandlePreCommitWrite impls TxnStorage:Commit
+func (h *Handle) HandleCommit(
+	ctx context.Context,
+	meta txn.TxnMeta,
+	response *txn.TxnResponse,
+	commitRequests *txn.TxnCommitRequest,
+) (cts timestamp.Timestamp, err error) {
+	start := time.Now()
+
+	var (
+		txn      txnif.AsyncTxn
+		releaseF []func()
+		hasDDL   bool = false
+	)
+	defer func() {
+		for _, f := range releaseF {
+			f()
+		}
+
+		common.DoIfInfoEnabled(func() {
+			_, _, injected := fault.TriggerFault(objectio.FJ_CommitSlowLog)
+			if time.Since(start) > MAX_ALLOWED_TXN_LATENCY || err != nil || hasDDL || injected {
+				var tnTxnInfo string
+				if txn != nil {
+					tnTxnInfo = txn.String()
+				}
+				logger := logutil.Warn
+				msg := "HandleCommit-SLOW-LOG"
+				if err != nil {
+					logger = logutil.Error
+					msg = "HandleCommit-Error"
+				} else if hasDDL {
+					logger = logutil.Info
+					msg = "HandleCommit-With-DDL"
+				}
+				logger(
+					msg,
+					zap.Error(err),
+					zap.Duration("commit-latency", time.Since(start)),
+					zap.String("cn-txn", meta.DebugString()),
+					zap.String("tn-txn", tnTxnInfo),
+				)
+			}
+		})
+	}()
+
+	if txn, err = h.db.GetOrCreateTxnWithMeta(
+		nil, meta.GetID(), types.TimestampToTS(meta.GetSnapshotTS())); err != nil {
+		return
+	}
+
+	if releaseF, hasDDL, err = h.handleRequests(
+		ctx, txn, commitRequests, response, meta); err != nil {
+		return
+	}
+
+	txn, err = h.db.GetTxnByID(meta.GetID())
 	if err != nil {
 		return
 	}
@@ -168,732 +580,523 @@ func (h *Handle) HandleCommit(
 	if txn.Is2PC() {
 		txn.SetCommitTS(types.TimestampToTS(meta.GetCommitTS()))
 	}
-	err = txn.Commit()
-	cts = txn.GetCommitTS().ToTimestamp()
 
-	//delete the txn's context.
-	h.mu.Lock()
-	delete(h.mu.txnCtxs, string(meta.GetID()))
-	h.mu.Unlock()
+	v2.TxnBeforeCommitDurationHistogram.Observe(time.Since(start).Seconds())
+
+	err = txn.Commit(ctx)
+	cts = txn.GetCommitTS().ToTimestamp()
+	if cts.PhysicalTime == txnif.UncommitTS.Physical() {
+		panic("bad committs causing hung")
+	}
+
+	if moerr.IsMoErrCode(err, moerr.ErrTAENeedRetry) {
+		for {
+			for _, f := range releaseF {
+				f()
+			}
+			txn, err = h.db.StartTxnWithStartTSAndSnapshotTS(nil,
+				types.TimestampToTS(meta.GetSnapshotTS()))
+			if err != nil {
+				return
+			}
+			logutil.Info(
+				"TAE-RETRY-TXN",
+				zap.String("old-txn", string(meta.GetID())),
+				zap.String("new-txn", txn.GetID()),
+			)
+			//Handle precommit-write command for 1PC
+			releaseF, hasDDL, err = h.handleRequests(ctx, txn, commitRequests, response, meta)
+			if err != nil && !moerr.IsMoErrCode(err, moerr.ErrTAENeedRetry) {
+				break
+			}
+			//if txn is 2PC ,need to set commit timestamp passed by coordinator.
+			if txn.Is2PC() {
+				txn.SetCommitTS(types.TimestampToTS(meta.GetCommitTS()))
+			}
+			err = txn.Commit(ctx)
+			cts = txn.GetCommitTS().ToTimestamp()
+			if !moerr.IsMoErrCode(err, moerr.ErrTAENeedRetry) {
+				break
+			}
+		}
+	}
+	return
+}
+
+// HandleGetLogTail impls TxnStorage:Read
+func (h *Handle) HandleGetLogTail(
+	ctx context.Context,
+	meta txn.TxnMeta,
+	req *api.SyncLogTailReq,
+	resp *api.SyncLogTailResp) (closeCB func(), err error) {
+	res, closeCB, err := logtail.HandleSyncLogTailReq(
+		ctx,
+		h.db,
+		h.db.LogtailMgr,
+		h.db.Catalog,
+		*req,
+		true)
+	if err != nil {
+		return
+	}
+	*resp = res
 	return
 }
 
 func (h *Handle) HandleRollback(
 	ctx context.Context,
 	meta txn.TxnMeta) (err error) {
-	h.mu.Lock()
-	_, ok := h.mu.txnCtxs[string(meta.GetID())]
-	delete(h.mu.txnCtxs, string(meta.GetID()))
-	h.mu.Unlock()
+	_, ok := h.txnCtxs.LoadAndDelete(util.UnsafeBytesToString(meta.GetID()))
+
 	//Rollback after pre-commit write.
 	if ok {
 		return
 	}
-	var txn moengine.Txn
-	txn, err = h.eng.GetTxnByID(meta.GetID())
+	txn, err := h.db.GetTxnByID(meta.GetID())
 
 	if err != nil {
 		return err
 	}
-	err = txn.Rollback()
+	err = txn.Rollback(ctx)
 	return
-}
-
-func (h *Handle) HandleCommitting(
-	ctx context.Context,
-	meta txn.TxnMeta) (err error) {
-	var txn moengine.Txn
-	txn, err = h.eng.GetTxnByID(meta.GetID())
-	if err != nil {
-		return err
-	}
-	txn.SetCommitTS(types.TimestampToTS(meta.GetCommitTS()))
-	err = txn.Committing()
-	return
-}
-
-func (h *Handle) HandlePrepare(
-	ctx context.Context,
-	meta txn.TxnMeta) (pts timestamp.Timestamp, err error) {
-	h.mu.RLock()
-	txnCtx, ok := h.mu.txnCtxs[string(meta.GetID())]
-	h.mu.RUnlock()
-	var txn moengine.Txn
-	if ok {
-		//handle pre-commit write for 2PC
-		for _, e := range txnCtx.reqs {
-			switch req := e.(type) {
-			case *db.CreateDatabaseReq:
-				err = h.HandleCreateDatabase(
-					ctx,
-					meta,
-					req,
-					&db.CreateDatabaseResp{},
-				)
-			case *db.CreateRelationReq:
-				err = h.HandleCreateRelation(
-					ctx,
-					meta,
-					req,
-					&db.CreateRelationResp{},
-				)
-			case *db.DropDatabaseReq:
-				err = h.HandleDropDatabase(
-					ctx,
-					meta,
-					req,
-					&db.DropDatabaseResp{},
-				)
-			case *db.DropOrTruncateRelationReq:
-				err = h.HandleDropOrTruncateRelation(
-					ctx,
-					meta,
-					req,
-					&db.DropOrTruncateRelationResp{},
-				)
-			case *db.UpdateConstraintReq:
-				err = h.HandleUpdateConstraint(
-					ctx,
-					meta,
-					req,
-					&db.UpdateConstraintResp{},
-				)
-			case *db.WriteReq:
-				err = h.HandleWrite(
-					ctx,
-					meta,
-					req,
-					&db.WriteResp{},
-				)
-			default:
-				panic(moerr.NewNYI(ctx, "Pls implement me"))
-			}
-			//need to rollback the txn
-			if err != nil {
-				txn, _ = h.eng.GetTxnByID(meta.GetID())
-				txn.Rollback()
-				return
-			}
-		}
-	}
-	txn, err = h.eng.GetTxnByID(meta.GetID())
-	if err != nil {
-		return timestamp.Timestamp{}, err
-	}
-	participants := make([]uint64, 0, len(meta.GetDNShards()))
-	for _, shard := range meta.GetDNShards() {
-		participants = append(participants, shard.GetShardID())
-	}
-	txn.SetParticipants(participants)
-	var ts types.TS
-	ts, err = txn.Prepare()
-	pts = ts.ToTimestamp()
-	//delete the txn's context.
-	h.mu.Lock()
-	delete(h.mu.txnCtxs, string(meta.GetID()))
-	h.mu.Unlock()
-	return
-}
-
-func (h *Handle) HandleStartRecovery(
-	ctx context.Context,
-	ch chan txn.TxnMeta) {
-	//panic(moerr.NewNYI("HandleStartRecovery is not implemented yet"))
-	//TODO:: 1.  Get the 2PC transactions which be in prepared or
-	//           committing state from txn engine's recovery.
-	//       2.  Feed these transaction into ch.
-	close(ch)
 }
 
 func (h *Handle) HandleClose(ctx context.Context) (err error) {
 	//FIXME::should wait txn request's job done?
-	return h.eng.Close()
+	//if h.GCJob != nil {
+	//	h.GCJob.Stop()
+	//}
+	return h.db.Close()
 }
 
 func (h *Handle) HandleDestroy(ctx context.Context) (err error) {
 	//FIXME::should wait txn request's job done?
-	return h.eng.Destroy()
-}
-
-func (h *Handle) HandleGetLogTail(
-	ctx context.Context,
-	meta txn.TxnMeta,
-	req apipb.SyncLogTailReq,
-	resp *apipb.SyncLogTailResp) (err error) {
-	tae := h.eng.GetTAE(context.Background())
-	res, err := logtail.HandleSyncLogTailReq(
-		ctx,
-		tae.BGCheckpointRunner,
-		tae.LogtailMgr,
-		tae.Catalog,
-		req,
-		true)
-	if err != nil {
-		return err
-	}
-	*resp = res
-	return nil
-}
-
-func (h *Handle) HandleFlushTable(
-	ctx context.Context,
-	meta txn.TxnMeta,
-	req db.FlushTable,
-	resp *apipb.SyncLogTailResp) (err error) {
-
-	// We use current TS instead of transaction ts.
-	// Here, the point of this handle function is to trigger a flush
-	// via mo_ctl.  We mimic the behaviour of a real background flush
-	// currTs := types.TimestampToTS(meta.GetSnapshotTS())
-	currTs := types.BuildTS(time.Now().UTC().UnixNano(), 0)
-
-	err = h.eng.FlushTable(ctx,
-		req.AccessInfo.AccountID,
-		req.DatabaseID,
-		req.TableID,
-		currTs)
-	return err
-}
-
-func (h *Handle) HandleForceCheckpoint(
-	ctx context.Context,
-	meta txn.TxnMeta,
-	req db.Checkpoint,
-	resp *apipb.SyncLogTailResp) (err error) {
-
-	timeout := req.FlushDuration
-
-	currTs := types.BuildTS(time.Now().UTC().UnixNano(), 0)
-
-	err = h.eng.ForceCheckpoint(ctx,
-		currTs, timeout)
-	return err
-}
-
-func (h *Handle) HandleInspectDN(
-	ctx context.Context,
-	meta txn.TxnMeta,
-	req db.InspectDN,
-	resp *db.InspectResp) (err error) {
-	tae := h.eng.GetTAE(context.Background())
-	args, _ := shlex.Split(req.Operation)
-	logutil.Info("Inspect", zap.Strings("args", args))
-	b := &bytes.Buffer{}
-
-	inspectCtx := &inspectContext{
-		db:     tae,
-		acinfo: &req.AccessInfo,
-		args:   args,
-		out:    b,
-		resp:   resp,
-	}
-	RunInspect(inspectCtx)
-	resp.Message = b.String()
-	return nil
-}
-
-func (h *Handle) prefetch(ctx context.Context,
-	req *db.WriteReq) error {
-	if len(req.DeltaLocs) == 0 {
-		return nil
-	}
-	//for loading deleted rowid.
-	columnIdx := 0
-	//start loading jobs asynchronously,should create a new root context.
-	reader, err := blockio.NewObjectReader(
-		h.eng.GetTAE(ctx).Fs.Service, req.DeltaLocs[0])
-	if err != nil {
-		return nil
-	}
-
-	pref := blockio.BuildPrefetch(reader, nil)
-	for _, key := range req.DeltaLocs {
-		_, id, _, _, err := blockio.DecodeLocation(key)
-		if err != nil {
-			return nil
-		}
-		pref.AddBlock([]uint16{uint16(columnIdx)}, []uint32{id})
-	}
-	return blockio.PrefetchWithMerged(pref)
-}
-
-// EvaluateTxnRequest only evaluate the request ,do not change the state machine of TxnEngine.
-func (h *Handle) EvaluateTxnRequest(
-	ctx context.Context,
-	meta txn.TxnMeta,
-) (err error) {
-	h.mu.RLock()
-	txnCtx := h.mu.txnCtxs[string(meta.GetID())]
-	h.mu.RUnlock()
-	for _, e := range txnCtx.reqs {
-		if r, ok := e.(*db.WriteReq); ok {
-			if r.FileName != "" {
-				if r.Type == db.EntryDelete {
-					//start to load deleted row ids
-					err = h.prefetch(ctx, r)
-					if err != nil {
-						return
-					}
-				}
-			}
-		}
-	}
 	return
 }
 
-func (h *Handle) CacheTxnRequest(
-	ctx context.Context,
-	meta txn.TxnMeta,
-	req any,
-	rsp any) (err error) {
-	h.mu.Lock()
-	txnCtx, ok := h.mu.txnCtxs[string(meta.GetID())]
-	if !ok {
-		txnCtx = &txnContext{
-			createAt: time.Now(),
-			meta:     meta,
-			toCreate: make(map[uint64]*catalog2.Schema),
-		}
-		h.mu.txnCtxs[string(meta.GetID())] = txnCtx
-	}
-	h.mu.Unlock()
-	txnCtx.reqs = append(txnCtx.reqs, req)
-	if r, ok := req.(*db.CreateRelationReq); ok {
-		// Does this place need
-		schema, err := moengine.DefsToSchema(r.Name, r.Defs)
-		if err != nil {
-			return err
-		}
-		txnCtx.toCreate[r.RelationId] = schema
-	}
-	return nil
-}
+//#endregion
 
-func (h *Handle) HandlePreCommitWrite(
-	ctx context.Context,
-	meta txn.TxnMeta,
-	req apipb.PrecommitWriteCmd,
-	resp *apipb.SyncLogTailResp) (err error) {
-	var e any
-
-	es := req.EntryList
-
-	for len(es) > 0 {
-		e, es, err = catalog.ParseEntryList(es)
-		if err != nil {
-			return err
-		}
-		switch cmds := e.(type) {
-		case []catalog.CreateDatabase:
-			for _, cmd := range cmds {
-				req := &db.CreateDatabaseReq{
-					Name:       cmd.Name,
-					CreateSql:  cmd.CreateSql,
-					DatabaseId: cmd.DatabaseId,
-					AccessInfo: db.AccessInfo{
-						UserID:    cmd.Creator,
-						RoleID:    cmd.Owner,
-						AccountID: cmd.AccountId,
-					},
-					DatTyp: cmd.DatTyp,
-				}
-				if err = h.CacheTxnRequest(ctx, meta, req,
-					new(db.CreateDatabaseResp)); err != nil {
-					return err
-				}
-			}
-		case []catalog.CreateTable:
-			for _, cmd := range cmds {
-				req := &db.CreateRelationReq{
-					AccessInfo: db.AccessInfo{
-						UserID:    cmd.Creator,
-						RoleID:    cmd.Owner,
-						AccountID: cmd.AccountId,
-					},
-					Name:         cmd.Name,
-					RelationId:   cmd.TableId,
-					DatabaseName: cmd.DatabaseName,
-					DatabaseID:   cmd.DatabaseId,
-					Defs:         cmd.Defs,
-				}
-				if err = h.CacheTxnRequest(ctx, meta, req,
-					new(db.CreateRelationResp)); err != nil {
-					return err
-				}
-			}
-		case []catalog.UpdateConstraint:
-			for _, cmd := range cmds {
-				req := &db.UpdateConstraintReq{
-					TableName:    cmd.TableName,
-					TableId:      cmd.TableId,
-					DatabaseName: cmd.DatabaseName,
-					DatabaseId:   cmd.DatabaseId,
-					Constraint:   cmd.Constraint,
-				}
-				if err = h.CacheTxnRequest(ctx, meta, req,
-					new(db.UpdateConstraintResp)); err != nil {
-					return err
-				}
-			}
-		case []catalog.DropDatabase:
-			for _, cmd := range cmds {
-				req := &db.DropDatabaseReq{
-					Name: cmd.Name,
-					ID:   cmd.Id,
-				}
-				if err = h.CacheTxnRequest(ctx, meta, req,
-					new(db.DropDatabaseResp)); err != nil {
-					return err
-				}
-			}
-		case []catalog.DropOrTruncateTable:
-			for _, cmd := range cmds {
-				req := &db.DropOrTruncateRelationReq{
-					IsDrop:       cmd.IsDrop,
-					Name:         cmd.Name,
-					ID:           cmd.Id,
-					NewId:        cmd.NewId,
-					DatabaseName: cmd.DatabaseName,
-					DatabaseID:   cmd.DatabaseId,
-				}
-				if err = h.CacheTxnRequest(ctx, meta, req,
-					new(db.DropOrTruncateRelationResp)); err != nil {
-					return err
-				}
-			}
-		case *apipb.Entry:
-			//Handle DML
-			pe := e.(*apipb.Entry)
-			moBat, err := batch.ProtoBatchToBatch(pe.GetBat())
-			if err != nil {
-				panic(err)
-			}
-			req := &db.WriteReq{
-				Type:         db.EntryType(pe.EntryType),
-				DatabaseId:   pe.GetDatabaseId(),
-				TableID:      pe.GetTableId(),
-				DatabaseName: pe.GetDatabaseName(),
-				TableName:    pe.GetTableName(),
-				FileName:     pe.GetFileName(),
-				Batch:        moBat,
-				PkCheck:      db.PKCheckType(pe.GetPkCheckByDn()),
-			}
-			if req.FileName != "" {
-				rows := catalog.GenRows(req.Batch)
-				for _, row := range rows {
-					if req.Type == db.EntryInsert {
-						//req.Blks[i] = row[catalog.BLOCKMETA_ID_ON_FS_IDX].(uint64)
-						//req.MetaLocs[i] = string(row[catalog.BLOCKMETA_METALOC_ON_FS_IDX].([]byte))
-						req.MetaLocs = append(req.MetaLocs,
-							string(row[0].([]byte)))
-					} else {
-						//req.DeltaLocs[i] = string(row[0].([]byte))
-						req.DeltaLocs = append(req.DeltaLocs,
-							string(row[0].([]byte)))
-					}
-				}
-			}
-			if err = h.CacheTxnRequest(ctx, meta, req,
-				new(db.WriteResp)); err != nil {
-				return err
-			}
-		default:
-			panic(moerr.NewNYI(ctx, ""))
-		}
-	}
-	//evaluate all the txn requests.
-	return h.EvaluateTxnRequest(ctx, meta)
-}
-
-//Handle DDL commands.
+//#region WriteDB: Handle DDL & DML
 
 func (h *Handle) HandleCreateDatabase(
 	ctx context.Context,
-	meta txn.TxnMeta,
-	req *db.CreateDatabaseReq,
-	resp *db.CreateDatabaseResp) (err error) {
+	txn txnif.AsyncTxn,
+	req *pkgcatalog.CreateDatabaseReq) (err error) {
 	_, span := trace.Start(ctx, "HandleCreateDatabase")
 	defer span.End()
 
-	txn, err := h.eng.GetOrCreateTxnWithMeta(nil, meta.GetID(),
-		types.TimestampToTS(meta.GetSnapshotTS()))
-	if err != nil {
-		return err
+	for i, c := range req.Cmds {
+		common.DoIfInfoEnabled(func() {
+			logutil.Info(
+				"PreCommit-CreateDB",
+				zap.String("txn", txn.String()),
+				zap.String("i/cnt", fmt.Sprintf("%d/%d", i+1, len(req.Cmds))),
+				zap.String("cmd", fmt.Sprintf("%+v", c)),
+			)
+		})
+		ctx = defines.AttachAccount(ctx, c.AccountId, c.Creator, c.Owner)
+		ctx = context.WithValue(ctx, defines.DatTypKey{}, c.DatTyp)
+		if _, err = txn.CreateDatabaseWithCtx(
+			ctx,
+			c.Name,
+			c.CreateSql,
+			c.DatTyp,
+			c.DatabaseId); err != nil {
+			return
+		}
 	}
 
-	logutil.Infof("[precommit] create database: %+v\n txn: %s\n", req, txn.String())
-	defer func() {
-		logutil.Infof("[precommit] create database end txn: %s\n", txn.String())
-	}()
+	// Write to mo_database table
+	catalog, _ := txn.GetDatabaseByID(pkgcatalog.MO_CATALOG_ID)
+	databaseTbl, _ := catalog.GetRelationByID(pkgcatalog.MO_DATABASE_ID)
+	err = AppendDataToTable(ctx, databaseTbl, req.Bat)
 
-	ctx = context.WithValue(ctx, defines.TenantIDKey{}, req.AccessInfo.AccountID)
-	ctx = context.WithValue(ctx, defines.UserIDKey{}, req.AccessInfo.UserID)
-	ctx = context.WithValue(ctx, defines.RoleIDKey{}, req.AccessInfo.RoleID)
-	ctx = context.WithValue(ctx, defines.DatTypKey{}, req.DatTyp)
-	err = h.eng.CreateDatabaseWithID(ctx, req.Name, req.CreateSql, req.DatTyp, req.DatabaseId, txn)
-	if err != nil {
-		return
-	}
-	resp.ID = req.DatabaseId
 	return
 }
 
 func (h *Handle) HandleDropDatabase(
 	ctx context.Context,
-	meta txn.TxnMeta,
-	req *db.DropDatabaseReq,
-	resp *db.DropDatabaseResp) (err error) {
-
-	txn, err := h.eng.GetOrCreateTxnWithMeta(nil, meta.GetID(),
-		types.TimestampToTS(meta.GetSnapshotTS()))
-	if err != nil {
-		return err
+	txn txnif.AsyncTxn,
+	req *pkgcatalog.DropDatabaseReq,
+) (err error) {
+	for i, c := range req.Cmds {
+		common.DoIfInfoEnabled(func() {
+			logutil.Info(
+				"PreCommit-DropDB",
+				zap.String("txn", txn.String()),
+				zap.String("i/cnt", fmt.Sprintf("%d/%d", i+1, len(req.Cmds))),
+				zap.String("cmd", fmt.Sprintf("%+v", c)),
+			)
+		})
+		if _, err = txn.DropDatabaseByID(c.Id); err != nil {
+			return
+		}
 	}
 
-	logutil.Infof("[precommit] drop database: %+v\n txn: %s\n", req, txn.String())
-	defer func() {
-		logutil.Infof("[precommit] drop database end: %s\n", txn.String())
-	}()
+	// Delete in mo_database table
+	catalog, _ := txn.GetDatabaseByID(pkgcatalog.MO_CATALOG_ID)
+	databaseTbl, _ := catalog.GetRelationByID(pkgcatalog.MO_DATABASE_ID)
+	rowIDVec := containers.ToTNVector(req.Bat.GetVector(0), common.WorkspaceAllocator)
+	defer rowIDVec.Close()
+	pkVec := containers.ToTNVector(req.Bat.GetVector(1), common.WorkspaceAllocator)
+	defer pkVec.Close()
+	err = databaseTbl.DeleteByPhyAddrKeys(rowIDVec, pkVec, handle.DT_Normal)
 
-	if err = h.eng.DropDatabaseByID(ctx, req.ID, txn); err != nil {
-		return
-	}
-	resp.ID = req.ID
 	return
 }
 
 func (h *Handle) HandleCreateRelation(
 	ctx context.Context,
-	meta txn.TxnMeta,
-	req *db.CreateRelationReq,
-	resp *db.CreateRelationResp) (err error) {
+	txn txnif.AsyncTxn,
+	req *pkgcatalog.CreateTableReq,
+) error {
+	for i, c := range req.Cmds {
+		common.DoIfInfoEnabled(func() {
+			logutil.Info(
+				"PreCommit-CreateTBL",
+				zap.String("txn", txn.String()),
+				zap.String("i/cnt", fmt.Sprintf("%d/%d", i+1, len(req.Cmds))),
+				zap.String("cmd", fmt.Sprintf("%+v", c)),
+			)
+		})
+		ctx = defines.AttachAccount(ctx, c.AccountId, c.Creator, c.Owner)
+		txn.BindAccessInfo(c.AccountId, c.Creator, c.Owner)
+		dbH, err := txn.GetDatabaseByID(c.DatabaseId)
+		if err != nil {
+			return err
+		}
 
-	txn, err := h.eng.GetOrCreateTxnWithMeta(nil, meta.GetID(),
-		types.TimestampToTS(meta.GetSnapshotTS()))
-	if err != nil {
-		return
+		if err = CreateRelation(ctx, dbH, c.Name, c.TableId, c.Defs); err != nil {
+			return err
+		}
 	}
 
-	logutil.Infof("[precommit] create relation: %+v\n txn: %s\n", req, txn.String())
-	defer func() {
-		logutil.Infof("[precommit] create relation end txn: %s\n", txn.String())
-	}()
-
-	ctx = context.WithValue(ctx, defines.TenantIDKey{}, req.AccessInfo.AccountID)
-	ctx = context.WithValue(ctx, defines.UserIDKey{}, req.AccessInfo.UserID)
-	ctx = context.WithValue(ctx, defines.RoleIDKey{}, req.AccessInfo.RoleID)
-	db, err := h.eng.GetDatabase(ctx, req.DatabaseName, txn)
-	if err != nil {
-		return
+	catalog, _ := txn.GetDatabaseByID(pkgcatalog.MO_CATALOG_ID)
+	tablesTbl, _ := catalog.GetRelationByID(pkgcatalog.MO_TABLES_ID)
+	if err := AppendDataToTable(ctx, tablesTbl, req.TableBat); err != nil {
+		return err
+	}
+	columnsTbl, _ := catalog.GetRelationByID(pkgcatalog.MO_COLUMNS_ID)
+	for _, bat := range req.ColumnBat {
+		if err := AppendDataToTable(ctx, columnsTbl, bat); err != nil {
+			return err
+		}
 	}
 
-	err = db.CreateRelationWithID(ctx, req.Name, req.RelationId, req.Defs)
-	if err != nil {
-		return
-	}
-
-	resp.ID = req.RelationId
-	return
+	return nil
 }
 
-func (h *Handle) HandleDropOrTruncateRelation(
+func (h *Handle) HandleDropRelation(
 	ctx context.Context,
-	meta txn.TxnMeta,
-	req *db.DropOrTruncateRelationReq,
-	resp *db.DropOrTruncateRelationResp) (err error) {
-
-	txn, err := h.eng.GetOrCreateTxnWithMeta(nil, meta.GetID(),
-		types.TimestampToTS(meta.GetSnapshotTS()))
-	if err != nil {
-		return
-	}
-
-	logutil.Infof("[precommit] drop/truncate relation: %+v\n txn: %s\n", req, txn.String())
-	defer func() {
-		logutil.Infof("[precommit] drop/truncate relation end txn: %s\n", txn.String())
-	}()
-
-	db, err := h.eng.GetDatabaseByID(ctx, req.DatabaseID, txn)
-	if err != nil {
-		return
-	}
-
-	if req.IsDrop {
-		err = db.DropRelationByID(ctx, req.ID)
+	txn txnif.AsyncTxn,
+	req *pkgcatalog.DropTableReq,
+) error {
+	for i, c := range req.Cmds {
+		common.DoIfInfoEnabled(func() {
+			logutil.Info(
+				"PreCommit-DropTBL",
+				zap.String("txn", txn.String()),
+				zap.String("i/cnt", fmt.Sprintf("%d/%d", i+1, len(req.Cmds))),
+				zap.String("cmd", fmt.Sprintf("%+v", c)),
+			)
+		})
+		db, err := txn.GetDatabaseByID(c.DatabaseId)
 		if err != nil {
-			return
+			return err
 		}
-		return
+
+		if !c.IsDrop {
+			panic("truncate table should be splitted into drop and create")
+		}
+		if _, err = db.DropRelationByID(c.Id); err != nil {
+			return err
+		}
 	}
-	err = db.TruncateRelationByID(ctx, req.ID, req.NewId)
-	return err
+
+	catalog, _ := txn.GetDatabaseByID(pkgcatalog.MO_CATALOG_ID)
+	tablesTbl, _ := catalog.GetRelationByID(pkgcatalog.MO_TABLES_ID)
+	rowIDVec := containers.ToTNVector(req.TableBat.GetVector(0), common.WorkspaceAllocator)
+	defer rowIDVec.Close()
+	pkVec := containers.ToTNVector(req.TableBat.GetVector(1), common.WorkspaceAllocator)
+	defer pkVec.Close()
+	if err := tablesTbl.DeleteByPhyAddrKeys(rowIDVec, pkVec, handle.DT_Normal); err != nil {
+		return err
+	}
+	columnsTbl, _ := catalog.GetRelationByID(pkgcatalog.MO_COLUMNS_ID)
+	for _, bat := range req.ColumnBat {
+		rowIDVec := containers.ToTNVector(bat.GetVector(0), common.WorkspaceAllocator)
+		defer rowIDVec.Close()
+		pkVec := containers.ToTNVector(bat.GetVector(1), common.WorkspaceAllocator)
+		defer pkVec.Close()
+		if err := columnsTbl.DeleteByPhyAddrKeys(rowIDVec, pkVec, handle.DT_Normal); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // HandleWrite Handle DML commands
 func (h *Handle) HandleWrite(
 	ctx context.Context,
-	meta txn.TxnMeta,
-	req *db.WriteReq,
-	resp *db.WriteResp) (err error) {
+	txn txnif.AsyncTxn,
+	req *cmd_util.WriteReq,
+) (
+	inMemoryInsertRows int,
+	persistedMemoryInsertRows int,
+	inMemoryTombstoneRows int,
+	persistedTombstoneRows int,
+	err error,
+) {
 	defer func() {
 		if req.Cancel != nil {
 			req.Cancel()
 		}
 	}()
-	txn, err := h.eng.GetOrCreateTxnWithMeta(nil, meta.GetID(),
-		types.TimestampToTS(meta.GetSnapshotTS()))
-	if err != nil {
-		return
+	ctx = perfcounter.WithCounterSetFrom(ctx, h.db.Opts.Ctx)
+	switch req.PkCheck {
+	case cmd_util.FullDedup:
+		txn.SetDedupType(txnif.DedupPolicy_CheckAll)
+	case cmd_util.IncrementalDedup:
+		if h.db.Opts.IncrementalDedup {
+			txn.SetDedupType(txnif.DedupPolicy_CheckIncremental)
+		} else {
+			txn.SetDedupType(txnif.DedupPolicy_SkipWorkspace)
+		}
+	case cmd_util.FullSkipWorkspaceDedup:
+		txn.SetDedupType(txnif.DedupPolicy_SkipWorkspace)
 	}
-	if req.PkCheck == db.PKCheckDisable {
-		txn.SetPKDedupSkip(txnif.PKDedupSkipWorkSpace)
-	}
-	logutil.Infof("[precommit] handle write typ: %v, %d-%s, %d-%s\n txn: %s\n",
-		req.Type, req.TableID,
-		req.TableName, req.DatabaseId, req.DatabaseName,
-		txn.String(),
-	)
-	logutil.Debugf("[precommit] write batch: %s\n", common.DebugMoBatch(req.Batch))
+	common.DoIfDebugEnabled(func() {
+		logutil.Debugf("[precommit] handle write typ: %v, %d-%s, %d-%s txn: %s",
+			req.Type, req.TableID,
+			req.TableName, req.DatabaseId, req.DatabaseName,
+			txn.String(),
+		)
+		logutil.Debugf("[precommit] write batch: %s", common.DebugMoBatch(req.Batch))
+	})
 	defer func() {
-		logutil.Infof("[precommit] handle write end txn: %s\n", txn.String())
+		common.DoIfDebugEnabled(func() {
+			logutil.Debugf("[precommit] handle write end txn: %s", txn.String())
+		})
 	}()
 
-	dbase, err := h.eng.GetDatabaseByID(ctx, req.DatabaseId, txn)
+	dbase, err := txn.GetDatabaseByID(req.DatabaseId)
 	if err != nil {
 		return
 	}
 
-	tb, err := dbase.GetRelationByID(ctx, req.TableID)
+	tb, err := dbase.GetRelationByID(req.TableID)
 	if err != nil {
 		return
 	}
 
-	if req.Type == db.EntryInsert {
+	if req.Type == cmd_util.EntryInsert {
 		//Add blocks which had been bulk-loaded into S3 into table.
 		if req.FileName != "" {
-			err = tb.AddBlksWithMetaLoc(
+			statsVec := req.Batch.Vecs[0]
+			for i := 0; i < statsVec.Length(); i++ {
+				s := objectio.ObjectStats(statsVec.GetBytesAt(i))
+				if !s.GetCNCreated() {
+					logutil.Fatalf("the `CNCreated` mask not set: %s", s.String())
+				}
+				persistedMemoryInsertRows += int(s.Rows())
+			}
+			err = tb.AddDataFiles(
 				ctx,
-				nil,
-				req.MetaLocs)
+				containers.ToTNVector(statsVec, common.WorkspaceAllocator),
+			)
 			return
 		}
 		//check the input batch passed by cn is valid.
-		len := 0
 		for i, vec := range req.Batch.Vecs {
 			if vec == nil {
-				logutil.Errorf("the vec:%d in req.Batch is nil", i)
-				panic("invalid vector : vector is nil")
-			}
-			if vec.Length() == 0 {
-				logutil.Errorf("the vec:%d in req.Batch is empty", i)
-				panic("invalid vector: vector is empty")
+				logutil.Fatal(
+					"INVALID-INSERT-BATCH-NIL-VEC",
+					zap.Int("idx", i),
+					zap.Uint64("table-id", req.TableID),
+					zap.String("table-name", req.TableName),
+					zap.String("txn", txn.String()),
+				)
 			}
 			if i == 0 {
-				len = vec.Length()
+				inMemoryInsertRows = vec.Length()
 			}
-			if vec.Length() != len {
-				logutil.Errorf("the length of vec:%d in req.Batch is not equal to the first vec", i)
-				panic("invalid batch : the length of vectors in batch is not the same")
+			if vec.Length() != inMemoryInsertRows {
+				logutil.Fatal(
+					"INVALID-INSERT-BATCH-DIFF-LENGTH",
+					zap.Int("idx", i),
+					zap.Uint64("table-id", req.TableID),
+					zap.String("table-name", req.TableName),
+					zap.String("rows", fmt.Sprintf("%d/%d", vec.Length(), inMemoryInsertRows)),
+					zap.String("txn", txn.String()),
+				)
 			}
 		}
+
+		// TODO: debug for #13342, remove me later
+		if h.IsInterceptTable(tb.Schema(false).(*catalog.Schema).Name) {
+			schema := tb.Schema(false).(*catalog.Schema)
+			if schema.HasPK() {
+				pkDef := schema.GetSingleSortKey()
+				idx := pkDef.Idx
+				isCompositeKey := pkDef.IsCompositeColumn()
+				for i := 0; i < req.Batch.Vecs[0].Length(); i++ {
+					if isCompositeKey {
+						pkbuf := req.Batch.Vecs[idx].GetBytesAt(i)
+						tuple, _ := types.Unpack(pkbuf)
+						logutil.Info(
+							"op1",
+							zap.String("txn", txn.String()),
+							zap.String("pk", common.TypeStringValue(*req.Batch.Vecs[idx].GetType(), pkbuf, false)),
+							zap.Any("detail", tuple.SQLStrings(nil)),
+						)
+					} else {
+						logutil.Info(
+							"op1",
+							zap.String("txn", txn.String()),
+							zap.String("pk", common.MoVectorToString(req.Batch.Vecs[idx], i)),
+						)
+					}
+				}
+			}
+
+		}
 		//Appends a batch of data into table.
-		err = tb.Write(ctx, req.Batch)
+		err = AppendDataToTable(ctx, tb, req.Batch)
 		return
 	}
+
 	//handle delete
 	if req.FileName != "" {
 		//wait for loading deleted row-id done.
 		nctx := context.Background()
 		if deadline, ok := ctx.Deadline(); ok {
-			nctx, req.Cancel = context.WithTimeout(nctx, time.Until(deadline))
+			_, req.Cancel = context.WithTimeoutCause(nctx, time.Until(deadline), moerr.CauseHandleWrite)
 		}
-		columnIdx := 0
-		var reader dataio.Reader
-		reader, err = blockio.NewObjectReader(
-			h.eng.GetTAE(nctx).Fs.Service, req.DeltaLocs[0])
-		if err != nil {
-			return
-		}
-		for _, key := range req.DeltaLocs {
-			var id uint32
-			_, id, _, _, err = blockio.DecodeLocation(key)
-			var bats []*batch.Batch
-			bats, err = reader.LoadColumns(
-				ctx,
-				[]uint16{uint16(columnIdx)},
-				[]uint32{id},
-				nil,
-			)
-			if err != nil {
-				return
-			}
-			vec := containers.NewVectorWithSharedMemory(bats[0].Vecs[0], false)
+		rowidIdx := 0
+		pkIdx := 1
 
-			err = tb.DeleteByPhyAddrKeys(ctx, containers.UnmarshalToMoVec(vec))
-			if err != nil {
-				vec.Close()
+		var (
+			ok        bool
+			loc       objectio.Location
+			vectors   []containers.Vector
+			closeFunc func()
+		)
+
+		for _, stats := range req.TombstoneStats {
+			persistedTombstoneRows += int(stats.Rows())
+			id := tb.GetMeta().(*catalog.TableEntry).AsCommonID()
+
+			if ok, err = tb.AddPersistedTombstoneFile(id, stats); err != nil {
+				logutil.Errorf("try delete by stats faild: %s, %v", stats.String(), err)
 				return
+			} else if ok {
+				continue
 			}
-			vec.Close()
+
+			logutil.Errorf("try delete by stats faild: %s, try to delete by row id and pk",
+				stats.String())
+
+			for i := range stats.BlkCnt() {
+				loc = stats.BlockLocation(uint16(i), objectio.BlockMaxRows)
+				vectors, closeFunc, err = ioutil.LoadColumns2(
+					ctx,
+					[]uint16{uint16(rowidIdx), uint16(pkIdx)},
+					nil,
+					h.db.Runtime.Fs.Service,
+					loc,
+					fileservice.Policy(0),
+					false,
+					nil,
+				)
+
+				if err = tb.DeleteByPhyAddrKeys(vectors[0], vectors[1], handle.DT_Normal); err != nil {
+					logutil.Errorf("delete by phyaddr keys faild: %s, %s, [idx]%d, %v",
+						stats.String(), loc.String(), i, err)
+
+					closeFunc()
+					return
+				}
+
+				closeFunc()
+			}
 		}
 		return
 	}
-	err = tb.DeleteByPhyAddrKeys(ctx, req.Batch.GetVector(0))
+
+	if len(req.Batch.Vecs) != 2 {
+		panic(fmt.Sprintf("req.Batch.Vecs length is %d, should be 2", len(req.Batch.Vecs)))
+	}
+	rowIDVec := containers.ToTNVector(req.Batch.GetVector(0), common.WorkspaceAllocator)
+	pkVec := containers.ToTNVector(req.Batch.GetVector(1), common.WorkspaceAllocator)
+	inMemoryTombstoneRows += rowIDVec.Length()
+	//defer pkVec.Close()
+	// TODO: debug for #13342, remove me later
+	_, _, injected := fault.TriggerFault(objectio.FJ_CommitDelete)
+	if h.IsInterceptTable(tb.Schema(false).(*catalog.Schema).Name) || injected {
+		schema := tb.Schema(false).(*catalog.Schema)
+		if schema.HasPK() {
+			rowids := vector.MustFixedColNoTypeCheck[types.Rowid](rowIDVec.GetDownstreamVector())
+			isCompositeKey := schema.GetSingleSortKey().IsCompositeColumn()
+			for i := 0; i < len(rowids); i++ {
+				if isCompositeKey {
+					pkbuf := req.Batch.Vecs[1].GetBytesAt(i)
+					tuple, _ := types.Unpack(pkbuf)
+					logutil.Info(
+						"op2",
+						zap.String("txn", txn.String()),
+						zap.String("pk", common.TypeStringValue(*req.Batch.Vecs[1].GetType(), pkbuf, false)),
+						zap.String("rowid", rowids[i].String()),
+						zap.Any("detail", tuple.SQLStrings(nil)),
+					)
+				} else {
+					logutil.Info(
+						"op2",
+						zap.String("txn", txn.String()),
+						zap.String("pk", common.MoVectorToString(req.Batch.Vecs[1], i)),
+						zap.String("rowid", rowids[i].String()),
+					)
+				}
+			}
+		}
+	}
+	err = tb.DeleteByPhyAddrKeys(rowIDVec, pkVec, handle.DT_Normal)
 	return
 }
 
-func (h *Handle) HandleUpdateConstraint(
+func (h *Handle) HandleAlterTable(
 	ctx context.Context,
-	meta txn.TxnMeta,
-	req *db.UpdateConstraintReq,
-	resp *db.UpdateConstraintResp) (err error) {
-	txn, err := h.eng.GetOrCreateTxnWithMeta(nil, meta.GetID(),
-		types.TimestampToTS(meta.GetSnapshotTS()))
-	if err != nil {
-		return err
-	}
+	txn txnif.AsyncTxn,
+	req *api.AlterTableReq,
+) (err error) {
+	var (
+		dbase handle.Database
+		tbl   handle.Relation
+	)
 
-	cstr := req.Constraint
-	req.Constraint = nil
-	logutil.Infof("[precommit] update cstr: %+v cstr %d bytes\n txn: %s\n", req, len(cstr), txn.String())
-
-	dbase, err := h.eng.GetDatabaseByID(ctx, req.DatabaseId, txn)
-	if err != nil {
-		return
-	}
-
-	tbl, err := dbase.GetRelationByID(ctx, req.TableId)
-	if err != nil {
-		return
-	}
-
-	tbl.UpdateConstraintWithBin(ctx, cstr)
-
-	return nil
-}
-
-func openTAE(targetDir string, opt *options.Options) (tae *db.DB, err error) {
-
-	if targetDir != "" {
-		mask := syscall.Umask(0)
-		if err := os.MkdirAll(targetDir, os.FileMode(0755)); err != nil {
-			syscall.Umask(mask)
-			logutil.Infof("Recreate dir error:%v\n", err)
-			return nil, err
-		}
-		syscall.Umask(mask)
-		tae, err = db.Open(targetDir+"/tae", opt)
+	defer func() {
+		logger := logutil.Info
 		if err != nil {
-			logutil.Infof("Open tae failed. error:%v", err)
-			return nil, err
+			logger = logutil.Error
 		}
-		return tae, nil
+		logger(
+			"PreCommit-AlterTBL",
+			zap.String("req", req.String()),
+			zap.String("txn", txn.String()),
+			zap.Error(err),
+		)
+	}()
+
+	if dbase, err = txn.GetDatabaseByID(req.DbId); err != nil {
+		return
 	}
 
-	tae, err = db.Open(targetDir, opt)
-	if err != nil {
-		logutil.Infof("Open tae failed. error:%v", err)
-		return nil, err
+	if tbl, err = dbase.GetRelationByID(req.TableId); err != nil {
+		return
 	}
+
+	err = tbl.AlterTable(ctx, req)
 	return
 }
+
+//#endregion

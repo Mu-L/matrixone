@@ -17,70 +17,96 @@ import (
 	"bytes"
 
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(_ any, buf *bytes.Buffer) {
-	buf.WriteString(" MergeS3BlocksMetaLoc ")
+const opName = "merge_block"
+
+func (mergeBlock *MergeBlock) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(": MergeS3BlocksMetaLoc ")
 }
 
-func Prepare(proc *process.Process, arg any) error {
-	ap := arg.(*Argument)
-	ap.container = new(Container)
-	ap.container.mp = make(map[int]*batch.Batch)
-	ap.container.mp2 = make(map[int][]*batch.Batch)
+func (mergeBlock *MergeBlock) OpType() vm.OpType {
+	return vm.MergeBlock
+}
+
+func (mergeBlock *MergeBlock) Prepare(proc *process.Process) error {
+	if mergeBlock.OpAnalyzer == nil {
+		mergeBlock.OpAnalyzer = process.NewAnalyzer(mergeBlock.GetIdx(), mergeBlock.IsFirst, mergeBlock.IsLast, "merge_block")
+	} else {
+		mergeBlock.OpAnalyzer.Reset()
+	}
+
+	if mergeBlock.container.mp == nil {
+		mergeBlock.container.mp = make(map[int]*batch.Batch)
+		mergeBlock.container.mp2 = make(map[int][]*batch.Batch)
+	}
+
+	ref := mergeBlock.Ref
+	eng := mergeBlock.Engine
+	rel, err := colexec.GetRelAndPartitionRelsByObjRef(proc.Ctx, proc, eng, ref)
+	if err != nil {
+		return err
+	}
+	mergeBlock.container.source = rel
+	mergeBlock.container.affectedRows = 0
 	return nil
 }
 
-func Call(idx int, proc *process.Process, arg any, isFirst bool, isLast bool) (bool, error) {
+func (mergeBlock *MergeBlock) Call(proc *process.Process) (vm.CallResult, error) {
+	analyzer := mergeBlock.OpAnalyzer
+
 	var err error
-	ap := arg.(*Argument)
-	bat := proc.Reg.InputBatch
-	if bat == nil {
-		return true, nil
+	input, err := vm.ChildrenCall(mergeBlock.GetChildren(0), proc, analyzer)
+	if err != nil {
+		return input, err
 	}
 
-	if len(bat.Zs) == 0 {
-		return false, nil
+	if input.Batch == nil {
+		return vm.CancelResult, nil
+	}
+	if input.Batch.IsEmpty() {
+		return input, nil
+	}
+	bat := input.Batch
+	if err := mergeBlock.Split(proc, bat, analyzer); err != nil {
+		return input, err
 	}
 
-	if err := ap.Split(proc, bat); err != nil {
-		return false, err
-	}
+	// handle origin/main table.
+	if mergeBlock.container.mp[0].RowCount() > 0 {
+		crs := analyzer.GetOpCounterSet()
+		newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
 
-	if !ap.notFreeBatch {
-		defer func() {
-			for k := range ap.container.mp {
-				ap.container.mp[k].Clean(proc.GetMPool())
-			}
-		}()
-	}
-
-	for i := range ap.Unique_tbls {
-		if ap.container.mp[i+1].Length() > 0 {
-			if err = ap.Unique_tbls[i].Write(proc.Ctx, ap.container.mp[i+1]); err != nil {
-				return false, err
-			}
+		//batches in mp will be deeply copied into txn's workspace.
+		if err = mergeBlock.container.source.Write(newCtx, mergeBlock.container.mp[0]); err != nil {
+			return input, err
 		}
-
-		for _, bat := range ap.container.mp2[i+1] {
-			if err = ap.Unique_tbls[i].Write(proc.Ctx, bat); err != nil {
-				return false, err
-			}
-		}
-		ap.container.mp2[i+1] = ap.container.mp2[i+1][:0]
-	}
-	if ap.container.mp[0].Length() > 0 {
-		if err = ap.Tbl.Write(proc.Ctx, ap.container.mp[0]); err != nil {
-			return false, err
-		}
+		analyzer.AddWrittenRows(int64(mergeBlock.container.mp[0].RowCount()))
+		analyzer.AddS3RequestCount(crs)
+		analyzer.AddFileServiceCacheInfo(crs)
+		analyzer.AddDiskIO(crs)
 	}
 
-	for _, bat := range ap.container.mp2[0] {
-		if err = ap.Tbl.Write(proc.Ctx, bat); err != nil {
-			return false, err
+	for _, bat := range mergeBlock.container.mp2[0] {
+		crs := analyzer.GetOpCounterSet()
+		newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
+		//batches in mp2 will be deeply copied into txn's workspace.
+		if err = mergeBlock.container.source.Write(newCtx, bat); err != nil {
+			return input, err
 		}
+		analyzer.AddWrittenRows(int64(bat.RowCount()))
+		analyzer.AddS3RequestCount(crs)
+		analyzer.AddFileServiceCacheInfo(crs)
+		analyzer.AddDiskIO(crs)
+
+		bat.Clean(proc.GetMPool())
 	}
-	ap.container.mp2[0] = ap.container.mp2[0][:0]
-	return false, nil
+	mergeBlock.container.mp2[0] = mergeBlock.container.mp2[0][:0]
+
+	return input, nil
 }

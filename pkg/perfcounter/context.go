@@ -22,19 +22,134 @@ type ctxKeyCounters struct{}
 
 var CtxKeyCounters = ctxKeyCounters{}
 
-func WithCounterSet(ctx context.Context, set *CounterSet) context.Context {
+func WithCounterSet(ctx context.Context, sets ...*CounterSet) context.Context {
 	// check existed
 	v := ctx.Value(CtxKeyCounters)
 	if v == nil {
-		return context.WithValue(ctx, CtxKeyCounters, CounterSets{
-			set: struct{}{},
-		})
+		v := make(CounterSets)
+		for _, s := range sets {
+			if s == nil {
+				panic("nil counter set")
+			}
+			v[s] = struct{}{}
+		}
+		return context.WithValue(ctx, CtxKeyCounters, v)
 	}
+
 	counters := v.(CounterSets)
+
+	allExist := true
+	for _, s := range sets {
+		if _, ok := counters[s]; !ok {
+			allExist = false
+			break
+		}
+	}
+
+	// if all exist already, try not to nest context too depth
+	if allExist {
+		return ctx
+	}
+
 	newCounters := make(CounterSets, len(counters)+1)
 	for counter := range counters {
 		newCounters[counter] = struct{}{}
 	}
-	newCounters[set] = struct{}{}
+
+	for _, s := range sets {
+		if s == nil {
+			panic("nil counter set")
+		}
+		newCounters[s] = struct{}{}
+	}
 	return context.WithValue(ctx, CtxKeyCounters, newCounters)
+}
+
+func WithCounterSetFrom(ctx context.Context, fromCtx context.Context) context.Context {
+	if v := fromCtx.Value(CtxKeyCounters); v != nil {
+		var sets []*CounterSet
+		for set := range v.(CounterSets) {
+			sets = append(sets, set)
+		}
+		return WithCounterSet(ctx, sets...)
+	}
+	return ctx
+}
+
+// ----------------------------------------------------------------------------------------------------------------------
+// S3RequestKey is an empty struct used as a key for attaching S3 request counters to a context, which
+// used to count the usage of S3 resources when a certain function is called
+type S3RequestKey struct{}
+
+// AttachS3RequestKey attaches a *CounterSet to the given context with an S3RequestKey.
+func AttachS3RequestKey(ctx context.Context, counter *CounterSet) context.Context {
+	return context.WithValue(ctx, S3RequestKey{}, counter)
+}
+
+func GetS3RequestKey(ctx context.Context) (*CounterSet, bool) {
+	counter, ok := ctx.Value(S3RequestKey{}).(*CounterSet)
+	return counter, ok
+}
+
+// Background Executor Internal Executor
+type BackgroundExecutorKey struct{}
+
+func AttachBackgroundExecutorKey(ctx context.Context) context.Context {
+	return context.WithValue(ctx, BackgroundExecutorKey{}, struct{}{})
+}
+
+// TxnExecutorKey `refers to `TxnExecuter`
+type TxnExecutorKey struct{}
+
+func AttachTxnExecutorKey(ctx context.Context) context.Context {
+	return context.WithValue(ctx, TxnExecutorKey{}, struct{}{})
+}
+
+// IsInternalExecutor checks if the given context contains the TxnExecutorKey
+func IsInternalExecutor(ctx context.Context) bool {
+	_, ok := ctx.Value(TxnExecutorKey{}).(struct{})
+	return ok
+}
+
+// BuildPlanMarkKey is an empty struct used as a key for attaching a build plan counter to a context.
+type BuildPlanMarkKey struct{}
+
+// AttachBuildPlanMarkKey attaches a *CounterSet to the given context with a BuildPlanMarkKey.
+func AttachBuildPlanMarkKey(ctx context.Context, counter *CounterSet) context.Context {
+	return context.WithValue(ctx, BuildPlanMarkKey{}, counter)
+}
+
+// CompilePlanMarkKey is an empty struct used as a key for attaching a compile plan counter to a context.
+type CompilePlanMarkKey struct{}
+
+// AttachCompilePlanMarkKey attaches a *CounterSet to the given context with a CompilePlanMarkKey.
+func AttachCompilePlanMarkKey(ctx context.Context, counter *CounterSet) context.Context {
+	return context.WithValue(ctx, CompilePlanMarkKey{}, counter)
+}
+
+// ExecPipelineMarkKey is an empty struct used as a key for attaching an execution pipeline counter to a context.
+type ExecPipelineMarkKey struct{}
+
+// AttachExecPipelineKey attaches a *CounterSet to the given context with an ExecPipelineMarkKey.
+func AttachExecPipelineKey(ctx context.Context, counter *CounterSet) context.Context {
+	return context.WithValue(ctx, ExecPipelineMarkKey{}, counter)
+}
+
+// ------------------------------------------------------------------------------------------------
+type CalcTableStatsKey struct{}
+
+func AttachCalcTableStatsKey(ctx context.Context) context.Context {
+	return context.WithValue(ctx, CalcTableStatsKey{}, true)
+}
+
+type CalcTableSizeKey struct{}
+
+func AttachCalcTableSizeKey(ctx context.Context) context.Context {
+	return context.WithValue(ctx, CalcTableSizeKey{}, true)
+}
+
+type CalcTableRowsKey struct{}
+
+func AttachCalcTableRowsKey(ctx context.Context) context.Context {
+	return context.WithValue(ctx, CalcTableRowsKey{}, true)
 }

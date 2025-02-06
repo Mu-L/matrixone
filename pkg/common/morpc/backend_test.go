@@ -17,6 +17,7 @@ package morpc
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"runtime/debug"
 	"sync"
@@ -55,6 +56,64 @@ func TestSend(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, req, resp)
 		},
+	)
+}
+
+func TestReadTimeoutWithNormalMessageMissed(t *testing.T) {
+	testBackendSend(t,
+		func(conn goetty.IOSession, msg interface{}, _ uint64) error {
+			request := msg.(RPCMessage)
+			if request.internal {
+				if m, ok := request.Message.(*flagOnlyMessage); ok {
+					switch m.flag {
+					case flagPing:
+						return conn.Write(RPCMessage{
+							Ctx:      request.Ctx,
+							internal: true,
+							Message: &flagOnlyMessage{
+								flag: flagPong,
+								id:   m.id,
+							},
+						}, goetty.WriteOptions{Flush: true})
+					default:
+						panic(fmt.Sprintf("invalid internal message, flag %d", m.flag))
+					}
+				}
+			}
+			// no response
+			return nil
+		},
+		func(b *remoteBackend) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			req := newTestMessage(1)
+			f, err := b.Send(ctx, req)
+			assert.NoError(t, err)
+			defer f.Close()
+			_, err = f.Get()
+			assert.Equal(t, ctx.Err(), err)
+		},
+		WithBackendReadTimeout(time.Millisecond*200),
+	)
+}
+
+func TestReadTimeout(t *testing.T) {
+	testBackendSend(t,
+		func(conn goetty.IOSession, msg interface{}, _ uint64) error {
+			// no response
+			return nil
+		},
+		func(b *remoteBackend) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+			defer cancel()
+			req := newTestMessage(1)
+			f, err := b.Send(ctx, req)
+			assert.NoError(t, err)
+			defer f.Close()
+			_, err = f.Get()
+			assert.NotEqual(t, backendClosed, err)
+		},
+		WithBackendReadTimeout(time.Millisecond*200),
 	)
 }
 
@@ -303,7 +362,7 @@ func TestStream(t *testing.T) {
 			st, err := b.NewStream(false)
 			assert.NoError(t, err)
 			defer func() {
-				assert.NoError(t, st.Close())
+				assert.NoError(t, st.Close(false))
 				b.mu.RLock()
 				assert.Equal(t, 0, len(b.mu.futures))
 				b.mu.RUnlock()
@@ -329,6 +388,46 @@ func TestStream(t *testing.T) {
 	)
 }
 
+func TestCloseStreamWithCloseConn(t *testing.T) {
+	testBackendSend(t,
+		func(conn goetty.IOSession, msg interface{}, seq uint64) error {
+			for {
+				if err := conn.Write(msg, goetty.WriteOptions{Flush: true}); err != nil {
+					return err
+				}
+			}
+		},
+		func(b *remoteBackend) {
+			st, err := b.NewStream(false)
+			assert.NoError(t, err)
+
+			ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+			defer cancel()
+
+			req := &testMessage{id: st.ID()}
+			assert.NoError(t, st.Send(ctx, req))
+
+			for {
+				n := len(st.(*stream).c)
+				if n == 2 {
+					break
+				}
+				time.Sleep(time.Millisecond * 10)
+			}
+
+			require.NoError(t, st.Close(true))
+
+			_, err = st.Receive()
+			require.Error(t, err)
+
+			b.Lock()
+			defer b.Unlock()
+			assert.Equal(t, stateStopped, b.stateMu.state)
+		},
+		WithBackendStreamBufferSize(2),
+	)
+}
+
 func TestStreamSendWillPanicIfDeadlineNotSet(t *testing.T) {
 	testBackendSend(t,
 		func(conn goetty.IOSession, msg interface{}, seq uint64) error {
@@ -338,7 +437,7 @@ func TestStreamSendWillPanicIfDeadlineNotSet(t *testing.T) {
 			st, err := b.NewStream(false)
 			assert.NoError(t, err)
 			defer func() {
-				assert.NoError(t, st.Close())
+				assert.NoError(t, st.Close(false))
 				b.mu.RLock()
 				assert.Equal(t, 0, len(b.mu.futures))
 				b.mu.RUnlock()
@@ -368,7 +467,7 @@ func TestStreamClosedByConnReset(t *testing.T) {
 			st, err := b.NewStream(false)
 			assert.NoError(t, err)
 			defer func() {
-				assert.NoError(t, st.Close())
+				assert.NoError(t, st.Close(false))
 			}()
 			c, err := st.Receive()
 			assert.NoError(t, err)
@@ -395,7 +494,7 @@ func TestStreamClosedBySequenceNotMatch(t *testing.T) {
 			st, err := b.NewStream(false)
 			assert.NoError(t, err)
 			defer func() {
-				assert.NoError(t, st.Close())
+				assert.NoError(t, st.Close(false))
 			}()
 			c, err := st.Receive()
 			assert.NoError(t, err)
@@ -448,25 +547,27 @@ func TestDoneWithClosedStreamCannotPanic(t *testing.T) {
 	defer cancel()
 
 	c := make(chan Message, 1)
-	s := newStream(c,
+	s := newStream(
+		nil,
+		c,
 		func() *Future { return newFuture(nil) },
 		func(m *Future) error {
-			m.messageSended(nil)
+			m.messageSent(nil)
 			return nil
 		},
 		func(s *stream) {},
 		func() {})
 	s.init(1, false)
 	assert.NoError(t, s.Send(ctx, &testMessage{id: s.ID()}))
-	assert.NoError(t, s.Close())
-	assert.Nil(t, <-c)
-
-	s.done(RPCMessage{})
+	assert.NoError(t, s.Close(false))
+	s.done(context.TODO(), RPCMessage{}, false)
 }
 
 func TestGCStream(t *testing.T) {
 	c := make(chan Message, 1)
-	s := newStream(c,
+	s := newStream(
+		nil,
+		c,
 		func() *Future { return newFuture(nil) },
 		func(m *Future) error {
 			return nil
@@ -539,7 +640,7 @@ func TestLastActiveWithStream(t *testing.T) {
 			st, err := b.NewStream(false)
 			assert.NoError(t, err)
 			defer func() {
-				assert.NoError(t, st.Close())
+				assert.NoError(t, st.Close(false))
 			}()
 
 			n := 1
@@ -555,7 +656,10 @@ func TestLastActiveWithStream(t *testing.T) {
 }
 
 func TestBackendConnectTimeout(t *testing.T) {
-	rb, err := NewRemoteBackend(testAddr, newTestCodec(),
+	rb, err := NewRemoteBackend(
+		testAddr,
+		newTestCodec(),
+		WithBackendMetrics(newMetrics("")),
 		WithBackendConnectTimeout(time.Millisecond*200),
 	)
 	assert.Error(t, err)
@@ -634,16 +738,107 @@ func TestLockedStream(t *testing.T) {
 			st, err := b.NewStream(true)
 			assert.NoError(t, err)
 			assert.True(t, b.Locked())
-			assert.NoError(t, st.Close())
+			assert.NoError(t, st.Close(false))
 			assert.False(t, b.Locked())
 		},
 	)
 }
 
 func TestIssue7678(t *testing.T) {
-	s := &stream{lastReceivedSequence: 10}
+	s := &stream{}
+	s.lastReceivedSequence = 10
 	s.init(0, false)
 	assert.Equal(t, uint32(0), s.lastReceivedSequence)
+}
+
+func TestWaitingFutureMustGetClosedError(t *testing.T) {
+	testBackendSend(t,
+		func(conn goetty.IOSession, msg interface{}, _ uint64) error {
+			return backendClosed
+		},
+		func(b *remoteBackend) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+			defer cancel()
+			req := newTestMessage(1)
+			f, err := b.Send(ctx, req)
+			assert.NoError(t, err)
+			defer f.Close()
+
+			_, err = f.Get()
+			assert.Error(t, err)
+			assert.Equal(t, io.EOF, err)
+		},
+	)
+}
+
+func TestIssue11838(t *testing.T) {
+	testBackendSend(t,
+		func(conn goetty.IOSession, msg interface{}, seq uint64) error {
+			if seq == 100 {
+				return backendClosed
+			}
+			return conn.Write(msg, goetty.WriteOptions{Flush: true})
+		},
+		func(b *remoteBackend) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*200)
+			defer cancel()
+
+			var futures []*Future
+			for i := 0; i < 10000; i++ {
+				req := newTestMessage(uint64(i))
+				f, err := b.Send(ctx, req)
+				if err == nil {
+					futures = append(futures, f)
+				}
+			}
+
+			for _, f := range futures {
+				_, err := f.Get()
+				if err == nil {
+					f.Close()
+				}
+			}
+		},
+	)
+}
+
+func TestCannotBusyLoopIfWriteCIsFull(t *testing.T) {
+	testBackendSend(t,
+		func(conn goetty.IOSession, msg interface{}, _ uint64) error {
+			return conn.Write(msg, goetty.WriteOptions{Flush: true})
+		},
+		func(b *remoteBackend) {
+			var wg sync.WaitGroup
+			for i := 0; i < 10; i++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := 0; i < 10; i++ {
+						func() {
+							ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+							defer cancel()
+							req := newTestMessage(0)
+							f, err := b.Send(ctx, req)
+							if err == nil { //ignore timeout
+								_, _ = f.Get()
+								f.Close()
+							}
+						}()
+					}
+				}()
+			}
+			wg.Wait()
+		},
+		WithBackendBufferSize(1),
+	)
+}
+
+func TestCannotChangeStoppedToStopping(t *testing.T) {
+	b := &remoteBackend{}
+	b.stateMu.state = stateStopped
+
+	b.changeToStopping()
+	require.Equal(t, stateStopped, b.stateMu.state)
 }
 
 func testBackendSend(t *testing.T,
@@ -670,7 +865,9 @@ func testBackendSendWithoutServer(t *testing.T, addr string,
 	testFunc func(b *remoteBackend),
 	options ...BackendOption) {
 
-	options = append(options,
+	options = append(
+		options,
+		WithBackendMetrics(newMetrics("")),
 		WithBackendBufferSize(1),
 		WithBackendLogger(logutil.GetPanicLoggerWithLevel(zap.DebugLevel).With(zap.String("testcase", t.Name()))))
 	rb, err := NewRemoteBackend(addr, newTestCodec(), options...)
@@ -679,7 +876,7 @@ func testBackendSendWithoutServer(t *testing.T, addr string,
 	b := rb.(*remoteBackend)
 	defer func() {
 		b.Close()
-		assert.False(t, b.conn.Connected())
+		assert.Nil(t, b.conn)
 	}()
 	testFunc(b)
 }
@@ -705,7 +902,7 @@ func newTestBackendFactory() *testBackendFactory {
 	return &testBackendFactory{}
 }
 
-func (bf *testBackendFactory) Create(backend string) (Backend, error) {
+func (bf *testBackendFactory) Create(backend string, opts ...BackendOption) (Backend, error) {
 	bf.Lock()
 	defer bf.Unlock()
 	b := &testBackend{id: bf.id}
@@ -739,10 +936,12 @@ func (b *testBackend) SendInternal(ctx context.Context, request Message) (*Futur
 
 func (b *testBackend) NewStream(unlockAfterClose bool) (Stream, error) {
 	b.active()
-	st := newStream(make(chan Message, 1),
+	st := newStream(
+		nil,
+		make(chan Message, 1),
 		func() *Future { return newFuture(nil) },
 		func(m *Future) error {
-			m.messageSended(nil)
+			m.messageSent(nil)
 			return nil
 		},
 		func(s *stream) {
@@ -818,7 +1017,7 @@ func (tm *testMessage) DebugString() string {
 	return fmt.Sprintf("%d:%d", tm.id, len(tm.payload))
 }
 
-func (tm *testMessage) Size() int {
+func (tm *testMessage) ProtoSize() int {
 	return 8 + len(tm.payload)
 }
 
@@ -837,13 +1036,20 @@ func (tm *testMessage) GetPayloadField() []byte {
 }
 
 func (tm *testMessage) SetPayloadField(data []byte) {
-	tm.payload = data
+	if len(data) > 0 {
+		tm.payload = make([]byte, len(data))
+		copy(tm.payload, data)
+	}
 }
 
 func newTestCodec(options ...CodecOption) Codec {
 	options = append(options,
 		WithCodecPayloadCopyBufferSize(1024))
-	return NewMessageCodec(func() Message { return messagePool.Get().(*testMessage) }, options...)
+	return NewMessageCodec(
+		"",
+		func() Message { return messagePool.Get().(*testMessage) },
+		options...,
+	)
 }
 
 var (

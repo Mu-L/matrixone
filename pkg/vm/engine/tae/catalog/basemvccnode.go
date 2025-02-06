@@ -15,49 +15,57 @@
 package catalog
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
+	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
+)
+
+const (
+	EntryMVCCNodeSize int = int(unsafe.Sizeof(EntryMVCCNode{}))
 )
 
 type EntryMVCCNode struct {
 	CreatedAt, DeletedAt types.TS
 }
 
+func EncodeEntryMVCCNode(node *EntryMVCCNode) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(node)), EntryMVCCNodeSize)
+}
+
+func DecodeEntryMVCCNode(v []byte) *EntryMVCCNode {
+	return (*EntryMVCCNode)(unsafe.Pointer(&v[0]))
+}
+
 // Dropped committed
-func (un *EntryMVCCNode) HasDropCommitted() bool {
+func (un EntryMVCCNode) HasDropCommitted() bool {
 	return !un.DeletedAt.IsEmpty() && un.DeletedAt != txnif.UncommitTS
 }
 
 // Dropped committed or uncommitted
-func (un *EntryMVCCNode) HasDropIntent() bool {
+func (un EntryMVCCNode) HasDropIntent() bool {
 	return !un.DeletedAt.IsEmpty()
 }
 
-func (un *EntryMVCCNode) GetCreatedAt() types.TS {
+func (un EntryMVCCNode) GetCreatedAt() types.TS {
 	return un.CreatedAt
 }
 
-func (un *EntryMVCCNode) GetDeletedAt() types.TS {
+func (un EntryMVCCNode) GetDeletedAt() types.TS {
 	return un.DeletedAt
 }
 
-func (un *EntryMVCCNode) IsCreating() bool {
-	return un.CreatedAt.Equal(txnif.UncommitTS)
+func (un EntryMVCCNode) IsCreating() bool {
+	return un.CreatedAt.Equal(&txnif.UncommitTS)
 }
 
-func (un *EntryMVCCNode) Clone() *EntryMVCCNode {
-	return &EntryMVCCNode{
-		CreatedAt: un.CreatedAt,
-		DeletedAt: un.DeletedAt,
-	}
-}
-
-func (un *EntryMVCCNode) CloneData() *EntryMVCCNode {
-	return &EntryMVCCNode{
+func (un EntryMVCCNode) Clone() EntryMVCCNode {
+	return EntryMVCCNode{
 		CreatedAt: un.CreatedAt,
 		DeletedAt: un.DeletedAt,
 	}
@@ -68,31 +76,25 @@ func (un *EntryMVCCNode) Delete() {
 }
 
 func (un *EntryMVCCNode) ReadFrom(r io.Reader) (n int64, err error) {
-	if err = binary.Read(r, binary.BigEndian, &un.CreatedAt); err != nil {
+	var sn int
+	if sn, err = r.Read(EncodeEntryMVCCNode(un)); err != nil {
 		return
 	}
-	n += 12
-	if err = binary.Read(r, binary.BigEndian, &un.DeletedAt); err != nil {
-		return
-	}
-	n += 12
+	n += int64(sn)
 	return
 }
-func (un *EntryMVCCNode) WriteTo(w io.Writer) (n int64, err error) {
-	if err = binary.Write(w, binary.BigEndian, un.CreatedAt); err != nil {
+func (un EntryMVCCNode) WriteTo(w io.Writer) (n int64, err error) {
+	var sn int
+	if sn, err = w.Write(EncodeEntryMVCCNode(&un)); err != nil {
 		return
 	}
-	n += 12
-	if err = binary.Write(w, binary.BigEndian, un.DeletedAt); err != nil {
-		return
-	}
-	n += 12
+	n += int64(sn)
 	return
 }
-func (un *EntryMVCCNode) PrepareCommit() (err error) {
+func (un EntryMVCCNode) PrepareCommit() (err error) {
 	return nil
 }
-func (un *EntryMVCCNode) String() string {
+func (un EntryMVCCNode) String() string {
 	return fmt.Sprintf("[C@%s,D@%s]", un.CreatedAt.ToString(), un.DeletedAt.ToString())
 }
 func (un *EntryMVCCNode) ApplyCommit(ts types.TS) (err error) {
@@ -103,4 +105,217 @@ func (un *EntryMVCCNode) ApplyCommit(ts types.TS) (err error) {
 		un.DeletedAt = ts
 	}
 	return nil
+}
+
+func (un EntryMVCCNode) AppendTuple(bat *containers.Batch) {
+	startTSVec := bat.GetVectorByName(EntryNode_CreateAt)
+	vector.AppendFixed(
+		startTSVec.GetDownstreamVector(),
+		un.CreatedAt,
+		false,
+		startTSVec.GetAllocator(),
+	)
+	vector.AppendFixed(
+		bat.GetVectorByName(EntryNode_DeleteAt).GetDownstreamVector(),
+		un.DeletedAt,
+		false,
+		startTSVec.GetAllocator(),
+	)
+}
+
+func (un EntryMVCCNode) AppendObjectTuple(bat *containers.Batch, create bool) {
+	startTSVec := bat.GetVectorByName(EntryNode_CreateAt)
+	vector.AppendFixed(
+		startTSVec.GetDownstreamVector(),
+		un.CreatedAt,
+		false,
+		startTSVec.GetAllocator(),
+	)
+	if create {
+		vector.AppendFixed(
+			bat.GetVectorByName(EntryNode_DeleteAt).GetDownstreamVector(),
+			types.TS{},
+			false,
+			startTSVec.GetAllocator(),
+		)
+		return
+	}
+	vector.AppendFixed(
+		bat.GetVectorByName(EntryNode_DeleteAt).GetDownstreamVector(),
+		un.DeletedAt,
+		false,
+		startTSVec.GetAllocator(),
+	)
+}
+
+func (un EntryMVCCNode) AppendTupleWithCommitTS(bat *containers.Batch, ts types.TS) {
+	startTSVec := bat.GetVectorByName(EntryNode_CreateAt)
+	createTS := un.CreatedAt
+	if createTS.Equal(&txnif.UncommitTS) {
+		createTS = ts
+	}
+	vector.AppendFixed(
+		startTSVec.GetDownstreamVector(),
+		createTS,
+		false,
+		startTSVec.GetAllocator(),
+	)
+	deleteTS := un.DeletedAt
+	if deleteTS.Equal(&txnif.UncommitTS) {
+		deleteTS = ts
+	}
+	vector.AppendFixed(
+		bat.GetVectorByName(EntryNode_DeleteAt).GetDownstreamVector(),
+		deleteTS,
+		false,
+		startTSVec.GetAllocator(),
+	)
+}
+
+func ReadEntryNodeTuple(createAt, deleteAt types.TS) (un *EntryMVCCNode) {
+	un = &EntryMVCCNode{
+		CreatedAt: createAt,
+		DeletedAt: deleteAt,
+	}
+	return
+}
+
+type BaseNode[T any] interface {
+	CloneAll() T
+	CloneData() T
+	String() string
+	Update(vun T)
+	WriteTo(w io.Writer) (n int64, err error)
+	ReadFromWithVersion(r io.Reader, ver uint16) (n int64, err error)
+}
+
+type MVCCNode[T BaseNode[T]] struct {
+	EntryMVCCNode
+	txnbase.TxnMVCCNode
+	BaseNode         T
+	CommitSideEffect func(id string, commitTs types.TS) // used for object replay, no need to persist
+}
+
+func NewEmptyMVCCNodeFactory[T BaseNode[T]](factory func() T) func() *MVCCNode[T] {
+	return func() *MVCCNode[T] {
+		return &MVCCNode[T]{
+			BaseNode: factory(),
+		}
+	}
+}
+
+func CompareBaseNode[T BaseNode[T]](e, o *MVCCNode[T]) int {
+	return e.Compare(&o.TxnMVCCNode)
+}
+
+func (e *MVCCNode[T]) CloneAll() *MVCCNode[T] {
+	if e == nil {
+		return nil
+	}
+	node := &MVCCNode[T]{
+		EntryMVCCNode: e.EntryMVCCNode.Clone(),
+		TxnMVCCNode:   e.TxnMVCCNode.CloneAll(),
+		BaseNode:      e.BaseNode.CloneAll(),
+	}
+	return node
+}
+
+func (e *MVCCNode[T]) CloneData() *MVCCNode[T] {
+	return &MVCCNode[T]{
+		EntryMVCCNode: e.EntryMVCCNode.Clone(),
+		TxnMVCCNode:   txnbase.TxnMVCCNode{},
+		BaseNode:      e.BaseNode.CloneData(),
+	}
+}
+func (e *MVCCNode[T]) IsNil() bool {
+	return e == nil
+}
+func (e *MVCCNode[T]) String() string {
+
+	return fmt.Sprintf("%s%s%s",
+		e.TxnMVCCNode.String(),
+		e.EntryMVCCNode.String(),
+		e.BaseNode.String())
+}
+
+// for create drop in one txn
+func (e *MVCCNode[T]) Update(un *MVCCNode[T]) {
+	e.CreatedAt = un.CreatedAt
+	e.DeletedAt = un.DeletedAt
+	e.BaseNode.Update(un.BaseNode)
+}
+
+func (e *MVCCNode[T]) ApplyCommit(id string) (err error) {
+	var commitTS types.TS
+	commitTS, err = e.TxnMVCCNode.ApplyCommit(id)
+	if err != nil {
+		return
+	}
+	err = e.EntryMVCCNode.ApplyCommit(commitTS)
+	if e.CommitSideEffect != nil {
+		e.CommitSideEffect(id, commitTS)
+	}
+	return err
+}
+func (e *MVCCNode[T]) PrepareRollback() (err error) {
+	return e.TxnMVCCNode.PrepareRollback()
+}
+func (e *MVCCNode[T]) ApplyRollback() (err error) {
+	var commitTS types.TS
+	commitTS, err = e.TxnMVCCNode.ApplyRollback()
+	if err != nil {
+		return
+	}
+	err = e.EntryMVCCNode.ApplyCommit(commitTS)
+	return
+}
+
+func (e *MVCCNode[T]) PrepareCommit() (err error) {
+	_, err = e.TxnMVCCNode.PrepareCommit()
+	if err != nil {
+		return
+	}
+	err = e.EntryMVCCNode.PrepareCommit()
+	return
+}
+
+func (e *MVCCNode[T]) WriteTo(w io.Writer) (n int64, err error) {
+	var sn int64
+	sn, err = e.EntryMVCCNode.WriteTo(w)
+	if err != nil {
+		return
+	}
+	n += sn
+	sn, err = e.TxnMVCCNode.WriteTo(w)
+	if err != nil {
+		return
+	}
+	n += sn
+
+	sn, err = e.BaseNode.WriteTo(w)
+	if err != nil {
+		return
+	}
+	n += sn
+	return
+}
+
+func (e *MVCCNode[T]) ReadFromWithVersion(r io.Reader, ver uint16) (n int64, err error) {
+	var sn int64
+	sn, err = e.EntryMVCCNode.ReadFrom(r)
+	if err != nil {
+		return
+	}
+	n += sn
+	sn, err = e.TxnMVCCNode.ReadFrom(r)
+	if err != nil {
+		return
+	}
+	n += sn
+	sn, err = e.BaseNode.ReadFromWithVersion(r, ver)
+	if err != nil {
+		return
+	}
+	n += sn
+	return
 }

@@ -15,20 +15,25 @@
 package types
 
 import (
+	"bytes"
 	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 )
 
 const (
 	VarlenaInlineSize = 23
 	VarlenaSize       = 24
-	MaxStringSize     = 10485760
 	VarlenaBigHdr     = 0xffffffff
-	MaxVarcharLen     = 65535
 	MaxCharLen        = 255
 	MaxBinaryLen      = 255
-	MaxVarBinaryLen   = 65535
+	MaxEnumLen        = 65535
+	MaxBitLen         = 64
+	MaxBlobLen        = 67108864 // 64 MB
+	MaxStringSize     = 65535    // 64 KB
+	MaxVarcharLen     = MaxStringSize
+	MaxVarBinaryLen   = MaxStringSize
 )
 
 func (v *Varlena) UnsafePtr() unsafe.Pointer {
@@ -50,6 +55,7 @@ func (v *Varlena) OffsetLen() (uint32, uint32) {
 	s := v.U32Slice()
 	return s[1], s[2]
 }
+
 func (v *Varlena) SetOffsetLen(voff, vlen uint32) {
 	s := v.U32Slice()
 	s[0] = VarlenaBigHdr
@@ -57,6 +63,8 @@ func (v *Varlena) SetOffsetLen(voff, vlen uint32) {
 	s[2] = vlen
 }
 
+// do not use this function, will be deleted in the future
+// use BuildVarlenaFromVarlena or BuildVarlenaFromByteSlice instead
 func BuildVarlena(bs []byte, area []byte, m *mpool.MPool) (Varlena, []byte, error) {
 	var err error
 	var v Varlena
@@ -70,7 +78,7 @@ func BuildVarlena(bs []byte, area []byte, m *mpool.MPool) (Varlena, []byte, erro
 		if voff+vlen < cap(area) || m == nil {
 			area = append(area, bs...)
 		} else {
-			area, err = m.Grow2(area, bs, voff+vlen)
+			area, err = m.Grow2(area, bs, voff+vlen, false)
 			if err != nil {
 				return v, nil, err
 			}
@@ -99,7 +107,23 @@ func (v *Varlena) GetByteSlice(area []byte) []byte {
 	return area[voff : voff+vlen]
 }
 
+// GetArray Returns []T from Varlena. If the Varlena size is less than Inline size,
+// it returns the value from the Varlena header.
+// Else, it returns the value from the area.
+func GetArray[T RealNumbers](v *Varlena, area []byte) []T {
+	svlen := (*v)[0]
+	if svlen <= VarlenaInlineSize {
+		return BytesToArray[T](v.ByteSlice())
+	}
+	voff, vlen := v.OffsetLen()
+	return BytesToArray[T](area[voff : voff+vlen])
+}
+
 // See the lifespan comment above.
+func (v *Varlena) UnsafeGetString(area []byte) string {
+	return util.UnsafeBytesToString(v.GetByteSlice(area))
+}
+
 func (v *Varlena) GetString(area []byte) string {
 	return string(v.GetByteSlice(area))
 }
@@ -107,4 +131,12 @@ func (v *Varlena) GetString(area []byte) string {
 func (v *Varlena) Reset() {
 	var vzero Varlena
 	*v = vzero
+}
+
+func PrefixCompare(lhs, rhs []byte) int {
+	if len(lhs) > len(rhs) {
+		lhs = lhs[:len(rhs)]
+	}
+
+	return bytes.Compare(lhs, rhs)
 }

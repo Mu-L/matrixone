@@ -1,4 +1,4 @@
-// Copyright 2021 Matrix Origin
+// Copyright 2021 - 2024 Matrix Origin
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,14 +15,16 @@
 package mergetop
 
 import (
-	"reflect"
-
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/compare"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
+
+var _ vm.Operator = new(MergeTop)
 
 type container struct {
 	n     int // result vector number
@@ -30,33 +32,115 @@ type container struct {
 	poses []int32           // sorted list of attributes
 	cmps  []compare.Compare // compare structure used to do sort work
 
+	limit         uint64
+	limitExecutor colexec.ExpressionExecutor
+
 	bat *batch.Batch // bat stores the final result of merge-top
 
-	// aliveMergeReceiver is a count for no-close receiver
-	aliveMergeReceiver int
-	// receiverListener is a structure to listen all the merge receiver.
-	receiverListener []reflect.SelectCase
+	executorsForOrderList []colexec.ExpressionExecutor
 }
 
-type Argument struct {
-	Limit int64               // Limit store the number of mergeTop-operator
-	ctr   *container          // ctr stores the attributes needn't do Serialization work
+type MergeTop struct {
+	Limit *plan.Expr          // Limit store the number of mergeTop-operator
+	ctr   container           // ctr stores the attributes needn't do Serialization work
 	Fs    []*plan.OrderBySpec // Fs store the order information
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
-	if ctr != nil {
-		mp := proc.Mp()
-		ctr.cleanBatch(mp)
+func (mergeTop *MergeTop) GetOperatorBase() *vm.OperatorBase {
+	return &mergeTop.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool(
+		func() *MergeTop {
+			return &MergeTop{}
+		},
+		func(a *MergeTop) {
+			*a = MergeTop{}
+		},
+		reuse.DefaultOptions[MergeTop]().
+			WithEnableChecker(),
+	)
+}
+
+func (mergeTop MergeTop) TypeName() string {
+	return opName
+}
+
+func NewArgument() *MergeTop {
+	return reuse.Alloc[MergeTop](nil)
+}
+
+func (mergeTop *MergeTop) WithLimit(limit *plan.Expr) *MergeTop {
+	mergeTop.Limit = limit
+	return mergeTop
+}
+
+func (mergeTop *MergeTop) WithFs(fs []*plan.OrderBySpec) *MergeTop {
+	mergeTop.Fs = fs
+	return mergeTop
+}
+
+func (mergeTop *MergeTop) Release() {
+	if mergeTop != nil {
+		reuse.Free(mergeTop, nil)
 	}
 }
 
-func (ctr *container) cleanBatch(mp *mpool.MPool) {
+func (mergeTop *MergeTop) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	mergeTop.ctr.reset()
+}
+
+func (mergeTop *MergeTop) Free(proc *process.Process, pipelineFailed bool, err error) {
+	mergeTop.ctr.free(proc)
+}
+
+func (mergeTop *MergeTop) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
+}
+
+func (ctr *container) reset() {
+	ctr.n = 0
+	ctr.sels = nil
+	ctr.poses = nil
+	ctr.cmps = nil
+
+	ctr.limit = 0
+	if ctr.limitExecutor != nil {
+		ctr.limitExecutor.ResetForNextQuery()
+	}
+
 	if ctr.bat != nil {
-		ctr.bat.Clean(mp)
+		ctr.bat.CleanOnlyData()
+	}
+
+	for _, executor := range ctr.executorsForOrderList {
+		if executor != nil {
+			executor.ResetForNextQuery()
+		}
+	}
+}
+
+func (ctr *container) free(proc *process.Process) {
+	if ctr.bat != nil {
+		ctr.bat.Clean(proc.Mp())
 		ctr.bat = nil
 	}
+
+	for i := range ctr.executorsForOrderList {
+		if ctr.executorsForOrderList[i] == nil {
+			continue
+		}
+		ctr.executorsForOrderList[i].Free()
+	}
+	ctr.executorsForOrderList = nil
+
+	if ctr.limitExecutor != nil {
+		ctr.limitExecutor.Free()
+	}
+	ctr.limitExecutor = nil
 }
 
 func (ctr *container) compare(vi, vj int, i, j int64) int {

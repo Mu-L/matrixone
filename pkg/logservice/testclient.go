@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/lni/vfs"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
@@ -25,19 +26,20 @@ import (
 
 func NewTestService(fs vfs.FS) (*Service, ClientConfig, error) {
 	addr := []string{"localhost:9000"}
-	cfg := Config{
-		UUID:                 uuid.New().String(),
-		RTTMillisecond:       10,
-		GossipSeedAddresses:  []string{defaultGossipSeedAddress},
-		DeploymentID:         1,
-		FS:                   fs,
-		ServiceListenAddress: addr[0],
-		ServiceAddress:       addr[0],
-		DisableWorkers:       true,
-	}
-	cfg.Fill()
+	cfg := DefaultConfig()
+	cfg.UUID = uuid.New().String()
+	cfg.RTTMillisecond = 10
+	cfg.GossipSeedAddresses = []string{DefaultGossipServiceAddress}
+	cfg.DeploymentID = 1
+	cfg.FS = fs
+	cfg.LogServicePort = 9000
+	cfg.DisableWorkers = true
+
+	runtime.SetupServiceBasedRuntime(cfg.UUID, runtime.ServiceRuntime(""))
+
 	service, err := NewService(cfg,
 		newFS(),
+		nil,
 		WithBackendFilter(func(msg morpc.Message, backendAddr string) bool {
 			return true
 		}),
@@ -60,27 +62,27 @@ func NewTestService(fs vfs.FS) (*Service, ClientConfig, error) {
 
 	ccfg := ClientConfig{
 		LogShardID:       1,
-		DNReplicaID:      10,
+		TNReplicaID:      10,
 		ServiceAddresses: addr,
 	}
 	return service, ccfg, nil
 }
 
 func newFS() *fileservice.FileServices {
-	local, err := fileservice.NewMemoryFS(defines.LocalFileServiceName)
+	local, err := fileservice.NewMemoryFS(defines.LocalFileServiceName, fileservice.DisabledCacheConfig, nil)
 	if err != nil {
 		panic(err)
 	}
-	s3, err := fileservice.NewMemoryFS(defines.SharedFileServiceName)
+	s3, err := fileservice.NewMemoryFS(defines.SharedFileServiceName, fileservice.DisabledCacheConfig, nil)
 	if err != nil {
 		panic(err)
 	}
-	etl, err := fileservice.NewMemoryFS(defines.ETLFileServiceName)
+	etl, err := fileservice.NewMemoryFS(defines.ETLFileServiceName, fileservice.DisabledCacheConfig, nil)
 	if err != nil {
 		panic(err)
 	}
 	fs, err := fileservice.NewFileServices(
-		"local",
+		defines.SharedFileServiceName,
 		local,
 		s3,
 		etl,

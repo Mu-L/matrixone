@@ -15,9 +15,6 @@
 package memorytable
 
 import (
-	"bytes"
-	"encoding"
-	"encoding/gob"
 	"fmt"
 	"io"
 	"sync/atomic"
@@ -78,27 +75,27 @@ func (t *tableState[K, V]) merge(
 		if log.Pair != nil && log.OldPair != nil {
 			// update
 			if oldPair == nil {
-				return nil, nil, moerr.NewTxnWWConflictNoCtx()
+				return nil, nil, moerr.NewTxnWWConflictNoCtx(0, "")
 			}
 			if oldPair.ID != log.OldPair.ID {
-				return nil, nil, moerr.NewTxnWWConflictNoCtx()
+				return nil, nil, moerr.NewTxnWWConflictNoCtx(0, "")
 			}
 			t.setPair(log.Pair, oldNode.KVPair)
 
 		} else if log.Pair == nil {
 			// delete
 			if oldPair == nil {
-				return nil, nil, moerr.NewTxnWWConflictNoCtx()
+				return nil, nil, moerr.NewTxnWWConflictNoCtx(0, "")
 			}
 			if oldPair.ID != log.OldPair.ID {
-				return nil, nil, moerr.NewTxnWWConflictNoCtx()
+				return nil, nil, moerr.NewTxnWWConflictNoCtx(0, "")
 			}
 			t.unsetPair(*pivot.KVPair, oldNode.KVPair)
 
 		} else if log.Pair != nil && log.OldPair == nil {
 			// insert
 			if oldPair != nil {
-				return nil, nil, moerr.NewTxnWWConflictNoCtx()
+				return nil, nil, moerr.NewTxnWWConflictNoCtx(0, "")
 			}
 			t.setPair(log.Pair, oldNode.KVPair)
 		}
@@ -211,39 +208,4 @@ func (s *tableState[K, V]) unsetPair(pivot KVPair[K, V], oldPair *KVPair[K, V]) 
 		OldPair: oldPair,
 	})
 
-}
-
-type encodingTableState[
-	K Ordered[K],
-	V any,
-] struct {
-	Tree Tree[K, V]
-	Log  Log[K, V]
-}
-
-var _ encoding.BinaryMarshaler = new(tableState[Int, int])
-
-func (t *tableState[K, V]) MarshalBinary() ([]byte, error) {
-	gobRegister(t.tree)
-	gobRegister(t.log)
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(encodingTableState[K, V]{
-		Log:  t.log,
-		Tree: t.tree,
-	}); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
-}
-
-var _ encoding.BinaryUnmarshaler = new(tableState[Int, int])
-
-func (t *tableState[K, V]) UnmarshalBinary(data []byte) error {
-	var e encodingTableState[K, V]
-	if err := gob.NewDecoder(bytes.NewReader(data)).Decode(&e); err != nil {
-		return err
-	}
-	t.tree = e.Tree
-	t.log = e.Log
-	return nil
 }

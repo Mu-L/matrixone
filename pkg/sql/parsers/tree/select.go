@@ -26,11 +26,13 @@ type SelectStatement interface {
 // Select represents a SelectStatement with an ORDER and/or LIMIT.
 type Select struct {
 	statementImpl
-	Select  SelectStatement
-	OrderBy OrderBy
-	Limit   *Limit
-	With    *With
-	Ep      *ExportParam
+	Select         SelectStatement
+	TimeWindow     *TimeWindow
+	OrderBy        OrderBy
+	Limit          *Limit
+	With           *With
+	Ep             *ExportParam
+	SelectLockInfo *SelectLockInfo
 }
 
 func (node *Select) Format(ctx *FmtCtx) {
@@ -43,6 +45,10 @@ func (node *Select) Format(ctx *FmtCtx) {
 		ctx.WriteByte(' ')
 		node.OrderBy.Format(ctx)
 	}
+	if node.TimeWindow != nil {
+		ctx.WriteByte(' ')
+		node.TimeWindow.Format(ctx)
+	}
 	if node.Limit != nil {
 		ctx.WriteByte(' ')
 		node.Limit.Format(ctx)
@@ -50,6 +56,10 @@ func (node *Select) Format(ctx *FmtCtx) {
 	if node.Ep != nil {
 		ctx.WriteByte(' ')
 		node.Ep.Format(ctx)
+	}
+	if node.SelectLockInfo != nil {
+		ctx.WriteByte(' ')
+		node.SelectLockInfo.Format(ctx)
 	}
 }
 
@@ -62,6 +72,99 @@ func NewSelect(s SelectStatement, o OrderBy, l *Limit) *Select {
 		OrderBy: o,
 		Limit:   l,
 	}
+}
+
+type TimeWindow struct {
+	Interval *Interval
+	Sliding  *Sliding
+	Fill     *Fill
+}
+
+func (node *TimeWindow) Format(ctx *FmtCtx) {
+	node.Interval.Format(ctx)
+	if node.Sliding != nil {
+		ctx.WriteByte(' ')
+		node.Sliding.Format(ctx)
+	}
+	if node.Fill != nil {
+		ctx.WriteByte(' ')
+		node.Fill.Format(ctx)
+	}
+}
+
+type Interval struct {
+	Col  *UnresolvedName
+	Val  Expr
+	Unit string
+}
+
+func (node *Interval) Format(ctx *FmtCtx) {
+	ctx.WriteString("interval(")
+	node.Col.Format(ctx)
+	ctx.WriteString(", ")
+	node.Val.Format(ctx)
+	ctx.WriteString(", ")
+	ctx.WriteString(node.Unit)
+	ctx.WriteByte(')')
+}
+
+type Sliding struct {
+	Val  Expr
+	Unit string
+}
+
+func (node *Sliding) Format(ctx *FmtCtx) {
+	ctx.WriteString("sliding(")
+	node.Val.Format(ctx)
+	ctx.WriteString(", ")
+	ctx.WriteString(node.Unit)
+	ctx.WriteByte(')')
+}
+
+type FillMode int
+
+const (
+	FillNone FillMode = iota
+	FillPrev
+	FillNext
+	FillValue
+	FillNull
+	FillLinear
+)
+
+func (f FillMode) String() string {
+	switch f {
+	case FillNone:
+		return "none"
+	case FillPrev:
+		return "prev"
+	case FillNext:
+		return "next"
+	case FillValue:
+		return "value"
+	case FillNull:
+		return "null"
+	case FillLinear:
+		return "linear"
+	default:
+		return ""
+	}
+}
+
+type Fill struct {
+	Mode FillMode
+	Val  Expr
+}
+
+func (node *Fill) Format(ctx *FmtCtx) {
+	ctx.WriteString("fill(")
+	ctx.WriteString(node.Mode.String())
+
+	if node.Mode == FillValue {
+		ctx.WriteString(", ")
+		node.Val.Format(ctx)
+	}
+	ctx.WriteByte(')')
 }
 
 // OrderBy represents an ORDER BY clause.
@@ -190,6 +293,36 @@ func (node *ParenSelect) Format(ctx *FmtCtx) {
 	ctx.WriteByte(')')
 }
 
+const (
+	QuerySpecOptionNone             uint64 = 0
+	QuerySpecOptionAll              uint64 = 1 << 1
+	QuerySpecOptionDistinct         uint64 = 1 << 2
+	QuerySpecOptionDistinctRow      uint64 = 1 << 3
+	QuerySpecOptionHighPriority     uint64 = 1 << 4
+	QuerySpecOptionStraightJoin     uint64 = 1 << 5
+	QuerySpecOptionSqlSmallResult   uint64 = 1 << 6
+	QuerySpecOptionSqlBigResult     uint64 = 1 << 7
+	QuerySpecOptionSqlBufferResult  uint64 = 1 << 8
+	QuerySpecOptionSqlNoCache       uint64 = 1 << 9
+	QuerySpecOptionSqlCalcFoundRows uint64 = 1 << 10
+)
+
+var (
+	QuerySpecOptionNames = map[uint64]string{
+		QuerySpecOptionNone:             "none",
+		QuerySpecOptionAll:              "all",
+		QuerySpecOptionDistinct:         "distinct",
+		QuerySpecOptionDistinctRow:      "distinctrow",
+		QuerySpecOptionHighPriority:     "high_priority",
+		QuerySpecOptionStraightJoin:     "straight_join",
+		QuerySpecOptionSqlSmallResult:   "sql_small_result",
+		QuerySpecOptionSqlBigResult:     "sql_big_result",
+		QuerySpecOptionSqlBufferResult:  "sql_buffer_result",
+		QuerySpecOptionSqlNoCache:       "sql_no_cache",
+		QuerySpecOptionSqlCalcFoundRows: "sql_calc_found_rows",
+	}
+)
+
 // SelectClause represents a SELECT statement.
 type SelectClause struct {
 	SelectStatement
@@ -197,9 +330,9 @@ type SelectClause struct {
 	Exprs    SelectExprs
 	From     *From
 	Where    *Where
-	GroupBy  GroupBy
+	GroupBy  *GroupByClause
 	Having   *Where
-	Option   string
+	Option   uint64
 }
 
 func (node *SelectClause) Format(ctx *FmtCtx) {
@@ -207,9 +340,19 @@ func (node *SelectClause) Format(ctx *FmtCtx) {
 	if node.Distinct {
 		ctx.WriteString("distinct ")
 	}
-	if node.Option != "" {
-		ctx.WriteString(node.Option)
-		ctx.WriteByte(' ')
+	if node.Option != 0 {
+		for i := uint64(1); i <= 10; i++ {
+			opt := uint64(1 << i)
+			//distinct printed already
+			if opt == QuerySpecOptionDistinct || opt == QuerySpecOptionDistinctRow {
+				continue
+			}
+
+			if node.Option&opt != 0 {
+				ctx.WriteString(QuerySpecOptionNames[opt])
+				ctx.WriteByte(' ')
+			}
+		}
 	}
 	node.Exprs.Format(ctx)
 	if len(node.From.Tables) > 0 {
@@ -232,7 +375,7 @@ func (node *SelectClause) Format(ctx *FmtCtx) {
 		ctx.WriteByte(' ')
 		node.Where.Format(ctx)
 	}
-	if len(node.GroupBy) > 0 {
+	if node.GroupBy != nil {
 		ctx.WriteByte(' ')
 		node.GroupBy.Format(ctx)
 	}
@@ -294,14 +437,28 @@ func (node *SelectExpr) Format(ctx *FmtCtx) {
 }
 
 // a GROUP BY clause.
-type GroupBy []Expr
+type GroupByClause struct {
+	GroupByExprsList []Exprs
+	GroupingSet      Exprs
+	Apart            bool
+	Cube             bool
+	Rollup           bool
+}
 
-func (node *GroupBy) Format(ctx *FmtCtx) {
+func (node *GroupByClause) Format(ctx *FmtCtx) {
 	prefix := "group by "
-	for _, n := range *node {
-		ctx.WriteString(prefix)
-		n.Format(ctx)
-		prefix = ", "
+	for _, list := range node.GroupByExprsList {
+		for _, n := range list {
+			ctx.WriteString(prefix)
+			n.Format(ctx)
+			prefix = ", "
+		}
+	}
+	if node.Cube {
+		ctx.WriteString("with cube")
+	}
+	if node.Rollup {
+		ctx.WriteString(" with rollup")
 	}
 }
 
@@ -315,6 +472,8 @@ const (
 	JOIN_TYPE_NATURAL       = "NATURAL"
 	JOIN_TYPE_NATURAL_LEFT  = "NATURAL LEFT"
 	JOIN_TYPE_NATURAL_RIGHT = "NATURAL RIGHT"
+	JOIN_TYPE_CROSS_L2      = "CROSS_L2"
+	JOIN_TYPE_DEDUP         = "DEDUP"
 )
 
 // the table expression
@@ -412,6 +571,30 @@ func NewUsingJoinCond(c IdentifierList) *UsingJoinCond {
 	return &UsingJoinCond{Cols: c}
 }
 
+const (
+	APPLY_TYPE_CROSS = "CROSS APPLY"
+	APPLY_TYPE_OUTER = "OUTER APPLY"
+)
+
+type ApplyTableExpr struct {
+	TableExpr
+	ApplyType string
+	Left      TableExpr
+	Right     TableExpr
+}
+
+type ApplyCond interface {
+	NodeFormatter
+}
+
+func (node *ApplyTableExpr) Format(ctx *FmtCtx) {
+	node.Left.Format(ctx)
+	ctx.WriteByte(' ')
+	ctx.WriteString(strings.ToLower(node.ApplyType))
+	ctx.WriteByte(' ')
+	node.Right.Format(ctx)
+}
+
 // the parenthesized TableExpr.
 type ParenTableExpr struct {
 	TableExpr
@@ -471,10 +654,13 @@ func (node *AliasedTableExpr) Format(ctx *FmtCtx) {
 	}
 }
 
-func NewAliasedTableExpr(e TableExpr, a AliasClause) *AliasedTableExpr {
+func NewAliasedTableExpr(e TableExpr, a string, i IdentifierList) *AliasedTableExpr {
 	return &AliasedTableExpr{
 		Expr: e,
-		As:   a,
+		As: AliasClause{
+			Alias: Identifier(a),
+			Cols:  i,
+		},
 	}
 }
 

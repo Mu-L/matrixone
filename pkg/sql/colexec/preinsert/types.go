@@ -15,22 +15,103 @@
 package preinsert
 
 import (
-	"context"
-	pb "github.com/matrixorigin/matrixone/pkg/pb/plan"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
+var _ vm.Operator = new(PreInsert)
+
 type proc = process.Process
-type eng = engine.Engine
 
-type Argument struct {
-	Ctx context.Context
+type container struct {
+	buf               *batch.Batch
+	canFreeVecIdx     map[int]bool //auto incr & expand constant vecotr.need free
+	clusterByExecutor colexec.ExpressionExecutor
+	compPkExecutor    colexec.ExpressionExecutor
+}
+type PreInsert struct {
+	ctr container
 
-	Eg         eng
-	SchemaName string
-	TableDef   *pb.TableDef
-	ParentIdx  map[string]int32
+	HasAutoCol  bool
+	IsOldUpdate bool
+	IsNewUpdate bool
+	SchemaName  string
+	TableDef    *plan.TableDef
+	// letter case: origin
+	Attrs []string
+
+	EstimatedRowCount int64
+	CompPkeyExpr      *plan.Expr
+	ClusterByExpr     *plan.Expr
+	ColOffset         int32
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(*process.Process, bool) {}
+func (preInsert *PreInsert) GetOperatorBase() *vm.OperatorBase {
+	return &preInsert.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[PreInsert](
+		func() *PreInsert {
+			return &PreInsert{}
+		},
+		func(a *PreInsert) {
+			*a = PreInsert{}
+		},
+		reuse.DefaultOptions[PreInsert]().
+			WithEnableChecker(),
+	)
+}
+
+func (preInsert PreInsert) TypeName() string {
+	return opName
+}
+
+func NewArgument() *PreInsert {
+	return reuse.Alloc[PreInsert](nil)
+}
+
+func (preInsert *PreInsert) Release() {
+	if preInsert != nil {
+		reuse.Free[PreInsert](preInsert, nil)
+	}
+}
+
+func (preInsert *PreInsert) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	if preInsert.ctr.compPkExecutor != nil {
+		preInsert.ctr.compPkExecutor.ResetForNextQuery()
+	}
+	if preInsert.ctr.clusterByExecutor != nil {
+		preInsert.ctr.clusterByExecutor.ResetForNextQuery()
+	}
+}
+
+func (preInsert *PreInsert) Free(proc *process.Process, pipelineFailed bool, err error) {
+	if preInsert.ctr.compPkExecutor != nil {
+		preInsert.ctr.compPkExecutor.Free()
+		preInsert.ctr.compPkExecutor = nil
+	}
+	if preInsert.ctr.clusterByExecutor != nil {
+		preInsert.ctr.clusterByExecutor.Free()
+		preInsert.ctr.clusterByExecutor = nil
+	}
+	if preInsert.ctr.buf != nil {
+		for idx := range preInsert.ctr.buf.Vecs {
+			if !preInsert.ctr.canFreeVecIdx[idx] {
+				preInsert.ctr.buf.SetVector(int32(idx), nil)
+			}
+		}
+		preInsert.ctr.buf.Clean(proc.Mp())
+		preInsert.ctr.buf = nil
+	}
+}
+
+func (preInsert *PreInsert) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
+}

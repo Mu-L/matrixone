@@ -115,7 +115,7 @@ null
 select date_add("9999-12-31 23:59:59",INTERVAL 1 SECOND);
 Data truncation: data out of range: data type datetime, 
 select date_sub("0000-00-00 00:00:00",INTERVAL 1 SECOND);
-invalid input: invalid datatime value 0000-00-00 00:00:00
+invalid input: invalid datetime value 0000-00-00 00:00:00
 select date_add('1998-01-30',Interval 1 month);
 date_add('1998-01-30',Interval 1 month)
 1998-02-28 00:00:00
@@ -259,7 +259,7 @@ select date_sub("1998-01-01 00:00:00",INTERVAL 1 SECOND);
 date_sub("1998-01-01 00:00:00",INTERVAL 1 SECOND)
 1997-12-31 23:59:59
 select date_sub("0000-00-00 00:00:00",INTERVAL 1 SECOND);
-invalid input: invalid datatime value 0000-00-00 00:00:00
+invalid input: invalid datetime value 0000-00-00 00:00:00
 select date_add('1998-01-30',Interval 1 month);
 date_add('1998-01-30',Interval 1 month)
 1998-02-28 00:00:00
@@ -403,9 +403,11 @@ select date("1997-12-31 23:59:59" + INTERVAL 1 SECOND) + INTERVAL "1:1:1" HOUR_S
 date("1997-12-31 23:59:59" + INTERVAL 1 SECOND) + INTERVAL "1:1:1" HOUR_SECOND
 1998-01-01 01:01:01
 SELECT CAST(CAST('2006-08-10 10:11:12' AS DATETIME) AS DECIMAL(20,6));
-invalid argument operator cast, bad value [DATETIME DECIMAL128]
+cast(cast(2006-08-10 10:11:12 as datetime(26)) as decimal(20, 6))
+1155204672.000000
 SELECT CAST(CAST('2006-08-10 10:11:12' AS DATETIME) + INTERVAL 14 MICROSECOND AS DECIMAL(20,6));
-invalid argument operator cast, bad value [DATETIME DECIMAL128]
+cast(cast(2006-08-10 10:11:12 as datetime(26)) + interval(14, microsecond) as decimal(20, 6))
+1155204672.000014
 drop table if exists t1;
 drop table if exists t2;
 create table t1(i int,a datetime,b datetime,c datetime,d char(200),e varchar(50));
@@ -479,7 +481,11 @@ a
 1998-12-30
 1997-12-30
 select count(a),c + INTERVAL 1 DAY as c1 from t1 group by (c + INTERVAL 1 DAY) having c1 > "1998-01-01 00:59:59";
-SQL syntax error: column "c1" must appear in the GROUP BY clause or be used in an aggregate function
+count(a)    c1
+2    1998-01-02 00:59:59
+2    1998-01-03 00:59:59
+2    1998-01-03 01:01:00
+4    1998-01-02 00:00:00
 select i,c + INTERVAL 1 MINUTE from t1 where a - INTERVAL 1 SECOND  > "1997-01-01 00:00:00.000001" order by c + INTERVAL 1 MINUTE DESC;
 i	c + INTERVAL 1 MINUTE
 3	1998-01-02 01:02:00
@@ -587,3 +593,13 @@ null
 null
 null
 drop table t1;
+set @tt=now();
+select @tt;
+@tt
+2024-04-09 16:58:58.056874
+select date_add(@tt, Interval 30 SECOND);
+date_add(@tt, interval(30, second))
+2024-04-09 16:59:28.056874000
+select date_sub(@tt, Interval 30 SECOND);
+date_sub(@tt, interval(30, second))
+2024-04-09 16:58:28.056874000

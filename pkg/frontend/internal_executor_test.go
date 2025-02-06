@@ -15,16 +15,20 @@
 package frontend
 
 import (
-	"bytes"
 	"context"
 	"testing"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/config"
-	"github.com/matrixorigin/matrixone/pkg/defines"
-	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/config"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/testutil"
+	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 )
 
 func mockResultSet() *MysqlResultSet {
@@ -38,61 +42,49 @@ func mockResultSet() *MysqlResultSet {
 	return set
 }
 
-type miniExec struct {
-	sess *Session
-}
-
-func (e *miniExec) doComQuery(context.Context, string) error {
-	_ = e.sess.GetMysqlProtocol()
-	return nil
-}
-func (e *miniExec) SetSession(sess *Session) {
-	e.sess = sess
-}
-
 func TestIe(t *testing.T) {
-	ctx := context.TODO()
-	pu := config.NewParameterUnit(&config.FrontendParameters{}, nil, nil, nil)
+	sid := ""
+	runtime.RunTest(
+		sid,
+		func(rt runtime.Runtime) {
+			ctx := context.TODO()
+			pu := config.NewParameterUnit(&config.FrontendParameters{}, nil, nil, nil)
+			setPu("", pu)
+			executor := newIe(sid)
+			executor.ApplySessionOverride(ie.NewOptsBuilder().Username("dump").Finish())
+			sess := executor.newCmdSession(ctx, ie.NewOptsBuilder().Database("mo_catalog").Internal(true).Finish())
+			assert.Equal(t, "dump", sess.GetResponser().GetStr(USERNAME))
 
-	// Mock autoIncrCaches
-	aic := defines.AutoIncrCaches{}
-
-	executor := newIe(pu, &miniExec{}, aic)
-	executor.ApplySessionOverride(ie.NewOptsBuilder().Username("dump").Finish())
-	sess := executor.newCmdSession(ctx, ie.NewOptsBuilder().Database("mo_catalog").Internal(true).Finish())
-	assert.Equal(t, "dump", sess.GetMysqlProtocol().GetUserName())
-
-	err := executor.Exec(ctx, "whatever", ie.NewOptsBuilder().Finish())
-	assert.NoError(t, err)
-	res := executor.Query(ctx, "whatever", ie.NewOptsBuilder().Finish())
-	assert.NoError(t, err)
-	assert.Equal(t, uint64(0), res.RowCount())
+			err := executor.Exec(ctx, "whatever", ie.NewOptsBuilder().Finish())
+			assert.Error(t, err)
+			res := executor.Query(ctx, "whatever", ie.NewOptsBuilder().Finish())
+			assert.Error(t, err)
+			assert.Equal(t, uint64(0), res.RowCount())
+		},
+	)
 }
 
 func TestIeProto(t *testing.T) {
-	pu := config.NewParameterUnit(&config.FrontendParameters{}, nil, nil, nil)
-
+	setPu("", config.NewParameterUnit(&config.FrontendParameters{}, nil, nil, nil))
 	// Mock autoIncrCaches
-	aic := defines.AutoIncrCaches{}
+	setAicm("", &defines.AutoIncrCacheManager{})
 
-	executor := NewInternalExecutor(pu, aic)
+	executor := NewInternalExecutor("")
 	p := executor.proto
 	assert.True(t, p.IsEstablished())
 	p.SetEstablished()
-	p.Quit()
+	p.Close()
 	p.ResetStatistics()
-	_ = p.GetStats()
 	_ = p.ConnectionID()
 	ctx := context.TODO()
-	assert.Panics(t, func() { p.GetRequest([]byte{1}) })
-	assert.Nil(t, p.SendColumnDefinitionPacket(ctx, nil, 1))
-	assert.Nil(t, p.SendColumnCountPacket(1))
-	assert.Nil(t, p.SendEOFPacketIf(0, 1))
-	assert.Nil(t, p.sendOKPacket(1, 1, 0, 0, ""))
-	assert.Nil(t, p.sendEOFOrOkPacket(0, 1))
+	assert.Nil(t, p.WriteColumnDef(ctx, nil, 1))
+	assert.Nil(t, p.WriteLengthEncodedNumber(1))
+	assert.Nil(t, p.WriteEOFIF(0, 1))
+	assert.Nil(t, p.WriteOK(1, 1, 0, 0, ""))
+	assert.Nil(t, p.WriteEOFOrOK(0, 1))
 
 	p.stashResult = true
-	p.SendResponse(ctx, &Response{
+	p.WriteResponse(ctx, &Response{
 		category:     OkResponse,
 		status:       0,
 		affectedRows: 1,
@@ -100,7 +92,7 @@ func TestIeProto(t *testing.T) {
 	})
 	assert.Nil(t, nil, p.result.resultSet)
 	assert.Equal(t, uint64(1), p.result.affectedRows)
-	p.SendResponse(ctx, &Response{
+	p.WriteResponse(ctx, &Response{
 		category: ResultResponse,
 		status:   0,
 		data: &MysqlExecutionResult{
@@ -112,18 +104,11 @@ func TestIeProto(t *testing.T) {
 	assert.Equal(t, 42, v.(int))
 
 	p.ResetStatistics()
-	assert.NoError(t, p.SendResultSetTextBatchRowSpeedup(mockResultSet(), 1))
+	assert.NoError(t, p.WriteResultSetRow(mockResultSet(), 1))
 	r := p.swapOutResult()
 	v, e := r.Value(ctx, 0, 0)
 	assert.NoError(t, e)
 	assert.Equal(t, 42, v.(int))
-	p.ResetStatistics()
-	assert.NoError(t, p.SendResultSetTextBatchRow(mockResultSet(), 1))
-	r = p.swapOutResult()
-	v, e = r.Value(ctx, 0, 0)
-	assert.NoError(t, e)
-	assert.Equal(t, 42, v.(int))
-	assert.Equal(t, uint64(1), r.affectedRows)
 	p.ResetStatistics()
 
 	r = p.swapOutResult()
@@ -151,28 +136,68 @@ func TestIeResult(t *testing.T) {
 	v, e := result.Value(context.TODO(), 0, 0)
 	require.NoError(t, e)
 	require.Equal(t, 42, v.(int))
-	v, e = result.ValueByName(context.TODO(), 0, "test")
-	require.NoError(t, e)
-	require.Equal(t, 42, v.(int))
-	str, e := result.StringValueByName(context.TODO(), 0, "test")
-	require.NoError(t, e)
-	require.Equal(t, "42", str)
-	str, e = result.StringValueByName(context.TODO(), 0, "tet")
-	require.Error(t, e)
-	require.Equal(t, "", str)
 }
 
-func DebugPrintInternalResult(ctx context.Context, res ie.InternalExecResult) string {
-	buf := &bytes.Buffer{}
-	for i := uint64(0); i < res.ColumnCount(); i++ {
-		col, _, _, _ := res.Column(context.TODO(), i)
-		buf.WriteString(col + ": ")
-		for j := uint64(0); j < res.RowCount(); j++ {
-			s, _ := res.StringValueByName(ctx, j, col)
-			buf.WriteString(" | ")
-			buf.WriteString(s)
-		}
-		buf.WriteString("\n")
+func Test_internalProtocol_Write(t *testing.T) {
+	setPu("", config.NewParameterUnit(&config.FrontendParameters{}, nil, nil, nil))
+	// Mock autoIncrCaches
+	setAicm("", &defines.AutoIncrCacheManager{})
+
+	executorVar := NewInternalExecutor("")
+	ip := executorVar.proto
+	assert.True(t, ip.IsEstablished())
+	ip.stashResult = true
+	ip.SetEstablished()
+	ip.Close()
+	ip.ResetStatistics()
+	_ = ip.ConnectionID()
+	ctx := context.TODO()
+	assert.Nil(t, ip.WriteColumnDef(ctx, nil, 1))
+	assert.Nil(t, ip.WriteLengthEncodedNumber(1))
+	assert.Nil(t, ip.WriteEOFIF(0, 1))
+	assert.Nil(t, ip.WriteOK(1, 1, 0, 0, ""))
+	assert.Nil(t, ip.WriteEOFOrOK(0, 1))
+
+	ses := executorVar.newCmdSession(ctx, ie.NewOptsBuilder().Finish())
+	col1 := &MysqlColumn{}
+	col1.SetName("col1")
+	col1.SetColumnType(defines.MYSQL_TYPE_LONG)
+	ses.mrs = &MysqlResultSet{}
+	ses.mrs.AddColumn(col1)
+
+	execCtx := &ExecCtx{
+		reqCtx: ctx,
+		ses:    ses,
 	}
-	return buf.String()
+
+	mockBatch := func(vals []int64) *batch.Batch {
+		bat := batch.New([]string{"col1"})
+		vecs := make([]*vector.Vector, 1)
+		vecs[0] = testutil.MakeInt64Vector(vals, nil)
+		bat.Vecs = vecs
+		bat.SetRowCount(len(vals))
+		return bat
+	}
+	batch1 := mockBatch([]int64{100})
+	batch2 := mockBatch([]int64{200, 201})
+
+	// ======================= main ===================
+	ip.Reset(ses)
+	err := ip.Write(execCtx, nil, batch1)
+	require.NoError(t, err)
+	require.Equal(t, 1, int(ip.result.affectedRows))
+	require.Equal(t, 1, len(ip.result.resultSet.Data))
+	require.Equal(t, [][]any{{int64(100)} /*colum1, rows: 1*/}, ip.result.resultSet.Data)
+
+	err = ip.Write(execCtx, nil, batch2)
+	require.NoError(t, err)
+	require.Equal(t, 3, int(ip.result.affectedRows))
+	require.Equal(t, 3, len(ip.result.resultSet.Data))
+	require.Equal(t, [][]any{{int64(100)}, {int64(200)}, {int64(201)} /*column1, rows: 3*/}, ip.result.resultSet.Data)
+}
+
+func Test_WriteResultSetRow2(t *testing.T) {
+	ip := &internalProtocol{}
+	err := ip.WriteResultSetRow2(nil, nil, 1)
+	assert.NoError(t, err)
 }

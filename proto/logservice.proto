@@ -16,18 +16,23 @@
 
 syntax = "proto3";
 package logservice;
+
 option go_package = "github.com/matrixorigin/matrixone/pkg/pb/logservice";
 
 import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "google/protobuf/timestamp.proto";
 import "metadata.proto";
 
 option (gogoproto.goproto_enum_prefix_all) = false;
+option (gogoproto.sizer_all) = false;
+option (gogoproto.protosizer_all) = true;
 
 enum UpdateType {
   LeaseHolderIDUpdate = 0;
   TruncateLSNUpdate   = 1;
   UserEntryUpdate     = 2;
   TSOUpdate           = 3;
+  RequiredLSNUpdate   = 4;
 }
 
 enum NodeState {
@@ -40,23 +45,37 @@ message CNStore {
   string          ServiceAddress     = 2;
   string          SQLAddress         = 3;
   string          LockServiceAddress = 4;
-  metadata.CNRole Role               = 5;
-  uint64          Tick               = 6;
-  NodeState       State              = 7;
+  reserved 5;
+  metadata.CNRole Role               = 6;
+  uint64          Tick               = 7;
+  NodeState       State              = 8;
+  map<string, metadata.LabelList> Labels = 9 [(gogoproto.nullable) = false];
+  metadata.WorkState WorkState       = 10;
+  string          QueryAddress       = 11;
+  ConfigData ConfigData = 12;
+  Resource Resource = 13 [(gogoproto.nullable) = false];
+  int64 UpTime = 14;
+  string          ShardServiceAddress = 15;
+  string CommitID = 16;
 }
 
-message DNStore {
+message TNStore {
   string    UUID           = 1;
   string    ServiceAddress = 2;
   uint64    Tick           = 3;
   NodeState State          = 4;
 
-  repeated DNShardInfo Shards = 5 [(gogoproto.nullable) = false];
+  repeated TNShardInfo Shards = 5 [(gogoproto.nullable) = false];
 
   // Server address for logtail push model
   string LogtailServerAddress = 6;
   // LockServiceAddress lock service address for lock table allocator
   string LockServiceAddress = 7;
+  reserved 8;
+  ConfigData ConfigData = 9;
+  // QueryAddress is the address of the queryservice on tn
+  string QueryAddress = 10;
+  string  ShardServiceAddress   = 11;
 }
 
 message LogStore {
@@ -66,6 +85,8 @@ message LogStore {
   NodeState State          = 4;
 
   repeated LogReplicaInfo Replicas = 5 [(gogoproto.nullable) = false];
+  ConfigData ConfigData = 6;
+  Locality Locality = 7 [(gogoproto.nullable) = false];
 }
 
 // LogShardInfo contains information a log shard.
@@ -73,16 +94,19 @@ message LogShardInfo {
   // ShardID is the ID of a Log shard.
   uint64 ShardID               = 1;
   // Replicas is a map of ReplicaID to LogStore UUID, it describe the member
-  // replicas of the shard at the given Epoch. 
+  // replicas of the shard at the given Epoch.
+  // It only contains normal replicas but no non-voting replicas.
   map<uint64, string> Replicas = 2;
   // Epoch is the epoch value of the Shard, member replicas of the Shard can
-  // change across epochs. 
+  // change across epochs.
   uint64 Epoch                 = 3;
   // LeaderID is the ReplicaID of the leader replica at the given term. When
   // LeaderID is 0, it means there is no leader or the leader is unknown.
   uint64 LeaderID              = 4;
-  // Term is the Raft term value. 
+  // Term is the Raft term value.
   uint64 Term                  = 5;
+  // NonVotingReplicas is the non-voting replicas belongs to this shard.
+  map<uint64, string> NonVotingReplicas = 6;
 
   // TODO: per shard stats like CPU/memory/network usage can be added here
 };
@@ -92,6 +116,15 @@ message LogReplicaInfo {
   LogShardInfo LogShardInfo = 1 [(gogoproto.nullable) = false, (gogoproto.embed) = true];
   // ReplicaID is the ID of a replica within the Log shard.
   uint64 ReplicaID = 2;
+  // IsNonVoting indicates if the replica is a non-voting replica.
+  bool IsNonVoting = 3;
+}
+
+message Resource {
+  uint64 CPUTotal = 1;
+  double CPUAvailable = 2;
+  uint64 MemTotal = 3;
+  uint64 MemAvailable = 4;
 }
 
 // CNStoreHeartbeat is the periodic message sent tp the HAKeeper by CN stores.
@@ -100,10 +133,18 @@ message CNStoreHeartbeat {
   string          ServiceAddress     = 2;
   string          SQLAddress         = 3;
   string          LockServiceAddress = 4;
-  metadata.CNRole Role               = 5;
-  bool            TaskServiceCreated = 6;
+  reserved 5;
+  metadata.CNRole Role               = 6;
+  bool            TaskServiceCreated = 7;
+  string          QueryAddress       = 8;
+  string          InitWorkState      = 9;
+  string          GossipAddress      = 10;
+  bool            GossipJoined       = 11;
+  ConfigData      ConfigData         = 12;
+  Resource        Resource           = 13 [(gogoproto.nullable) = false];
+  string  ShardServiceAddress   = 14;
+  string          CommitID           = 15;
 }
-
 
 // CNAllocateID is the periodic message sent tp the HAKeeper by CN stores.
 message CNAllocateID {
@@ -123,39 +164,46 @@ message LogStoreHeartbeat {
   // Replicas is a list of LogReplicaInfo instances collected on the specified
   // LogStore. Details in Shards are based on the local knowledge of each
   // replica running on the current LogStore, it may not be accurate or
-  // update to date due to various reasons. 
+  // update to date due to various reasons.
   repeated LogReplicaInfo Replicas = 5 [(gogoproto.nullable) = false];
   // TaskServiceCreated task service is created at the current log node
   bool            TaskServiceCreated    = 6;
+
+  ConfigData ConfigData = 7;
+  Locality Locality = 8 [(gogoproto.nullable) = false];
 };
 
-// DNShardInfo contains information of a launched DN shard. 
-message DNShardInfo {
-  // ShardID uniquely identifies a DN shard. Each DN shard manages a Primary
-  // Key range or hashed Primary Key value range. 
+// TNShardInfo contains information of a launched TN shard.
+message TNShardInfo {
+  // ShardID uniquely identifies a TN shard. Each TN shard manages a Primary
+  // Key range or hashed Primary Key value range.
   uint64 ShardID                 = 1;
-  // ReplicaID uniquely identifies a DN shard instance. After repairing a
-  // failed DN shard, a new DN shard instance is created with a new ReplicaID
+  // ReplicaID uniquely identifies a TN shard instance. After repairing a
+  // failed TN shard, a new TN shard instance is created with a new ReplicaID
   // value.
   uint64 ReplicaID               = 2;
 
   // TODO: per shard stats like CPU/memory/network usage can be added here
 };
 
-// DNStoreHeartbeat is the periodic message sent to the HAKeeper by DN stores.
-message DNStoreHeartbeat {
-  // UUID is the uuid of the DN Store.
-  string UUID                 = 1; 
+// TNStoreHeartbeat is the periodic message sent to the HAKeeper by TN stores.
+message TNStoreHeartbeat {
+  // UUID is the uuid of the TN Store.
+  string UUID                 = 1;
   string ServiceAddress       = 2;
-  // Shards is a list of DNShardInfo instances collected on the specified
-  // DN store. 
-  repeated DNShardInfo Shards = 3 [(gogoproto.nullable) = false];
+  // Shards is a list of TNShardInfo instances collected on the specified
+  // TN store.
+  repeated TNShardInfo Shards = 3 [(gogoproto.nullable) = false];
   bool            TaskServiceCreated = 4;
-
   // Server address for logtail push model
   string LogtailServerAddress = 5;
   // LockServiceAddress lock service address for lock table allocator
   string LockServiceAddress = 6;
+  reserved 7;
+  ConfigData ConfigData = 8;
+  // QueryAddress is the address of queryservice on tn
+  string QueryAddress = 9;
+  string  ShardServiceAddress   = 10;
 };
 
 message RSMState {
@@ -164,6 +212,9 @@ message RSMState {
   uint64 LeaseHolderID = 3;
   uint64 TruncatedLsn = 4;
   map<uint64, uint64> LeaseHistory = 5; // log lsn -> truncate lsn
+  // RequiredLsn is the first lsn position of upstream for datasync shard.
+  // The entries before it have been synced.
+  uint64 RequiredLsn = 6;
 }
 
 enum MethodType {
@@ -176,12 +227,25 @@ enum MethodType {
   CONNECT_RO     = 6;
   LOG_HEARTBEAT  = 7;
   CN_HEARTBEAT   = 8;
-  DN_HEARTBEAT   = 9;
+  TN_HEARTBEAT   = 9;
   CHECK_HAKEEPER = 10;
   GET_CLUSTER_DETAILS = 11;
   GET_SHARD_INFO = 12;
   CN_ALLOCATE_ID = 13;
   GET_CLUSTER_STATE = 14;
+  UPDATE_CN_LABEL = 15;
+  UPDATE_CN_WORK_STATE = 16;
+  PATCH_CN_STORE = 17;
+  DELETE_CN_STORE = 18;
+  PROXY_HEARTBEAT = 19;
+  UPDATE_NON_VOTING_REPLICA_NUM = 20;
+  UPDATE_NON_VOTING_LOCALITY = 21;
+  SET_REQUIRED_LSN = 22;
+  GET_REQUIRED_LSN = 23;
+  GET_LATEST_LSN = 24;
+  GET_LEADER_ID = 25;
+  CHECK_HEALTH = 26;
+  READ_LSN = 27;
 };
 
 enum RecordType {
@@ -203,12 +267,45 @@ message LogRequest {
   uint64 ShardID      = 2;
   uint64 Lsn          = 3;
   uint64 MaxSize      = 4;
-  uint64 DNShardID    = 5;
-  uint64 DNID         = 6;
+  uint64 TNShardID    = 5;
+  uint64 TNID         = 6;
+  google.protobuf.Timestamp TS = 7
+    [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
 }
 
 message TsoRequest {
   uint64 Count        = 1;
+}
+
+enum CNLabelOp {
+  SetLabel = 0;
+  DeleteLabel = 1;
+}
+
+message CNStoreLabel {
+  // UUID is the uuid of the CN store.
+  string UUID = 1;
+  // Operation is the CN label operation.
+  // TODO(volgariver6): Unused field.
+  CNLabelOp Operation = 2;
+  // Labels is the labels of the CN store.
+  map<string, metadata.LabelList> Labels = 3 [(gogoproto.nullable) = false];
+}
+
+message CNWorkState {
+  // UUID is the uuid of the CN store.
+  string UUID     = 1;
+  // State is the CN work state.
+  metadata.WorkState State = 2;
+}
+
+message CNStateLabel {
+  // UUID is the uuid of the CN store.
+  string UUID     = 1;
+  // State is the CN work state.
+  metadata.WorkState State = 2;
+  // Labels is the labels of the CN store.
+  map<string, metadata.LabelList> Labels = 3 [(gogoproto.nullable) = false];
 }
 
 message Request {
@@ -217,15 +314,24 @@ message Request {
   LogRequest LogRequest          = 3 [(gogoproto.nullable) = false];
   LogStoreHeartbeat LogHeartbeat = 4;
   CNStoreHeartbeat CNHeartbeat   = 5;
-  DNStoreHeartbeat DNHeartbeat   = 6;
+  TNStoreHeartbeat TNHeartbeat   = 6;
   TsoRequest TsoRequest          = 7;
   CNAllocateID CNAllocateID      = 8;
+  CNStoreLabel CNStoreLabel      = 9;
+  CNWorkState CNWorkState        = 10;
+  CNStateLabel CNStateLabel      = 11;
+  DeleteCNStore DeleteCNStore    = 12;
+  ProxyHeartbeat ProxyHeartbeat  = 13;
+  uint64 NonVotingReplicaNum     = 14;
+  Locality NonVotingLocality     = 15;
+  CheckHealth CheckHealth        = 16;
 };
 
 message LogResponse {
   uint64 ShardID      = 1;
   uint64 Lsn          = 2;
   uint64 LastLsn      = 3;
+  uint64 LeaderID     = 4;
 }
 
 message AllocateIDResponse {
@@ -262,7 +368,7 @@ message TsoResponse {
 enum HAKeeperUpdateType {
   TickUpdate              = 0;
   CNHeartbeatUpdate       = 1;
-  DNHeartbeatUpdate       = 2;
+  TNHeartbeatUpdate       = 2;
   LogHeartbeatUpdate      = 3;
   GetIDUpdate             = 4;
   ScheduleCommandUpdate   = 5;
@@ -270,6 +376,14 @@ enum HAKeeperUpdateType {
   InitialClusterUpdate    = 7;
   SetTaskSchedulerStateUpdate  = 8;
   SetTaskTableUserUpdate       = 9;
+  UpdateCNLabel = 10;
+  UpdateCNWorkState = 11;
+  PatchCNStore = 12;
+  RemoveCNStore = 13;
+  ProxyHeartbeatUpdate = 14;
+  UpdateNonVotingReplicaNum = 15;
+  UpdateNonVotingLocality = 16;
+  LogShardUpdate = 17;
 }
 
 // HAKeeperState state transition diagram
@@ -329,7 +443,7 @@ message Replica {
   uint64 ReplicaID = 3;
   uint64 Epoch     = 4;
 
-  // LogShardID only used for DNShard.
+  // LogShardID only used for TNShard.
   uint64 LogShardID = 5;
 }
 
@@ -340,6 +454,11 @@ enum ConfigChangeType {
   StartReplica  = 2;
   StopReplica   = 3;
   KillZombie    = 4;
+  // for non-voting
+  AddNonVotingReplica = 5;
+  RemoveNonVotingReplica = 6;
+  StartNonVotingReplica = 7;
+  StopNonVotingReplica = 8;
 }
 
 // ConfigChange is the detail of a config change.
@@ -359,8 +478,9 @@ message ShutdownStore {
 // ServiceType specifies type of service
 enum ServiceType {
   LogService = 0;
-  DNService  = 1;
+  TNService  = 1;
   CNService  = 2;
+  ProxyService = 3;
 }
 
 // ScheduleCommand contains a shard schedule command.
@@ -373,6 +493,14 @@ message ScheduleCommand {
   ShutdownStore     ShutdownStore   = 5;
   CreateTaskService CreateTaskService = 6;
   DeleteCNStore     DeleteCNStore     = 7;
+  JoinGossipCluster JoinGossipCluster = 8;
+  DeleteProxyStore  DeleteProxyStore  = 9;
+  AddLogShard       AddLogShard       = 10;
+  BootstrapShard    BootstrapShard    = 11;
+}
+
+message JoinGossipCluster {
+  repeated string Existing = 1;
 }
 
 // CreateTaskService start task service at current node
@@ -388,6 +516,24 @@ message DeleteCNStore {
   string StoreID = 1;
 }
 
+// DeleteProxyStore deletes Proxy store from ProxyState to save hakeeper's memory.
+message DeleteProxyStore {
+  string StoreID = 1;
+}
+
+// AddLogShard adds a new shard to logservice.
+message AddLogShard {
+  uint64 ShardID = 1;
+}
+
+// BootstrapShard bootstraps a new shard.
+message BootstrapShard {
+  uint64 ShardID = 1;
+  uint64 ReplicaID = 2;
+  map<uint64, string> InitialMembers = 3;
+  bool Join = 4;
+}
+
 message CommandBatch {
   uint64 Term                       = 1;
   repeated ScheduleCommand Commands = 2 [(gogoproto.nullable) = false];
@@ -399,8 +545,19 @@ message CNStoreInfo {
   string          ServiceAddress     = 2;
   string          SQLAddress         = 3;
   string          LockServiceAddress = 4;
-  metadata.CNRole Role               = 5;
-  bool            TaskServiceCreated = 6;
+  reserved 5;
+  metadata.CNRole Role               = 6;
+  bool            TaskServiceCreated = 7;
+  map<string, metadata.LabelList> Labels = 8 [(gogoproto.nullable) = false];
+  metadata.WorkState WorkState       = 9;
+  string          QueryAddress       = 10;
+  string          GossipAddress      = 11;
+  bool            GossipJoined       = 12;
+  ConfigData      ConfigData         = 13;
+  Resource        Resource           = 14 [(gogoproto.nullable) = false];
+  int64           UpTime             = 15;
+  string       ShardServiceAddress   = 16;
+  string          CommitID           = 17;
 }
 
 // CNState contains all CN details known to the HAKeeper.
@@ -410,11 +567,11 @@ message CNState {
 }
 
 
-// DNStoreInfo contains information on a DN store.
-message DNStoreInfo {
+// TNStoreInfo contains information on a TN store.
+message TNStoreInfo {
   uint64 Tick                 = 1;
   string ServiceAddress       = 2;
-  repeated DNShardInfo Shards = 3 [(gogoproto.nullable) = false];
+  repeated TNShardInfo Shards = 3 [(gogoproto.nullable) = false];
 
   bool TaskServiceCreated = 4;
 
@@ -422,32 +579,59 @@ message DNStoreInfo {
   string LogtailServerAddress = 5;
   // LockServiceAddress lock service address for lock table allocator
   string LockServiceAddress = 6;
+  reserved 7;
+  ConfigData ConfigData = 8;
+  // QueryAddress is the address of queryservice on tn
+  string          QueryAddress       = 9;
+  string  ShardServiceAddress   = 10;
 }
 
-// DNState contains all DN details known to the HAKeeper.
-message DNState {
-  // Stores is keyed by DN store UUID.
-  map<string, DNStoreInfo> Stores = 1 [(gogoproto.nullable) = false];
+// TNState contains all TN details known to the HAKeeper.
+message TNState {
+  // Stores is keyed by TN store UUID.
+  map<string, TNStoreInfo> Stores = 1 [(gogoproto.nullable) = false];
 }
+
+message ProxyStore {
+  string UUID = 1;
+  uint64 Tick = 2;
+  string ListenAddress = 3;
+  ConfigData ConfigData = 4;
+}
+
+message ProxyState {
+  map<string, ProxyStore> Stores = 1 [(gogoproto.nullable) = false];
+}
+
+message ProxyHeartbeat {
+  string UUID = 1;
+  string ListenAddress = 2;
+  ConfigData ConfigData = 3;
+};
 
 message ClusterDetails {
-  repeated DNStore  DNStores    = 1 [(gogoproto.nullable) = false];
+  repeated TNStore  TNStores    = 1 [(gogoproto.nullable) = false];
   repeated CNStore  CNStores    = 2 [(gogoproto.nullable) = false];
   repeated LogStore LogStores   = 3 [(gogoproto.nullable) = false];
+  repeated ProxyStore ProxyStores = 4 [(gogoproto.nullable) = false];
+  repeated DeletedStore DeletedStores = 5 [(gogoproto.nullable) = false];
 }
 
 // ClusterInfo provides a global view of all shards in the cluster. It
 // describes the logical sharding of the system, rather than physical
 // distribution of all replicas that belong to those shards.
 message ClusterInfo {
-  repeated metadata.DNShardRecord DNShards = 1 [(gogoproto.nullable) = false];
+  repeated metadata.TNShardRecord TNShards = 1 [(gogoproto.nullable) = false];
   repeated metadata.LogShardRecord LogShards = 2 [(gogoproto.nullable) = false];
 }
 
 message InitialClusterRequest {
   uint64 NumOfLogShards   = 1;
-  uint64 NumOfDNShards    = 2;
+  uint64 NumOfTNShards    = 2;
   uint64 NumOfLogReplicas = 3;
+  uint64 NextID           = 4;
+  map<string, uint64> NextIDByKey = 5;
+  map<string, string> NonVotingLocality = 6;
 }
 
 // LogStoreInfo contains information of all replicas found on a Log store.
@@ -459,6 +643,8 @@ message LogStoreInfo {
   repeated LogReplicaInfo Replicas = 5 [(gogoproto.nullable) = false];
 
   bool TaskServiceCreated = 6;
+  ConfigData ConfigData = 7;
+  Locality Locality = 8 [(gogoproto.nullable) = false];
 }
 
 message LogState {
@@ -478,31 +664,60 @@ message LogState {
 message CheckerState {
   uint64 Tick             = 1;
   ClusterInfo ClusterInfo = 2 [(gogoproto.nullable) = false];
-  DNState DNState         = 3 [(gogoproto.nullable) = false];
+  TNState TNState         = 3 [(gogoproto.nullable) = false];
   LogState LogState       = 4 [(gogoproto.nullable) = false];
   CNState CNState         = 5 [(gogoproto.nullable) = false];
   HAKeeperState State     = 6;
   TaskSchedulerState TaskSchedulerState = 7;
   TaskTableUser TaskTableUser           = 8 [(gogoproto.nullable) = false];
+  uint64 NextId                         = 9;
+  map<string, uint64> NextIDByKey       = 10;
+  ProxyState ProxyState = 11 [(gogoproto.nullable) = false];
+  Resource Resource = 12 [(gogoproto.nullable) = false];
+  uint64 NonVotingReplicaNum = 13;
+  Locality NonVotingLocality = 14 [(gogoproto.nullable) = false];
+}
+
+message DeletedStore {
+  string UUID = 1;
+  // StoreType indicates the type of the store: CN, TN or proxy.
+  string StoreType = 2;
+  string Address = 3;
+  int64 UpTime = 4;
+  int64 DownTime = 5;
 }
 
 // HAKeeperRSMState contains state maintained by HAKeeper's RSM.
 message HAKeeperRSMState {
-  uint64 Tick                                = 1;
+  uint64 Index                               = 1;
+  uint64 Tick                                = 2;
   // NextID is a shared, global ID.
-  uint64 NextID                              = 2;
+  uint64 NextID                              = 3;
   // NextIDByKey is IDs isolated by keys.
-  map<string, uint64> NextIDByKey            = 3;
-  uint64 Term                                = 4;
-  HAKeeperState State                        = 5;
-  TaskSchedulerState TaskSchedulerState      = 6;
-  map<string, CommandBatch> ScheduleCommands = 7 [(gogoproto.nullable) = false];
-  map<string, uint64> LogShards = 8;
-  CNState CNState               = 9  [(gogoproto.nullable) = false];
-  DNState DNState               = 10 [(gogoproto.nullable) = false];
-  LogState LogState             = 11 [(gogoproto.nullable) = false];
-  ClusterInfo ClusterInfo       = 12 [(gogoproto.nullable) = false];
-  TaskTableUser TaskTableUser   = 13 [(gogoproto.nullable) = false];
+  map<string, uint64> NextIDByKey            = 4;
+  uint64 Term                                = 5;
+  HAKeeperState State                        = 6;
+  TaskSchedulerState TaskSchedulerState      = 7;
+  map<string, CommandBatch> ScheduleCommands = 8 [(gogoproto.nullable) = false];
+  map<string, uint64> LogShards = 9;
+  CNState CNState               = 10  [(gogoproto.nullable) = false];
+  TNState TNState               = 11 [(gogoproto.nullable) = false];
+  LogState LogState             = 12 [(gogoproto.nullable) = false];
+  ClusterInfo ClusterInfo       = 13 [(gogoproto.nullable) = false];
+  TaskTableUser TaskTableUser   = 14 [(gogoproto.nullable) = false];
+  ProxyState ProxyState         = 15 [(gogoproto.nullable) = false];
+  repeated DeletedStore DeletedStores = 16 [(gogoproto.nullable) = false];
+  // NonVotingReplicaNum is the number of non-voting replicas in all shards.
+  // The default value is 0 means there are no non-voting replicas by default.
+  // When set it to non-zero, we will check whether there are enough logservice
+  // stores for the extra non-voting replicas. If not, an error will return
+  // to client setting, and if there are enough stores, hakeeper will choose
+  // the property stores to start the replicas.
+  uint64 NonVotingReplicaNum = 17;
+  // NonVotingLocality is the locality information of non-voting replicas.
+  // If it is set, that is strongly recommended, the non-voting replicas will
+  // be scheduled to the stores which has such localities.
+  Locality NonVotingLocality = 18 [(gogoproto.nullable) = false];
 }
 
 // ReplicaInfo contains details of a replica
@@ -518,4 +733,40 @@ message ShardInfoQueryResult {
   uint64 Epoch                      = 3;
   uint64 LeaderID                   = 4;
   uint64 Term                       = 5;
+}
+
+// BackupData is the information that needs to backup, including NextID and
+// NextIDByKey in HAKeeperRSMState.
+message BackupData {
+  // NextID is a shared, global ID.
+  uint64 NextID                   = 1;
+  // NextIDByKey is IDs isolated by keys.
+  map<string, uint64> NextIDByKey = 2;
+}
+
+message ConfigItem{
+  // Name is the name of config item
+  string Name = 1;
+  // CurrentValue is the current value of config item
+  string CurrentValue = 2;
+  // DefaultValue is the default value of config item
+  string DefaultValue = 3;
+  // Internal denotes the config item is internal or not
+  string Internal = 4;
+}
+
+// ConfigData is the content of config on cn,tn,log and proxy
+message ConfigData{
+  // Content is the key value of the config
+  map<string, ConfigItem> Content = 1;
+}
+
+// Locality defines the locality information of a logservice store.
+message Locality {
+  // Value is the locality content.
+  map<string, string> Value = 1;
+}
+
+message CheckHealth {
+  uint64 ShardID = 1;
 }

@@ -1,0 +1,18 @@
+name:  MO Checkin Regression On TKE
+
+on:
+  pull_request_target:
+    branches: [ main,'[0-9]+.[0-9]+*' ]
+    types:
+      - closed
+    paths:
+      - '**.go'
+      - '**.c'
+      - '**.h'
+      - 'test/distributed/**'
+
+jobs:
+  mo-checkin-regression:
+    name: MO Checkin Regression On TKE
+    uses: matrixorigin/CI/.github/workflows/merge-trigger-tke.yaml@main
+    secrets: inherit

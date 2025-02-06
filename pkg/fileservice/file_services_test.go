@@ -15,6 +15,7 @@
 package fileservice
 
 import (
+	"context"
 	"testing"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -23,9 +24,10 @@ import (
 
 func TestFileServices(t *testing.T) {
 	t.Run("file service", func(t *testing.T) {
-		testFileService(t, func(name string) FileService {
+		testFileService(t, 0, func(name string) FileService {
+			ctx := context.Background()
 			dir := t.TempDir()
-			fs, err := NewLocalFS(name, dir, 0, nil)
+			fs, err := NewLocalFS(ctx, name, dir, DisabledCacheConfig, nil)
 			assert.Nil(t, err)
 			fs2, err := NewFileServices(name, fs)
 			assert.Nil(t, err)
@@ -35,9 +37,9 @@ func TestFileServices(t *testing.T) {
 }
 
 func TestFileServicesNameCaseInsensitive(t *testing.T) {
-	fs1, err := NewMemoryFS("foo")
+	fs1, err := NewMemoryFS("foo", DisabledCacheConfig, nil)
 	assert.Nil(t, err)
-	fs2, err := NewMemoryFS("FOO")
+	fs2, err := NewMemoryFS("FOO", DisabledCacheConfig, nil)
 	assert.Nil(t, err)
 	_, err = NewFileServices(fs1.Name(), fs1, fs2)
 	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrDupServiceName))

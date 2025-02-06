@@ -19,16 +19,16 @@ import (
 	"time"
 
 	"github.com/lni/dragonboat/v4"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestGetShardInfo(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
+		testServiceAddress := s.cfg.LogServiceServiceAddr()
 		done := false
 		for i := 0; i < 1000; i++ {
-			si, ok, err := GetShardInfo(testServiceAddress, 1)
+			si, ok, err := GetShardInfo("", testServiceAddress, 1)
 			if err != nil || !ok {
 				time.Sleep(10 * time.Millisecond)
 				continue
@@ -45,7 +45,7 @@ func TestGetShardInfo(t *testing.T) {
 		if !done {
 			t.Fatalf("failed to get shard info")
 		}
-		_, ok, err := GetShardInfo(testServiceAddress, 2)
+		_, ok, err := GetShardInfo("", testServiceAddress, 2)
 		require.Equal(t, dragonboat.ErrShardNotFound, err)
 		assert.False(t, ok)
 	}

@@ -15,12 +15,12 @@
 package store
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 
 	"github.com/RoaringBitmap/roaring"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
 )
 
@@ -46,14 +46,14 @@ func (info *partialCkpInfo) IsAllCheckpointed() bool {
 
 func (info *partialCkpInfo) MergePartialCkpInfo(o *partialCkpInfo) {
 	if info.size != o.size {
-		panic(moerr.NewInternalErrorNoCtx("logic error %d != %d", info.size, o.size))
+		panic(moerr.NewInternalErrorNoCtxf("logic error %d != %d", info.size, o.size))
 	}
 	info.ckps.Or(o.ckps)
 }
 
 func (info *partialCkpInfo) MergeCommandInfos(cmds *entry.CommandInfo) {
 	if info.size != cmds.Size {
-		panic(moerr.NewInternalErrorNoCtx("logic error %d != %d", info.size, cmds.Size))
+		panic(moerr.NewInternalErrorNoCtxf("logic error %d != %d", info.size, cmds.Size))
 	}
 	for _, csn := range cmds.CommandIds {
 		info.ckps.Add(csn)
@@ -61,7 +61,7 @@ func (info *partialCkpInfo) MergeCommandInfos(cmds *entry.CommandInfo) {
 }
 
 func (info *partialCkpInfo) WriteTo(w io.Writer) (n int64, err error) {
-	if err = binary.Write(w, binary.BigEndian, info.size); err != nil {
+	if _, err = w.Write(types.EncodeUint32(&info.size)); err != nil {
 		return
 	}
 	n += 4
@@ -74,7 +74,7 @@ func (info *partialCkpInfo) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 func (info *partialCkpInfo) ReadFrom(r io.Reader) (n int64, err error) {
-	if err = binary.Read(r, binary.BigEndian, &info.size); err != nil {
+	if _, err = r.Read(types.EncodeUint32(&info.size)); err != nil {
 		return
 	}
 	n += 4

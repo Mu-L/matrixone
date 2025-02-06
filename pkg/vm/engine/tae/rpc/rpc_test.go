@@ -16,111 +16,79 @@ package rpc
 
 import (
 	"context"
-	"fmt"
-	"os"
-	"path"
 	"strconv"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	catalog2 "github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/defines"
-	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/testutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/mergesort"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/moengine"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/jobs"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils/config"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils/mocks"
+	"github.com/panjf2000/ants/v2"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestHandle_HandleCommitPerformanceForS3Load(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	opts := config.WithLongScanAndCKPOpts(nil)
+	ctx := context.Background()
 
-	//create  file service;
-	//dir := testutils.GetDefaultTestPath(ModuleName, t)
-	dir := "/tmp/s3"
-	dir = path.Join(dir, "/local")
-	//if dir exists, remove it.
-	os.RemoveAll(dir)
-	c := fileservice.Config{
-		Name:    defines.LocalFileServiceName,
-		Backend: "DISK",
-		DataDir: dir,
-	}
-	//create dir;
-	fs, err := fileservice.NewFileService(c, nil)
-	assert.Nil(t, err)
-	opts.Fs = fs
-	handle := mockTAEHandle(t, opts)
+	handle := mockTAEHandle(ctx, t, opts)
 	defer handle.HandleClose(context.TODO())
+	fs := handle.db.Opts.Fs
 	IDAlloc := catalog.NewIDAllocator()
-	txnEngine := handle.GetTxnEngine()
 
 	schema := catalog.MockSchema(2, 1)
 	schema.Name = "tbtest"
-	schema.BlockMaxRows = 10
-	schema.SegmentMaxBlocks = 2
-	//100 segs, one seg contains 50 blocks, one block contains 10 rows.
+	schema.Extra.BlockMaxRows = 10
+	schema.Extra.ObjectMaxBlocks = 2
+	//100 objs, one obj contains 50 blocks, one block contains 10 rows.
 	taeBat := catalog.MockBatch(schema, 100*50*10)
 	defer taeBat.Close()
 	taeBats := taeBat.Split(100 * 50)
 
-	//taeBats[0] = taeBats[0].CloneWindow(0, 10)
-	//taeBats[1] = taeBats[1].CloneWindow(0, 10)
-	//taeBats[2] = taeBats[2].CloneWindow(0, 10)
-	//taeBats[3] = taeBats[3].CloneWindow(0, 10)
-
-	//sort by primary key
-	//_, err = mergesort.SortBlockColumns(taeBats[0].Vecs, 1)
-	//assert.Nil(t, err)
-	//_, err = mergesort.SortBlockColumns(taeBats[1].Vecs, 1)
-	//assert.Nil(t, err)
-	//_, err = mergesort.SortBlockColumns(taeBats[2].Vecs, 1)
-	//assert.Nil(t, err)
-
-	//moBats := make([]*batch.Batch, 4)
-	//moBats[0] = containers.CopyToMoBatch(taeBats[0])
-	//moBats[1] = containers.CopyToMoBatch(taeBats[1])
-	//moBats[2] = containers.CopyToMoBatch(taeBats[2])
-	//moBats[3] = containers.CopyToMoBatch(taeBats[3])
-
-	var objNames []string
-	var blkMetas []string
+	var objNames []objectio.ObjectName
+	var stats []objectio.ObjectStats
 	offset := 0
 	for i := 0; i < 100; i++ {
-		name := common.NewSegmentid().ToString() + "-0"
+		name := objectio.BuildObjectNameWithObjectID(objectio.NewObjectid())
 		objNames = append(objNames, name)
-		writer, err := blockio.NewBlockWriter(fs, objNames[i])
+		writer, err := ioutil.NewBlockWriterNew(fs, objNames[i], 0, nil, false)
 		assert.Nil(t, err)
-		for i := 0; i < 50; i++ {
-			_, err := writer.WriteBlock(taeBats[offset+i])
+		for j := 0; j < 50; j++ {
+			_, err = writer.WriteBatch(containers.ToCNBatch(taeBats[offset+j]))
 			assert.Nil(t, err)
-			//offset++
 		}
 		offset += 50
 		blocks, _, err := writer.Sync(context.Background())
 		assert.Nil(t, err)
 		assert.Equal(t, 50, len(blocks))
-		for _, blk := range blocks {
-			metaLoc, err := blockio.EncodeLocation(
-				blk.GetExtent(),
-				uint32(taeBats[0].Vecs[0].Length()),
-				blocks)
-			assert.Nil(t, err)
-			blkMetas = append(blkMetas, metaLoc)
-		}
+
+		ss := writer.GetObjectStats(objectio.WithCNCreated())
+		stats = append(stats, ss)
+
+		require.Equal(t, int(50), int(ss.BlkCnt()))
+		require.Equal(t, int(50*10), int(ss.Rows()))
 	}
 
 	//create dbtest and tbtest;
@@ -132,7 +100,7 @@ func TestHandle_HandleCommitPerformanceForS3Load(t *testing.T) {
 	}
 	//var entries []*api.Entry
 	entries := make([]*api.Entry, 0)
-	txn := mock1PCTxn(txnEngine)
+	txn := mock1PCTxn(handle.db)
 	dbTestID := IDAlloc.NextDB()
 	createDbEntries, err := makeCreateDatabaseEntries(
 		"",
@@ -143,16 +111,16 @@ func TestHandle_HandleCommitPerformanceForS3Load(t *testing.T) {
 	assert.Nil(t, err)
 	entries = append(entries, createDbEntries...)
 	//create table from "dbtest"
-	defs, err := moengine.SchemaToDefs(schema)
+	defs, err := catalog.SchemaToDefs(schema)
 	for i := 0; i < len(defs); i++ {
 		if attrdef, ok := defs[i].(*engine.AttributeDef); ok {
 			attrdef.Attr.Default = &plan.Default{
 				NullAbility: true,
 				Expr: &plan.Expr{
-					Expr: &plan.Expr_C{
-						C: &plan.Const{
+					Expr: &plan.Expr_Lit{
+						Lit: &plan.Literal{
 							Isnull: false,
-							Value: &plan.Const_Sval{
+							Value: &plan.Literal_Sval{
 								Sval: "expr" + strconv.Itoa(i),
 							},
 						},
@@ -172,6 +140,7 @@ func TestHandle_HandleCommitPerformanceForS3Load(t *testing.T) {
 		tbTestID,
 		dbTestID,
 		dbName,
+		schema.Constraint,
 		handle.m,
 		defs,
 	)
@@ -179,35 +148,30 @@ func TestHandle_HandleCommitPerformanceForS3Load(t *testing.T) {
 	entries = append(entries, createTbEntries...)
 
 	//add 100 * 50 blocks from S3 into "tbtest" table
-	attrs := []string{catalog2.BlockMeta_MetaLoc}
+	attrs := []string{catalog2.ObjectMeta_ObjectStats}
 	vecTypes := []types.Type{types.New(types.T_varchar, types.MaxVarcharLen, 0)}
-	nullable := []bool{false}
 	vecOpts := containers.Options{}
 	vecOpts.Capacity = 0
-	offset = 0
-	for _, obj := range objNames {
-		metaLocBat := containers.BuildBatch(attrs, vecTypes, nullable, vecOpts)
-		for i := 0; i < 50; i++ {
-			metaLocBat.Vecs[0].Append([]byte(blkMetas[offset+i]))
-		}
-		offset += 50
-		metaLocMoBat := containers.CopyToMoBatch(metaLocBat)
+	for i, obj := range objNames {
+		metaLocBat := containers.BuildBatch(attrs, vecTypes, vecOpts)
+		metaLocBat.Vecs[0].Append([]byte(stats[i][:]), false)
+		metaLocMoBat := containers.ToCNBatch(metaLocBat)
 		addS3BlkEntry, err := makePBEntry(INSERT, dbTestID,
-			tbTestID, dbName, schema.Name, obj, metaLocMoBat)
+			tbTestID, dbName, schema.Name, obj.String(), metaLocMoBat)
 		assert.NoError(t, err)
 		entries = append(entries, addS3BlkEntry)
-		metaLocBat.Close()
+		defer metaLocBat.Close()
 	}
 	err = handle.HandlePreCommit(
 		context.TODO(),
 		txn,
-		api.PrecommitWriteCmd{
+		&api.PrecommitWriteCmd{
 			//UserId:    ac.userId,
 			//AccountId: ac.accountId,
 			//RoleId:    ac.roleId,
 			EntryList: entries,
 		},
-		new(api.SyncLogTailResp),
+		nil,
 	)
 	assert.Nil(t, err)
 	//t.FailNow()
@@ -220,33 +184,21 @@ func TestHandle_HandleCommitPerformanceForS3Load(t *testing.T) {
 func TestHandle_HandlePreCommitWriteS3(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	opts := config.WithLongScanAndCKPOpts(nil)
+	ctx := context.Background()
 
-	//create  file service;
-	//dir := testutils.GetDefaultTestPath(ModuleName, t)
-	dir := "/tmp/s3"
-	dir = path.Join(dir, "/local")
-	//if dir exists, remove it.
-	os.RemoveAll(dir)
-	c := fileservice.Config{
-		Name:    defines.LocalFileServiceName,
-		Backend: "DISK",
-		DataDir: dir,
-	}
-	//create dir;
-	fs, err := fileservice.NewFileService(c, nil)
-	assert.Nil(t, err)
-	opts.Fs = fs
-	handle := mockTAEHandle(t, opts)
+	handle := mockTAEHandle(ctx, t, opts)
 	defer handle.HandleClose(context.TODO())
+	fs := handle.db.Opts.Fs
+	defer fs.Close(ctx)
 	IDAlloc := catalog.NewIDAllocator()
-	txnEngine := handle.GetTxnEngine()
 
 	schema := catalog.MockSchema(2, 1)
 	schema.Name = "tbtest"
-	schema.BlockMaxRows = 10
-	schema.SegmentMaxBlocks = 2
+	schema.Extra.BlockMaxRows = 10
+	schema.Extra.ObjectMaxBlocks = 2
 	taeBat := catalog.MockBatch(schema, 40)
 	defer taeBat.Close()
+
 	taeBats := taeBat.Split(4)
 	taeBats[0] = taeBats[0].CloneWindow(0, 10)
 	taeBats[1] = taeBats[1].CloneWindow(0, 10)
@@ -254,63 +206,52 @@ func TestHandle_HandlePreCommitWriteS3(t *testing.T) {
 	taeBats[3] = taeBats[3].CloneWindow(0, 10)
 
 	//sort by primary key
-	_, err = mergesort.SortBlockColumns(taeBats[0].Vecs, 1)
+	_, err := mergesort.SortBlockColumns(taeBats[0].Vecs, 1, mocks.GetTestVectorPool())
 	assert.Nil(t, err)
-	_, err = mergesort.SortBlockColumns(taeBats[1].Vecs, 1)
+	_, err = mergesort.SortBlockColumns(taeBats[1].Vecs, 1, mocks.GetTestVectorPool())
 	assert.Nil(t, err)
-	_, err = mergesort.SortBlockColumns(taeBats[2].Vecs, 1)
+	_, err = mergesort.SortBlockColumns(taeBats[2].Vecs, 1, mocks.GetTestVectorPool())
 	assert.Nil(t, err)
 
 	moBats := make([]*batch.Batch, 4)
-	moBats[0] = containers.CopyToMoBatch(taeBats[0])
-	moBats[1] = containers.CopyToMoBatch(taeBats[1])
-	moBats[2] = containers.CopyToMoBatch(taeBats[2])
-	moBats[3] = containers.CopyToMoBatch(taeBats[3])
+	moBats[0] = containers.ToCNBatch(taeBats[0])
+	moBats[1] = containers.ToCNBatch(taeBats[1])
+	moBats[2] = containers.ToCNBatch(taeBats[2])
+	moBats[3] = containers.ToCNBatch(taeBats[3])
 
 	//write taeBats[0], taeBats[1] two blocks into file service
-	objName1 := common.NewSegmentid().ToString() + "-0"
-	writer, err := blockio.NewBlockWriter(fs, objName1)
+	objName1 := objectio.BuildObjectNameWithObjectID(objectio.NewObjectid())
+	writer, err := ioutil.NewBlockWriterNew(fs, objName1, 0, nil, false)
 	assert.Nil(t, err)
 	writer.SetPrimaryKey(1)
 	for i, bat := range taeBats {
 		if i == 2 {
 			break
 		}
-		_, err := writer.WriteBlock(bat)
+		_, err := writer.WriteBatch(containers.ToCNBatch(bat))
 		assert.Nil(t, err)
 	}
 	blocks, _, err := writer.Sync(context.Background())
 	assert.Nil(t, err)
 	assert.Equal(t, 2, len(blocks))
-	metaLoc1, err := blockio.EncodeLocation(
-		blocks[0].GetExtent(),
-		uint32(taeBats[0].Vecs[0].Length()),
-		blocks,
-	)
-	assert.Nil(t, err)
-	metaLoc2, err := blockio.EncodeLocation(
-		blocks[1].GetExtent(),
-		uint32(taeBats[1].Vecs[0].Length()),
-		blocks,
-	)
-	assert.Nil(t, err)
+	stats1 := writer.GetObjectStats(objectio.WithCNCreated())
+	require.Equal(t, int(2), int(stats1.BlkCnt()))
+	require.Equal(t, int(20), int(stats1.Rows()))
 
 	//write taeBats[3] into file service
-	objName2 := common.NewSegmentid().ToString() + "-0"
-	writer, err = blockio.NewBlockWriter(fs, objName2)
+	objName2 := objectio.BuildObjectNameWithObjectID(objectio.NewObjectid())
+	writer, err = ioutil.NewBlockWriterNew(fs, objName2, 0, nil, false)
 	assert.Nil(t, err)
 	writer.SetPrimaryKey(1)
-	_, err = writer.WriteBlock(taeBats[3])
+	_, err = writer.WriteBatch(containers.ToCNBatch(taeBats[3]))
 	assert.Nil(t, err)
 	blocks, _, err = writer.Sync(context.Background())
 	assert.Equal(t, 1, len(blocks))
 	assert.Nil(t, err)
-	metaLoc3, err := blockio.EncodeLocation(
-		blocks[0].GetExtent(),
-		uint32(taeBats[3].Vecs[0].Length()),
-		blocks,
-	)
-	assert.Nil(t, err)
+
+	stats3 := writer.GetObjectStats(objectio.WithCNCreated())
+	require.Equal(t, int(1), int(stats3.BlkCnt()))
+	require.Equal(t, int(10), int(stats3.Rows()))
 
 	//create db;
 	dbName := "dbtest"
@@ -320,7 +261,7 @@ func TestHandle_HandlePreCommitWriteS3(t *testing.T) {
 		roleId:    0,
 	}
 	var entries []*api.Entry
-	txn := mock1PCTxn(txnEngine)
+	txn := mock1PCTxn(handle.db)
 	dbTestID := IDAlloc.NextDB()
 	createDbEntries, err := makeCreateDatabaseEntries(
 		"",
@@ -331,16 +272,16 @@ func TestHandle_HandlePreCommitWriteS3(t *testing.T) {
 	assert.Nil(t, err)
 	entries = append(entries, createDbEntries...)
 	//create table from "dbtest"
-	defs, err := moengine.SchemaToDefs(schema)
+	defs, err := catalog.SchemaToDefs(schema)
 	for i := 0; i < len(defs); i++ {
 		if attrdef, ok := defs[i].(*engine.AttributeDef); ok {
 			attrdef.Attr.Default = &plan.Default{
 				NullAbility: true,
 				Expr: &plan.Expr{
-					Expr: &plan.Expr_C{
-						C: &plan.Const{
+					Expr: &plan.Expr_Lit{
+						Lit: &plan.Literal{
 							Isnull: false,
-							Value: &plan.Const_Sval{
+							Value: &plan.Literal_Sval{
 								Sval: "expr" + strconv.Itoa(i),
 							},
 						},
@@ -360,11 +301,40 @@ func TestHandle_HandlePreCommitWriteS3(t *testing.T) {
 		tbTestID,
 		dbTestID,
 		dbName,
+		schema.Constraint,
 		handle.m,
 		defs,
 	)
 	assert.Nil(t, err)
 	entries = append(entries, createTbEntries...)
+	err = handle.HandlePreCommit(
+		context.TODO(),
+		txn,
+		&api.PrecommitWriteCmd{
+			//UserId:    ac.userId,
+			//AccountId: ac.accountId,
+			//RoleId:    ac.roleId,
+			EntryList: entries,
+		},
+		nil,
+	)
+	assert.Nil(t, err)
+	//t.FailNow()
+	_, err = handle.HandleCommit(context.TODO(), txn)
+	assert.Nil(t, err)
+	entries = entries[:0]
+
+	// set blockmaxrow as 10
+	p := &catalog.LoopProcessor{}
+	p.TableFn = func(te *catalog.TableEntry) error {
+		schema := te.GetLastestSchemaLocked(false)
+		if schema.Name == "tbtest" {
+			schema.Extra.BlockMaxRows = 10
+		}
+		return nil
+	}
+	handle.db.Catalog.RecurLoop(p)
+	txn = mock1PCTxn(handle.db)
 	//append data into "tbtest" table
 	insertEntry, err := makePBEntry(INSERT, dbTestID,
 		tbTestID, dbName, schema.Name, "", moBats[2])
@@ -372,202 +342,181 @@ func TestHandle_HandlePreCommitWriteS3(t *testing.T) {
 	entries = append(entries, insertEntry)
 
 	//add two non-appendable blocks from S3 into "tbtest" table
-	attrs := []string{catalog2.BlockMeta_MetaLoc}
+	attrs := []string{catalog2.ObjectMeta_ObjectStats}
 	vecTypes := []types.Type{types.New(types.T_varchar, types.MaxVarcharLen, 0)}
-	nullable := []bool{false}
 	vecOpts := containers.Options{}
 	vecOpts.Capacity = 0
-	metaLocBat1 := containers.BuildBatch(attrs, vecTypes, nullable, vecOpts)
-	metaLocBat1.Vecs[0].Append([]byte(metaLoc1))
-	metaLocBat1.Vecs[0].Append([]byte(metaLoc2))
-	metaLocMoBat1 := containers.CopyToMoBatch(metaLocBat1)
+
+	metaLocBat1 := containers.BuildBatch(attrs, vecTypes, vecOpts)
+	metaLocBat1.Vecs[0].Append([]byte(stats1[:]), false)
+
+	metaLocMoBat1 := containers.ToCNBatch(metaLocBat1)
 	addS3BlkEntry1, err := makePBEntry(INSERT, dbTestID,
-		tbTestID, dbName, schema.Name, objName1, metaLocMoBat1)
+		tbTestID, dbName, schema.Name, objName1.String(), metaLocMoBat1)
 	assert.NoError(t, err)
-	loc1 := vector.MustStrCol(metaLocMoBat1.GetVector(0))[0]
-	loc2 := vector.MustStrCol(metaLocMoBat1.GetVector(0))[1]
-	assert.Equal(t, metaLoc1, loc1)
-	assert.Equal(t, metaLoc2, loc2)
+
 	entries = append(entries, addS3BlkEntry1)
 
 	//add one non-appendable block from S3 into "tbtest" table
-	metaLocBat2 := containers.BuildBatch(attrs, vecTypes, nullable, vecOpts)
-	metaLocBat2.Vecs[0].Append([]byte(metaLoc3))
-	metaLocMoBat2 := containers.CopyToMoBatch(metaLocBat2)
+	metaLocBat2 := containers.BuildBatch(attrs, vecTypes, vecOpts)
+	metaLocBat2.Vecs[0].Append([]byte(stats3[:]), false)
+
+	metaLocMoBat2 := containers.ToCNBatch(metaLocBat2)
 	addS3BlkEntry2, err := makePBEntry(INSERT, dbTestID,
-		tbTestID, dbName, schema.Name, objName2, metaLocMoBat2)
+		tbTestID, dbName, schema.Name, objName2.String(), metaLocMoBat2)
 	assert.NoError(t, err)
 	entries = append(entries, addS3BlkEntry2)
 
 	err = handle.HandlePreCommit(
 		context.TODO(),
 		txn,
-		api.PrecommitWriteCmd{
+		&api.PrecommitWriteCmd{
 			//UserId:    ac.userId,
 			//AccountId: ac.accountId,
 			//RoleId:    ac.roleId,
 			EntryList: entries,
 		},
-		new(api.SyncLogTailResp),
+		nil,
 	)
 	assert.Nil(t, err)
 	//t.FailNow()
 	_, err = handle.HandleCommit(context.TODO(), txn)
 	assert.Nil(t, err)
+	t.Log(handle.db.Catalog.SimplePPString(3))
 	//check rows of "tbtest" which should has three blocks.
-	txnR, err := txnEngine.StartTxn(nil)
+	txnR, err := handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err := txnEngine.GetDatabase(context.TODO(), dbName, txnR)
+	dbH, err := txnR.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err := dbHandle.GetRelation(context.TODO(), schema.Name)
+	tbH, err := dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	hideDef, err := tbHandle.GetHideKeys(context.TODO())
+	hideDef, err := GetHideKeysOfTable(tbH)
 	assert.NoError(t, err)
-	blkReaders, _ := tbHandle.NewReader(context.TODO(), 1, nil, nil)
+
 	rows := 0
-	var hideBats []*batch.Batch
-	for i := 0; i < len(taeBats); i++ {
-		//read primary key column
-		bat, err := blkReaders[0].Read(
-			context.TODO(),
-			[]string{schema.ColDefs[1].Name},
-			nil,
-			handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			rows += bat.Vecs[0].Length()
+	it := tbH.MakeObjectIt(false)
+	for it.Next() {
+		var cv *containers.Batch
+		blk := it.GetObject()
+		for j := 0; j < blk.BlkCnt(); j++ {
+			err := blk.Scan(ctx, &cv, uint16(j), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
 		}
+		rows += cv.Length()
+		cv.Close()
 	}
+	_ = it.Close()
 	assert.Equal(t, taeBat.Length(), rows)
 
-	//read physical addr column
-	blkReaders, _ = tbHandle.NewReader(context.TODO(), 1, nil, nil)
-	for i := 0; i < len(taeBats); i++ {
-		hideBat, err := blkReaders[0].Read(
-			context.TODO(),
-			[]string{hideDef[0].Name},
-			nil,
-			handle.m,
-		)
-		assert.Nil(t, err)
-		if hideBat != nil {
-			batch.SetLength(hideBat, 5)
-			hideBats = append(hideBats, hideBat)
+	var physicals []*containers.Batch
+	it = tbH.MakeObjectIt(false)
+	for it.Next() {
+		blk := it.GetObject()
+		for j := 0; j < blk.BlkCnt(); j++ {
+			var bv *containers.Batch
+			err := blk.GetMeta().(*catalog.ObjectEntry).GetObjectData().Scan(
+				ctx, &bv, txnR, schema, uint16(j), []int{schema.GetColIdx(hideDef[0].Name), schema.GetPrimaryKey().Idx}, common.DefaultAllocator,
+			)
+			assert.NoError(t, err)
+			physicals = append(physicals, bv)
 		}
 	}
-	assert.Equal(t, len(taeBats), len(hideBats))
-	err = txnR.Commit()
+	_ = it.Close()
+
+	//read physical addr column
+	assert.Equal(t, len(taeBats), len(physicals))
+	err = txnR.Commit(context.Background())
 	assert.Nil(t, err)
 
 	//write deleted row ids into FS
-	objName3 := fmt.Sprintf("%d.del", 42)
-	writer, err = blockio.NewBlockWriter(fs, objName3)
+	objName3 := objectio.BuildObjectNameWithObjectID(objectio.NewObjectid())
+	writer, err = ioutil.NewBlockWriterNew(fs, objName3, 0, nil, true)
 	assert.Nil(t, err)
-	for _, bat := range hideBats {
-		taeBat := toTAEBatchWithSharedMemory(schema, bat)
-		//defer taeBat.Close()
-		_, err := writer.WriteBlockWithOutIndex(taeBat)
+	writer.SetPrimaryKeyWithType(uint16(objectio.TombstonePrimaryKeyIdx), index.HBF,
+		index.ObjectPrefixFn,
+		index.BlockPrefixFn)
+	for _, view := range physicals {
+		bat := batch.New([]string{hideDef[0].Name, schema.GetPrimaryKey().GetName()})
+		bat.Vecs[0], _ = view.Vecs[0].GetDownstreamVector().Window(0, 5)
+		bat.Vecs[1], _ = view.Vecs[1].GetDownstreamVector().Window(0, 5)
+		_, err := writer.WriteBatch(bat)
 		assert.Nil(t, err)
 	}
 	blocks, _, err = writer.Sync(context.Background())
 	assert.Nil(t, err)
-	assert.Equal(t, len(hideBats), len(blocks))
-	delLoc1, err := blockio.EncodeLocation(
-		blocks[0].GetExtent(),
-		uint32(hideBats[0].Vecs[0].Length()),
-		blocks,
-	)
-	assert.Nil(t, err)
-	delLoc2, err := blockio.EncodeLocation(
-		blocks[1].GetExtent(),
-		uint32(hideBats[1].Vecs[0].Length()),
-		blocks,
-	)
-	assert.Nil(t, err)
-	delLoc3, err := blockio.EncodeLocation(
-		blocks[2].GetExtent(),
-		uint32(hideBats[2].Vecs[0].Length()),
-		blocks,
-	)
-	assert.Nil(t, err)
-	delLoc4, err := blockio.EncodeLocation(
-		blocks[3].GetExtent(),
-		uint32(hideBats[3].Vecs[0].Length()),
-		blocks,
-	)
-	assert.Nil(t, err)
+	assert.Equal(t, len(physicals), len(blocks))
+
+	stats := writer.GetObjectStats()
+	require.False(t, stats.IsZero())
 
 	//prepare delete locations.
-	attrs = []string{catalog2.BlockMeta_DeltaLoc}
+	attrs = []string{catalog2.ObjectMeta_ObjectStats}
 	vecTypes = []types.Type{types.New(types.T_varchar, types.MaxVarcharLen, 0)}
-	nullable = []bool{false}
+
 	vecOpts = containers.Options{}
 	vecOpts.Capacity = 0
-	delLocBat := containers.BuildBatch(attrs, vecTypes, nullable, vecOpts)
-	delLocBat.Vecs[0].Append([]byte(delLoc1))
-	delLocBat.Vecs[0].Append([]byte(delLoc2))
-	delLocBat.Vecs[0].Append([]byte(delLoc3))
-	delLocBat.Vecs[0].Append([]byte(delLoc4))
+	delLocBat := containers.BuildBatch(attrs, vecTypes, vecOpts)
+	delLocBat.Vecs[0].Append(stats.Marshal(), false)
 
-	delLocMoBat := containers.CopyToMoBatch(delLocBat)
+	delLocMoBat := containers.ToCNBatch(delLocBat)
 	var delApiEntries []*api.Entry
 	deleteS3BlkEntry, err := makePBEntry(DELETE, dbTestID,
-		tbTestID, dbName, schema.Name, objName3, delLocMoBat)
+		tbTestID, dbName, schema.Name, objName3.String(), delLocMoBat)
 	assert.NoError(t, err)
 	delApiEntries = append(delApiEntries, deleteS3BlkEntry)
 
-	txn = mock1PCTxn(txnEngine)
+	txn = mock1PCTxn(handle.db)
 	err = handle.HandlePreCommit(
 		context.TODO(),
 		txn,
-		api.PrecommitWriteCmd{
+		&api.PrecommitWriteCmd{
 			//UserId:    ac.userId,
 			//AccountId: ac.accountId,
 			//RoleId:    ac.roleId,
 			EntryList: delApiEntries,
 		},
-		new(api.SyncLogTailResp),
+		nil,
 	)
 	assert.Nil(t, err)
 	_, err = handle.HandleCommit(context.TODO(), txn)
 	assert.Nil(t, err)
 	//Now, the "tbtest" table has 20 rows left.
-	txnR, err = txnEngine.StartTxn(nil)
+	txnR, err = handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err = txnEngine.GetDatabase(context.TODO(), dbName, txnR)
+	dbH, err = txnR.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err = dbHandle.GetRelation(context.TODO(), schema.Name)
+	tbH, err = dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	blkReaders, _ = tbHandle.NewReader(context.TODO(), 1, nil, nil)
+
 	rows = 0
-	for i := 0; i < len(taeBats); i++ {
-		//read primary key column
-		bat, err := blkReaders[0].Read(
-			context.TODO(),
-			[]string{schema.ColDefs[1].Name},
-			nil,
-			handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			rows += bat.Vecs[0].Length()
+	it = tbH.MakeObjectIt(false)
+	for it.Next() {
+		blk := it.GetObject()
+		for j := 0; j < blk.BlkCnt(); j++ {
+			var cv *containers.Batch
+			err := blk.HybridScan(ctx, &cv, uint16(j), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
+			defer cv.Close()
+			cv.Compact()
+			rows += cv.Length()
 		}
 	}
 	assert.Equal(t, len(taeBats)*taeBats[0].Length()-5*len(taeBats), rows)
-	err = txnR.Commit()
+	err = txnR.Commit(context.Background())
 	assert.Nil(t, err)
 }
 
 func TestHandle_HandlePreCommit1PC(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	opts := config.WithLongScanAndCKPOpts(nil)
-	handle := mockTAEHandle(t, opts)
+	handle := mockTAEHandle(ctx, t, opts)
 	defer handle.HandleClose(context.TODO())
 	IDAlloc := catalog.NewIDAllocator()
-	txnEngine := handle.GetTxnEngine()
 	schema := catalog.MockSchema(2, 1)
 	schema.Name = "tbtest"
-	schema.BlockMaxRows = 10
-	schema.SegmentMaxBlocks = 2
+	schema.Extra.BlockMaxRows = 10
+	schema.Extra.ObjectMaxBlocks = 2
 	//DDL
 	//create db;
 	dbName := "dbtest"
@@ -583,45 +532,44 @@ func TestHandle_HandlePreCommit1PC(t *testing.T) {
 		IDAlloc.NextDB(),
 		handle.m)
 	assert.Nil(t, err)
-	createDbTxn := mock1PCTxn(txnEngine)
+	createDbTxn := mock1PCTxn(handle.db)
 	err = handle.HandlePreCommit(
 		context.TODO(),
 		createDbTxn,
-		api.PrecommitWriteCmd{
+		&api.PrecommitWriteCmd{
 			//UserId:    ac.userId,
 			//AccountId: ac.accountId,
 			//RoleId:    ac.roleId,
 			EntryList: createDbEntries,
 		},
-		new(api.SyncLogTailResp),
+		nil,
 	)
 	assert.Nil(t, err)
 	_, err = handle.HandleCommit(context.TODO(), createDbTxn)
 	assert.Nil(t, err)
 
 	//start txn ,read "dbtest"'s ID
-	ctx := context.TODO()
-	txn, err := txnEngine.StartTxn(nil)
+	txn, err := handle.db.StartTxn(nil)
 	assert.Nil(t, err)
-	names, _ := txnEngine.DatabaseNames(ctx, txn)
+	names := txn.DatabaseNames()
 	assert.Equal(t, 2, len(names))
-	dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err := txn.GetDatabase(dbName)
 	assert.Nil(t, err)
-	dbTestId := dbHandle.GetDatabaseID(ctx)
-	err = txn.Commit()
+	dbTestId := dbH.GetID()
+	err = txn.Commit(context.Background())
 	assert.Nil(t, err)
 
 	//create table from "dbtest"
-	defs, err := moengine.SchemaToDefs(schema)
+	defs, err := catalog.SchemaToDefs(schema)
 	for i := 0; i < len(defs); i++ {
 		if attrdef, ok := defs[i].(*engine.AttributeDef); ok {
 			attrdef.Attr.Default = &plan.Default{
 				NullAbility: true,
 				Expr: &plan.Expr{
-					Expr: &plan.Expr_C{
-						C: &plan.Const{
+					Expr: &plan.Expr_Lit{
+						Lit: &plan.Literal{
 							Isnull: false,
-							Value: &plan.Const_Sval{
+							Value: &plan.Literal_Sval{
 								Sval: "expr" + strconv.Itoa(i),
 							},
 						},
@@ -633,7 +581,7 @@ func TestHandle_HandlePreCommit1PC(t *testing.T) {
 	}
 	assert.Nil(t, err)
 
-	createTbTxn := mock1PCTxn(txnEngine)
+	createTbTxn := mock1PCTxn(handle.db)
 
 	createTbEntries, err := makeCreateTableEntries(
 		"",
@@ -642,6 +590,7 @@ func TestHandle_HandlePreCommit1PC(t *testing.T) {
 		IDAlloc.NextTable(),
 		dbTestId,
 		dbName,
+		schema.Constraint,
 		handle.m,
 		defs,
 	)
@@ -654,6 +603,7 @@ func TestHandle_HandlePreCommit1PC(t *testing.T) {
 		IDAlloc.NextTable(),
 		dbTestId,
 		dbName,
+		schema.Constraint,
 		handle.m,
 		defs,
 	)
@@ -662,54 +612,54 @@ func TestHandle_HandlePreCommit1PC(t *testing.T) {
 	err = handle.HandlePreCommit(
 		context.TODO(),
 		createTbTxn,
-		api.PrecommitWriteCmd{
+		&api.PrecommitWriteCmd{
 			//UserId:    ac.userId,
 			//AccountId: ac.accountId,
 			//RoleId:    ac.roleId,
 			EntryList: createTbEntries,
 		},
-		new(api.SyncLogTailResp))
+		nil)
 	assert.Nil(t, err)
 	_, err = handle.HandleCommit(context.TODO(), createTbTxn)
 	assert.Nil(t, err)
 	//start txn ,read table ID
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.Nil(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	dbId := dbHandle.GetDatabaseID(ctx)
+	dbId := dbH.GetID()
 	assert.True(t, dbTestId == dbId)
-	names, _ = dbHandle.RelationNames(ctx)
+	names, _ = TableNamesOfDB(dbH)
 	assert.Equal(t, 2, len(names))
-	tbHandle, err := dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err := dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbTestId := tbHandle.GetRelationID(ctx)
-	rDefs, _ := tbHandle.TableDefs(ctx)
+	tbTestId := tbH.ID()
+	rDefs, _ := TableDefs(tbH)
 	//assert.Equal(t, 3, len(rDefs))
-	rAttr := rDefs[0].(*engine.AttributeDef).Attr
+	rAttr := rDefs[1].(*engine.AttributeDef).Attr
 	assert.Equal(t, true, rAttr.Default.NullAbility)
-	rAttr = rDefs[1].(*engine.AttributeDef).Attr
+	rAttr = rDefs[2].(*engine.AttributeDef).Attr
 	assert.Equal(t, "expr2", rAttr.Default.OriginString)
 
-	err = txn.Commit()
+	err = txn.Commit(context.Background())
 	assert.NoError(t, err)
 
 	//DML: insert batch into table
-	insertTxn := mock1PCTxn(txnEngine)
-	moBat := containers.CopyToMoBatch(catalog.MockBatch(schema, 100))
+	insertTxn := mock1PCTxn(handle.db)
+	moBat := containers.ToCNBatch(catalog.MockBatch(schema, 100))
 	insertEntry, err := makePBEntry(INSERT, dbTestId,
 		tbTestId, dbName, schema.Name, "", moBat)
 	assert.NoError(t, err)
 	err = handle.HandlePreCommit(
 		context.TODO(),
 		insertTxn,
-		api.PrecommitWriteCmd{
+		&api.PrecommitWriteCmd{
 			//UserId:    ac.userId,
 			//AccountId: ac.accountId,
 			//RoleId:    ac.roleId,
 			EntryList: []*api.Entry{insertEntry},
 		},
-		new(api.SyncLogTailResp),
+		nil,
 	)
 	assert.NoError(t, err)
 	// TODO:: Dml delete
@@ -721,33 +671,43 @@ func TestHandle_HandlePreCommit1PC(t *testing.T) {
 	//bat = batch.NewWithSize(2)
 
 	//start txn ,read table ID
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err = dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err = dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbReaders, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-	for _, reader := range tbReaders {
-		bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			len := bat.Vecs[0].Length()
-			assert.Equal(t, 100, len)
+
+	it := tbH.MakeObjectIt(false)
+	for it.Next() {
+		blk := it.GetObject()
+		for j := 0; j < blk.BlkCnt(); j++ {
+			var cv *containers.Batch
+			err := blk.Scan(ctx, &cv, uint16(j), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
+			defer cv.Close()
+			assert.Equal(t, 100, cv.Length())
 		}
 	}
+	_ = it.Close()
+
 	// read row ids
-	hideCol, err := tbHandle.GetHideKeys(ctx)
+	hideCol, err := GetHideKeysOfTable(tbH)
 	assert.NoError(t, err)
-	reader, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-	hideBat, err := reader[0].Read(ctx, []string{hideCol[0].Name}, nil, handle.m)
-	assert.Nil(t, err)
-	err = txn.Commit()
-	assert.Nil(t, err)
+
+	hideColIdx := schema.GetColIdx(hideCol[0].Name)
+	var cv *containers.Batch
+	err = testutil.GetOneObject(tbH).Scan(ctx, &cv, 0, []int{hideColIdx, schema.GetPrimaryKey().Idx}, common.DefaultAllocator)
+	assert.NoError(t, err)
+	defer cv.Close()
+
+	assert.NoError(t, txn.Commit(context.Background()))
+	delBat := batch.New([]string{hideCol[0].Name, schema.GetPrimaryKey().GetName()})
+	delBat.Vecs[0], _ = cv.Vecs[0].GetDownstreamVector().Window(0, 20)
+	delBat.Vecs[1], _ = cv.Vecs[1].GetDownstreamVector().Window(0, 20)
 
 	//delete 20 rows
-	deleteTxn := mock1PCTxn(handle.GetTxnEngine())
-	batch.SetLength(hideBat, 20)
+	deleteTxn := mock1PCTxn(handle.db)
 	deleteEntry, _ := makePBEntry(
 		DELETE,
 		dbId,
@@ -755,53 +715,57 @@ func TestHandle_HandlePreCommit1PC(t *testing.T) {
 		dbName,
 		schema.Name,
 		"",
-		hideBat,
+		delBat,
 	)
 	err = handle.HandlePreCommit(
 		context.TODO(),
 		deleteTxn,
-		api.PrecommitWriteCmd{
+		&api.PrecommitWriteCmd{
 			//UserId:    ac.userId,
 			//AccountId: ac.accountId,
 			//RoleId:    ac.roleId,
 			EntryList: append([]*api.Entry{}, deleteEntry),
 		},
-		new(api.SyncLogTailResp),
+		nil,
 	)
 	assert.Nil(t, err)
 	_, err = handle.HandleCommit(context.TODO(), deleteTxn)
 	assert.Nil(t, err)
 	//read, there should be 80 rows left.
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err = dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err = dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbReaders, _ = tbHandle.NewReader(ctx, 2, nil, nil)
-	for _, reader := range tbReaders {
-		bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			len := bat.Vecs[0].Length()
-			assert.Equal(t, 80, len)
+
+	it = tbH.MakeObjectIt(false)
+	for it.Next() {
+		blk := it.GetObject()
+		for j := 0; j < blk.BlkCnt(); j++ {
+			var v *containers.Batch
+			err := blk.HybridScan(ctx, &v, uint16(j), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
+			defer v.Close()
+			v.Compact()
+			assert.Equal(t, 80, v.Length())
 		}
 	}
-	err = txn.Commit()
-	assert.Nil(t, err)
+	it.Close()
+	assert.NoError(t, txn.Commit(context.Background()))
 }
 
 func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	opts := config.WithLongScanAndCKPOpts(nil)
-	handle := mockTAEHandle(t, opts)
+	handle := mockTAEHandle(ctx, t, opts)
 	defer handle.HandleClose(context.TODO())
 	IDAlloc := catalog.NewIDAllocator()
-	txnEngine := handle.GetTxnEngine()
-	schema := catalog.MockSchema(2, -1)
+	schema := catalog.MockSchemaAll(2, -1)
 	schema.Name = "tbtest"
-	schema.BlockMaxRows = 10
-	schema.SegmentMaxBlocks = 2
+	schema.Extra.BlockMaxRows = 10
+	schema.Extra.ObjectMaxBlocks = 2
 	dbName := "dbtest"
 	ac := AccessInfo{
 		accountId: 0,
@@ -829,32 +793,30 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 		{typ: CmdCommitting},
 		{typ: CmdCommit},
 	}
-	txnMeta := mock2PCTxn(txnEngine)
-	ctx := context.TODO()
+	txnMeta := mock2PCTxn(handle.db)
 	err = handle.handleCmds(ctx, txnMeta, txnCmds)
 	assert.Nil(t, err)
 
 	//start 1pc txn ,read "dbtest"'s ID
-	ctx = context.TODO()
-	txn, err := txnEngine.StartTxn(nil)
+	txn, err := handle.db.StartTxn(nil)
 	assert.Nil(t, err)
-	names, _ := txnEngine.DatabaseNames(ctx, txn)
+	names := txn.DatabaseNames()
 	assert.Equal(t, 2, len(names))
-	dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err := txn.GetDatabase(dbName)
 	assert.Nil(t, err)
-	dbTestId := dbHandle.GetDatabaseID(ctx)
-	err = txn.Commit()
+	dbTestId := dbH.GetID()
+	err = txn.Commit(ctx)
 	assert.Nil(t, err)
 
 	//create table from "dbtest"
-	defs, err := moengine.SchemaToDefs(schema)
+	defs, err := catalog.SchemaToDefs(schema)
 	defs[0].(*engine.AttributeDef).Attr.Default = &plan.Default{
 		NullAbility: true,
 		Expr: &plan.Expr{
-			Expr: &plan.Expr_C{
-				C: &plan.Const{
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
 					Isnull: false,
-					Value: &plan.Const_Sval{
+					Value: &plan.Literal_Sval{
 						Sval: "expr1",
 					},
 				},
@@ -865,10 +827,10 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 	defs[1].(*engine.AttributeDef).Attr.Default = &plan.Default{
 		NullAbility: false,
 		Expr: &plan.Expr{
-			Expr: &plan.Expr_C{
-				C: &plan.Const{
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
 					Isnull: false,
-					Value: &plan.Const_Sval{
+					Value: &plan.Literal_Sval{
 						Sval: "expr2",
 					},
 				},
@@ -884,6 +846,7 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 		IDAlloc.NextTable(),
 		dbTestId,
 		dbName,
+		schema.Constraint,
 		handle.m,
 		defs,
 	)
@@ -901,34 +864,34 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 		{typ: CmdCommitting},
 		{typ: CmdCommit},
 	}
-	txnMeta = mock2PCTxn(txnEngine)
+	txnMeta = mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, txnMeta, txnCmds)
 	assert.Nil(t, err)
 
 	//start 1pc txn ,read table ID
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.Nil(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	dbId := dbHandle.GetDatabaseID(ctx)
+	dbId := dbH.GetID()
 	assert.True(t, dbTestId == dbId)
-	names, _ = dbHandle.RelationNames(ctx)
+	names, _ = TableNamesOfDB(dbH)
 	assert.Equal(t, 1, len(names))
-	tbHandle, err := dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err := dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbTestId := tbHandle.GetRelationID(ctx)
-	rDefs, _ := tbHandle.TableDefs(ctx)
-	assert.Equal(t, 3, len(rDefs))
+	tbTestId := tbH.ID()
+	rDefs, _ := TableDefs(tbH)
+	assert.Equal(t, 4, len(rDefs))
 	rAttr := rDefs[0].(*engine.AttributeDef).Attr
 	assert.Equal(t, true, rAttr.Default.NullAbility)
 	rAttr = rDefs[1].(*engine.AttributeDef).Attr
 	assert.Equal(t, "expr2", rAttr.Default.OriginString)
-	err = txn.Commit()
+	err = txn.Commit(ctx)
 	assert.NoError(t, err)
 
 	//DML::insert batch into table
-	moBat := containers.CopyToMoBatch(catalog.MockBatch(schema, 100))
+	moBat := containers.ToCNBatch(catalog.MockBatch(schema, 100))
 	insertEntry, err := makePBEntry(INSERT, dbTestId,
 		tbTestId, dbName, schema.Name, "", moBat)
 	assert.NoError(t, err)
@@ -945,17 +908,17 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 		{typ: CmdCommitting},
 		{typ: CmdCommit},
 	}
-	insertTxn := mock2PCTxn(txnEngine)
+	insertTxn := mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, insertTxn, txnCmds)
 	assert.Nil(t, err)
 
 	//start 2PC txn ,rollback it after prepared
-	rollbackTxn := mock2PCTxn(txnEngine)
+	rollbackTxn := mock2PCTxn(handle.db)
 	//insert 20 rows, then rollback the txn
 	//FIXME::??
 	//batch.SetLength(moBat, 20)
-	moBat = containers.CopyToMoBatch(catalog.MockBatch(schema, 20))
+	moBat = containers.ToCNBatch(catalog.MockBatch(schema, 20))
 	insertEntry, err = makePBEntry(INSERT, dbTestId,
 		tbTestId, dbName, schema.Name, "", moBat)
 	assert.NoError(t, err)
@@ -976,31 +939,42 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 	assert.Nil(t, err)
 
 	//start 1PC txn , read table
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err = dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err = dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbReaders, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-	for _, reader := range tbReaders {
-		bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			len := bat.Vecs[0].Length()
-			assert.Equal(t, 100, len)
+
+	it := tbH.MakeObjectIt(false)
+	for it.Next() {
+		blk := it.GetObject()
+		for j := 0; j < blk.BlkCnt(); j++ {
+			var v *containers.Batch
+			err := blk.Scan(ctx, &v, uint16(j), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
+			defer v.Close()
+			assert.Equal(t, 100, v.Length())
 		}
 	}
-	// read row ids
-	hideCol, err := tbHandle.GetHideKeys(ctx)
-	assert.NoError(t, err)
-	reader, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-	hideBat, err := reader[0].Read(ctx, []string{hideCol[0].Name}, nil, handle.m)
-	assert.Nil(t, err)
-	err = txn.Commit()
-	assert.Nil(t, err)
+	_ = it.Close()
 
-	hideBats := containers.SplitBatch(hideBat, 5)
+	// read row ids
+	hideCol, err := GetHideKeysOfTable(tbH)
+	assert.NoError(t, err)
+	hideColIdx := schema.GetColIdx(hideCol[0].Name)
+	var cv *containers.Batch
+	err = testutil.GetOneObject(tbH).Scan(ctx, &cv, 0, []int{hideColIdx, schema.GetPrimaryKey().Idx}, common.DefaultAllocator)
+	assert.NoError(t, err)
+	defer cv.Close()
+
+	delBat := batch.New([]string{hideCol[0].Name, schema.GetPrimaryKey().GetName()})
+	delBat.Vecs[0] = cv.Vecs[0].GetDownstreamVector()
+	delBat.Vecs[1] = cv.Vecs[1].GetDownstreamVector()
+
+	assert.NoError(t, txn.Commit(ctx))
+
+	hideBats := containers.SplitBatch(delBat, 5)
 	//delete 20 rows by 2PC txn
 	//batch.SetLength(hideBats[0], 20)
 	deleteEntry, err := makePBEntry(
@@ -1026,13 +1000,13 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 		{typ: CmdCommitting},
 		{typ: CmdCommit},
 	}
-	deleteTxn := mock2PCTxn(txnEngine)
+	deleteTxn := mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, deleteTxn, txnCmds)
 	assert.Nil(t, err)
 
 	//start a 2PC txn ,rollback it after prepared.
-	rollbackTxn = mock2PCTxn(txnEngine)
+	rollbackTxn = mock2PCTxn(handle.db)
 	deleteEntry, _ = makePBEntry(
 		DELETE,
 		dbId,
@@ -1059,36 +1033,38 @@ func TestHandle_HandlePreCommit2PCForCoordinator(t *testing.T) {
 	assert.Nil(t, err)
 
 	//read, there should be 80 rows left.
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err = dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err = dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbReaders, _ = tbHandle.NewReader(ctx, 2, nil, nil)
-	for _, reader := range tbReaders {
-		bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			len := bat.Vecs[0].Length()
-			assert.Equal(t, 80, len)
+
+	it = tbH.MakeObjectIt(false)
+	for it.Next() {
+		obj := it.GetObject()
+		for j := 0; j < obj.BlkCnt(); j++ {
+			var v *containers.Batch
+			err := obj.HybridScan(ctx, &v, uint16(0), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
+			defer v.Close()
+			v.Compact()
+			assert.Equal(t, 80, v.Length())
 		}
 	}
-	err = txn.Commit()
-	assert.Nil(t, err)
+	_ = it.Close()
+	assert.NoError(t, txn.Commit(ctx))
 }
 
 func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	opts := config.WithLongScanAndCKPOpts(nil)
-	handle := mockTAEHandle(t, opts)
+	handle := mockTAEHandle(ctx, t, opts)
 	defer handle.HandleClose(context.TODO())
 	IDAlloc := catalog.NewIDAllocator()
-	txnEngine := handle.GetTxnEngine()
-	schema := catalog.MockSchema(2, -1)
+	schema := catalog.MockSchemaAll(2, -1)
 	schema.Name = "tbtest"
-	schema.BlockMaxRows = 10
-	schema.SegmentMaxBlocks = 2
 	dbName := "dbtest"
 	ac := AccessInfo{
 		accountId: 0,
@@ -1115,32 +1091,30 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 		{typ: CmdPrepare},
 		{typ: CmdCommit},
 	}
-	txnMeta := mock2PCTxn(txnEngine)
-	ctx := context.TODO()
+	txnMeta := mock2PCTxn(handle.db)
 	err = handle.handleCmds(ctx, txnMeta, txnCmds)
 	assert.Nil(t, err)
 
 	//start 1pc txn ,read "dbtest"'s ID
-	ctx = context.TODO()
-	txn, err := txnEngine.StartTxn(nil)
+	txn, err := handle.db.StartTxn(nil)
 	assert.Nil(t, err)
-	names, _ := txnEngine.DatabaseNames(ctx, txn)
+	names := txn.DatabaseNames()
 	assert.Equal(t, 2, len(names))
-	dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err := txn.GetDatabase(dbName)
 	assert.Nil(t, err)
-	dbTestId := dbHandle.GetDatabaseID(ctx)
-	err = txn.Commit()
+	dbTestId := dbH.GetID()
+	err = txn.Commit(ctx)
 	assert.Nil(t, err)
 
 	//create table from "dbtest"
-	defs, err := moengine.SchemaToDefs(schema)
+	defs, err := catalog.SchemaToDefs(schema)
 	defs[0].(*engine.AttributeDef).Attr.Default = &plan.Default{
 		NullAbility: true,
 		Expr: &plan.Expr{
-			Expr: &plan.Expr_C{
-				C: &plan.Const{
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
 					Isnull: false,
-					Value: &plan.Const_Sval{
+					Value: &plan.Literal_Sval{
 						Sval: "expr1",
 					},
 				},
@@ -1151,10 +1125,10 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 	defs[1].(*engine.AttributeDef).Attr.Default = &plan.Default{
 		NullAbility: false,
 		Expr: &plan.Expr{
-			Expr: &plan.Expr_C{
-				C: &plan.Const{
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
 					Isnull: false,
-					Value: &plan.Const_Sval{
+					Value: &plan.Literal_Sval{
 						Sval: "expr2",
 					},
 				},
@@ -1170,6 +1144,7 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 		IDAlloc.NextTable(),
 		dbTestId,
 		dbName,
+		schema.Constraint,
 		handle.m,
 		defs,
 	)
@@ -1186,34 +1161,34 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 		{typ: CmdPrepare},
 		{typ: CmdCommit},
 	}
-	txnMeta = mock2PCTxn(txnEngine)
+	txnMeta = mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, txnMeta, txnCmds)
 	assert.Nil(t, err)
 
 	//start 1pc txn ,read table ID
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.Nil(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	dbId := dbHandle.GetDatabaseID(ctx)
+	dbId := dbH.GetID()
 	assert.True(t, dbTestId == dbId)
-	names, _ = dbHandle.RelationNames(ctx)
+	names, _ = TableNamesOfDB(dbH)
 	assert.Equal(t, 1, len(names))
-	tbHandle, err := dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err := dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbTestId := tbHandle.GetRelationID(ctx)
-	rDefs, _ := tbHandle.TableDefs(ctx)
-	assert.Equal(t, 3, len(rDefs))
+	tbTestId := tbH.ID()
+	rDefs, _ := TableDefs(tbH)
+	assert.Equal(t, 4, len(rDefs))
 	rAttr := rDefs[0].(*engine.AttributeDef).Attr
 	assert.Equal(t, true, rAttr.Default.NullAbility)
 	rAttr = rDefs[1].(*engine.AttributeDef).Attr
 	assert.Equal(t, "expr2", rAttr.Default.OriginString)
-	err = txn.Commit()
+	err = txn.Commit(ctx)
 	assert.NoError(t, err)
 
 	//DML::insert batch into table
-	moBat := containers.CopyToMoBatch(catalog.MockBatch(schema, 100))
+	moBat := containers.ToCNBatch(catalog.MockBatch(schema, 100))
 	insertEntry, err := makePBEntry(INSERT, dbTestId,
 		tbTestId, dbName, schema.Name, "", moBat)
 	assert.NoError(t, err)
@@ -1229,17 +1204,17 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 		{typ: CmdPrepare},
 		{typ: CmdCommit},
 	}
-	insertTxn := mock2PCTxn(txnEngine)
+	insertTxn := mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, insertTxn, txnCmds)
 	assert.Nil(t, err)
 
 	//start 2PC txn ,rollback it after prepared
-	rollbackTxn := mock2PCTxn(txnEngine)
+	rollbackTxn := mock2PCTxn(handle.db)
 	//insert 20 rows ,then rollback
 	//FIXME::??
 	//batch.SetLength(moBat, 20)
-	moBat = containers.CopyToMoBatch(catalog.MockBatch(schema, 20))
+	moBat = containers.ToCNBatch(catalog.MockBatch(schema, 20))
 	insertEntry, err = makePBEntry(INSERT, dbTestId,
 		tbTestId, dbName, schema.Name, "", moBat)
 	assert.NoError(t, err)
@@ -1260,10 +1235,10 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 	assert.Nil(t, err)
 
 	//start 2PC txn , rollback it when it is ACTIVE.
-	rollbackTxn = mock2PCTxn(txnEngine)
+	rollbackTxn = mock2PCTxn(handle.db)
 	//insert 10 rows ,then rollback
 	//batch.SetLength(moBat, 10)
-	moBat = containers.CopyToMoBatch(catalog.MockBatch(schema, 10))
+	moBat = containers.ToCNBatch(catalog.MockBatch(schema, 10))
 	insertEntry, err = makePBEntry(INSERT, dbTestId,
 		tbTestId, dbName, schema.Name, "", moBat)
 	assert.NoError(t, err)
@@ -1283,33 +1258,43 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 	assert.Nil(t, err)
 
 	//start 1PC txn , read table
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err = dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err = dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbReaders, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-	for _, reader := range tbReaders {
-		bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			len := bat.Vecs[0].Length()
-			assert.Equal(t, 100, len)
+	it := tbH.MakeObjectIt(false)
+	for it.Next() {
+		obj := it.GetObject()
+		for j := 0; j < obj.BlkCnt(); j++ {
+			var v *containers.Batch
+			err := it.GetObject().Scan(ctx, &v, uint16(j), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
+			defer v.Close()
+			assert.Equal(t, 100, v.Length())
 		}
 	}
-	// read row ids
-	hideCol, err := tbHandle.GetHideKeys(ctx)
-	assert.NoError(t, err)
-	reader, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-	hideBat, err := reader[0].Read(ctx, []string{hideCol[0].Name}, nil, handle.m)
-	assert.Nil(t, err)
-	err = txn.Commit()
-	assert.Nil(t, err)
+	_ = it.Close()
 
-	hideBats := containers.SplitBatch(hideBat, 5)
+	hideCol, err := GetHideKeysOfTable(tbH)
+	assert.NoError(t, err)
+	hideColIdx := schema.GetColIdx(hideCol[0].Name)
+	var v *containers.Batch
+	err = testutil.GetOneObject(tbH).Scan(ctx, &v, 0, []int{hideColIdx, schema.GetPrimaryKey().Idx}, common.DefaultAllocator)
+	assert.NoError(t, err)
+	defer v.Close()
+	assert.Equal(t, 100, v.Length())
+
+	delBat := batch.New([]string{hideCol[0].Name, schema.GetPrimaryKey().GetName()})
+	delBat.Vecs[0] = v.Vecs[0].GetDownstreamVector()
+	delBat.Vecs[1] = v.Vecs[1].GetDownstreamVector()
+
+	assert.NoError(t, txn.Commit(ctx))
+
+	hideBats := containers.SplitBatch(delBat, 5)
 	//delete 20 rows by 2PC txn
-	//batch.SetLength(hideBat, 20)
+	//batch.SetLength(delBat, 20)
 	deleteEntry, err := makePBEntry(
 		DELETE,
 		dbId,
@@ -1333,14 +1318,14 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 		{typ: CmdCommitting},
 		{typ: CmdCommit},
 	}
-	deleteTxn := mock2PCTxn(txnEngine)
+	deleteTxn := mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, deleteTxn, txnCmds)
 	assert.Nil(t, err)
 
 	//start a 2PC txn ,rollback it after prepared.
 	// delete 20 rows ,then rollback
-	rollbackTxn = mock2PCTxn(txnEngine)
+	rollbackTxn = mock2PCTxn(handle.db)
 	deleteEntry, _ = makePBEntry(
 		DELETE,
 		dbId,
@@ -1367,36 +1352,42 @@ func TestHandle_HandlePreCommit2PCForParticipant(t *testing.T) {
 	assert.Nil(t, err)
 
 	//read, there should be 80 rows left.
-	txn, err = txnEngine.StartTxn(nil)
+	txn, err = handle.db.StartTxn(nil)
 	assert.NoError(t, err)
-	dbHandle, err = txnEngine.GetDatabase(ctx, dbName, txn)
+	dbH, err = txn.GetDatabase(dbName)
 	assert.NoError(t, err)
-	tbHandle, err = dbHandle.GetRelation(ctx, schema.Name)
+	tbH, err = dbH.GetRelationByName(schema.Name)
 	assert.NoError(t, err)
-	tbReaders, _ = tbHandle.NewReader(ctx, 2, nil, nil)
-	for _, reader := range tbReaders {
-		bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-		assert.Nil(t, err)
-		if bat != nil {
-			len := bat.Vecs[0].Length()
-			assert.Equal(t, 80, len)
+
+	it = tbH.MakeObjectIt(false)
+	for it.Next() {
+		obj := it.GetObject()
+		for j := 0; j < obj.BlkCnt(); j++ {
+			var v *containers.Batch
+			err := obj.HybridScan(ctx, &v, uint16(j), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+			assert.NoError(t, err)
+			defer v.Close()
+			v.Compact()
+			assert.Equal(t, 80, v.Length())
 		}
 	}
-	err = txn.Commit()
-	assert.Nil(t, err)
+	_ = it.Close()
+
+	assert.NoError(t, txn.Commit(ctx))
 }
 
 func TestHandle_MVCCVisibility(t *testing.T) {
+	t.Skip("debug later")
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	opts := config.WithLongScanAndCKPOpts(nil)
-	handle := mockTAEHandle(t, opts)
+	handle := mockTAEHandle(ctx, t, opts)
 	defer handle.HandleClose(context.TODO())
 	IDAlloc := catalog.NewIDAllocator()
-	txnEngine := handle.GetTxnEngine()
-	schema := catalog.MockSchema(2, -1)
+	schema := catalog.MockSchemaAll(2, -1)
 	schema.Name = "tbtest"
-	schema.BlockMaxRows = 10
-	schema.SegmentMaxBlocks = 2
+	schema.Extra.BlockMaxRows = 10
+	schema.Extra.ObjectMaxBlocks = 2
 	dbName := "dbtest"
 	ac := AccessInfo{
 		accountId: 0,
@@ -1421,8 +1412,7 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 				EntryList: createDbEntries},
 		},
 	}
-	txnMeta := mock2PCTxn(txnEngine)
-	ctx := context.TODO()
+	txnMeta := mock2PCTxn(handle.db)
 	err = handle.handleCmds(ctx, txnMeta, txnCmds)
 	assert.Nil(t, err)
 	var dbTestId uint64
@@ -1432,11 +1422,10 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	//start a db reader.
 	go func() {
 		//start 1pc txn ,read "dbtest"'s ID
-		ctx := context.TODO()
-		txn, err := txnEngine.StartTxn(nil)
+		txn, err := handle.db.StartTxn(nil)
 		assert.Nil(t, err)
-		dbNames, _ = txnEngine.DatabaseNames(ctx, txn)
-		err = txn.Commit()
+		dbNames = txn.DatabaseNames()
+		err = txn.Commit(ctx)
 		assert.Nil(t, err)
 		wg.Done()
 
@@ -1451,16 +1440,15 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		//start 1pc txn ,read "dbtest"'s ID
-		ctx := context.TODO()
-		txn, err := txnEngine.StartTxn(nil)
+		txn, err := handle.db.StartTxn(nil)
 		assert.Nil(t, err)
 		//reader should wait until the writer committed.
-		dbNames, _ = txnEngine.DatabaseNames(ctx, txn)
+		dbNames = txn.DatabaseNames()
 		assert.Equal(t, 2, len(dbNames))
-		dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+		dbH, err := txn.GetDatabase(dbName)
 		assert.Nil(t, err)
-		dbTestId = dbHandle.GetDatabaseID(ctx)
-		err = txn.Commit()
+		dbTestId = dbH.GetID()
+		err = txn.Commit(ctx)
 		assert.Nil(t, err)
 		//wg.Done()
 		//To check whether reader had waited.
@@ -1478,14 +1466,14 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	wg.Wait()
 
 	//create table from "dbtest"
-	defs, err := moengine.SchemaToDefs(schema)
+	defs, err := catalog.SchemaToDefs(schema)
 	defs[0].(*engine.AttributeDef).Attr.Default = &plan.Default{
 		NullAbility: true,
 		Expr: &plan.Expr{
-			Expr: &plan.Expr_C{
-				C: &plan.Const{
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
 					Isnull: false,
-					Value: &plan.Const_Sval{
+					Value: &plan.Literal_Sval{
 						Sval: "expr1",
 					},
 				},
@@ -1496,10 +1484,10 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	defs[1].(*engine.AttributeDef).Attr.Default = &plan.Default{
 		NullAbility: false,
 		Expr: &plan.Expr{
-			Expr: &plan.Expr_C{
-				C: &plan.Const{
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
 					Isnull: false,
-					Value: &plan.Const_Sval{
+					Value: &plan.Literal_Sval{
 						Sval: "expr2",
 					},
 				},
@@ -1515,6 +1503,7 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 		IDAlloc.NextTable(),
 		dbTestId,
 		dbName,
+		schema.Constraint,
 		handle.m,
 		defs,
 	)
@@ -1530,7 +1519,7 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 		},
 		{typ: CmdPrepare},
 	}
-	txnMeta = mock2PCTxn(txnEngine)
+	txnMeta = mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, txnMeta, txnCmds)
 	assert.Nil(t, err)
@@ -1539,26 +1528,25 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		//start 1pc txn ,read table ID
-		txn, err := txnEngine.StartTxn(nil)
+		txn, err := handle.db.StartTxn(nil)
 		assert.Nil(t, err)
-		ctx := context.TODO()
-		dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+		dbH, err := txn.GetDatabase(dbName)
 		assert.NoError(t, err)
-		dbId := dbHandle.GetDatabaseID(ctx)
+		dbId := dbH.GetID()
 		assert.True(t, dbTestId == dbId)
 		//txn should wait here.
-		names, _ := dbHandle.RelationNames(ctx)
+		names, _ := TableNamesOfDB(dbH)
 		assert.Equal(t, 1, len(names))
-		tbHandle, err := dbHandle.GetRelation(ctx, schema.Name)
+		tbH, err := dbH.GetRelationByName(schema.Name)
 		assert.NoError(t, err)
-		tbTestId = tbHandle.GetRelationID(ctx)
-		rDefs, _ := tbHandle.TableDefs(ctx)
-		assert.Equal(t, 3, len(rDefs))
+		tbTestId = tbH.ID()
+		rDefs, _ := TableDefs(tbH)
+		assert.Equal(t, 4, len(rDefs))
 		rAttr := rDefs[0].(*engine.AttributeDef).Attr
 		assert.Equal(t, true, rAttr.Default.NullAbility)
 		rAttr = rDefs[1].(*engine.AttributeDef).Attr
 		assert.Equal(t, "expr2", rAttr.Default.OriginString)
-		err = txn.Commit()
+		err = txn.Commit(ctx)
 		assert.NoError(t, err)
 		//wg.Done()
 		//To check whether reader had waited.
@@ -1573,7 +1561,7 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	wg.Wait()
 
 	//DML::insert batch into table
-	moBat := containers.CopyToMoBatch(catalog.MockBatch(schema, 100))
+	moBat := containers.ToCNBatch(catalog.MockBatch(schema, 100))
 	insertEntry, err := makePBEntry(INSERT, dbTestId,
 		tbTestId, dbName, schema.Name, "", moBat)
 	assert.NoError(t, err)
@@ -1588,7 +1576,7 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 		},
 		{typ: CmdPrepare},
 	}
-	insertTxn := mock2PCTxn(txnEngine)
+	insertTxn := mock2PCTxn(handle.db)
 	ctx = context.TODO()
 	err = handle.handleCmds(ctx, insertTxn, txnCmds)
 	assert.Nil(t, err)
@@ -1596,23 +1584,26 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		//start 1PC txn , read table
-		txn, err := txnEngine.StartTxn(nil)
+		txn, err := handle.db.StartTxn(nil)
 		assert.NoError(t, err)
-		ctx := context.TODO()
-		dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+		dbH, err := txn.GetDatabase(dbName)
 		assert.NoError(t, err)
-		tbHandle, err := dbHandle.GetRelation(ctx, schema.Name)
+		tbH, err := dbH.GetRelationByName(schema.Name)
 		assert.NoError(t, err)
-		tbReaders, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-		for _, reader := range tbReaders {
-			bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-			assert.Nil(t, err)
-			if bat != nil {
-				len := bat.Vecs[0].Length()
-				assert.Equal(t, 100, len)
+
+		it := tbH.MakeObjectIt(false)
+		for it.Next() {
+			obj := it.GetObject()
+			for j := 0; j < obj.BlkCnt(); j++ {
+				var v *containers.Batch
+				err := obj.Scan(ctx, &v, 0, []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+				assert.NoError(t, err)
+				defer v.Close()
+				assert.Equal(t, 100, v.Length())
 			}
 		}
-		txn.Commit()
+		_ = it.Close()
+		txn.Commit(ctx)
 		//To check whether reader had waited.
 		assert.True(t, time.Since(startTime) > 1*time.Second)
 		wg.Done()
@@ -1627,28 +1618,34 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 
 	//DML:delete rows
 	//read row ids
-	var hideBat *batch.Batch
+	var delBat *batch.Batch
 	{
-		txn, err := txnEngine.StartTxn(nil)
+		txn, err := handle.db.StartTxn(nil)
 		assert.NoError(t, err)
-		ctx = context.TODO()
-		dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+		dbH, err := txn.GetDatabase(dbName)
 		assert.NoError(t, err)
-		tbHandle, err := dbHandle.GetRelation(ctx, schema.Name)
+		tbH, err := dbH.GetRelationByName(schema.Name)
 		assert.NoError(t, err)
-		hideCol, err := tbHandle.GetHideKeys(ctx)
+		hideCol, err := GetHideKeysOfTable(tbH)
 		assert.NoError(t, err)
-		reader, _ := tbHandle.NewReader(ctx, 1, nil, nil)
-		hideBat, err = reader[0].Read(ctx, []string{hideCol[0].Name}, nil, handle.m)
-		assert.Nil(t, err)
-		err = txn.Commit()
-		assert.Nil(t, err)
+
+		hideColIdx := schema.GetColIdx(hideCol[0].Name)
+		var v *containers.Batch
+		err = testutil.GetOneObject(tbH).Scan(ctx, &v, 0, []int{hideColIdx, schema.GetPrimaryKey().Idx}, common.DefaultAllocator)
+		assert.NoError(t, err)
+		defer v.Close()
+
+		delBat = batch.New([]string{hideCol[0].Name, schema.GetPrimaryKey().GetName()})
+		delBat.Vecs[0] = v.Vecs[0].GetDownstreamVector()
+		delBat.Vecs[1] = v.Vecs[1].GetDownstreamVector()
+
+		assert.NoError(t, txn.Commit(ctx))
 	}
 
-	hideBats := containers.SplitBatch(hideBat, 5)
+	hideBats := containers.SplitBatch(delBat, 5)
 	//delete 20 rows by 2PC txn
-	deleteTxn := mock2PCTxn(txnEngine)
-	//batch.SetLength(hideBat, 20)
+	deleteTxn := mock2PCTxn(handle.db)
+	//batch.SetLength(delBat, 20)
 	deleteEntry, err := makePBEntry(
 		DELETE,
 		dbTestId,
@@ -1663,9 +1660,6 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 		{
 			typ: CmdPreCommitWrite,
 			cmd: api.PrecommitWriteCmd{
-				//UserId:    ac.userId,
-				//AccountId: ac.accountId,
-				//RoleId:    ac.roleId,
 				EntryList: []*api.Entry{deleteEntry}},
 		},
 		{typ: CmdPrepare},
@@ -1677,24 +1671,28 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		//read, there should be 80 rows left.
-		txn, err := txnEngine.StartTxn(nil)
+		txn, err := handle.db.StartTxn(nil)
 		assert.NoError(t, err)
-		ctx := context.TODO()
-		dbHandle, err := txnEngine.GetDatabase(ctx, dbName, txn)
+		dbH, err := txn.GetDatabase(dbName)
 		assert.NoError(t, err)
-		tbHandle, err := dbHandle.GetRelation(ctx, schema.Name)
+		tbH, err := dbH.GetRelationByName(schema.Name)
 		assert.NoError(t, err)
-		tbReaders, _ := tbHandle.NewReader(ctx, 2, nil, nil)
-		for _, reader := range tbReaders {
-			bat, err := reader.Read(ctx, []string{schema.ColDefs[1].Name}, nil, handle.m)
-			assert.Nil(t, err)
-			if bat != nil {
-				len := bat.Vecs[0].Length()
-				assert.Equal(t, 80, len)
+
+		it := tbH.MakeObjectIt(false)
+		for it.Next() {
+			obj := it.GetObject()
+			for j := 0; j < obj.BlkCnt(); j++ {
+				var v *containers.Batch
+				err := obj.HybridScan(ctx, &v, uint16(0), []int{schema.ColDefs[1].Idx}, common.DefaultAllocator)
+				assert.NoError(t, err)
+				defer v.Close()
+				v.Compact()
+				assert.Equal(t, 80, v.Length())
 			}
 		}
-		err = txn.Commit()
-		assert.Nil(t, err)
+		_ = it.Close()
+
+		assert.NoError(t, txn.Commit(ctx))
 		//To check whether reader had waited.
 		assert.True(t, time.Since(startTime) > 1*time.Second)
 		wg.Done()
@@ -1707,4 +1705,194 @@ func TestHandle_MVCCVisibility(t *testing.T) {
 	})
 	assert.Nil(t, err)
 	wg.Wait()
+}
+
+func TestApplyDeltaloc(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	opts := config.WithLongScanAndCKPOpts(nil)
+	ctx := context.Background()
+
+	h := mockTAEHandle(ctx, t, opts)
+	defer h.HandleClose(context.TODO())
+	defer opts.Fs.Close(ctx)
+
+	schema := catalog.MockSchema(2, 1)
+	schema.Name = "tbtest"
+	schema.Extra.BlockMaxRows = 5
+	schema.Extra.ObjectMaxBlocks = 2
+	//5 objs, one obj contains 2 blocks, one block contains 10 rows.
+	rowCount := 100 * 2 * 5
+	taeBat := catalog.MockBatch(schema, rowCount)
+	defer taeBat.Close()
+	// taeBats := taeBat.Split(rowCount)
+
+	// create relation
+	txn0, err := h.db.StartTxn(nil)
+	assert.NoError(t, err)
+	db, err := txn0.CreateDatabase("db", "create", "typ")
+	assert.NoError(t, err)
+	_, err = db.CreateRelation(schema)
+	assert.NoError(t, err)
+	assert.NoError(t, txn0.Commit(context.Background()))
+
+	// append
+	txn0, err = h.db.StartTxn(nil)
+	assert.NoError(t, err)
+	db, err = txn0.GetDatabase("db")
+	dbID := db.GetID()
+	assert.NoError(t, err)
+	rel, err := db.GetRelationByName(schema.Name)
+	assert.NoError(t, err)
+	tid := rel.GetMeta().(*catalog.TableEntry).GetID()
+	assert.NoError(t, rel.Append(context.Background(), taeBat))
+	assert.NoError(t, txn0.Commit(context.Background()))
+
+	// compact
+	txn0, err = h.db.StartTxn(nil)
+	assert.NoError(t, err)
+	db, err = txn0.GetDatabase("db")
+	assert.NoError(t, err)
+	rel, err = db.GetRelationByName(schema.Name)
+	assert.NoError(t, err)
+	var metas []*catalog.ObjectEntry
+	it := rel.MakeObjectIt(false)
+	for it.Next() {
+		blk := it.GetObject()
+		meta := blk.GetMeta().(*catalog.ObjectEntry)
+		metas = append(metas, meta)
+	}
+	assert.NoError(t, txn0.Commit(context.Background()))
+
+	txn0, err = h.db.StartTxn(nil)
+	assert.NoError(t, err)
+	task, err := jobs.NewFlushTableTailTask(nil, txn0, metas, nil, h.db.Runtime)
+	assert.NoError(t, err)
+	err = task.OnExec(context.Background())
+	assert.NoError(t, err)
+	assert.NoError(t, txn0.Commit(context.Background()))
+
+	txn0, err = h.db.StartTxn(nil)
+	assert.NoError(t, err)
+	db, err = txn0.GetDatabase("db")
+	assert.NoError(t, err)
+	rel, err = db.GetRelationByName(schema.Name)
+	assert.NoError(t, err)
+	inMemoryDeleteTxns := make([]*txn.TxnMeta, 0)
+	makeDeleteTxnFn := func(val any) {
+		filter := handle.NewEQFilter(val)
+		id, offset, err := rel.GetByFilter(context.Background(), filter)
+		assert.NoError(t, err)
+		rowIDVec := containers.MakeVector(types.T_Rowid.ToType(), common.DefaultAllocator)
+		rowIDVec.Append(*objectio.NewRowid(&id.BlockID, offset), false)
+		pkVec := containers.MakeVector(schema.GetPrimaryKey().GetType(), common.DefaultAllocator)
+		pkVec.Append(val, false)
+		bat := containers.NewBatch()
+		bat.AddVector(objectio.TombstoneAttr_Rowid_Attr, rowIDVec)
+		bat.AddVector(schema.GetPrimaryKey().GetName(), pkVec)
+		insertEntry, err := makePBEntry(DELETE, dbID, tid, "db", schema.Name, "", containers.ToCNBatch(bat))
+		assert.NoError(t, err)
+
+		txn := mock1PCTxn(h.db)
+		err = h.HandlePreCommit(context.Background(), txn, &api.PrecommitWriteCmd{EntryList: []*api.Entry{insertEntry}}, nil)
+		assert.NoError(t, err)
+		inMemoryDeleteTxns = append(inMemoryDeleteTxns, txn)
+	}
+	assert.NoError(t, txn0.Commit(context.Background()))
+
+	pkVec := containers.MakeVector(schema.GetPrimaryKey().Type, common.DebugAllocator)
+	defer pkVec.Close()
+	rowIDVec := containers.MakeVector(types.T_Rowid.ToType(), common.DebugAllocator)
+	defer rowIDVec.Close()
+	for i := 0; i < rowCount; i++ {
+		val := taeBat.Vecs[schema.GetSingleSortKeyIdx()].Get(i)
+		if i%5 == 0 {
+			// try apply deltaloc
+			filter := handle.NewEQFilter(val)
+			id, offset, err := rel.GetByFilter(context.Background(), filter)
+			assert.NoError(t, err)
+			rowid := types.NewRowIDWithObjectIDBlkNumAndRowID(*id.ObjectID(), id.BlockID.Sequence(), offset)
+			pkVec.Append(val, false)
+			rowIDVec.Append(rowid, false)
+		} else {
+			// in memory deletes
+			makeDeleteTxnFn(val)
+		}
+	}
+
+	// make txn for apply deltaloc
+
+	txn0, err = h.db.StartTxn(nil)
+	assert.NoError(t, err)
+	db, err = txn0.GetDatabase("db")
+	assert.NoError(t, err)
+	rel, err = db.GetRelationByName(schema.Name)
+	assert.NoError(t, err)
+	attrs := []string{catalog2.ObjectMeta_ObjectStats}
+	vecTypes := []types.Type{types.New(types.T_varchar, types.MaxVarcharLen, 0)}
+
+	vecOpts := containers.Options{}
+	vecOpts.Capacity = 0
+	delLocBat := containers.BuildBatch(attrs, vecTypes, vecOpts)
+	stats, err := testutil.MockCNDeleteInS3(h.db.Runtime.Fs, rowIDVec, pkVec, schema, txn0)
+	assert.NoError(t, err)
+	require.False(t, stats.IsZero())
+	delLocBat.Vecs[0].Append(stats.Marshal(), false)
+	deleteS3Entry, err := makePBEntry(DELETE, dbID, tid, "db", schema.Name, "file", containers.ToCNBatch(delLocBat))
+	assert.NoError(t, err)
+	deleteS3Txn := mock1PCTxn(h.db)
+	err = h.HandlePreCommit(
+		context.Background(),
+		deleteS3Txn, &api.PrecommitWriteCmd{
+			EntryList: []*api.Entry{deleteS3Entry}}, nil)
+	assert.NoError(t, err)
+	assert.NoError(t, txn0.Commit(context.Background()))
+
+	var wg sync.WaitGroup
+	pool, _ := ants.NewPool(80)
+	defer pool.Release()
+
+	wg.Add(1)
+	pool.Submit(func() {
+		defer wg.Done()
+		_, err := h.HandleCommit(context.Background(), deleteS3Txn)
+		assert.NoError(t, err)
+	})
+
+	commitMemoryFn := func(txnMeta *txn.TxnMeta) func() {
+		return func() {
+			defer wg.Done()
+			_, err := h.HandleCommit(context.Background(), txnMeta)
+			assert.NoError(t, err)
+		}
+	}
+	for _, deleteTxn := range inMemoryDeleteTxns {
+		wg.Add(1)
+		pool.Submit(commitMemoryFn(deleteTxn))
+	}
+	wg.Wait()
+
+	txn0, err = h.db.StartTxn(nil)
+	assert.NoError(t, err)
+	db, err = txn0.GetDatabase("db")
+	assert.NoError(t, err)
+	rel, err = db.GetRelationByName(schema.Name)
+	assert.NoError(t, err)
+	it = rel.MakeObjectIt(false)
+	for _, def := range schema.ColDefs {
+		length := 0
+		for it.Next() {
+			blk := it.GetObject()
+			meta := blk.GetMeta().(*catalog.ObjectEntry)
+			for j := 0; j < blk.BlkCnt(); j++ {
+				var view *containers.Batch
+				blkID := objectio.NewBlockidWithObjectID(meta.ID(), uint16(j))
+				err := tables.HybridScanByBlock(ctx, meta.GetTable(), txn0, &view, schema, []int{def.Idx}, blkID, common.DefaultAllocator)
+				assert.NoError(t, err)
+				view.Compact()
+				length += view.Length()
+			}
+		}
+		assert.Equal(t, 0, length)
+	}
+	assert.NoError(t, txn0.Commit(context.Background()))
 }

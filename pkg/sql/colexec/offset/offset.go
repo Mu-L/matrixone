@@ -19,48 +19,83 @@ import (
 	"fmt"
 
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(arg any, buf *bytes.Buffer) {
-	n := arg.(*Argument)
-	buf.WriteString(fmt.Sprintf("offset(%v)", n.Offset))
+const opName = "offset"
+
+func (offset *Offset) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(fmt.Sprintf("offset(%v)", offset.OffsetExpr))
 }
 
-func Prepare(_ *process.Process, _ any) error {
+func (offset *Offset) OpType() vm.OpType {
+	return vm.Offset
+}
+
+func (offset *Offset) Prepare(proc *process.Process) error {
+	var err error
+
+	if offset.OpAnalyzer == nil {
+		offset.OpAnalyzer = process.NewAnalyzer(offset.GetIdx(), offset.IsFirst, offset.IsLast, "offset")
+	} else {
+		offset.OpAnalyzer.Reset()
+	}
+
+	if offset.ctr.offsetExecutor == nil {
+		offset.ctr.offsetExecutor, err = colexec.NewExpressionExecutor(proc, offset.OffsetExpr)
+		if err != nil {
+			return err
+		}
+	}
+	vec, err := offset.ctr.offsetExecutor.Eval(proc, []*batch.Batch{batch.EmptyForConstFoldBatch}, nil)
+	if err != nil {
+		return err
+	}
+	offset.ctr.offset = uint64(vector.MustFixedColWithTypeCheck[uint64](vec)[0])
+
 	return nil
 }
 
-func Call(idx int, proc *process.Process, arg any, isFirst bool, isLast bool) (bool, error) {
-	bat := proc.InputBatch()
-	if bat == nil {
-		return true, nil
-	}
-	if bat.Length() == 0 {
-		return false, nil
-	}
-	ap := arg.(*Argument)
-	anal := proc.GetAnalyze(idx)
-	anal.Start()
-	defer anal.Stop()
-	anal.Input(bat, isFirst)
+func (offset *Offset) Call(proc *process.Process) (vm.CallResult, error) {
+	analyzer := offset.OpAnalyzer
 
-	if ap.Seen > ap.Offset {
-		return false, nil
+	for {
+		input, err := vm.ChildrenCall(offset.GetChildren(0), proc, analyzer)
+		if err != nil {
+			return vm.CancelResult, err
+		}
+		if input.Batch == nil || input.Batch.Last() {
+			return input, nil
+		}
+		if input.Batch.IsEmpty() {
+			continue
+		}
+		if offset.ctr.seen > offset.ctr.offset {
+			return input, nil
+		}
+
+		length := input.Batch.RowCount()
+		if offset.ctr.buf != nil {
+			offset.ctr.buf.CleanOnlyData()
+		}
+		if offset.ctr.seen+uint64(length) > offset.ctr.offset {
+			sels := newSels(int64(offset.ctr.offset-offset.ctr.seen), int64(length)-int64(offset.ctr.offset-offset.ctr.seen), proc)
+			offset.ctr.buf, err = offset.ctr.buf.AppendWithCopy(proc.Ctx, proc.GetMPool(), input.Batch)
+			if err != nil {
+				return vm.CancelResult, err
+			}
+			offset.ctr.buf.Shrink(sels, false)
+			proc.Mp().PutSels(sels)
+			offset.ctr.seen += uint64(length)
+
+			return vm.CallResult{Batch: offset.ctr.buf, Status: vm.ExecNext}, nil
+		}
+		offset.ctr.seen += uint64(length)
 	}
-	length := bat.Length()
-	if ap.Seen+uint64(length) > ap.Offset {
-		sels := newSels(int64(ap.Offset-ap.Seen), int64(length)-int64(ap.Offset-ap.Seen), proc)
-		ap.Seen += uint64(length)
-		bat.Shrink(sels)
-		proc.Mp().PutSels(sels)
-		proc.SetInputBatch(bat)
-		return false, nil
-	}
-	ap.Seen += uint64(length)
-	bat.Clean(proc.Mp())
-	proc.SetInputBatch(&batch.Batch{})
-	return false, nil
 }
 
 func newSels(start, count int64, proc *process.Process) []int64 {

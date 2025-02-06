@@ -21,23 +21,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 )
 
-const (
-	// For cmd. Basic message type
-	UnknowType = iota
-	PipelineMessage
-	BatchMessage
-	PrepareDoneNotifyMessage // for dispatch
-
-	// For Sid. Status type
-	WaitingNext
-	Last
-	MessageEnd
-)
-
-func (m *Message) Size() int {
-	return m.ProtoSize()
-}
-
 func (m *Message) GetID() uint64 {
 	return m.Id
 }
@@ -46,16 +29,12 @@ func (m *Message) SetID(id uint64) {
 	m.Id = id
 }
 
-func (m *Message) SetSid(sid uint64) {
+func (m *Message) SetDebugMsg(msg string) {
+	m.DebugMsg = msg
+}
+
+func (m *Message) SetSid(sid Status) {
 	m.Sid = sid
-}
-
-func (m *Message) SetCheckSum(sum uint32) {
-	m.Checksum = sum
-}
-
-func (m *Message) SetSequence(s uint64) {
-	m.Sequence = s
 }
 
 func (m *Message) SetMoError(ctx context.Context, err error) {
@@ -78,7 +57,7 @@ func (m *Message) TryToGetMoErr() (error, bool) {
 	return nil, false
 }
 
-func (m *Message) SetMessageType(cmd uint64) {
+func (m *Message) SetMessageType(cmd Method) {
 	m.Cmd = cmd
 }
 
@@ -93,34 +72,37 @@ func (m *Message) SetProcData(data []byte) {
 func (m *Message) DebugString() string {
 	errInfo := "none"
 	if len(m.Err) > 0 {
-		me := moerr.Error{}
-		errInfo = me.UnmarshalBinary(m.Err).Error()
+		me := &moerr.Error{}
+		if err := me.UnmarshalBinary(m.Err); err != nil {
+			panic(err)
+		}
+		errInfo = me.Error()
 	}
-	return fmt.Sprintf("MessageSize: %d, sid: %d, ErrInfo: %s, batchSize: %d", m.Size(), m.Sid, errInfo, len(m.Data))
+	return fmt.Sprintf("MessageSize: %d, sid: %d, ErrInfo: %s, batchSize: %d", m.ProtoSize(), m.Sid, errInfo, len(m.Data))
 }
 
 func (m *Message) IsBatchMessage() bool {
-	return m.GetCmd() == BatchMessage
+	return m.GetCmd() == Method_BatchMessage
 }
 
 func (m *Message) IsNotifyMessage() bool {
-	return m.GetCmd() == PrepareDoneNotifyMessage
+	return m.GetCmd() == Method_PrepareDoneNotifyMessage
 }
 
 func (m *Message) IsPipelineMessage() bool {
-	return m.GetCmd() == PipelineMessage
+	return m.GetCmd() == Method_PipelineMessage
 }
 
 func (m *Message) IsEndMessage() bool {
-	return m.Sid == MessageEnd
+	return m.Sid == Status_MessageEnd
 }
 
 func (m *Message) WaitingNextToMerge() bool {
-	return m.Sid == WaitingNext
+	return m.Sid == Status_WaitingNext
 }
 
 func (m *Message) IsLast() bool {
-	return m.Sid == Last
+	return m.Sid == Status_Last
 }
 
 func EncodedMessageError(ctx context.Context, err error) []byte {
@@ -140,16 +122,4 @@ func EncodedMessageError(ctx context.Context, err error) []byte {
 		errData, _ = moerr.ConvertGoError(ctx, err).(*moerr.Error).MarshalBinary()
 	}
 	return errData
-}
-
-func GetMessageErrorInfo(m *Message) error {
-	errData := m.GetErr()
-	if len(errData) > 0 {
-		err := &moerr.Error{}
-		if errUnmarshal := err.UnmarshalBinary(errData); errUnmarshal != nil {
-			return errUnmarshal
-		}
-		return err
-	}
-	return nil
 }

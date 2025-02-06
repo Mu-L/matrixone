@@ -15,105 +15,90 @@
 package dispatch
 
 import (
-	"bytes"
-	"context"
 	"testing"
 
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
-	"github.com/stretchr/testify/require"
 )
 
-const (
-	Rows = 10 // default rows
-)
+func TestPrepareRemote(t *testing.T) {
+	_ = colexec.NewServer(nil)
 
-// add unit tests for cases
-type dispatchTestCase struct {
-	arg    *Argument
-	types  []types.Type
-	proc   *process.Process
-	cancel context.CancelFunc
-}
+	proc := testutil.NewProcess()
 
-var (
-	tcs []dispatchTestCase
-)
+	uid, err := uuid.NewV7()
+	require.NoError(t, err)
 
-func init() {
-	tcs = []dispatchTestCase{
-		newTestCase(true),
-		newTestCase(false),
-	}
-}
-
-func TestString(t *testing.T) {
-	buf := new(bytes.Buffer)
-	for _, tc := range tcs {
-		String(tc.arg, buf)
-	}
-}
-
-func TestPrepare(t *testing.T) {
-	for _, tc := range tcs {
-		err := Prepare(tc.proc, tc.arg)
-		require.NoError(t, err)
-	}
-}
-
-func TestDispatch(t *testing.T) {
-	for _, tc := range tcs {
-		err := Prepare(tc.proc, tc.arg)
-		require.NoError(t, err)
-		bat := newBatch(t, tc.types, tc.proc, Rows)
-		tc.proc.Reg.InputBatch = bat
-		/*{
-			for _, vec := range bat.Vecs {
-				if vec.IsOriginal() {
-					vec.FreeOriginal(tc.proc.Mp())
-				}
-			}
-		}*/
-		_, _ = Call(0, tc.proc, tc.arg, false, false)
-		tc.proc.Reg.InputBatch = &batch.Batch{}
-		_, _ = Call(0, tc.proc, tc.arg, false, false)
-		tc.proc.Reg.InputBatch = nil
-		_, _ = Call(0, tc.proc, tc.arg, false, false)
-		tc.arg.Free(tc.proc, false)
-		for _, re := range tc.arg.LocalRegs {
-			for len(re.Ch) > 0 {
-				bat = <-re.Ch
-				if bat == nil {
-					break
-				}
-				bat.Clean(tc.proc.Mp())
-			}
-		}
-		require.Equal(t, int64(0), tc.proc.Mp().CurrNB())
-	}
-}
-
-func newTestCase(all bool) dispatchTestCase {
-	proc := testutil.NewProcessWithMPool(mpool.MustNewZero())
-	proc.Reg.MergeReceivers = make([]*process.WaitRegister, 2)
-	ctx, cancel := context.WithCancel(context.Background())
-	reg := &process.WaitRegister{Ctx: ctx, Ch: make(chan *batch.Batch, 3)}
-	return dispatchTestCase{
-		proc:  proc,
-		types: []types.Type{types.T_int8.ToType()},
-		arg: &Argument{
-			FuncId:    SendToAllLocalFunc,
-			LocalRegs: []*process.WaitRegister{reg},
+	d := Dispatch{
+		FuncId: SendToAllFunc,
+		ctr:    &container{},
+		RemoteRegs: []colexec.ReceiveInfo{
+			{Uuid: uid},
 		},
-		cancel: cancel,
 	}
 
+	// uuid map should have this pipeline information after prepare remote.
+	require.NoError(t, d.prepareRemote(proc))
+
+	p, c, b := colexec.Get().GetProcByUuid(uid, false)
+	require.True(t, b)
+	require.Equal(t, proc, p)
+	require.Equal(t, d.ctr.remoteInfo, c)
 }
 
-// create a new block based on the type information
-func newBatch(t *testing.T, ts []types.Type, proc *process.Process, rows int64) *batch.Batch {
-	return testutil.NewBatch(ts, false, int(rows), proc.Mp())
+func TestReceiverDone(t *testing.T) {
+	proc := testutil.NewProcess()
+	d := &Dispatch{
+		ctr: &container{},
+	}
+	d.ctr.localRegsCnt = 1
+	d.ctr.remoteReceivers = make([]*process.WrapCs, 1)
+	d.ctr.remoteReceivers[0] = &process.WrapCs{ReceiverDone: true, Err: make(chan error, 2)}
+	d.ctr.remoteToIdx = make(map[uuid.UUID]int)
+	d.ctr.remoteToIdx[d.ctr.remoteReceivers[0].Uid] = 0
+	bat := batch.New(nil)
+	bat.SetRowCount(1)
+	sendBatToIndex(d, proc, bat, 0)
+	sendBatToMultiMatchedReg(d, proc, bat, 0)
+}
+
+func Test_waitRemoteRegsReady(t *testing.T) {
+	d := &Dispatch{
+		ctr: &container{},
+		RemoteRegs: []colexec.ReceiveInfo{
+			{},
+		},
+	}
+	proc := testutil.NewProcess()
+	//wait waitNotifyTimeout seconds
+	ret, err := d.waitRemoteRegsReady(proc)
+	assert.Error(t, err)
+	assert.False(t, ret)
+}
+
+func Test_removeIdxReceiver(t *testing.T) {
+	d := &Dispatch{
+		ctr: &container{},
+	}
+
+	w1 := &process.WrapCs{}
+	w2 := &process.WrapCs{}
+	w3 := &process.WrapCs{}
+	d.ctr.remoteReceivers = []*process.WrapCs{w1, w2, w3}
+	d.ctr.remoteRegsCnt = 3
+	d.ctr.aliveRegCnt = 10
+
+	d.ctr.removeIdxReceiver(1)
+
+	require.Equal(t, 9, d.ctr.aliveRegCnt)
+	require.Equal(t, 2, d.ctr.remoteRegsCnt)
+	require.Equal(t, 2, len(d.ctr.remoteReceivers))
+	require.Equal(t, w1, d.ctr.remoteReceivers[0])
+	require.Equal(t, w3, d.ctr.remoteReceivers[1])
 }

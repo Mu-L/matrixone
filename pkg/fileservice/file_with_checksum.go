@@ -44,8 +44,6 @@ const (
 
 var (
 	crcTable = crc32.MakeTable(crc32.Castagnoli)
-
-	ErrChecksumNotMatch = moerr.NewInternalErrorNoCtx("checksum not match")
 )
 
 func NewFileWithChecksum[T FileLike](
@@ -68,8 +66,9 @@ func NewFileWithChecksumOSFile(
 	underlying *os.File,
 	blockContentSize int,
 	perfCounterSets []*perfcounter.CounterSet,
-) (*FileWithChecksum[*os.File], func()) {
-	f, put := fileWithChecksumPoolOSFile.Get()
+) (*FileWithChecksum[*os.File], PutBack[*FileWithChecksum[*os.File]]) {
+	var f *FileWithChecksum[*os.File]
+	put := fileWithChecksumPoolOSFile.Get(&f)
 	f.ctx = ctx
 	f.underlying = underlying
 	f.blockSize = blockContentSize + _ChecksumSize
@@ -101,15 +100,17 @@ func (f *FileWithChecksum[T]) ReadAt(buf []byte, offset int64) (n int, err error
 	}()
 
 	for len(buf) > 0 {
+
 		blockOffset, offsetInBlock := f.contentOffsetToBlockOffset(offset)
 		var data []byte
-		var freeData func()
-		data, freeData, err = f.readBlock(blockOffset)
-		defer freeData()
+		var putback PutBack[[]byte]
+		data, putback, err = f.readBlock(blockOffset)
 		if err != nil && err != io.EOF {
 			// read error
+			putback.Put()
 			return
 		}
+
 		data = data[offsetInBlock:]
 		nBytes := copy(buf, data)
 		buf = buf[nBytes:]
@@ -117,12 +118,15 @@ func (f *FileWithChecksum[T]) ReadAt(buf []byte, offset int64) (n int, err error
 			// not fully read
 			err = nil
 		}
+		putback.Put()
+
 		offset += int64(nBytes)
 		n += nBytes
 		if err == io.EOF && nBytes == 0 {
 			// no more data
 			break
 		}
+
 	}
 	return
 }
@@ -143,9 +147,9 @@ func (f *FileWithChecksum[T]) WriteAt(buf []byte, offset int64) (n int, err erro
 	for len(buf) > 0 {
 
 		blockOffset, offsetInBlock := f.contentOffsetToBlockOffset(offset)
-		data, freeData, err := f.readBlock(blockOffset)
-		defer freeData()
+		data, putback, err := f.readBlock(blockOffset)
 		if err != nil && err != io.EOF {
+			putback.Put()
 			return 0, err
 		}
 
@@ -166,20 +170,16 @@ func (f *FileWithChecksum[T]) WriteAt(buf []byte, offset int64) (n int, err erro
 		checksumBytes := make([]byte, _ChecksumSize)
 		binary.LittleEndian.PutUint32(checksumBytes, checksum)
 		if n, err := f.underlying.WriteAt(checksumBytes, blockOffset); err != nil {
+			putback.Put()
 			return n, err
-		} else {
-			perfcounter.Update(f.ctx, func(c *perfcounter.CounterSet) {
-				c.FileService.FileWithChecksum.UnderlyingWrite.Add(int64(n))
-			}, f.perfCounterSets...)
 		}
 
 		if n, err := f.underlying.WriteAt(data, blockOffset+_ChecksumSize); err != nil {
+			putback.Put()
 			return n, err
-		} else {
-			perfcounter.Update(f.ctx, func(c *perfcounter.CounterSet) {
-				c.FileService.FileWithChecksum.UnderlyingWrite.Add(int64(n))
-			}, f.perfCounterSets...)
 		}
+
+		putback.Put()
 
 		n += nBytes
 		offset += int64(nBytes)
@@ -238,22 +238,25 @@ func (f *FileWithChecksum[T]) contentOffsetToBlockOffset(
 	return
 }
 
-func (f *FileWithChecksum[T]) readBlock(offset int64) (data []byte, freeData func(), err error) {
+func (f *FileWithChecksum[T]) readBlock(offset int64) (data []byte, putback PutBack[[]byte], err error) {
 
 	if f.blockSize == _DefaultBlockSize {
-		data, freeData = bytesPoolDefaultBlockSize.Get()
+		putback = bytesPoolDefaultBlockSize.Get(&data)
 	} else {
 		data = make([]byte, f.blockSize)
-		freeData = noopPut
+		// putback does not need ptr, bytesPoolDefaultBlockSize put is a no-op
+		putback = PutBack[[]byte]{-1, nil, nil}
 	}
+
 	n, err := f.underlying.ReadAt(data, offset)
 	data = data[:n]
 	if err != nil && err != io.EOF {
-		return nil, nil, err
+		return nil, putback, err
 	}
-	perfcounter.Update(f.ctx, func(c *perfcounter.CounterSet) {
-		c.FileService.FileWithChecksum.UnderlyingRead.Add(int64(n))
-	}, f.perfCounterSets...)
+
+	//perfcounter.Update(f.ctx, func(c *perfcounter.CounterSet) {
+	//	c.FileService.FileWithChecksum.UnderlyingRead.Add(int64(n))
+	//}, f.perfCounterSets...)
 
 	if n < _ChecksumSize {
 		// empty
@@ -265,7 +268,7 @@ func (f *FileWithChecksum[T]) readBlock(offset int64) (data []byte, freeData fun
 
 	expectedChecksum := crc32.Checksum(data, crcTable)
 	if checksum != expectedChecksum {
-		return nil, nil, ErrChecksumNotMatch
+		return nil, putback, moerr.NewInternalErrorNoCtx("checksum not match")
 	}
 
 	return

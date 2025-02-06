@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
@@ -30,10 +32,15 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/frontend/constant"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
+	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 func getQueryResultDir() string {
@@ -44,20 +51,26 @@ func getPathOfQueryResultFile(fileName string) string {
 	return fmt.Sprintf("%s/%s", getQueryResultDir(), fileName)
 }
 
-func openSaveQueryResult(ses *Session) bool {
-	if ses.ast == nil || ses.tStmt == nil {
+func canSaveQueryResult(ctx context.Context, ses *Session) bool {
+	if ses.ast == nil {
 		return false
 	}
-	if ses.tStmt.SqlSourceType == "internal_sql" || isSimpleResultQuery(ses.ast) {
+
+	stmtProfile := ses.GetStmtProfile()
+	if stmtProfile.GetSqlSourceType() == constant.InternalSql {
 		return false
 	}
-	val, err := ses.GetGlobalVar("save_query_result")
+	if stmtProfile.GetStmtType() == "Select" && stmtProfile.GetSqlSourceType() != constant.CloudUserSql {
+		return false
+	}
+
+	val, err := ses.GetSessionSysVar("save_query_result")
 	if err != nil {
 		return false
 	}
 	if v, _ := val.(int8); v > 0 {
 		if ses.blockIdx == 0 {
-			if err = initQueryResulConfig(ses); err != nil {
+			if err = initQueryResulConfig(ctx, ses); err != nil {
 				return false
 			}
 		}
@@ -66,8 +79,8 @@ func openSaveQueryResult(ses *Session) bool {
 	return false
 }
 
-func initQueryResulConfig(ses *Session) error {
-	val, err := ses.GetGlobalVar("query_result_maxsize")
+func initQueryResulConfig(ctx context.Context, ses *Session) error {
+	val, err := ses.GetSessionSysVar("query_result_maxsize")
 	if err != nil {
 		return err
 	}
@@ -77,8 +90,9 @@ func initQueryResulConfig(ses *Session) error {
 	case float64:
 		ses.limitResultSize = v
 	}
+
 	var p uint64
-	val, err = ses.GetGlobalVar("query_result_timeout")
+	val, err = ses.GetSessionSysVar("query_result_timeout")
 	if err != nil {
 		return err
 	}
@@ -88,67 +102,29 @@ func initQueryResulConfig(ses *Session) error {
 	case float64:
 		p = uint64(v)
 	}
+
 	ses.createdTime = time.Now()
 	ses.expiredTime = ses.createdTime.Add(time.Hour * time.Duration(p))
-	return nil
+	return err
 }
 
-func isSimpleResultQuery(ast tree.Statement) bool {
-	switch stmt := ast.(type) {
-	case *tree.Select:
-		if stmt.With != nil || stmt.OrderBy != nil || stmt.Ep != nil {
-			return false
-		}
-		if clause, ok := stmt.Select.(*tree.SelectClause); ok {
-			if len(clause.From.Tables) > 1 || clause.Where != nil || clause.Having != nil || len(clause.GroupBy) > 0 {
-				return false
-			}
-			t := clause.From.Tables[0]
-			// judge table
-			if j, ok := t.(*tree.JoinTableExpr); ok {
-				if j.Right != nil {
-					return false
-				}
-				if a, ok := j.Left.(*tree.AliasedTableExpr); ok {
-					if f, ok := a.Expr.(*tree.TableFunction); ok {
-						if f.Id() != "result_scan" && f.Id() != "meta_scan" {
-							return false
-						}
-						// judge proj
-						for _, selectExpr := range clause.Exprs {
-							switch selectExpr.Expr.(type) {
-							case tree.UnqualifiedStar:
-								continue
-							case *tree.UnresolvedName:
-								continue
-							default:
-								return false
-							}
-						}
-						return true
-					}
-					return false
-				}
-				return false
-			}
-			return false
-		}
-		return false
-	case *tree.ParenSelect:
-		return isSimpleResultQuery(stmt)
+func saveBatch(ctx context.Context, ses *Session, bat *batch.Batch) error {
+	n := uint64(0)
+	if bat != nil && bat.Vecs[0] != nil {
+		n = uint64(bat.Vecs[0].Length())
 	}
-	return false
-}
+	ses.queryRowCount += n
 
-func saveQueryResult(ses *Session, bat *batch.Batch) error {
 	s := ses.curResultSize + float64(bat.Size())/(1024*1024)
 	if s > ses.limitResultSize {
+		ses.Debug(ctx, "open save query result", zap.Float64("current result size:", s))
 		return nil
 	}
-	fs := ses.GetParameterUnit().FileService
+	fs := getPu(ses.GetService()).FileService
 	// write query result
-	path := catalog.BuildQueryResultPath(ses.GetTenantInfo().GetTenant(), uuid.UUID(ses.tStmt.StatementID).String(), ses.GetIncBlockIdx())
-	writer, err := objectio.NewObjectWriter(path, fs)
+	path := catalog.BuildQueryResultPath(ses.GetTenantInfo().GetTenant(), uuid.UUID(ses.GetStmtId()).String(), ses.GetIncBlockIdx())
+	ses.Debug(ctx, "open save query result", zap.String("statemant id is:", uuid.UUID(ses.GetStmtId()).String()), zap.String("fileservice name is:", fs.Name()), zap.String("write path is:", path), zap.Float64("current result size:", s))
+	writer, err := objectio.NewObjectWriterSpecial(objectio.WriterQueryResult, path, fs)
 	if err != nil {
 		return err
 	}
@@ -160,24 +136,44 @@ func saveQueryResult(ses *Session, bat *batch.Batch) error {
 		Type: objectio.WriteTS,
 		Val:  ses.expiredTime,
 	}
-	_, err = writer.WriteEnd(ses.requestCtx, option)
+	_, err = writer.WriteEnd(ctx, option)
 	if err != nil {
 		return err
 	}
 	ses.curResultSize = s
+	ses.savedRowCount += n
+	return err
+}
+
+func saveBatches(ctx context.Context, ses *Session, data []*batch.Batch) error {
+	for _, b := range data {
+		if err := saveBatch(ctx, ses, b); err != nil {
+			return err
+		}
+	}
+	if err := saveMeta(ctx, ses); err != nil {
+		return err
+	}
 	return nil
 }
 
-func saveQueryResultMeta(ses *Session) error {
+func saveMeta(ctx context.Context, ses *Session) error {
 	defer func() {
 		ses.ResetBlockIdx()
 		ses.p = nil
-		ses.tStmt = nil
+		// TIPs: Session.SetTStmt() do reset the tStmt while query is DONE.
+		// Be careful, if you want to do async op.
+		// ses.tStmt = nil /* #16028: QueryResult independent of ses.tStmt */
 		ses.curResultSize = 0
+		ses.savedRowCount = 0
+		ses.queryRowCount = 0
 	}()
-	fs := ses.GetParameterUnit().FileService
+	fs := getPu(ses.GetService()).FileService
 	// write query result meta
-	colMap := buildColumnMap(ses.rs)
+	colMap, err := buildColumnMap(ctx, ses.rs)
+	if err != nil {
+		return err
+	}
 	b, err := ses.rs.Marshal()
 	if err != nil {
 		return err
@@ -188,39 +184,50 @@ func saveQueryResultMeta(ses *Session) error {
 		if i > 1 {
 			buf.WriteString(prefix)
 		}
-		buf.WriteString(catalog.BuildQueryResultPath(ses.GetTenantInfo().GetTenant(), uuid.UUID(ses.tStmt.StatementID).String(), i))
+		buf.WriteString(catalog.BuildQueryResultPath(ses.GetTenantInfo().GetTenant(), uuid.UUID(ses.GetStmtId()).String(), i))
 	}
 
-	sp, err := ses.p.Marshal()
-	if err != nil {
-		return err
+	var sp []byte
+	if ses.p != nil {
+		sp, err = ses.p.Marshal()
+		if err != nil {
+			return err
+		}
 	}
+
 	st, err := simpleAstMarshal(ses.ast)
 	if err != nil {
-		return nil
+		return err
 	}
+
+	//-------------------------------------------------------
+	roleId := defines.GetRoleId(ctx)
+	//-------------------------------------------------------
+
 	m := &catalog.Meta{
-		QueryId:     ses.tStmt.StatementID,
-		Statement:   ses.tStmt.Statement,
-		AccountId:   ses.GetTenantInfo().GetTenantID(),
-		RoleId:      ses.tStmt.RoleId,
-		ResultPath:  buf.String(),
-		CreateTime:  types.UnixToTimestamp(ses.createdTime.Unix()),
-		ResultSize:  ses.curResultSize,
-		Columns:     string(b),
-		Tables:      getTablesFromPlan(ses.p),
-		UserId:      ses.GetTenantInfo().GetUserID(),
-		ExpiredTime: types.UnixToTimestamp(ses.expiredTime.Unix()),
-		Plan:        string(sp),
-		Ast:         string(st),
-		ColumnMap:   colMap,
+		QueryId:       ses.GetStmtId(),
+		Statement:     ses.GetSql(),
+		AccountId:     ses.GetTenantInfo().GetTenantID(),
+		RoleId:        roleId,
+		ResultPath:    buf.String(),
+		CreateTime:    types.UnixToTimestamp(ses.createdTime.Unix()),
+		ResultSize:    ses.curResultSize,
+		Columns:       string(b),
+		Tables:        getTablesFromPlan(ses.p),
+		UserId:        ses.GetTenantInfo().GetUserID(),
+		ExpiredTime:   types.UnixToTimestamp(ses.expiredTime.Unix()),
+		Plan:          string(sp),
+		Ast:           string(st),
+		ColumnMap:     colMap,
+		SaveRowCount:  ses.savedRowCount,
+		QueryRowCount: ses.queryRowCount,
 	}
-	metaBat, err := buildQueryResultMetaBatch(m, ses.mp)
+	metaBat, err := buildQueryResultMetaBatch(m, ses.pool)
 	if err != nil {
 		return err
 	}
-	metaPath := catalog.BuildQueryResultMetaPath(ses.GetTenantInfo().GetTenant(), uuid.UUID(ses.tStmt.StatementID).String())
-	metaWriter, err := objectio.NewObjectWriter(metaPath, fs)
+	metaPath := catalog.BuildQueryResultMetaPath(ses.GetTenantInfo().GetTenant(), uuid.UUID(ses.GetStmtId()).String())
+	metaWriter, err := objectio.NewObjectWriterSpecial(objectio.WriterQueryResult, metaPath, fs)
 	if err != nil {
 		return err
 	}
@@ -232,14 +239,76 @@ func saveQueryResultMeta(ses *Session) error {
 		Type: objectio.WriteTS,
 		Val:  ses.expiredTime,
 	}
-	_, err = metaWriter.WriteEnd(ses.requestCtx, option)
+	_, err = metaWriter.WriteEnd(ctx, option)
 	if err != nil {
 		return err
+	}
+	return err
+}
+
+// saveQueryResult saves the data composited by hand
+func saveQueryResult(ctx context.Context, ses *Session,
+	genData func() ([]*batch.Batch, error),
+	cleanData func([]*batch.Batch),
+) error {
+	if genData != nil {
+		data, err := genData()
+		if cleanData != nil {
+			defer cleanData(data)
+		}
+		if err != nil {
+			return err
+		}
+		err = saveBatches(ctx, ses, data)
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func buildColumnMap(rs *plan.ResultColDef) string {
+// saveQueryResult2 saves the data from the engine.
+func saveQueryResult2(execCtx *ExecCtx, crs *perfcounter.CounterSet, bat *batch.Batch) error {
+	ses := execCtx.ses.(*Session)
+	if canSaveQueryResult(execCtx.reqCtx, ses) {
+		newCtx := perfcounter.AttachS3RequestKey(execCtx.reqCtx, crs)
+		if bat == nil {
+			if err := saveMeta(newCtx, ses); err != nil {
+				return err
+			}
+		} else {
+			if err := saveBatch(newCtx, ses, bat); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func trySaveQueryResult(ctx context.Context, ses *Session, mrs *MysqlResultSet) (err error) {
+	if canSaveQueryResult(ctx, ses) {
+		var data *batch.Batch
+		data, ses.rs, err = convertRowsIntoBatch(ses.GetMemPool(), mrs.Columns, mrs.Data)
+		defer cleanBatch(ses.GetMemPool(), data)
+		if err != nil {
+			return err
+		}
+		err = saveQueryResult(ctx, ses, func() ([]*batch.Batch, error) {
+			return []*batch.Batch{data}, nil
+		},
+			nil,
+		)
+		if err != nil {
+			return err
+		}
+	}
+	return
+}
+
+func buildColumnMap(ctx context.Context, rs *plan.ResultColDef) (string, error) {
+	if rs == nil {
+		return "", moerr.NewInternalError(ctx, "resultColDef is nil")
+	}
 	m := make(map[string][]int)
 	org := make([]string, len(rs.ResultCols))
 	for i, col := range rs.ResultCols {
@@ -265,10 +334,10 @@ func buildColumnMap(rs *plan.ResultColDef) string {
 			buf.WriteString(fmt.Sprintf("%s -> %s", org[i], rs.ResultCols[i].Name))
 		}
 	}
-	return buf.String()
+	return buf.String(), nil
 }
 
-func isResultQuery(p *plan.Plan) []string {
+func isResultQuery(proc *process.Process, p *plan.Plan) ([]string, error) {
 	var uuids []string = nil
 	if q, ok := p.Plan.(*plan.Plan_Query); ok {
 		for _, n := range q.Query.Nodes {
@@ -278,51 +347,63 @@ func isResultQuery(p *plan.Plan) []string {
 				}
 			} else if n.NodeType == plan.Node_FUNCTION_SCAN {
 				if n.TableDef.TblFunc.Name == "meta_scan" {
-					uuids = append(uuids, n.TableDef.Name)
+					// calculate uuid
+					vec, free, err := colexec.GetReadonlyResultFromNoColumnExpression(proc, n.TblFuncExprList[0])
+					if err != nil {
+						return nil, err
+					}
+					uuid := vector.MustFixedColNoTypeCheck[types.Uuid](vec)[0]
+					free()
+
+					uuids = append(uuids, uuid.String())
 				}
 			}
 		}
 	}
-	return uuids
+	return uuids, nil
 }
 
-func checkPrivilege(uuids []string, requestCtx context.Context, ses *Session) error {
-	f := ses.GetParameterUnit().FileService
+func checkPrivilege(sid string, uuids []string, reqCtx context.Context, ses *Session) (statistic.StatsArray, error) {
+	var stats statistic.StatsArray
+	stats.Reset()
+
+	f := getPu(ses.GetService()).FileService
 	for _, id := range uuids {
 		// var size int64 = -1
 		path := catalog.BuildQueryResultMetaPath(ses.GetTenantInfo().GetTenant(), id)
-		e, err := f.StatFile(requestCtx, path)
+		reader, err := ioutil.NewFileReader(f, path)
 		if err != nil {
-			if moerr.IsMoErrCode(err, moerr.ErrFileNotFound) {
-				return moerr.NewResultFileNotFound(requestCtx, path)
-			}
-			return err
-		}
-		reader, err := blockio.NewFileReader(f, path)
-		if err != nil {
-			return err
+			return stats, err
 		}
 		idxs := []uint16{catalog.PLAN_IDX, catalog.AST_IDX}
-		bats, err := reader.LoadAllColumns(requestCtx, idxs, e.Size, ses.GetMemPool())
+		bats, closeCB, err := reader.LoadAllColumns(reqCtx, idxs, ses.GetMemPool())
 		if err != nil {
-			return err
+			return stats, err
 		}
+		defer func() {
+			if closeCB != nil {
+				closeCB()
+			}
+		}()
 		bat := bats[0]
-		p := bat.Vecs[0].GetStringAt(0)
+		p := bat.Vecs[0].UnsafeGetStringAt(0)
 		pn := &plan.Plan{}
 		if err = pn.Unmarshal([]byte(p)); err != nil {
-			return err
+			return stats, err
 		}
-		a := bat.Vecs[1].GetStringAt(0)
+		a := bat.Vecs[1].UnsafeGetStringAt(0)
 		var ast tree.Statement
 		if ast, err = simpleAstUnmarshal([]byte(a)); err != nil {
-			return err
+			return stats, err
 		}
-		if err = authenticateCanExecuteStatementAndPlan(requestCtx, ses, ast, pn); err != nil {
-			return err
+
+		delta, err := authenticateCanExecuteStatementAndPlan(reqCtx, ses, ast, pn)
+		if err != nil {
+			return stats, err
 		}
+		stats.Add(&delta)
 	}
-	return nil
+	return stats, nil
 }
 
 type simpleAst struct {
@@ -350,10 +431,11 @@ func simpleAstMarshal(stmt tree.Statement) ([]byte, error) {
 		s.Typ = int(astShowAboutTable)
 	case *tree.ShowProcessList, *tree.ShowErrors, *tree.ShowWarnings, *tree.ShowVariables,
 		*tree.ShowStatus, *tree.ShowTarget, *tree.ShowTableStatus,
-		*tree.ShowGrants, *tree.ShowCollation, *tree.ShowIndex,
+		*tree.ShowGrants, *tree.ShowIndex,
 		*tree.ShowTableNumber, *tree.ShowColumnNumber,
 		*tree.ShowTableValues, *tree.ShowNodeList,
-		*tree.ShowLocks, *tree.ShowFunctionStatus:
+		*tree.ShowLocks, *tree.ShowFunctionOrProcedureStatus, *tree.ShowConnectors,
+		*tree.ShowLogserviceReplicas, *tree.ShowLogserviceStores, *tree.ShowLogserviceSettings, *tree.ShowRecoveryWindow:
 		s.Typ = int(astShowNone)
 	case *tree.ExplainFor, *tree.ExplainAnalyze, *tree.ExplainStmt:
 		s.Typ = int(astExplain)
@@ -459,6 +541,12 @@ func buildQueryResultMetaBatch(m *catalog.Meta, mp *mpool.MPool) (*batch.Batch, 
 	if err = vector.AppendBytes(bat.Vecs[catalog.COLUMN_MAP_IDX], []byte(m.ColumnMap), false, mp); err != nil {
 		return nil, err
 	}
+	if err = vector.AppendFixed(bat.Vecs[catalog.SAVED_ROW_COUNT_IDX], m.SaveRowCount, false, mp); err != nil {
+		return nil, err
+	}
+	if err = vector.AppendFixed(bat.Vecs[catalog.QUERY_ROW_COUNT_IDX], m.QueryRowCount, false, mp); err != nil {
+		return nil, err
+	}
 	return bat, nil
 }
 
@@ -477,7 +565,7 @@ type resultFileInfo struct {
 func doDumpQueryResult(ctx context.Context, ses *Session, eParam *tree.ExportParam) error {
 	var err error
 	var columnDefs *plan.ResultColDef
-	var reader *blockio.BlockReader
+	var reader *ioutil.BlockReader
 	var blocks []objectio.BlockObject
 	var files []resultFileInfo
 
@@ -520,20 +608,17 @@ func doDumpQueryResult(ctx context.Context, ses *Session, eParam *tree.ExportPar
 	for i := 0; i < 1; i++ {
 		mrs.Data[i] = make([]interface{}, columnCount)
 	}
-	exportParam := &ExportParam{
-		ExportParam: eParam,
+	exportParam := &ExportConfig{
+		userConfig: eParam,
+		mrs:        mrs,
+		service:    ses.GetService(),
 	}
 	//prepare output queue
-	oq := NewOutputQueue(ctx, ses, columnCount, mrs, exportParam)
-	oq.reset()
 	//prepare export param
-	exportParam.DefaultBufSize = ses.GetParameterUnit().SV.ExportDataDefaultFlushSize
-	exportParam.UseFileService = true
-	exportParam.FileService = ses.GetParameterUnit().FileService
+	exportParam.DefaultBufSize = getPu(exportParam.service).SV.ExportDataDefaultFlushSize
+	exportParam.FileService = getPu(exportParam.service).FileService
 	exportParam.Ctx = ctx
 	defer func() {
-		exportParam.LineBuffer = nil
-		exportParam.OutputStr = nil
 		if exportParam.AsyncReader != nil {
 			_ = exportParam.AsyncReader.Close()
 		}
@@ -568,16 +653,16 @@ func doDumpQueryResult(ctx context.Context, ses *Session, eParam *tree.ExportPar
 				break
 			}
 			tmpBatch.Clean(ses.GetMemPool())
-			bats, err := reader.LoadColumns(ctx, indexes, []uint32{block.GetExtent().Id()}, ses.GetMemPool())
+			bat, release, err := reader.LoadColumns(ctx, indexes, nil, block.BlockHeader().BlockID().Sequence(), ses.GetMemPool())
 			if err != nil {
 				return err
 			}
-			tmpBatch = bats[0]
-			tmpBatch.InitZsOne(tmpBatch.Vecs[0].Length())
+			defer release()
+			tmpBatch = bat
 
 			//step2.1: converts it into the csv string
 			//step2.2: writes the csv string into the outfile
-			n := tmpBatch.Vecs[0].Length()
+			n := tmpBatch.RowCount()
 			for j := 0; j < n; j++ { //row index
 				select {
 				case <-ctx.Done():
@@ -589,20 +674,16 @@ func doDumpQueryResult(ctx context.Context, ses *Session, eParam *tree.ExportPar
 					break
 				}
 
-				if tmpBatch.Zs[j] <= 0 {
-					continue
+				err = extractRowFromEveryVector(ctx, ses, tmpBatch, j, mrs.Data[0], false)
+				if err != nil {
+					return err
 				}
-				_, err = extractRowFromEveryVector(ses, tmpBatch, j, oq)
+				err = exportDataFromResultSetToCSVFile(exportParam)
 				if err != nil {
 					return err
 				}
 			}
 		}
-	}
-
-	err = oq.flush()
-	if err != nil {
-		return err
 	}
 
 	err = Close(exportParam)
@@ -620,27 +701,28 @@ func openResultMeta(ctx context.Context, ses *Session, queryId string) (*plan.Re
 		return nil, moerr.NewInternalError(ctx, "modump does not work without the account info")
 	}
 	metaFile := catalog.BuildQueryResultMetaPath(account.GetTenant(), queryId)
-	e, err := ses.GetParameterUnit().FileService.StatFile(ctx, metaFile)
-	if err != nil {
-		if moerr.IsMoErrCode(err, moerr.ErrFileNotFound) {
-			return nil, moerr.NewResultFileNotFound(ctx, metaFile)
-		}
-		return nil, err
-	}
 	// read meta's meta
-	reader, err := blockio.NewFileReader(ses.GetParameterUnit().FileService, metaFile)
+	reader, err := ioutil.NewFileReader(getPu(ses.GetService()).FileService, metaFile)
 	if err != nil {
 		return nil, err
 	}
 	idxs := make([]uint16, 1)
 	idxs[0] = catalog.COLUMNS_IDX
 	// read meta's data
-	bats, err := reader.LoadAllColumns(ctx, idxs, e.Size, ses.GetMemPool())
+	bats, closeCB, err := reader.LoadAllColumns(ctx, idxs, ses.GetMemPool())
 	if err != nil {
+		if moerr.IsMoErrCode(err, moerr.ErrFileNotFound) {
+			return nil, moerr.NewResultFileNotFound(ctx, makeResultMetaPath(account.GetTenant(), queryId))
+		}
 		return nil, err
 	}
+	defer func() {
+		if closeCB != nil {
+			closeCB()
+		}
+	}()
 	vec := bats[0].Vecs[0]
-	def := vec.GetStringAt(0)
+	def := vec.UnsafeGetStringAt(0)
 	r := &plan.ResultColDef{}
 	if err = r.Unmarshal([]byte(def)); err != nil {
 		return nil, err
@@ -660,7 +742,7 @@ func getResultFiles(ctx context.Context, ses *Session, queryId string) ([]result
 	}
 	rti := make([]resultFileInfo, 0, len(fileList))
 	for i, file := range fileList {
-		e, err := ses.GetParameterUnit().FileService.StatFile(ctx, file)
+		e, err := getPu(ses.GetService()).FileService.StatFile(ctx, file)
 		if err != nil {
 			if moerr.IsMoErrCode(err, moerr.ErrFileNotFound) {
 				return nil, moerr.NewResultFileNotFound(ctx, file)
@@ -678,14 +760,14 @@ func getResultFiles(ctx context.Context, ses *Session, queryId string) ([]result
 }
 
 // openResultFile reads all blocks of the result file
-func openResultFile(ctx context.Context, ses *Session, fileName string, fileSize int64) (*blockio.BlockReader, []objectio.BlockObject, error) {
+func openResultFile(ctx context.Context, ses *Session, fileName string, fileSize int64) (*ioutil.BlockReader, []objectio.BlockObject, error) {
 	// read result's blocks
 	filePath := getPathOfQueryResultFile(fileName)
-	reader, err := blockio.NewFileReader(ses.GetParameterUnit().FileService, filePath)
+	reader, err := ioutil.NewFileReader(getPu(ses.GetService()).FileService, filePath)
 	if err != nil {
 		return nil, nil, err
 	}
-	bs, err := reader.LoadAllBlocks(ctx, fileSize, ses.GetMemPool())
+	bs, err := reader.LoadAllBlocks(ctx, ses.GetMemPool())
 	if err != nil {
 		return nil, nil, err
 	}
@@ -701,4 +783,17 @@ func getFileSize(files []fileservice.DirEntry, fileName string) int64 {
 		}
 	}
 	return -1
+}
+
+var defResultSaver BinaryWriter = &QueryResult{}
+
+type QueryResult struct {
+}
+
+func (result *QueryResult) Write(execCtx *ExecCtx, crs *perfcounter.CounterSet, bat *batch.Batch) error {
+	return saveQueryResult2(execCtx, crs, bat)
+}
+
+func (result *QueryResult) Close() {
+
 }

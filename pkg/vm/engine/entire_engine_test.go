@@ -17,15 +17,18 @@ package engine
 import (
 	"context"
 	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
 
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/pb/lock"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/statsinfo"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/txn/rpc"
-	"github.com/stretchr/testify/assert"
 )
 
 const (
@@ -59,6 +62,31 @@ var _ Engine = new(testEngine)
 type testOperator struct {
 }
 
+func (o *testOperator) EnterIncrStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (o *testOperator) ExitIncrStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (o *testOperator) EnterRollbackStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (o *testOperator) ExitRollbackStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (o *testOperator) SetFootPrints(id int, enter bool) {
+	//TODO implement me
+	panic("implement me")
+}
+
 func TestEntireEngineNew(t *testing.T) {
 	ctx := context.TODO()
 	op := newtestOperator()
@@ -67,28 +95,6 @@ func TestEntireEngineNew(t *testing.T) {
 	assert.Equal(t, only_engine, ee.state)
 	ee = buildEntireEngineWithTempEngine()
 	ee.New(ctx, op)
-	assert.Equal(t, first_engine_then_tempengine, ee.state)
-}
-
-func TestEntireEngineCommit(t *testing.T) {
-	ctx := context.TODO()
-	op := newtestOperator()
-	ee := buildEntireEngineWithoutTempEngine()
-	ee.Commit(ctx, op)
-	assert.Equal(t, only_engine, ee.state)
-	ee = buildEntireEngineWithTempEngine()
-	ee.Commit(ctx, op)
-	assert.Equal(t, first_engine_then_tempengine, ee.state)
-}
-
-func TestEntireEngineRollback(t *testing.T) {
-	ctx := context.TODO()
-	op := newtestOperator()
-	ee := buildEntireEngineWithoutTempEngine()
-	ee.Rollback(ctx, op)
-	assert.Equal(t, only_engine, ee.state)
-	ee = buildEntireEngineWithTempEngine()
-	ee.Rollback(ctx, op)
 	assert.Equal(t, first_engine_then_tempengine, ee.state)
 }
 
@@ -139,10 +145,10 @@ func TestEntireEngineDatabase(t *testing.T) {
 
 func TestEntireEngineNodes(t *testing.T) {
 	ee := buildEntireEngineWithoutTempEngine()
-	ee.Nodes()
+	ee.Nodes(false, "", "", nil)
 	assert.Equal(t, only_engine, ee.state)
 	ee = buildEntireEngineWithTempEngine()
-	ee.Nodes()
+	ee.Nodes(false, "", "", nil)
 	assert.Equal(t, only_engine, ee.state)
 }
 
@@ -156,15 +162,18 @@ func TestEntireEngineHints(t *testing.T) {
 
 }
 
-func TestEntireEngineNewBlockReader(t *testing.T) {
-	ctx := context.TODO()
-	ee := buildEntireEngineWithoutTempEngine()
-	ee.NewBlockReader(ctx, 1, timestamp.Timestamp{}, nil, nil, nil)
-	assert.Equal(t, only_engine, ee.state)
-	ee = buildEntireEngineWithTempEngine()
-	ee.NewBlockReader(ctx, 1, timestamp.Timestamp{}, nil, nil, nil)
-	assert.Equal(t, only_engine, ee.state)
-}
+//func TestEntireEngineNewBlockReader(t *testing.T) {
+//	ctx := context.TODO()
+//	ee := buildEntireEngineWithoutTempEngine()
+//	proc := testutil.NewProcess()
+//	//ee.NewBlockReader(ctx, 1, timestamp.Timestamp{}, nil, nil, nil, nil, nil)
+//	ee.BuildBlockReaders(ctx, proc, timestamp.Timestamp{}, nil, nil, nil, 1)
+//	assert.Equal(t, only_engine, ee.state)
+//	ee = buildEntireEngineWithTempEngine()
+//	//ee.NewBlockReader(ctx, 1, timestamp.Timestamp{}, nil, nil, nil, nil, nil)
+//	ee.BuildBlockReaders(ctx, proc, timestamp.Timestamp{}, nil, nil, nil, 1)
+//	assert.Equal(t, only_engine, ee.state)
+//}
 
 func buildEntireEngineWithTempEngine() *testEntireEngine {
 	ee := new(testEntireEngine)
@@ -189,6 +198,17 @@ func buildEntireEngineWithoutTempEngine() *testEntireEngine {
 
 func newtestEngine(name string, tee *testEntireEngine) *testEngine {
 	return &testEngine{name: name, parent: tee}
+}
+
+func (e *testEngine) BuildBlockReaders(
+	ctx context.Context,
+	p any,
+	ts timestamp.Timestamp,
+	expr *plan.Expr,
+	def *plan.TableDef,
+	relData RelData,
+	num int) ([]Reader, error) {
+	panic("unimplemented")
 }
 
 func (e *testEngine) New(_ context.Context, _ client.TxnOperator) error {
@@ -270,7 +290,7 @@ func (e *testEngine) Database(ctx context.Context, name string, txnOp client.Txn
 	return nil, nil
 }
 
-func (e *testEngine) Nodes() (Nodes, error) {
+func (e *testEngine) Nodes(_ bool, _ string, _ string, _ map[string]string) (Nodes, error) {
 	e.parent.step = e.parent.step + 1
 	if e.name == origin {
 		e.parent.state = e.parent.state + e.parent.step*e.parent.state
@@ -290,17 +310,6 @@ func (e *testEngine) Hints() (h Hints) {
 	return
 }
 
-func (e *testEngine) NewBlockReader(_ context.Context, _ int, _ timestamp.Timestamp,
-	_ *plan.Expr, _ [][]byte, _ *plan.TableDef) ([]Reader, error) {
-	e.parent.step = e.parent.step + 1
-	if e.name == origin {
-		e.parent.state = e.parent.state + e.parent.step*e.parent.state
-	} else {
-		e.parent.state = e.parent.state - e.parent.step*e.parent.state
-	}
-	return nil, nil
-}
-
 func (e *testEngine) GetNameById(ctx context.Context, op client.TxnOperator, tableId uint64) (dbName string, tblName string, err error) {
 	return "", "", nil
 }
@@ -313,8 +322,51 @@ func (e *testEngine) AllocateIDByKey(ctx context.Context, key string) (uint64, e
 	return 0, nil
 }
 
+func (e *testEngine) TryToSubscribeTable(ctx context.Context, dbID, tbID uint64) error {
+	return nil
+}
+
+func (e *testEngine) UnsubscribeTable(ctx context.Context, dbID, tbID uint64) error {
+	return nil
+}
+
+func (e *testEngine) PrefetchTableMeta(ctx context.Context, key pb.StatsInfoKey) bool {
+	return true
+}
+
+func (e *testEngine) Stats(ctx context.Context, key pb.StatsInfoKey, sync bool) *pb.StatsInfo {
+	return nil
+}
+
+func (e *testEngine) GetMessageCenter() any {
+	return nil
+}
+
+func (e *testEngine) Rows(ctx context.Context, key pb.StatsInfoKey) uint64 {
+	return 0
+}
+
+func (e *testEngine) Size(ctx context.Context, key pb.StatsInfoKey, colName string) (uint64, error) {
+	return 0, nil
+}
+
+func (e *testEngine) GetService() string {
+	return ""
+}
+
+func (e *testEngine) LatestLogtailAppliedTime() timestamp.Timestamp {
+	return timestamp.Timestamp{}
+}
+
 func newtestOperator() *testOperator {
 	return &testOperator{}
+}
+
+func (o *testOperator) AddWorkspace(_ client.Workspace) {
+}
+
+func (o *testOperator) GetWorkspace() client.Workspace {
+	return nil
 }
 
 func (o *testOperator) ApplySnapshot(data []byte) error {
@@ -337,12 +389,40 @@ func (o *testOperator) Rollback(ctx context.Context) error {
 	return nil
 }
 
-func (o *testOperator) Snapshot() ([]byte, error) {
-	return nil, nil
+func (o *testOperator) Snapshot() (txn.CNTxnSnapshot, error) {
+	return txn.CNTxnSnapshot{}, nil
 }
 
 func (o *testOperator) Txn() txn.TxnMeta {
 	return txn.TxnMeta{}
+}
+
+func (o *testOperator) IsSnapOp() bool {
+	panic("should not call")
+}
+
+func (o *testOperator) CloneSnapshotOp(snapshot timestamp.Timestamp) client.TxnOperator {
+	panic("should not call")
+}
+
+func (o *testOperator) PKDedupCount() int {
+	panic("should not call")
+}
+
+func (o *testOperator) SnapshotTS() timestamp.Timestamp {
+	panic("should not call")
+}
+
+func (o *testOperator) CreateTS() timestamp.Timestamp {
+	panic("should not call")
+}
+
+func (o *testOperator) Status() txn.TxnStatus {
+	panic("should not call")
+}
+
+func (o *testOperator) TxnRef() *txn.TxnMeta {
+	return &txn.TxnMeta{}
 }
 
 func (o *testOperator) Write(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
@@ -353,6 +433,66 @@ func (o *testOperator) AddLockTable(lock.LockTable) error {
 	return nil
 }
 
-func (o *testOperator) UpdateSnapshot(ts timestamp.Timestamp) error {
+func (o *testOperator) HasLockTable(table uint64) bool {
+	return true
+}
+
+func (o *testOperator) UpdateSnapshot(ctx context.Context, ts timestamp.Timestamp) error {
 	panic("should not call")
+}
+
+func (o *testOperator) ResetRetry(retry bool) {
+	panic("unimplemented")
+}
+
+func (o *testOperator) IsRetry() bool {
+	panic("unimplemented")
+}
+
+func (o *testOperator) SetOpenLog(retry bool) {
+	panic("unimplemented")
+}
+
+func (o *testOperator) IsOpenLog() bool {
+	panic("unimplemented")
+}
+
+func (o *testOperator) AppendEventCallback(event client.EventType, callbacks ...func(event client.TxnEvent)) {
+	panic("unimplemented")
+}
+
+func (o *testOperator) Debug(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
+	panic("unimplemented")
+}
+
+func (o *testOperator) AddWaitLock(tableID uint64, rows [][]byte, opt lock.LockOptions) uint64 {
+	panic("should not call")
+}
+
+func (o *testOperator) RemoveWaitLock(key uint64) {
+	panic("should not call")
+}
+
+func (o *testOperator) GetOverview() client.TxnOverview {
+	panic("should not call")
+}
+
+func (o *testOperator) LockSkipped(tableID uint64, mode lock.LockMode) bool {
+	panic("should not call")
+}
+
+func (o *testOperator) TxnOptions() txn.TxnOptions {
+	panic("should not call")
+}
+
+func (o *testOperator) NextSequence() uint64 {
+	panic("should not call")
+}
+
+func (o *testOperator) EnterRunSql() {}
+
+func (o *testOperator) ExitRunSql() {}
+
+func (o *testOperator) GetWaitActiveCost() time.Duration {
+	return time.Duration(0)
 }

@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"runtime/debug"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 )
@@ -103,9 +104,14 @@ func (m LockTable) Changed(v LockTable) bool {
 		m.ServiceID != v.ServiceID
 }
 
+// Equal return true means same bind
+func (m LockTable) Equal(v LockTable) bool {
+	return m.Table == v.Table && m.Version == v.Version
+}
+
 // DebugString returns the debug string
 func (m LockTable) DebugString() string {
-	return fmt.Sprintf("%d-%s-%d", m.Table, m.ServiceID, m.Version)
+	return fmt.Sprintf("%d-%d(%d)-%s-%d", m.Group, m.Table, m.OriginTable, m.ServiceID, m.Version)
 }
 
 // WithGranularity set rows granularity, the default granularity is Row.
@@ -145,6 +151,9 @@ func (m Response) UnwrapError() error {
 	err := &moerr.Error{}
 	if e := err.UnmarshalBinary(m.Error); e != nil {
 		panic(e)
+	}
+	if moerr.IsMoErrCode(err, moerr.ErrRetryForCNRollingRestart) {
+		err.SetDetail(string(debug.Stack()))
 	}
 	return err
 }
@@ -194,7 +203,7 @@ func (m *GetTxnLockRequest) DebugString() string {
 func (m *GetTxnLockResponse) DebugString() string {
 	return fmt.Sprintf("%d-%s",
 		m.Value,
-		bytesArrayString(m.WaitingList))
+		waitTxnArrayString(m.WaitingList))
 }
 
 func (m *GetWaitingListRequest) DebugString() string {
@@ -253,4 +262,26 @@ func (m *WaitTxn) DebugString() string {
 	return fmt.Sprintf("%s(%s)",
 		hex.EncodeToString(m.TxnID),
 		m.CreatedOn)
+}
+
+func (m Request) TypeName() string {
+	return "lockservice.request"
+}
+
+func (m Response) TypeName() string {
+	return "lockservice.response"
+}
+
+func (m LockOptions) Validate(rows [][]byte) {
+	if m.Sharding == Sharding_None {
+		return
+	}
+
+	if m.Granularity != Granularity_Row {
+		panic("cannot lock with sharding without row granularity")
+	}
+
+	if len(rows) != 1 {
+		panic("cannot lock with sharding without single row")
+	}
 }

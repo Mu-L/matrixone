@@ -15,17 +15,37 @@
 package fileservice
 
 import (
+	"context"
+	"crypto/rand"
+	"fmt"
+	"io"
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/util/toml"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestLocalFS(t *testing.T) {
 
 	t.Run("file service", func(t *testing.T) {
-		testFileService(t, func(name string) FileService {
+		testFileService(t, 0, func(name string) FileService {
+			ctx := context.Background()
 			dir := t.TempDir()
-			fs, err := NewLocalFS(name, dir, -1, nil)
+			fs, err := NewLocalFS(ctx, name, dir, DisabledCacheConfig, nil)
+			assert.Nil(t, err)
+			return fs
+		})
+	})
+
+	t.Run("with memory cache", func(t *testing.T) {
+		testFileService(t, 0, func(name string) FileService {
+			ctx := context.Background()
+			dir := t.TempDir()
+			fs, err := NewLocalFS(ctx, name, dir, CacheConfig{
+				MemoryCapacity: ptrTo[toml.ByteSize](128 * 1024),
+			}, nil)
 			assert.Nil(t, err)
 			return fs
 		})
@@ -33,8 +53,9 @@ func TestLocalFS(t *testing.T) {
 
 	t.Run("mutable file service", func(t *testing.T) {
 		testMutableFileService(t, func() MutableFileService {
+			ctx := context.Background()
 			dir := t.TempDir()
-			fs, err := NewLocalFS("local", dir, -1, nil)
+			fs, err := NewLocalFS(ctx, "local", dir, DisabledCacheConfig, nil)
 			assert.Nil(t, err)
 			return fs
 		})
@@ -42,8 +63,9 @@ func TestLocalFS(t *testing.T) {
 
 	t.Run("replaceable file service", func(t *testing.T) {
 		testReplaceableFileService(t, func() ReplaceableFileService {
+			ctx := context.Background()
 			dir := t.TempDir()
-			fs, err := NewLocalFS("local", dir, -1, nil)
+			fs, err := NewLocalFS(ctx, "local", dir, DisabledCacheConfig, nil)
 			assert.Nil(t, err)
 			return fs
 		})
@@ -51,8 +73,11 @@ func TestLocalFS(t *testing.T) {
 
 	t.Run("caching file service", func(t *testing.T) {
 		testCachingFileService(t, func() CachingFileService {
+			ctx := context.Background()
 			dir := t.TempDir()
-			fs, err := NewLocalFS("local", dir, 128*1024, nil)
+			fs, err := NewLocalFS(ctx, "local", dir, CacheConfig{
+				MemoryCapacity: ptrTo[toml.ByteSize](128 * 1024),
+			}, nil)
 			assert.Nil(t, err)
 			return fs
 		})
@@ -61,10 +86,160 @@ func TestLocalFS(t *testing.T) {
 }
 
 func BenchmarkLocalFS(b *testing.B) {
-	benchmarkFileService(b, func() FileService {
+	ctx := context.Background()
+	benchmarkFileService(ctx, b, func() FileService {
 		dir := b.TempDir()
-		fs, err := NewLocalFS("local", dir, -1, nil)
+		fs, err := NewLocalFS(ctx, "local", dir, DisabledCacheConfig, nil)
 		assert.Nil(b, err)
 		return fs
 	})
+}
+
+func TestLocalFSWithDiskCache(t *testing.T) {
+	ctx := context.Background()
+	var counter perfcounter.CounterSet
+	ctx = perfcounter.WithCounterSet(ctx, &counter)
+	const (
+		n       = 32
+		dataLen = 32
+	)
+
+	// new fs
+	fs, err := NewLocalFS(
+		ctx,
+		"foo",
+		t.TempDir(),
+		CacheConfig{
+			DiskPath:                  ptrTo(t.TempDir()),
+			DiskCapacity:              ptrTo[toml.ByteSize](dataLen * n / 32),
+			enableDiskCacheForLocalFS: true,
+		},
+		nil,
+	)
+	assert.Nil(t, err)
+
+	// prepare data
+	datas := make([][]byte, 0, n)
+	for i := 0; i < n; i++ {
+		data := make([]byte, dataLen)
+		_, err := rand.Read(data)
+		assert.Nil(t, err)
+		datas = append(datas, data)
+	}
+
+	// write
+	for i := 0; i < n; i++ {
+		data := datas[i]
+		vec := IOVector{
+			FilePath: fmt.Sprintf("%d", i),
+			Entries: []IOEntry{
+				{
+					Data: data,
+					Size: int64(len(data)),
+				},
+			},
+		}
+		err := fs.Write(ctx, vec)
+		assert.Nil(t, err)
+	}
+
+	// read
+	for i := 0; i < n*10; i++ {
+		idx := i % n
+		expected := datas[idx]
+		length := 8
+		for j := 0; j < dataLen/length; j++ {
+			offset := j * length
+			vec := IOVector{
+				FilePath: fmt.Sprintf("%d", idx),
+				Entries: []IOEntry{
+					{
+						Offset: int64(offset),
+						Size:   int64(length),
+					},
+				},
+			}
+			err := fs.Read(ctx, &vec)
+			assert.Nil(t, err)
+			assert.Equal(t, expected[offset:offset+length], vec.Entries[0].Data)
+			vec.Release()
+		}
+	}
+
+}
+
+// default allocator must use with no memcache
+// only memory obtained through memcache.Alloc can be set to memcache
+func TestLocalFSWithIOVectorCache(t *testing.T) {
+	ctx := context.Background()
+	memCache1 := NewMemCache(
+		fscache.ConstCapacity(1<<20), nil,
+		nil,
+		"",
+	)
+	defer memCache1.Close(ctx)
+	memCache2 := NewMemCache(
+		fscache.ConstCapacity(1<<20), nil,
+		nil,
+		"",
+	)
+	defer memCache2.Close(ctx)
+	caches := []IOVectorCache{memCache1, memCache2}
+
+	dir := t.TempDir()
+	fs, err := NewLocalFS(ctx, "test", dir, CacheConfig{
+		MemoryCapacity: ptrTo[toml.ByteSize](128 * 1024),
+	}, nil)
+	assert.Nil(t, err)
+
+	err = fs.Write(ctx, IOVector{
+		Caches:   caches,
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Size: 8,
+				Data: []byte("12345678"),
+			},
+		},
+	})
+	assert.Nil(t, err)
+
+	vec := IOVector{
+		Caches:   caches,
+		FilePath: "foo",
+		Entries: []IOEntry{
+			{
+				Size: 8,
+				ToCacheData: func(ctx context.Context, r io.Reader, _ []byte, allocator CacheDataAllocator) (fscache.Data, error) {
+					cacheData := allocator.AllocateCacheData(ctx, 8)
+					_, err := io.ReadFull(r, cacheData.Bytes())
+					if err != nil {
+						return nil, err
+					}
+					return cacheData, nil
+				},
+			},
+		},
+	}
+	err = fs.Read(ctx, &vec)
+	assert.Nil(t, err)
+	vec.Release()
+
+	assert.Equal(t, int64(8), memCache1.cache.Used())
+	assert.Equal(t, int64(8), memCache2.cache.Used())
+	memCache1.cache.Flush(ctx)
+	memCache2.cache.Flush(ctx)
+	fs.FlushCache(ctx)
+}
+
+func TestLocalFSEmptyRootPath(t *testing.T) {
+	fs, err := NewLocalFS(
+		context.Background(),
+		"test",
+		"",
+		CacheConfig{},
+		nil,
+	)
+	assert.Nil(t, err)
+	assert.NotNil(t, fs)
 }

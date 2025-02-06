@@ -70,23 +70,27 @@ Main workflow:
 import (
 	"context"
 	"fmt"
-	"github.com/matrixorigin/matrixone/pkg/objectio"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
 	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/util/fault"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnimpl"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"go.uber.org/zap"
 )
 
@@ -94,22 +98,7 @@ const Size90M = 90 * 1024 * 1024
 
 type CheckpointClient interface {
 	CollectCheckpointsInRange(ctx context.Context, start, end types.TS) (ckpLoc string, lastEnd types.TS, err error)
-	FlushTable(dbID, tableID uint64, ts types.TS) error
-}
-
-func DecideTableScope(tableID uint64) Scope {
-	var scope Scope
-	switch tableID {
-	case pkgcatalog.MO_DATABASE_ID:
-		scope = ScopeDatabases
-	case pkgcatalog.MO_TABLES_ID:
-		scope = ScopeTables
-	case pkgcatalog.MO_COLUMNS_ID:
-		scope = ScopeColumns
-	default:
-		scope = ScopeUserTables
-	}
-	return scope
+	FlushTable(ctx context.Context, accoutID uint32, dbID, tableID uint64, ts types.TS) error
 }
 
 func HandleSyncLogTailReq(
@@ -118,9 +107,19 @@ func HandleSyncLogTailReq(
 	mgr *Manager,
 	c *catalog.Catalog,
 	req api.SyncLogTailReq,
-	canRetry bool) (resp api.SyncLogTailResp, err error) {
+	canRetry bool) (resp api.SyncLogTailResp, closeCB func(), err error) {
+	now := time.Now()
 	logutil.Debugf("[Logtail] begin handle %+v", req)
 	defer func() {
+		if elapsed := time.Since(now); elapsed > 5*time.Second {
+			logutil.Warn(
+				"LOGTAIL-SLOW-PULL",
+				zap.Duration("duration", elapsed),
+				zap.Any("request", req),
+				zap.Bool("can-retry", canRetry),
+				zap.Error(err),
+			)
+		}
 		logutil.Debugf("[Logtail] end handle %d entries[%q], err %v", len(resp.Commands), resp.CkpLocation, err)
 	}()
 	start := types.BuildTS(req.CnHave.PhysicalTime, req.CnHave.LogicalTime)
@@ -134,48 +133,49 @@ func HandleSyncLogTailReq(
 	if err != nil {
 		return
 	}
-	if start.Less(tableEntry.GetCreatedAt()) {
-		start = tableEntry.GetCreatedAt()
-	}
+	// fill table info, as req.Table will be used as the Table field in TableLogtail response.
+	schema := tableEntry.GetLastestSchemaLocked(false)
+	req.Table.AccId = schema.AcInfo.TenantID
+	req.Table.DbName = dbEntry.GetName()
+	req.Table.TbName = schema.Name
+	req.Table.PrimarySeqnum = uint32(schema.GetPrimaryKey().SeqNum)
 
 	ckpLoc, checkpointed, err := ckpClient.CollectCheckpointsInRange(ctx, start, end)
 	if err != nil {
 		return
 	}
 
-	if checkpointed.GreaterEq(end) {
+	if checkpointed.GE(&end) {
 		return api.SyncLogTailResp{
 			CkpLocation: ckpLoc,
-		}, err
+		}, nil, err
 	} else if ckpLoc != "" {
 		start = checkpointed.Next()
 	}
 
-	scope := DecideTableScope(tid)
+	visitor := NewTableLogtailRespBuilder(ctx, ckpLoc, start, end, tableEntry)
+	closeCB = visitor.Close
 
-	var visitor RespBuilder
-
-	if scope == ScopeUserTables {
-		visitor = NewTableLogtailRespBuilder(ckpLoc, start, end, tableEntry)
-	} else {
-		visitor = NewCatalogLogtailRespBuilder(scope, ckpLoc, start, end)
-	}
-	defer visitor.Close()
-
-	operator := mgr.GetTableOperator(start, end, c, did, tid, scope, visitor)
+	operator := mgr.GetTableOperator(start, end, c, did, tid, visitor)
 	if err := operator.Run(); err != nil {
-		return api.SyncLogTailResp{}, err
+		return api.SyncLogTailResp{}, visitor.Close, err
 	}
 	resp, err = visitor.BuildResp()
 
-	if canRetry && scope == ScopeUserTables { // check simple conditions first
+	if canRetry { // check simple conditions first
 		_, name, forceFlush := fault.TriggerFault("logtail_max_size")
-		if (forceFlush && name == tableEntry.GetSchema().Name) || resp.ProtoSize() > Size90M {
-			_ = ckpClient.FlushTable(did, tid, end)
+		if (forceFlush && name == tableEntry.GetLastestSchemaLocked(false).Name) || resp.ProtoSize() > Size90M {
+			flushErr := ckpClient.FlushTable(ctx, 0, did, tid, end)
 			// try again after flushing
-			newResp, err := HandleSyncLogTailReq(ctx, ckpClient, mgr, c, req, false)
-			logutil.Infof("[logtail] flush result: %d -> %d err: %v", resp.ProtoSize(), newResp.ProtoSize(), err)
-			return newResp, err
+			newResp, closeCB, err := HandleSyncLogTailReq(ctx, ckpClient, mgr, c, req, false)
+			logutil.Info(
+				"LOGTAIL-WITH-FLUSH",
+				zap.Any("flush-err", flushErr),
+				zap.Error(err),
+				zap.Int("from-size", resp.ProtoSize()),
+				zap.Int("to-size", newResp.ProtoSize()),
+			)
+			return newResp, closeCB, err
 		}
 	}
 	return
@@ -187,360 +187,149 @@ type RespBuilder interface {
 	Close()
 }
 
-// CatalogLogtailRespBuilder knows how to make api-entry from db and table entry.
-// impl catalog.Processor interface, driven by BoundTableOperator
-type CatalogLogtailRespBuilder struct {
-	*catalog.LoopProcessor
-	scope      Scope
-	start, end types.TS
-	checkpoint string
-	insBatch   *containers.Batch
-	delBatch   *containers.Batch
-}
-
-func NewCatalogLogtailRespBuilder(scope Scope, ckp string, start, end types.TS) *CatalogLogtailRespBuilder {
-	b := &CatalogLogtailRespBuilder{
-		LoopProcessor: new(catalog.LoopProcessor),
-		scope:         scope,
-		start:         start,
-		end:           end,
-		checkpoint:    ckp,
-	}
-	switch scope {
-	case ScopeDatabases:
-		b.insBatch = makeRespBatchFromSchema(catalog.SystemDBSchema)
-	case ScopeTables:
-		b.insBatch = makeRespBatchFromSchema(catalog.SystemTableSchema)
-	case ScopeColumns:
-		b.insBatch = makeRespBatchFromSchema(catalog.SystemColumnSchema)
-	}
-	b.delBatch = makeRespBatchFromSchema(DelSchema)
-	b.DatabaseFn = b.VisitDB
-	b.TableFn = b.VisitTbl
-
-	return b
-}
-
-func (b *CatalogLogtailRespBuilder) Close() {
-	if b.insBatch != nil {
-		b.insBatch.Close()
-		b.insBatch = nil
-	}
-	if b.delBatch != nil {
-		b.delBatch.Close()
-		b.delBatch = nil
-	}
-}
-
-// VisitDB = catalog.Processor.OnDatabase
-func (b *CatalogLogtailRespBuilder) VisitDB(entry *catalog.DBEntry) error {
-	entry.RLock()
-	if shouldIgnoreDBInLogtail(entry.ID) {
-		entry.RUnlock()
-		return nil
-	}
-	mvccNodes := entry.ClonePreparedInRange(b.start, b.end)
-	entry.RUnlock()
-	for _, node := range mvccNodes {
-		if node.IsAborted() {
-			continue
-		}
-		dbNode := node.(*catalog.DBMVCCNode)
-		if dbNode.HasDropCommitted() {
-			// delScehma is empty, it will just fill rowid / commit ts
-			catalogEntry2Batch(b.delBatch, entry, DelSchema, txnimpl.FillDBRow, u64ToRowID(entry.GetID()), dbNode.GetEnd(), dbNode.GetEnd())
-		} else {
-			catalogEntry2Batch(b.insBatch, entry, catalog.SystemDBSchema, txnimpl.FillDBRow, u64ToRowID(entry.GetID()), dbNode.GetEnd(), dbNode.GetEnd())
-		}
-	}
-	return nil
-}
-
-// VisitTbl = catalog.Processor.OnTable
-func (b *CatalogLogtailRespBuilder) VisitTbl(entry *catalog.TableEntry) error {
-	entry.RLock()
-	if shouldIgnoreTblInLogtail(entry.ID) {
-		entry.RUnlock()
-		return nil
-	}
-	mvccNodes := entry.ClonePreparedInRange(b.start, b.end)
-	entry.RUnlock()
-	for _, node := range mvccNodes {
-		if node.IsAborted() {
-			continue
-		}
-		tblNode := node.(*catalog.TableMVCCNode)
-		if b.scope == ScopeColumns {
-			var dstBatch *containers.Batch
-			if !tblNode.HasDropCommitted() {
-				dstBatch = b.insBatch
-				// fill unique syscol fields if inserting
-				for _, syscol := range catalog.SystemColumnSchema.ColDefs {
-					txnimpl.FillColumnRow(entry, syscol.Name, b.insBatch.GetVectorByName(syscol.Name))
-				}
-			} else {
-				dstBatch = b.delBatch
-			}
-
-			// fill common syscol fields for every user column
-			rowidVec := dstBatch.GetVectorByName(catalog.AttrRowID)
-			commitVec := dstBatch.GetVectorByName(catalog.AttrCommitTs)
-			tableID := entry.GetID()
-			commitTs := tblNode.GetEnd()
-			for _, usercol := range entry.GetSchema().ColDefs {
-				rowidVec.Append(bytesToRowID([]byte(fmt.Sprintf("%d-%s", tableID, usercol.Name))))
-				commitVec.Append(commitTs)
-			}
-		} else {
-			if tblNode.HasDropCommitted() {
-				catalogEntry2Batch(b.delBatch, entry, DelSchema, txnimpl.FillTableRow, u64ToRowID(entry.GetID()), tblNode.GetEnd(), tblNode.GetEnd())
-			} else {
-				catalogEntry2Batch(b.insBatch, entry, catalog.SystemTableSchema, txnimpl.FillTableRow, u64ToRowID(entry.GetID()), tblNode.GetEnd(), tblNode.GetEnd())
-			}
-		}
-	}
-	return nil
-}
-
-func (b *CatalogLogtailRespBuilder) BuildResp() (api.SyncLogTailResp, error) {
-	entries := make([]*api.Entry, 0)
-	var tblID uint64
-	var tableName string
-	switch b.scope {
-	case ScopeDatabases:
-		tblID = pkgcatalog.MO_DATABASE_ID
-		tableName = pkgcatalog.MO_DATABASE
-	case ScopeTables:
-		tblID = pkgcatalog.MO_TABLES_ID
-		tableName = pkgcatalog.MO_TABLES
-	case ScopeColumns:
-		tblID = pkgcatalog.MO_COLUMNS_ID
-		tableName = pkgcatalog.MO_COLUMNS
-	}
-
-	if b.insBatch.Length() > 0 {
-		bat, err := containersBatchToProtoBatch(b.insBatch)
-		logutil.Debugf("[logtail] catalog insert to %d-%s, %s", tblID, tableName,
-			DebugBatchToString("catalog", b.insBatch, true, zap.DebugLevel))
-		if err != nil {
-			return api.SyncLogTailResp{}, err
-		}
-		insEntry := &api.Entry{
-			EntryType:    api.Entry_Insert,
-			TableId:      tblID,
-			TableName:    tableName,
-			DatabaseId:   pkgcatalog.MO_CATALOG_ID,
-			DatabaseName: pkgcatalog.MO_CATALOG,
-			Bat:          bat,
-		}
-		entries = append(entries, insEntry)
-	}
-	if b.delBatch.Length() > 0 {
-		bat, err := containersBatchToProtoBatch(b.delBatch)
-		logutil.Debugf("[logtail] catalog delete from %d-%s, %s", tblID, tableName,
-			DebugBatchToString("catalog", b.delBatch, false, zap.DebugLevel))
-		if err != nil {
-			return api.SyncLogTailResp{}, err
-		}
-		delEntry := &api.Entry{
-			EntryType:    api.Entry_Delete,
-			TableId:      tblID,
-			TableName:    tableName,
-			DatabaseId:   pkgcatalog.MO_CATALOG_ID,
-			DatabaseName: pkgcatalog.MO_CATALOG,
-			Bat:          bat,
-		}
-		entries = append(entries, delEntry)
-	}
-	return api.SyncLogTailResp{
-		CkpLocation: b.checkpoint,
-		Commands:    entries,
-	}, nil
-}
-
-// this is used to collect ONE ROW of db or table change
-func catalogEntry2Batch[T *catalog.DBEntry | *catalog.TableEntry](
-	dstBatch *containers.Batch,
-	e T,
-	schema *catalog.Schema,
-	fillDataRow func(e T, attr string, col containers.Vector, ts types.TS),
-	rowid types.Rowid,
-	commitTs types.TS,
-	visibleTS types.TS,
-) {
-	for _, col := range schema.ColDefs {
-		fillDataRow(e, col.Name, dstBatch.GetVectorByName(col.Name), visibleTS)
-	}
-	dstBatch.GetVectorByName(catalog.AttrRowID).Append(rowid)
-	dstBatch.GetVectorByName(catalog.AttrCommitTs).Append(commitTs)
-}
-
 // CatalogLogtailRespBuilder knows how to make api-entry from block entry.
 // impl catalog.Processor interface, driven by BoundTableOperator
 type TableLogtailRespBuilder struct {
+	ctx context.Context
 	*catalog.LoopProcessor
-	start, end      types.TS
-	did, tid        uint64
-	dname, tname    string
-	checkpoint      string
-	blkMetaInsBatch *containers.Batch
-	blkMetaDelBatch *containers.Batch
-	dataInsBatch    *containers.Batch
-	dataDelBatch    *containers.Batch
+	start, end         types.TS
+	did, tid           uint64
+	dname, tname       string
+	checkpoint         string
+	dataMetaBatch      *containers.Batch
+	tombstoneMetaBatch *containers.Batch
+	dataInsBatches     map[uint32]*containers.BatchWithVersion // schema version -> data batch
+	dataDelBatches     map[uint32]*containers.BatchWithVersion
 }
 
-func NewTableLogtailRespBuilder(ckp string, start, end types.TS, tbl *catalog.TableEntry) *TableLogtailRespBuilder {
+func NewTableLogtailRespBuilder(ctx context.Context, ckp string, start, end types.TS, tbl *catalog.TableEntry) *TableLogtailRespBuilder {
 	b := &TableLogtailRespBuilder{
+		ctx:           ctx,
 		LoopProcessor: new(catalog.LoopProcessor),
 		start:         start,
 		end:           end,
 		checkpoint:    ckp,
 	}
-	b.BlockFn = b.VisitBlk
-
-	schema := tbl.GetSchema()
+	b.ObjectFn = b.VisitObj
+	b.TombstoneFn = b.VisitObj
 
 	b.did = tbl.GetDB().GetID()
 	b.tid = tbl.ID
 	b.dname = tbl.GetDB().GetName()
-	b.tname = schema.Name
+	b.tname = tbl.GetLastestSchemaLocked(false).Name
 
-	b.dataInsBatch = makeRespBatchFromSchema(schema)
-	b.dataDelBatch = makeRespBatchFromSchema(DelSchema)
-	b.blkMetaInsBatch = makeRespBatchFromSchema(BlkMetaSchema)
-	b.blkMetaDelBatch = makeRespBatchFromSchema(DelSchema)
+	b.dataInsBatches = make(map[uint32]*containers.BatchWithVersion)
+	b.dataDelBatches = make(map[uint32]*containers.BatchWithVersion)
+	b.dataMetaBatch = makeRespBatchFromSchema(ObjectInfoSchema, common.LogtailAllocator)
+	b.tombstoneMetaBatch = makeRespBatchFromSchema(ObjectInfoSchema, common.LogtailAllocator)
 	return b
 }
 
 func (b *TableLogtailRespBuilder) Close() {
-	if b.dataInsBatch != nil {
-		b.dataInsBatch.Close()
-		b.dataInsBatch = nil
+	for _, vec := range b.dataInsBatches {
+		if vec != nil {
+			vec.Close()
+		}
 	}
-	if b.dataDelBatch != nil {
-		b.dataDelBatch.Close()
-		b.dataDelBatch = nil
+	b.dataInsBatches = nil
+	for _, vec := range b.dataDelBatches {
+		if vec != nil {
+			vec.Close()
+		}
 	}
-	if b.blkMetaInsBatch != nil {
-		b.blkMetaInsBatch.Close()
-		b.blkMetaInsBatch = nil
+	b.dataDelBatches = nil
+	if b.dataMetaBatch != nil {
+		b.dataMetaBatch.Close()
+		b.dataMetaBatch = nil
 	}
-	if b.blkMetaDelBatch != nil {
-		b.blkMetaDelBatch.Close()
-		b.blkMetaDelBatch = nil
+	if b.tombstoneMetaBatch != nil {
+		b.tombstoneMetaBatch.Close()
+		b.tombstoneMetaBatch = nil
 	}
 }
 
-// visitBlkMeta try to collect block metadata. It might prefetch and generate duplicated entry.
-// see also https://github.com/matrixorigin/docs/blob/main/tech-notes/dnservice/ref_logtail_protocol.md#table-metadata-prefetch
-func (b *TableLogtailRespBuilder) visitBlkMeta(e *catalog.BlockEntry) (skipData bool) {
-	newEnd := b.end
-	e.RLock()
-	// try to find new end
-	if newest := e.GetLatestCommittedNode(); newest != nil {
-		latestPrepareTs := newest.CloneAll().(*catalog.MetadataMVCCNode).GetPrepare()
-		if latestPrepareTs.Greater(b.end) {
-			newEnd = latestPrepareTs
-		}
+func (b *TableLogtailRespBuilder) VisitObj(e *catalog.ObjectEntry) error {
+	skip, err := b.visitObjMeta(e)
+	if err != nil {
+		return err
 	}
-	mvccNodes := e.ClonePreparedInRange(b.start, newEnd)
-	e.RUnlock()
+	if skip {
+		return nil
+	} else {
+		return b.visitObjData(e)
+	}
+}
+func (b *TableLogtailRespBuilder) visitObjMeta(e *catalog.ObjectEntry) (bool, error) {
+	mvccNodes := e.GetMVCCNodeInRange(b.start, b.end)
+	if len(mvccNodes) == 0 {
+		return false, nil
+	}
 
+	var objectMVCCNode *catalog.ObjectMVCCNode
 	for _, node := range mvccNodes {
-		metaNode := node.(*catalog.MetadataMVCCNode)
-		if metaNode.MetaLoc != "" && !metaNode.IsAborted() {
-			b.appendBlkMeta(e, metaNode)
-		}
-	}
-
-	if n := len(mvccNodes); n > 0 {
-		newest := mvccNodes[n-1].(*catalog.MetadataMVCCNode)
-		if e.IsAppendable() {
-			if newest.MetaLoc != "" {
-				// appendable block has been flushed, no need to collect data
-				return true
-			}
+		if e.IsTombstone {
+			visitObject(b.tombstoneMetaBatch, e, node, node.End.Equal(&e.CreatedAt), false, types.TS{})
 		} else {
-			if newest.DeltaLoc != "" && newest.GetEnd().GreaterEq(b.end) {
-				// non-appendable block has newer delta data on s3, no need to collect data
-				return true
-			}
+			visitObject(b.dataMetaBatch, e, node, node.End.Equal(&e.CreatedAt), false, types.TS{})
 		}
 	}
-	return false
+	return b.skipObjectData(e, objectMVCCNode), nil
 }
-
-// appendBlkMeta add block metadata into api entry according to logtail protocol
-// see also https://github.com/matrixorigin/docs/blob/main/tech-notes/dnservice/ref_logtail_protocol.md#table-metadata
-func (b *TableLogtailRespBuilder) appendBlkMeta(e *catalog.BlockEntry, metaNode *catalog.MetadataMVCCNode) {
-	visitBlkMeta(e, metaNode, b.blkMetaInsBatch, b.blkMetaDelBatch, metaNode.HasDropCommitted(), metaNode.End, metaNode.CreatedAt, metaNode.DeletedAt)
-}
-
-func visitBlkMeta(e *catalog.BlockEntry, node *catalog.MetadataMVCCNode, insBatch, delBatch *containers.Batch, delete bool, committs, createts, deletets types.TS) {
-	logutil.Debugf("[Logtail] record block meta row %s, %v, %s, %s, %s, %s",
-		e.AsCommonID().String(), e.IsAppendable(),
-		createts.ToString(), node.DeletedAt.ToString(), node.MetaLoc, node.DeltaLoc)
-	is_sorted := false
-	if !e.IsAppendable() && e.GetSchema().HasSortKey() {
-		is_sorted = true
+func (b *TableLogtailRespBuilder) skipObjectData(e *catalog.ObjectEntry, objectMVCCNode *catalog.ObjectMVCCNode) bool {
+	if e.IsAppendable() {
+		// appendable block has been flushed, no need to collect data
+		return objectMVCCNode != nil
+	} else {
+		return true
 	}
-	insBatch.GetVectorByName(pkgcatalog.BlockMeta_ID).Append(e.ID)
-	insBatch.GetVectorByName(pkgcatalog.BlockMeta_EntryState).Append(e.IsAppendable())
-	insBatch.GetVectorByName(pkgcatalog.BlockMeta_Sorted).Append(is_sorted)
-	insBatch.GetVectorByName(pkgcatalog.BlockMeta_MetaLoc).Append([]byte(node.MetaLoc))
-	insBatch.GetVectorByName(pkgcatalog.BlockMeta_DeltaLoc).Append([]byte(node.DeltaLoc))
-	insBatch.GetVectorByName(pkgcatalog.BlockMeta_CommitTs).Append(committs)
-	insBatch.GetVectorByName(pkgcatalog.BlockMeta_SegmentID).Append(e.GetSegment().ID)
-	insBatch.GetVectorByName(catalog.AttrCommitTs).Append(createts)
-	insBatch.GetVectorByName(catalog.AttrRowID).Append(blockid2rowid(&e.ID))
-
-	// if block is deleted, send both Insert and Delete api entry
-	// see also https://github.com/matrixorigin/docs/blob/main/tech-notes/dnservice/ref_logtail_protocol.md#table-metadata-deletion-invalidate-table-data
-	if delete {
-		if node.DeletedAt.IsEmpty() {
-			panic(moerr.NewInternalErrorNoCtx("no delete at time in a dropped entry"))
-		}
-		delBatch.GetVectorByName(catalog.AttrCommitTs).Append(deletets)
-		delBatch.GetVectorByName(catalog.AttrRowID).Append(blockid2rowid(&e.ID))
-	}
-
 }
-
-// visitBlkData collects logtail in memory
-func (b *TableLogtailRespBuilder) visitBlkData(e *catalog.BlockEntry) (err error) {
-	block := e.GetBlockData()
-	insBatch, err := block.CollectAppendInRange(b.start, b.end, false)
+func (b *TableLogtailRespBuilder) visitObjData(e *catalog.ObjectEntry) error {
+	var err error
+	if e.IsTombstone {
+		err = tables.RangeScanInMemoryByObject(b.ctx, e, b.dataDelBatches, b.start, b.end, common.LogtailAllocator)
+	} else {
+		err = tables.RangeScanInMemoryByObject(b.ctx, e, b.dataInsBatches, b.start, b.end, common.LogtailAllocator)
+	}
 	if err != nil {
-		return
-	}
-	if insBatch != nil && insBatch.Length() > 0 {
-		b.dataInsBatch.Extend(insBatch)
-		// insBatch is freed, don't use anymore
-	}
-	delBatch, err := block.CollectDeleteInRange(b.start, b.end, false)
-	if err != nil {
-		return
-	}
-	if delBatch != nil && delBatch.Length() > 0 {
-		b.dataDelBatch.Extend(delBatch)
-		// delBatch is freed, don't use anymore
+		return err
 	}
 	return nil
 }
-
-// VisitBlk = catalog.Processor.OnBlock
-func (b *TableLogtailRespBuilder) VisitBlk(entry *catalog.BlockEntry) error {
-	if b.visitBlkMeta(entry) {
-		// data has been flushed, no need to collect data
-		return nil
+func visitObject(batch *containers.Batch, entry *catalog.ObjectEntry, txnMVCCNode *txnbase.TxnMVCCNode, create bool, push bool, committs types.TS) {
+	var rowid types.Rowid
+	batch.GetVectorByName(catalog.PhyAddrColumnName).Append(rowid, false)
+	if push {
+		batch.GetVectorByName(objectio.DefaultCommitTS_Attr).Append(committs, false)
+	} else {
+		batch.GetVectorByName(objectio.DefaultCommitTS_Attr).Append(txnMVCCNode.End, false)
 	}
-	return b.visitBlkData(entry)
+	entry.ObjectMVCCNode.AppendTuple(entry.ID(), batch)
+	if push {
+		txnMVCCNode.AppendTupleWithCommitTS(batch, committs)
+	} else {
+		txnMVCCNode.AppendTuple(batch)
+	}
+	if push {
+		entry.EntryMVCCNode.AppendTupleWithCommitTS(batch, committs)
+	} else {
+		entry.EntryMVCCNode.AppendObjectTuple(batch, create)
+	}
+	batch.GetVectorByName(SnapshotAttr_DBID).Append(entry.GetTable().GetDB().ID, false)
+	batch.GetVectorByName(SnapshotAttr_TID).Append(entry.GetTable().ID, false)
 }
+
+type TableRespKind int
+
+const (
+	TableRespKind_Data TableRespKind = iota
+	TableRespKind_DataMeta
+	TableRespKind_TombstoneMeta
+)
 
 func (b *TableLogtailRespBuilder) BuildResp() (api.SyncLogTailResp, error) {
 	entries := make([]*api.Entry, 0)
-	tryAppendEntry := func(typ api.Entry_EntryType, metaChange bool, batch *containers.Batch) error {
-		if batch.Length() == 0 {
+	tryAppendEntry := func(typ api.Entry_EntryType, kind TableRespKind, batch *containers.Batch, version uint32) error {
+		if batch == nil || batch.Length() == 0 {
 			return nil
 		}
 		bat, err := containersBatchToProtoBatch(batch)
@@ -549,18 +338,33 @@ func (b *TableLogtailRespBuilder) BuildResp() (api.SyncLogTailResp, error) {
 		}
 
 		tableName := b.tname
-		if metaChange {
-			tableName = fmt.Sprintf("_%d_meta", b.tid)
-			logutil.Infof("[Logtail] send block meta for %q", b.tname)
-		}
-		if metaChange {
-			logutil.Infof("[logtail] table meta [%v] %d-%s: %s", typ, b.tid, b.tname,
-				DebugBatchToString("meta", batch, true, zap.InfoLevel))
-		} else {
-			logutil.Infof("[logtail] table data [%v] %d-%s: %s", typ, b.tid, b.tname,
+		switch kind {
+		case TableRespKind_Data:
+			logutil.Debugf("[logtail] table data [%v] %d-%s-%d: %s", typ, b.tid, b.tname, version,
 				DebugBatchToString("data", batch, false, zap.InfoLevel))
+		case TableRespKind_DataMeta:
+			logutil.Debugf("[logtail] table data meta [%v] %d-%s: %s", typ, b.tid, b.tname,
+				DebugBatchToString("object", batch, false, zap.InfoLevel))
+		case TableRespKind_TombstoneMeta:
+			logutil.Debugf("[logtail] table tombstone meta [%v] %d-%s: %s", typ, b.tid, b.tname,
+				DebugBatchToString("object", batch, false, zap.InfoLevel))
 		}
 
+		// if b.tid == pkgcatalog.MO_DATABASE_ID || b.tid == pkgcatalog.MO_TABLES_ID || b.tid == pkgcatalog.MO_COLUMNS_ID {
+		// 	switch kind {
+		// 	case TableRespKind_Data:
+		// 		logutil.Infof("[yyyy pull] table data [%v] %d-%s-%d: %s", typ, b.tid, b.tname, version,
+		// 			DebugBatchToString("data", batch, false, zap.InfoLevel))
+		// 	case TableRespKind_Blk:
+		// 		logutil.Infof("[yyyy pull] blk meta [%v] %d-%s: %s", typ, b.tid, tableName,
+		// 			// batch.PPString(30)) // DebugBatchToString("blkmeta", batch, false, zap.InfoLevel))
+		// 			DebugBatchToString("blkmeta", batch, false, zap.InfoLevel))
+		// 	case TableRespKind_Obj:
+		// 		logutil.Infof("[yyyy pull] obj meta [%v] %d-%s: %s", typ, b.tid, tableName,
+		// 			// batch.PPString(30)) // DebugBatchToString("object", batch, false, zap.InfoLevel))
+		// 			DebugBatchToString("object", batch, false, zap.InfoLevel))
+		// 	}
+		// }
 		entry := &api.Entry{
 			EntryType:    typ,
 			TableId:      b.tid,
@@ -574,133 +378,230 @@ func (b *TableLogtailRespBuilder) BuildResp() (api.SyncLogTailResp, error) {
 	}
 
 	empty := api.SyncLogTailResp{}
-	if err := tryAppendEntry(api.Entry_Insert, true, b.blkMetaInsBatch); err != nil {
+	if err := tryAppendEntry(api.Entry_DataObject, TableRespKind_DataMeta, b.dataMetaBatch, 0); err != nil {
 		return empty, err
 	}
-	if err := tryAppendEntry(api.Entry_Delete, true, b.blkMetaDelBatch); err != nil {
+	if err := tryAppendEntry(api.Entry_TombstoneObject, TableRespKind_TombstoneMeta, b.tombstoneMetaBatch, 0); err != nil {
 		return empty, err
 	}
-	if err := tryAppendEntry(api.Entry_Insert, false, b.dataInsBatch); err != nil {
-		return empty, err
+	keys := make([]uint32, 0, len(b.dataInsBatches))
+	for k := range b.dataInsBatches {
+		keys = append(keys, k)
 	}
-	if err := tryAppendEntry(api.Entry_Delete, false, b.dataDelBatch); err != nil {
-		return empty, err
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, k := range keys {
+		if err := tryAppendEntry(api.Entry_Insert, TableRespKind_Data, DataChangeToLogtailBatch(b.dataInsBatches[k]), k); err != nil {
+			return empty, err
+		}
 	}
+	if len(b.dataDelBatches) > 1 {
+		panic(fmt.Sprintf("logic err, batch %v", b.dataDelBatches))
+	}
+	for _, bat := range b.dataDelBatches {
+		if err := tryAppendEntry(api.Entry_Delete, TableRespKind_Data, TombstoneChangeToLogtailBatch(bat), 0); err != nil {
+			return empty, err
+		}
+	}
+
+	// if b.tid == pkgcatalog.MO_DATABASE_ID || b.tid == pkgcatalog.MO_TABLES_ID || b.tid == pkgcatalog.MO_COLUMNS_ID {
+	// 	logutil.Infof("[yyyy pull] table %s: %d, ckp:%v", b.tname, len(entries), b.checkpoint)
+	// }
 
 	return api.SyncLogTailResp{
 		CkpLocation: b.checkpoint,
 		Commands:    entries,
 	}, nil
 }
-
+func GetMetaIdxesByVersion(ver uint32) []uint16 {
+	meteIdxSchema := checkpointDataReferVersions[ver][MetaIDX]
+	idxes := make([]uint16, len(meteIdxSchema.attrs))
+	for attr := range meteIdxSchema.attrs {
+		idxes[attr] = uint16(attr)
+	}
+	return idxes
+}
 func LoadCheckpointEntries(
 	ctx context.Context,
-	metLoc string,
+	sid string,
+	metaLoc string,
 	tableID uint64,
 	tableName string,
 	dbID uint64,
 	dbName string,
-	fs fileservice.FileService) (entries []*api.Entry, err error) {
-	if metLoc == "" {
-		return
+	mp *mpool.MPool,
+	fs fileservice.FileService) ([]*api.Entry, []func(), error) {
+	if metaLoc == "" {
+		return nil, nil, nil
 	}
+	v2.LogtailLoadCheckpointCounter.Inc()
 	now := time.Now()
 	defer func() {
-		logutil.Infof("LoadCheckpointEntries latency: %v", time.Since(now))
+		v2.LogTailLoadCheckpointDurationHistogram.Observe(time.Since(now).Seconds())
 	}()
-	locations := strings.Split(metLoc, ";")
-	datas := make([]*CheckpointData, len(locations))
+	locationsAndVersions := strings.Split(metaLoc, ";")
 
-	readers := make([]dataio.Reader, len(locations))
-	readerMetas := make([][]objectio.BlockObject, len(locations))
-	for i, key := range locations {
-		readers[i], err = blockio.NewCheckPointReader(fs, key)
+	datas := make([]*CNCheckpointData, len(locationsAndVersions)/2)
 
-		err = blockio.PrefetchBlocksMeta(readers[i], nil)
+	readers := make([]*ioutil.BlockReader, len(locationsAndVersions)/2)
+	objectLocations := make([]objectio.Location, len(locationsAndVersions)/2)
+	versions := make([]uint32, len(locationsAndVersions)/2)
+	locations := make([]objectio.Location, len(locationsAndVersions)/2)
+	for i := 0; i < len(locationsAndVersions); i += 2 {
+		key := locationsAndVersions[i]
+		version, err := strconv.ParseUint(locationsAndVersions[i+1], 10, 32)
 		if err != nil {
-			return
+			logutil.Error(
+				"Parse-CKP-Name-Error",
+				zap.String("loc", metaLoc),
+				zap.Int("i", i),
+				zap.Error(err),
+			)
+			return nil, nil, err
 		}
+		location, err := objectio.StringToLocation(key)
+		if err != nil {
+			logutil.Error(
+				"Parse-CKP-Name-Error",
+				zap.String("loc", metaLoc),
+				zap.Int("i", i),
+				zap.Error(err),
+			)
+			return nil, nil, err
+		}
+		locations[i/2] = location
+		reader, err := ioutil.NewObjectReader(fs, location)
+		if err != nil {
+			return nil, nil, err
+		}
+		readers[i/2] = reader
+		err = ioutil.PrefetchMeta(sid, fs, location)
+		if err != nil {
+			return nil, nil, err
+		}
+		objectLocations[i/2] = location
+		versions[i/2] = uint32(version)
 	}
 
-	for i := range locations {
-		readerMetas[i], err = readers[i].LoadBlocksMeta(ctx, common.DefaultAllocator)
-		if err != nil {
-			return
-		}
-
-		pref := blockio.BuildPrefetch(readers[i], common.DefaultAllocator)
-		for idx, item := range checkpointDataRefer {
-			idxes := make([]uint16, len(item.attrs))
-			for col := range item.attrs {
-				idxes[col] = uint16(col)
-			}
-			pref.AddBlock(idxes, []uint32{readerMetas[i][idx].GetID()})
-		}
-		err = blockio.PrefetchWithMerged(pref)
-		if err != nil {
-			return
-		}
-
+	shouldSkip := func(i int) bool {
+		versionTry := CheckpointCurrentVersion >= CheckpointVersion12 && versions[i] < CheckpointVersion12
+		sysTable := tableID == pkgcatalog.MO_DATABASE_ID || tableID == pkgcatalog.MO_TABLES_ID || tableID == pkgcatalog.MO_COLUMNS_ID
+		return versionTry && sysTable
 	}
 
-	for i := range locations {
-		data := NewCheckpointData()
-		for idx, item := range checkpointDataRefer {
-			var bat *containers.Batch
-			bat, err = LoadBlkColumnsByMeta(ctx, item.types, item.attrs, item.nullables, readerMetas[i][idx], readers[i])
-			if err != nil {
-				return
-			}
-			data.bats[idx] = bat
+	for i := range objectLocations {
+		data := NewCNCheckpointData(sid)
+		meteIdxSchema := checkpointDataReferVersions[versions[i]][MetaIDX]
+		idxes := make([]uint16, len(meteIdxSchema.attrs))
+		for attr := range meteIdxSchema.attrs {
+			idxes[attr] = uint16(attr)
+		}
+		err := data.PrefetchMetaIdx(ctx, versions[i], idxes, objectLocations[i], fs)
+		if err != nil {
+			return nil, nil, err
 		}
 		datas[i] = data
 	}
 
-	entries = make([]*api.Entry, 0)
-	for i := range locations {
-		data := datas[i]
-		ins, del, cnIns, err := data.GetTableData(tableID)
+	for i := range datas {
+		if shouldSkip(i) {
+			continue
+		}
+		err := datas[i].InitMetaIdx(ctx, versions[i], readers[i], locations[i], mp)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if tableName != pkgcatalog.MO_DATABASE &&
-			tableName != pkgcatalog.MO_COLUMNS &&
-			tableName != pkgcatalog.MO_TABLES {
-			tableName = fmt.Sprintf("_%d_meta", tableID)
+	}
+
+	for i := range datas {
+		if shouldSkip(i) {
+			continue
 		}
-		if ins != nil {
+		err := datas[i].PrefetchMetaFrom(ctx, versions[i], locations[i], fs, tableID)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	for i := range datas {
+		if shouldSkip(i) {
+			continue
+		}
+		err := datas[i].PrefetchFrom(ctx, versions[i], fs, locations[i], tableID)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	closeCBs := make([]func(), 0)
+	dataBats := make([][]*batch.Batch, len(locationsAndVersions)/2)
+	var err error
+	for i, data := range datas {
+		if shouldSkip(i) {
+			continue
+		}
+		var bats []*batch.Batch
+		bats, err = data.ReadFromData(ctx, tableID, locations[i], readers[i], versions[i], mp)
+		cb := data.GetCloseCB(versions[i], mp)
+		closeCBs = append(closeCBs, func() {
+			for _, bat := range bats {
+				if bat != nil {
+					bat.Clean(mp)
+				}
+			}
+			cb()
+		})
+		if err != nil {
+			for j := range closeCBs {
+				if closeCBs[j] != nil {
+					closeCBs[j]()
+				}
+			}
+			return nil, nil, err
+		}
+		dataBats[i] = bats
+	}
+
+	entries := make([]*api.Entry, 0)
+	for i := range objectLocations {
+		if shouldSkip(i) {
+			continue
+		}
+		data := datas[i]
+		_, _, dataObj, tombstoneObj, err := data.GetTableDataFromBats(tableID, dataBats[i])
+		if err != nil {
+			for j := range closeCBs {
+				if closeCBs[j] != nil {
+					closeCBs[j]()
+				}
+			}
+			return nil, nil, err
+		}
+		if dataObj != nil {
 			entry := &api.Entry{
-				EntryType:    api.Entry_Insert,
+				EntryType:    api.Entry_DataObject,
 				TableId:      tableID,
 				TableName:    tableName,
 				DatabaseId:   dbID,
 				DatabaseName: dbName,
-				Bat:          ins,
+				Bat:          dataObj,
 			}
 			entries = append(entries, entry)
 		}
-		if cnIns != nil {
+		if tombstoneObj != nil {
 			entry := &api.Entry{
-				EntryType:    api.Entry_Insert,
+				EntryType:    api.Entry_TombstoneObject,
 				TableId:      tableID,
 				TableName:    tableName,
 				DatabaseId:   dbID,
 				DatabaseName: dbName,
-				Bat:          cnIns,
-			}
-			entries = append(entries, entry)
-		}
-		if del != nil {
-			entry := &api.Entry{
-				EntryType:    api.Entry_Delete,
-				TableId:      tableID,
-				TableName:    tableName,
-				DatabaseId:   dbID,
-				DatabaseName: dbName,
-				Bat:          del,
+				Bat:          tombstoneObj,
 			}
 			entries = append(entries, entry)
 		}
 	}
-	return
+
+	// if tableID <= 3 {
+	// 	logutil.Infof("[yyyy ckp] load checkpoint entries %d: %d", tableID, len(entries))
+	// }
+	return entries, closeCBs, nil
 }

@@ -15,109 +15,137 @@
 package colexec
 
 import (
-	"context"
-	"encoding/binary"
-	"fmt"
-	"math"
-	"time"
+	"sync/atomic"
 
 	"github.com/google/uuid"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-var Srv *Server
+// FIXME: shit design
+var srv atomic.Pointer[Server]
+
+const (
+	TxnWorkSpaceIdType = 1
+	CnBlockIdType      = 2
+)
+
+func Get() *Server {
+	return srv.Load()
+}
+
+func Set(s *Server) {
+	srv.Store(s)
+}
 
 func NewServer(client logservice.CNHAKeeperClient) *Server {
-	if Srv != nil {
-		return Srv
+	s := Get()
+	if s != nil {
+		return s
 	}
-	Srv = &Server{
-		mp:       make(map[uint64]*process.WaitRegister),
-		hakeeper: client,
-
-		uuidCsChanMap: UuidCsChanMap{mp: make(map[uuid.UUID]chan process.WrapCs)},
+	s = &Server{
+		hakeeper:      client,
+		uuidCsChanMap: UuidProcMap{mp: make(map[uuid.UUID]uuidProcMapItem, 1024)},
+		cnSegmentMap:  CnSegmentMap{mp: make(map[objectio.Segmentid]int32, 1024)},
+		receivedRunningPipeline: RunningPipelineMapForRemoteNode{
+			fromRpcClientToRelatedPipeline: make(map[rpcClientItem]runningPipelineInfo, 1024),
+		},
 	}
-	return Srv
+	Set(s)
+	return s
 }
 
-func (srv *Server) GetConnector(id uint64) *process.WaitRegister {
-	srv.Lock()
-	defer srv.Unlock()
-	defer func() { delete(srv.mp, id) }()
-	return srv.mp[id]
-}
-
-func (srv *Server) RegistConnector(reg *process.WaitRegister) uint64 {
-	srv.Lock()
-	defer srv.Unlock()
-	srv.mp[srv.id] = reg
-	defer func() { srv.id++ }()
-	return srv.id
-}
-
-func (srv *Server) GetNotifyChByUuid(u uuid.UUID) (chan process.WrapCs, bool) {
+// GetProcByUuid used the uuid to get a process from the srv.
+// if the process is nil, it means the process has done.
+// if forcedDelete, do an action to avoid another routine to put a new item.
+func (srv *Server) GetProcByUuid(u uuid.UUID, forcedDelete bool) (*process.Process, process.RemotePipelineInformationChannel, bool) {
 	srv.uuidCsChanMap.Lock()
 	defer srv.uuidCsChanMap.Unlock()
 	p, ok := srv.uuidCsChanMap.mp[u]
 	if !ok {
-		return nil, false
+		if forcedDelete {
+			srv.uuidCsChanMap.mp[u] = uuidProcMapItem{proc: nil, ch: nil}
+		}
+		return nil, nil, false
 	}
-	return p, true
+
+	result1 := p.proc
+	result2 := p.ch
+	if p.proc == nil {
+		delete(srv.uuidCsChanMap.mp, u)
+	} else {
+		p.proc = nil
+		p.ch = nil
+		srv.uuidCsChanMap.mp[u] = p
+	}
+	return result1, result2, true
 }
 
-func (srv *Server) PutNotifyChIntoUuidMap(u uuid.UUID, ch chan process.WrapCs) error {
+func (srv *Server) PutProcIntoUuidMap(u uuid.UUID, p *process.Process, ch process.RemotePipelineInformationChannel) error {
 	srv.uuidCsChanMap.Lock()
 	defer srv.uuidCsChanMap.Unlock()
-	srv.uuidCsChanMap.mp[u] = ch
+	if _, ok := srv.uuidCsChanMap.mp[u]; ok {
+		delete(srv.uuidCsChanMap.mp, u)
+		return moerr.NewInternalErrorNoCtx("remote receiver already done")
+	}
+
+	srv.uuidCsChanMap.mp[u] = uuidProcMapItem{proc: p, ch: ch}
 	return nil
 }
 
-// SegmentId is part of Id for cn2s3 directly, for more info, refer to docs about it
-func (srv *Server) GenerateSegment() (string, error) {
-	srv.Lock()
-	defer srv.Unlock()
-	if srv.InitSegmentId {
-		if err := srv.incrementSegmentId(); err != nil {
-			return "", err
+func (srv *Server) DeleteUuids(uuids []uuid.UUID) {
+	srv.uuidCsChanMap.Lock()
+	defer srv.uuidCsChanMap.Unlock()
+	for i := range uuids {
+		p, ok := srv.uuidCsChanMap.mp[uuids[i]]
+		if !ok {
+			continue
 		}
-	} else {
-		if err := srv.getNewSegmentId(); err != nil {
-			return "", err
+
+		if p.proc == nil {
+			delete(srv.uuidCsChanMap.mp, uuids[i])
+		} else {
+			p.proc = nil
+			p.ch = nil
+			srv.uuidCsChanMap.mp[uuids[i]] = p
 		}
-		srv.InitSegmentId = true
 	}
-	return fmt.Sprintf("%x.seg", (srv.CNSegmentId)[:]), nil
 }
 
-func (srv *Server) incrementSegmentId() error {
-	// increment SegmentId
-	b := binary.BigEndian.Uint32(srv.CNSegmentId[0:4])
-	// can't rise up to math.MaxUint32, we need to distinct the memory
-	// data in disttae, the batch's rowId's prefix is MaxUint64
-	if b < math.MaxUint32-1 {
-		b++
-		binary.BigEndian.PutUint32(srv.CNSegmentId[0:4], b)
-	} else {
-		if err := srv.getNewSegmentId(); err != nil {
-			return err
-		}
-	}
-	return nil
+func (srv *Server) PutCnSegment(sid *objectio.Segmentid, segmentType int32) {
+	srv.cnSegmentMap.Lock()
+	defer srv.cnSegmentMap.Unlock()
+	srv.cnSegmentMap.mp[*sid] = segmentType
 }
 
-// getNewSegmentId returns Id given from hakeeper
-func (srv *Server) getNewSegmentId() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
-	Id, err := srv.hakeeper.AllocateID(ctx)
-	if err != nil {
-		return err
+func (srv *Server) DeleteTxnSegmentIds(sids []objectio.Segmentid) {
+	srv.cnSegmentMap.Lock()
+	defer srv.cnSegmentMap.Unlock()
+	for _, segmentName := range sids {
+		delete(srv.cnSegmentMap.mp, segmentName)
 	}
-	srv.CNSegmentId[0] = 0x80
-	for i := 1; i < 4; i++ {
-		srv.CNSegmentId[i] = 0
+}
+
+func (srv *Server) GetCnSegmentMap() map[string]int32 {
+	srv.cnSegmentMap.Lock()
+	defer srv.cnSegmentMap.Unlock()
+	new_mp := make(map[string]int32)
+	for k, v := range srv.cnSegmentMap.mp {
+		new_mp[string(k[:])] = v
 	}
-	binary.BigEndian.PutUint64(srv.CNSegmentId[4:12], Id)
-	return nil
+	return new_mp
+}
+
+func (srv *Server) GetCnSegmentType(sid *objectio.Segmentid) int32 {
+	srv.cnSegmentMap.Lock()
+	defer srv.cnSegmentMap.Unlock()
+	return srv.cnSegmentMap.mp[*sid]
+}
+
+// GenerateObject used to generate a new object name for CN
+func (srv *Server) GenerateObject() objectio.ObjectName {
+	segId := objectio.NewSegmentid()
+	return objectio.BuildObjectName(segId, 0)
 }

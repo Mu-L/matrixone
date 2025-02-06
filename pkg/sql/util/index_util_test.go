@@ -18,15 +18,15 @@ import (
 	"context"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/sql/plan/function/builtin/multi"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
-
-	"github.com/stretchr/testify/require"
 )
 
 func TestBuildIndexTableName(t *testing.T) {
@@ -83,15 +83,41 @@ func TestBuildUniqueKeyBatch(t *testing.T) {
 			parts: []string{"a"},
 			proc:  proc,
 		},
+		{
+			vecs: []*vector.Vector{
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+			},
+			attrs: []string{"a", "b", "c"},
+			parts: []string{"a", "b", "c"},
+			proc:  proc,
+		},
+		{
+			vecs: []*vector.Vector{
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+			},
+			attrs: []string{"a", "b", "c"},
+			parts: []string{"a"},
+			proc:  proc,
+		},
 	}
 	for _, test := range tests {
+		packers := PackerList{}
 		if len(test.parts) >= 2 {
-			vec, _ := multi.Serial(test.vecs, proc)
-			b, _ := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc)
+			vec, _ := function.RunFunctionDirectly(proc, function.SerialFunctionEncodeID, test.vecs, test.vecs[0].Length())
+			b, _, err := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc, &packers)
+			require.NoError(t, err)
 			require.Equal(t, vec.UnsafeGetRawData(), b.Vecs[0].UnsafeGetRawData())
 		} else {
-			b, _ := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc)
+			b, _, err := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc, &packers)
+			require.NoError(t, err)
 			require.Equal(t, test.vecs[0].UnsafeGetRawData(), b.Vecs[0].UnsafeGetRawData())
+		}
+		for _, p := range packers.ps {
+			p.Close()
 		}
 	}
 }
@@ -124,18 +150,112 @@ func TestCompactUniqueKeyBatch(t *testing.T) {
 			parts: []string{"b"},
 			proc:  proc,
 		},
+		{
+			vecs: []*vector.Vector{
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+			},
+			attrs: []string{"a", "b", "c"},
+			parts: []string{"a", "b", "c"},
+			proc:  proc,
+		},
+		{
+			vecs: []*vector.Vector{
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+				testutil.NewVector(3, types.T_array_float32.ToType(), proc.Mp(), false, [][]float32{{1, 1, 1}, {2, 2, 2}, {3, 3, 3}}),
+			},
+			attrs: []string{"a", "b", "c"},
+			parts: []string{"b"},
+			proc:  proc,
+		},
 	}
 	for _, test := range tests {
 		nulls.Add(test.vecs[1].GetNulls(), 1)
 		//if JudgeIsCompositeIndexColumn(test.f) {
+		packers := PackerList{}
 		if len(test.parts) >= 2 {
 			//b, _ := BuildUniqueKeyBatch(test.vecs, test.attrs, test.f.Parts, "", test.proc)
-			b, _ := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc)
+			b, _, err := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc, &packers)
+			require.NoError(t, err)
 			require.Equal(t, 2, b.Vecs[0].Length())
 		} else {
 			//b, _ := BuildUniqueKeyBatch(test.vecs, test.attrs, test.f.Parts, "", test.proc)
-			b, _ := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc)
+			b, _, err := BuildUniqueKeyBatch(test.vecs, test.attrs, test.parts, "", test.proc, &packers)
+			require.NoError(t, err)
 			require.Equal(t, 2, b.Vecs[0].Length())
 		}
+		for _, p := range packers.ps {
+			p.Close()
+		}
+	}
+}
+
+func TestIsIndexTableName(t *testing.T) {
+	tests := []struct {
+		name      string
+		tableName string
+		expected  bool
+	}{
+		{
+			name:      "test01",
+			tableName: "__mo_index_unique_c1d278ec-bfd6-11ed-9e9d-000c29203f30",
+			expected:  true,
+		},
+		{
+			name:      "test02",
+			tableName: "something_random",
+			expected:  false,
+		},
+		{
+			name:      "test03",
+			tableName: "",
+			expected:  false,
+		},
+		{
+			name:      "test04",
+			tableName: "normal_table_001",
+			expected:  false,
+		},
+		{
+			name:      "test05",
+			tableName: "__mo_index_unique_c1d278ec-bfd6",
+			expected:  false,
+		},
+		{
+			name:      "test06",
+			tableName: "secondary_idx_5678",
+			expected:  false,
+		},
+		{
+			name:      "test07",
+			tableName: "__mo_index_secondary_c1d278ec-bfd6-11ed-9e9d-000c29203f30",
+			expected:  true,
+		},
+		{
+			name:      "test08",
+			tableName: "__mo_index_secondary_c1d278ec-bfd6-11ed-9e9d",
+			expected:  false,
+		},
+		{
+			name:      "test09",
+			tableName: "__mo_index_unique_",
+			expected:  false,
+		},
+		{
+			name:      "test10",
+			tableName: "__mo_index_secondary_",
+			expected:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := IsIndexTableName(tt.tableName)
+			if result != tt.expected {
+				t.Errorf("IsIndexTableName(%s) = %v, expected %v", tt.tableName, result, tt.expected)
+			}
+		})
 	}
 }

@@ -16,14 +16,20 @@ package rpc
 
 import (
 	"context"
+	"encoding/hex"
+	"errors"
+	"io"
 	"runtime"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
 
@@ -81,8 +87,11 @@ func NewSender(
 		},
 	}
 
-	client, err := s.cfg.NewClient("txn-rpc-sender",
-		s.rt.Logger().RawLogger(),
+	s.cfg.BackendOptions = append(s.cfg.BackendOptions,
+		morpc.WithBackendStreamBufferSize(10000))
+	client, err := s.cfg.NewClient(
+		s.rt.ServiceUUID(),
+		"txn-client",
 		func() morpc.Message { return s.acquireResponse() })
 	if err != nil {
 		return nil, err
@@ -115,16 +124,16 @@ func (s *sender) Send(ctx context.Context, requests []txn.TxnRequest) (*SendResu
 
 	sr.reset(requests)
 	for idx := range requests {
-		dn := requests[idx].GetTargetDN()
-		st := sr.getStream(dn.ShardID)
+		tn := requests[idx].GetTargetTN()
+		st := sr.getStream(tn.ShardID)
 		if st == nil {
-			v, err := s.createStream(ctx, dn, len(requests))
+			v, err := s.createStream(ctx, tn, len(requests))
 			if err != nil {
 				sr.Release()
 				return nil, err
 			}
 			st = v
-			sr.setStream(dn.ShardID, v)
+			sr.setStream(tn.ShardID, v)
 		}
 
 		requests[idx].RequestID = st.ID()
@@ -135,7 +144,7 @@ func (s *sender) Send(ctx context.Context, requests []txn.TxnRequest) (*SendResu
 	}
 
 	for idx := range requests {
-		st := sr.getStream(requests[idx].GetTargetDN().ShardID)
+		st := sr.getStream(requests[idx].GetTargetTN().ShardID)
 		c, err := st.Receive()
 		if err != nil {
 			sr.Release()
@@ -155,37 +164,72 @@ func (s *sender) Send(ctx context.Context, requests []txn.TxnRequest) (*SendResu
 func (s *sender) doSend(ctx context.Context, request txn.TxnRequest) (txn.TxnResponse, error) {
 	ctx, span := trace.Debug(ctx, "sender.doSend")
 	defer span.End()
-	dn := request.GetTargetDN()
+	tn := request.GetTargetTN()
 	if s.options.localDispatch != nil {
-		if handle := s.options.localDispatch(dn); handle != nil {
+		if handle := s.options.localDispatch(tn); handle != nil {
 			response := txn.TxnResponse{}
 			err := handle(ctx, &request, &response)
 			return response, err
 		}
 	}
 
-	f, err := s.client.Send(ctx, dn.Address, &request)
-	if err != nil {
-		return txn.TxnResponse{}, err
+	var f *morpc.Future
+	reqFn := func() error {
+		var err error
+		start := time.Now()
+		// TODO(volgariver6): when try to send request, we may need
+		// to refresh the tn address.
+		f, err = s.client.Send(ctx, tn.Address, &request)
+		if err != nil {
+			return err
+		}
+		v2.TxnCNSendCommitDurationHistogram.Observe(time.Since(start).Seconds())
+		return nil
 	}
-	defer f.Close()
 
+	for {
+		err := reqFn()
+		if err != nil {
+			// These errors are retriable error. Retry to send request to TN.
+			if moerr.IsMoErrCode(err, moerr.ErrNoAvailableBackend) ||
+				moerr.IsMoErrCode(err, moerr.ErrBackendCannotConnect) {
+				time.Sleep(time.Millisecond * 300)
+				continue
+			}
+			return txn.TxnResponse{}, err
+		}
+		break
+	}
+
+	defer f.Close()
 	v, err := f.Get()
 	if err != nil {
+		// if the error is io.EOF or "connection is reset by peer",
+		// means the connection to TN node is ended, but no response
+		// is returned from TN txn service. In this case, the result
+		// of the txn status is unknown.
+		if errors.Is(err, io.EOF) ||
+			strings.Contains(err.Error(), "connection reset by peer") {
+			return txn.TxnResponse{},
+				moerr.NewTxnUnknown(
+					ctx,
+					hex.EncodeToString(request.Txn.ID),
+				)
+		}
 		return txn.TxnResponse{}, err
 	}
 	return *(v.(*txn.TxnResponse)), nil
 }
 
-func (s *sender) createStream(ctx context.Context, dn metadata.DNShard, size int) (morpc.Stream, error) {
+func (s *sender) createStream(ctx context.Context, tn metadata.TNShard, size int) (morpc.Stream, error) {
 	if s.options.localDispatch != nil {
-		if h := s.options.localDispatch(dn); h != nil {
+		if h := s.options.localDispatch(tn); h != nil {
 			ls := s.acquireLocalStream()
 			ls.setup(ctx, h)
 			return ls, nil
 		}
 	}
-	return s.client.NewStream(dn.Address, false)
+	return s.client.NewStream(tn.Address, false)
 }
 
 func (s *sender) acquireLocalStream() *localStream {
@@ -279,7 +323,7 @@ func (ls *localStream) Receive() (chan morpc.Message, error) {
 	return ls.out, nil
 }
 
-func (ls *localStream) Close() error {
+func (ls *localStream) Close(closeConn bool) error {
 	if ls.closed {
 		return nil
 	}
@@ -326,12 +370,12 @@ func (sr *SendResult) reset(requests []txn.TxnRequest) {
 	}
 }
 
-func (sr *SendResult) setStream(dn uint64, st morpc.Stream) {
-	sr.streams[dn] = st
+func (sr *SendResult) setStream(tn uint64, st morpc.Stream) {
+	sr.streams[tn] = st
 }
 
-func (sr *SendResult) getStream(dn uint64) morpc.Stream {
-	return sr.streams[dn]
+func (sr *SendResult) getStream(tn uint64) morpc.Stream {
+	return sr.streams[tn]
 }
 
 func (sr *SendResult) setResponse(resp *txn.TxnResponse, index int) {
@@ -343,7 +387,7 @@ func (sr *SendResult) Release() {
 	if sr.pool != nil {
 		for k, st := range sr.streams {
 			if st != nil {
-				_ = st.Close()
+				_ = st.Close(false)
 			}
 			delete(sr.streams, k)
 		}

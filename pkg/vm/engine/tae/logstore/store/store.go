@@ -17,7 +17,6 @@ package store
 import (
 	"sync"
 
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/batchstoredriver"
 	driverEntry "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
@@ -30,7 +29,7 @@ var DefaultMaxBatchSize = 10000
 
 type StoreImpl struct {
 	*StoreInfo
-	common.ClosedState
+	sm.ClosedState
 
 	driver driver.Driver
 
@@ -47,12 +46,17 @@ type StoreImpl struct {
 }
 
 func NewStoreWithLogserviceDriver(factory logservicedriver.LogServiceClientFactory) Store {
-	cfg := logservicedriver.NewDefaultConfig(factory)
-	driver := logservicedriver.NewLogServiceDriver(cfg)
+	cfg := logservicedriver.NewConfig(
+		"",
+		logservicedriver.WithConfigOptClientFactory(factory),
+	)
+	driver := logservicedriver.NewLogServiceDriver(&cfg)
 	return NewStore(driver)
 }
 
-func NewStoreWithBatchStoreDriver(dir, name string, cfg *batchstoredriver.StoreCfg) Store {
+func NewStoreWithBatchStoreDriver(
+	dir, name string, cfg *batchstoredriver.StoreCfg,
+) Store {
 	driver, err := batchstoredriver.NewBaseStore(dir, name, cfg)
 	if err != nil {
 		panic(err)
@@ -102,21 +106,21 @@ func (w *StoreImpl) Close() error {
 	}
 	return nil
 }
-func (w *StoreImpl) Append(gid uint32, e entry.Entry) (lsn uint64, err error) {
+func (w *StoreImpl) AppendEntry(gid uint32, e entry.Entry) (lsn uint64, err error) {
 	_, lsn, err = w.doAppend(gid, e)
 	return
 }
 
 func (w *StoreImpl) doAppend(gid uint32, e entry.Entry) (drEntry *driverEntry.Entry, lsn uint64, err error) {
 	if w.IsClosed() {
-		return nil, 0, common.ErrClose
+		return nil, 0, sm.ErrClose
 	}
 	w.appendMu.Lock()
 	defer w.appendMu.Unlock()
 	w.appendWg.Add(1)
 	if w.IsClosed() {
 		w.appendWg.Done()
-		return nil, 0, common.ErrClose
+		return nil, 0, sm.ErrClose
 	}
 	lsn = w.allocateLsn(gid)
 	v1 := e.GetInfo()

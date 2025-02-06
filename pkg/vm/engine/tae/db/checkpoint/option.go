@@ -14,60 +14,10 @@
 
 package checkpoint
 
-import "time"
-
 type Option func(*runner)
 
 func WithObserver(o Observer) Option {
 	return func(r *runner) {
 		r.observers.add(o)
-	}
-}
-
-func WithCollectInterval(interval time.Duration) Option {
-	return func(r *runner) {
-		r.options.collectInterval = interval
-	}
-}
-
-func WithFlushInterval(interval time.Duration) Option {
-	return func(r *runner) {
-		r.options.maxFlushInterval = interval
-	}
-}
-
-func WithMinCount(count int) Option {
-	return func(r *runner) {
-		r.options.minCount = count
-	}
-}
-
-func WithMinIncrementalInterval(interval time.Duration) Option {
-	return func(r *runner) {
-		r.options.minIncrementalInterval = interval
-	}
-}
-
-func WithGlobalMinCount(count int) Option {
-	return func(r *runner) {
-		r.options.globalMinCount = count
-	}
-}
-
-func WithForceFlushTimeout(to time.Duration) Option {
-	return func(r *runner) {
-		r.options.forceFlushTimeout = to
-	}
-}
-
-func WithForceFlushCheckInterval(interval time.Duration) Option {
-	return func(r *runner) {
-		r.options.forceFlushCheckInterval = interval
-	}
-}
-
-func WithGlobalVersionInterval(interval time.Duration) Option {
-	return func(r *runner) {
-		r.options.globalVersionInterval = interval
 	}
 }

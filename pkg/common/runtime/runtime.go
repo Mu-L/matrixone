@@ -15,11 +15,13 @@
 package runtime
 
 import (
+	"context"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/log"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
@@ -28,7 +30,8 @@ import (
 )
 
 var (
-	processLevel atomic.Value
+	// service -> Runtime
+	allRuntime sync.Map
 )
 
 type LoggerName int
@@ -38,23 +41,45 @@ const (
 	SystemInit
 )
 
-// ProcessLevelRuntime returns a process-lelve runtime
-func ProcessLevelRuntime() Runtime {
-	v := processLevel.Load()
-	if v == nil {
+// GetLogger returns the runtime's logger
+func GetLogger(
+	sid string,
+) *log.MOLogger {
+	rt := ServiceRuntime(sid)
+	if rt == nil {
+		rt = DefaultRuntime()
+	}
+	return rt.Logger()
+}
+
+// SetupServiceBasedRuntime setup service based runtime.
+func SetupServiceBasedRuntime(
+	service string,
+	r Runtime,
+) {
+	if _, ok := r.GetGlobalVariables(MOProtocolVersion); !ok {
+		r.SetGlobalVariables(MOProtocolVersion, defines.MORPCLatestVersion)
+	}
+	allRuntime.Store(service, r)
+}
+
+// ServiceRuntime returns a service based runtime
+func ServiceRuntime(
+	service string,
+) Runtime {
+	v, ok := allRuntime.Load(service)
+	if !ok {
+		if service == "" {
+			rt := DefaultRuntime()
+			SetupServiceBasedRuntime("", rt)
+			return rt
+		}
 		return nil
 	}
 	return v.(Runtime)
 }
 
-// SetupProcessLevelRuntime set a process-level runtime. If the service does not
-// support a service-level runtime when running in launch mode, it will use the
-// process-level runtime. The process-level runtime must setup in main.
-func SetupProcessLevelRuntime(r Runtime) {
-	processLevel.Store(r)
-}
-
-// WithClock setup clock for a runtime, CN and DN must contain an instance of the
+// WithClock setup clock for a runtime, CN and TN must contain an instance of the
 // Clock that is used to provide the timestamp service to the transaction.
 func WithClock(clock clock.Clock) Option {
 	return func(r *runtime) {
@@ -124,7 +149,7 @@ func (r *runtime) GetGlobalVariables(name string) (any, bool) {
 
 // DefaultRuntime used to test
 func DefaultRuntime() Runtime {
-	return DefaultRuntimeWithLevel(zap.DebugLevel)
+	return DefaultRuntimeWithLevel(zap.InfoLevel)
 }
 
 // DefaultRuntime used to test
@@ -143,4 +168,59 @@ func (r *runtime) initSystemInitLogger() {
 		r.global.logger = log.GetServiceLogger(logutil.Adjust(nil), r.serviceType, r.serviceUUID)
 	}
 	r.global.systemInitLogger = r.Logger().WithProcess(log.SystemInit)
+}
+
+type methodType interface {
+	~int32
+	String() string
+}
+
+func CheckMethodVersion[Req interface{ GetMethod() T }, T methodType](
+	ctx context.Context,
+	service string,
+	versionMap map[T]int64,
+	req Req,
+) error {
+	return CheckMethodVersionWithRuntime(
+		ctx,
+		ServiceRuntime(service),
+		versionMap,
+		req,
+	)
+}
+
+func CheckMethodVersionWithRuntime[Req interface{ GetMethod() T }, T methodType](
+	ctx context.Context,
+	rt Runtime,
+	versionMap map[T]int64,
+	req Req,
+) error {
+	if version, ok := versionMap[req.GetMethod()]; !ok {
+		return moerr.NewNotSupportedf(ctx, "%s not support in current version", req.GetMethod().String())
+	} else {
+		v, ok := rt.GetGlobalVariables(MOProtocolVersion)
+		if !ok {
+			return moerr.NewInternalError(ctx, "failed to get protocol version")
+		}
+		if v.(int64) < version {
+			return moerr.NewInternalErrorf(ctx, "unsupported protocol version %d", version)
+		}
+	}
+	return nil
+}
+
+// RunTest run runtime test.
+func RunTest(
+	sid string,
+	fn func(rt Runtime),
+) {
+	v, ok := allRuntime.Load(sid)
+	if ok {
+		fn(v.(Runtime))
+		return
+	}
+
+	rt := DefaultRuntime()
+	SetupServiceBasedRuntime(sid, rt)
+	fn(rt)
 }

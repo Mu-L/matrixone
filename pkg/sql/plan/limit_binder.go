@@ -32,7 +32,7 @@ func NewLimitBinder(builder *QueryBuilder, ctx *BindContext) *LimitBinder {
 
 func (b *LimitBinder) BindExpr(astExpr tree.Expr, depth int32, isRoot bool) (*plan.Expr, error) {
 	switch astExpr.(type) {
-	case *tree.VarExpr, *tree.UnqualifiedStar:
+	case *tree.UnqualifiedStar:
 		// need check other expr
 		return nil, moerr.NewSyntaxError(b.GetContext(), "unsupported expr in limit clause")
 	}
@@ -42,19 +42,62 @@ func (b *LimitBinder) BindExpr(astExpr tree.Expr, depth int32, isRoot bool) (*pl
 		return nil, err
 	}
 
-	if expr.Typ.Id != int32(types.T_int64) {
+	if expr.Typ.Id != int32(types.T_uint64) {
+		if expr.Typ.Id == int32(types.T_int64) {
+			if cExpr, ok := expr.Expr.(*plan.Expr_Lit); ok {
+				if c, ok := cExpr.Lit.Value.(*plan.Literal_I64Val); ok {
+					if c.I64Val < 0 {
+						return nil, moerr.NewSyntaxError(b.GetContext(), "offset value must be nonnegative")
+					}
+					//convert to uint64 instead of CAST
+					expr = makePlan2Uint64ConstExprWithType(uint64(c.I64Val))
+					return expr, nil
+				}
+			}
+		}
 		// limit '10' / offset '2'
 		// the valid string should be cast to int64
-		if expr.Typ.Id == int32(types.T_varchar) {
-			targetType := types.T_int64.ToType()
+		if expr.Typ.Id == int32(types.T_varchar) || expr.Typ.Id == int32(types.T_int64) {
+			targetType := types.T_uint64.ToType()
 			planTargetType := makePlan2Type(&targetType)
 			var err error
 			expr, err = appendCastBeforeExpr(b.GetContext(), expr, planTargetType)
 			if err != nil {
 				return nil, err
 			}
+		} else if expr.GetP() != nil {
+			targetType := types.T_uint64.ToType()
+			planTargetType := makePlan2Type(&targetType)
+			return appendCastBeforeExpr(b.GetContext(), expr, planTargetType)
+		} else if expr.GetV() != nil {
+			// SELECT IFNULL(CAST(@var AS BIGINT), 1) => CASE( ISNULL(@var), 1, CAST(@var AS BIGINT))
+
+			//ISNULL(@var)
+			arg0, err := BindFuncExprImplByPlanExpr(b.GetContext(), "isnull", []*plan.Expr{
+				expr,
+			})
+			if err != nil {
+				return nil, err
+			}
+
+			// CAST( 1 AS BIGINT UNSIGNED)
+			arg1 := makePlan2Uint64ConstExprWithType(1)
+
+			// CAST(@var AS BIGINT UNSIGNED)
+			targetType := types.T_uint64.ToType()
+			planTargetType := makePlan2Type(&targetType)
+			arg2, err := appendCastBeforeExpr(b.GetContext(), expr, planTargetType)
+			if err != nil {
+				return nil, err
+			}
+
+			return BindFuncExprImplByPlanExpr(b.GetContext(), "case", []*plan.Expr{
+				arg0,
+				arg1,
+				arg2,
+			})
 		} else {
-			return nil, moerr.NewSyntaxError(b.GetContext(), "only int64 support in limit/offset clause")
+			return nil, moerr.NewSyntaxError(b.GetContext(), "only uint64 support in limit/offset clause")
 		}
 	}
 
@@ -75,4 +118,8 @@ func (b *LimitBinder) BindWinFunc(funcName string, astExpr *tree.FuncExpr, depth
 
 func (b *LimitBinder) BindSubquery(astExpr *tree.Subquery, isRoot bool) (*plan.Expr, error) {
 	return nil, moerr.NewSyntaxError(b.GetContext(), "subquery not allowed in limit clause")
+}
+
+func (b *LimitBinder) BindTimeWindowFunc(funcName string, astExpr *tree.FuncExpr, depth int32, isRoot bool) (*plan.Expr, error) {
+	return nil, moerr.NewInvalidInputf(b.GetContext(), "cannot bind time window functions '%s'", funcName)
 }

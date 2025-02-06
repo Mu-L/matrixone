@@ -1,3 +1,4 @@
+set global enable_privilege_cache = off;
 drop role if exists r1;
 create role r1;
 drop user if exists u1;
@@ -13,61 +14,85 @@ grant show tables on database * to r1;
 use mo_catalog;
 internal error: do not have privilege to execute the statement
 show tables;
-not connect to a database
+No database selected
 create database t;
 internal error: do not have privilege to execute the statement
 grant connect on account * to r1;
 use mo_catalog;
 show tables;
-tables_in_mo_catalog
-mo_indexes
-mo_user
+Tables_in_mo_catalog
 mo_account
+mo_cache
+mo_cdc_task
+mo_cdc_watermark
+mo_columns
+mo_configurations
+mo_data_key
+mo_database
+mo_foreign_keys
+mo_indexes
+mo_locks
+mo_mysql_compatibility_mode
+mo_pitr
+mo_pubs
+mo_retention
 mo_role
-mo_user_grant
 mo_role_grant
 mo_role_privs
-mo_user_defined_function
-mo_mysql_compatbility_mode
-mo_pubs
-mo_database
+mo_sessions
+mo_shards
+mo_shards_metadata
+mo_snapshots
+mo_stages
+mo_stored_procedure
+mo_subs
+mo_table_partitions
+mo_table_stats_alpha
 mo_tables
-mo_columns
+mo_transactions
+mo_upgrade
+mo_upgrade_tenant
+mo_user
+mo_user_defined_function
+mo_user_grant
+mo_variables
+mo_version
 create database t;
 internal error: do not have privilege to execute the statement
 grant create database on account * to r1;
 create database t;
 use t;
 create table A(a int);
-internal error: do not have privilege to execute the statement
+drop table A;
 grant create table on database * to r1;
 use t;
 create table A(a int);
 insert into A values (1),(1);
-internal error: do not have privilege to execute the statement
 grant insert on table t.* to r1;
 use t;
 insert into A values (1),(1);
 select a from A;
-internal error: do not have privilege to execute the statement
+a
+1
+1
+1
+1
 grant select on table t.* to r1;
 use t;
 select a from A;
 a
 1
 1
+1
+1
 update A set a = 2 where a = 1;
-internal error: do not have privilege to execute the statement
 update A set a = 2;
-internal error: do not have privilege to execute the statement
 grant update on table t.* to r1;
 use t;
 update A set a = 2 where a = 1;
 update A set a = 2;
 delete from A where a = 2;
-internal error: do not have privilege to execute the statement
 delete from A;
-internal error: do not have privilege to execute the statement
 grant delete on table t.* to r1;
 use t;
 delete from A where a = 2;
@@ -75,15 +100,14 @@ delete from A;
 select a from A;
 a
 drop table A;
-internal error: do not have privilege to execute the statement
 grant drop table on database t to r1;
 use t;
 drop table A;
+no such table t.a
 create database s;
 use s;
 create table B(b int);
 insert into B values (1),(1);
-internal error: do not have privilege to execute the statement
 grant select,insert,update,delete on table s.* to r1;
 use s;
 insert into B values (1),(1);
@@ -91,19 +115,19 @@ select b from B;
 b
 1
 1
+1
+1
 update B set b = 2 where b=1;
 update B set b = 2;
 delete from B where b = 1;
 delete from B;
 drop table B;
-internal error: do not have privilege to execute the statement
 grant drop table on database s to r1;
 use s;
 drop table B;
+no such table s.b
 drop database t;
-internal error: do not have privilege to execute the statement
 drop database s;
-internal error: do not have privilege to execute the statement
 create database v;
 use v;
 grant create table,drop table on database v to r1;
@@ -129,28 +153,23 @@ a    b
 select * from A,B where A.a = B.b;
 a    b
 update C,D set c = d+1 where c = d;
-internal error: do not have privilege to execute the statement
 grant update on table v.C to r1;
 use v;
 update C,D set c = d+1 where c = d;
-internal error: do not have privilege to execute the statement
 grant update on table v.D to r1;
 use v;
 update C,D set c = d+1 where c = d;
 use v;
 delete E,F from E,F where E.e = F.f;
-internal error: do not have privilege to execute the statement
 grant update on table v.E to r1;
 grant delete on table v.F to r1;
 use v;
 delete E,F from E,F where E.e = F.f;
-internal error: do not have privilege to execute the statement
 grant delete on table v.E to r1;
 use v;
 delete E,F from E,F where E.e = F.f;
 use v;
 insert into G select A.a from A,B where A.a = B.b;
-internal error: do not have privilege to execute the statement
 grant insert on table v.G to r1;
 use v;
 insert into G select A.a from A,B where A.a = B.b;
@@ -159,10 +178,10 @@ internal error: do not have privilege to execute the statement
 drop database if exists s;
 internal error: do not have privilege to execute the statement
 drop database if exists v;
-internal error: do not have privilege to execute the statement
 grant drop database on account * to r1;
 drop database if exists t;
 drop database if exists s;
 drop database if exists v;
 drop role if exists r1;
 drop user if exists u1;
+set global enable_privilege_cache = on;

@@ -17,11 +17,18 @@ package cnservice
 import (
 	"context"
 
+	"github.com/matrixorigin/matrixone/pkg/bootstrap"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/lockservice"
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	logservicepb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	qclient "github.com/matrixorigin/matrixone/pkg/queryservice/client"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/udf"
+	"github.com/matrixorigin/matrixone/pkg/util"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"go.uber.org/zap"
 )
@@ -36,10 +43,23 @@ func WithLogger(logger *zap.Logger) Option {
 	}
 }
 
-// WithTaskStorageFactory setup the special task strorage factory
+// WithTaskStorageFactory setup the special task storage factory
 func WithTaskStorageFactory(factory taskservice.TaskStorageFactory) Option {
 	return func(s *service) {
 		s.task.storageFactory = factory
+	}
+}
+
+// WithBootstrapOptions setup bootstrap options
+func WithBootstrapOptions(options ...bootstrap.Option) Option {
+	return func(s *service) {
+		s.options.bootstrapOptions = options
+	}
+}
+
+func WithTxnTraceData(traceDataPath string) Option {
+	return func(s *service) {
+		s.options.traceDataPath = traceDataPath
 	}
 }
 
@@ -51,9 +71,24 @@ func WithMessageHandle(f func(ctx context.Context,
 	engine engine.Engine,
 	fs fileservice.FileService,
 	lockService lockservice.LockService,
+	queryClient qclient.QueryClient,
+	hakeeper logservice.CNHAKeeperClient,
+	udfService udf.Service,
 	cli client.TxnClient,
+	aicm *defines.AutoIncrCacheManager,
 	mAcquirer func() morpc.Message) error) Option {
 	return func(s *service) {
 		s.requestHandler = f
+	}
+}
+
+// WithConfigData saves the data from the config file
+func WithConfigData(data map[string]*logservicepb.ConfigItem) Option {
+	return func(s *service) {
+		if s.config == nil {
+			s.config = util.NewConfigData(data)
+		} else {
+			util.MergeConfig(s.config, data)
+		}
 	}
 }

@@ -7,6 +7,7 @@ package mock_frontend
 import (
 	context "context"
 	reflect "reflect"
+	time "time"
 
 	gomock "github.com/golang/mock/gomock"
 	lock "github.com/matrixorigin/matrixone/pkg/pb/lock"
@@ -15,6 +16,145 @@ import (
 	client "github.com/matrixorigin/matrixone/pkg/txn/client"
 	rpc "github.com/matrixorigin/matrixone/pkg/txn/rpc"
 )
+
+// MockTxnTimestampAware is a mock of TxnTimestampAware interface.
+type MockTxnTimestampAware struct {
+	ctrl     *gomock.Controller
+	recorder *MockTxnTimestampAwareMockRecorder
+}
+
+// MockTxnTimestampAwareMockRecorder is the mock recorder for MockTxnTimestampAware.
+type MockTxnTimestampAwareMockRecorder struct {
+	mock *MockTxnTimestampAware
+}
+
+// NewMockTxnTimestampAware creates a new mock instance.
+func NewMockTxnTimestampAware(ctrl *gomock.Controller) *MockTxnTimestampAware {
+	mock := &MockTxnTimestampAware{ctrl: ctrl}
+	mock.recorder = &MockTxnTimestampAwareMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockTxnTimestampAware) EXPECT() *MockTxnTimestampAwareMockRecorder {
+	return m.recorder
+}
+
+// GetLatestCommitTS mocks base method.
+func (m *MockTxnTimestampAware) GetLatestCommitTS() timestamp.Timestamp {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetLatestCommitTS")
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	return ret0
+}
+
+// GetLatestCommitTS indicates an expected call of GetLatestCommitTS.
+func (mr *MockTxnTimestampAwareMockRecorder) GetLatestCommitTS() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetLatestCommitTS", reflect.TypeOf((*MockTxnTimestampAware)(nil).GetLatestCommitTS))
+}
+
+// GetSyncLatestCommitTSTimes mocks base method.
+func (m *MockTxnTimestampAware) GetSyncLatestCommitTSTimes() uint64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetSyncLatestCommitTSTimes")
+	ret0, _ := ret[0].(uint64)
+	return ret0
+}
+
+// GetSyncLatestCommitTSTimes indicates an expected call of GetSyncLatestCommitTSTimes.
+func (mr *MockTxnTimestampAwareMockRecorder) GetSyncLatestCommitTSTimes() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSyncLatestCommitTSTimes", reflect.TypeOf((*MockTxnTimestampAware)(nil).GetSyncLatestCommitTSTimes))
+}
+
+// MinTimestamp mocks base method.
+func (m *MockTxnTimestampAware) MinTimestamp() timestamp.Timestamp {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "MinTimestamp")
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	return ret0
+}
+
+// MinTimestamp indicates an expected call of MinTimestamp.
+func (mr *MockTxnTimestampAwareMockRecorder) MinTimestamp() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MinTimestamp", reflect.TypeOf((*MockTxnTimestampAware)(nil).MinTimestamp))
+}
+
+// SyncLatestCommitTS mocks base method.
+func (m *MockTxnTimestampAware) SyncLatestCommitTS(arg0 timestamp.Timestamp) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SyncLatestCommitTS", arg0)
+}
+
+// SyncLatestCommitTS indicates an expected call of SyncLatestCommitTS.
+func (mr *MockTxnTimestampAwareMockRecorder) SyncLatestCommitTS(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncLatestCommitTS", reflect.TypeOf((*MockTxnTimestampAware)(nil).SyncLatestCommitTS), arg0)
+}
+
+// WaitLogTailAppliedAt mocks base method.
+func (m *MockTxnTimestampAware) WaitLogTailAppliedAt(ctx context.Context, ts timestamp.Timestamp) (timestamp.Timestamp, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WaitLogTailAppliedAt", ctx, ts)
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// WaitLogTailAppliedAt indicates an expected call of WaitLogTailAppliedAt.
+func (mr *MockTxnTimestampAwareMockRecorder) WaitLogTailAppliedAt(ctx, ts interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitLogTailAppliedAt", reflect.TypeOf((*MockTxnTimestampAware)(nil).WaitLogTailAppliedAt), ctx, ts)
+}
+
+// MockTxnAction is a mock of TxnAction interface.
+type MockTxnAction struct {
+	ctrl     *gomock.Controller
+	recorder *MockTxnActionMockRecorder
+}
+
+// MockTxnActionMockRecorder is the mock recorder for MockTxnAction.
+type MockTxnActionMockRecorder struct {
+	mock *MockTxnAction
+}
+
+// NewMockTxnAction creates a new mock instance.
+func NewMockTxnAction(ctrl *gomock.Controller) *MockTxnAction {
+	mock := &MockTxnAction{ctrl: ctrl}
+	mock.recorder = &MockTxnActionMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockTxnAction) EXPECT() *MockTxnActionMockRecorder {
+	return m.recorder
+}
+
+// Pause mocks base method.
+func (m *MockTxnAction) Pause() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Pause")
+}
+
+// Pause indicates an expected call of Pause.
+func (mr *MockTxnActionMockRecorder) Pause() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Pause", reflect.TypeOf((*MockTxnAction)(nil).Pause))
+}
+
+// Resume mocks base method.
+func (m *MockTxnAction) Resume() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Resume")
+}
+
+// Resume indicates an expected call of Resume.
+func (mr *MockTxnActionMockRecorder) Resume() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Resume", reflect.TypeOf((*MockTxnAction)(nil).Resume))
+}
 
 // MockTxnClient is a mock of TxnClient interface.
 type MockTxnClient struct {
@@ -39,6 +179,20 @@ func (m *MockTxnClient) EXPECT() *MockTxnClientMockRecorder {
 	return m.recorder
 }
 
+// CNBasedConsistencyEnabled mocks base method.
+func (m *MockTxnClient) CNBasedConsistencyEnabled() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CNBasedConsistencyEnabled")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// CNBasedConsistencyEnabled indicates an expected call of CNBasedConsistencyEnabled.
+func (mr *MockTxnClientMockRecorder) CNBasedConsistencyEnabled() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CNBasedConsistencyEnabled", reflect.TypeOf((*MockTxnClient)(nil).CNBasedConsistencyEnabled))
+}
+
 // Close mocks base method.
 func (m *MockTxnClient) Close() error {
 	m.ctrl.T.Helper()
@@ -53,10 +207,78 @@ func (mr *MockTxnClientMockRecorder) Close() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Close", reflect.TypeOf((*MockTxnClient)(nil).Close))
 }
 
-// New mocks base method.
-func (m *MockTxnClient) New(options ...client.TxnOption) (client.TxnOperator, error) {
+// GetLatestCommitTS mocks base method.
+func (m *MockTxnClient) GetLatestCommitTS() timestamp.Timestamp {
 	m.ctrl.T.Helper()
-	varargs := []interface{}{}
+	ret := m.ctrl.Call(m, "GetLatestCommitTS")
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	return ret0
+}
+
+// GetLatestCommitTS indicates an expected call of GetLatestCommitTS.
+func (mr *MockTxnClientMockRecorder) GetLatestCommitTS() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetLatestCommitTS", reflect.TypeOf((*MockTxnClient)(nil).GetLatestCommitTS))
+}
+
+// GetState mocks base method.
+func (m *MockTxnClient) GetState() client.TxnState {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetState")
+	ret0, _ := ret[0].(client.TxnState)
+	return ret0
+}
+
+// GetState indicates an expected call of GetState.
+func (mr *MockTxnClientMockRecorder) GetState() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetState", reflect.TypeOf((*MockTxnClient)(nil).GetState))
+}
+
+// GetSyncLatestCommitTSTimes mocks base method.
+func (m *MockTxnClient) GetSyncLatestCommitTSTimes() uint64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetSyncLatestCommitTSTimes")
+	ret0, _ := ret[0].(uint64)
+	return ret0
+}
+
+// GetSyncLatestCommitTSTimes indicates an expected call of GetSyncLatestCommitTSTimes.
+func (mr *MockTxnClientMockRecorder) GetSyncLatestCommitTSTimes() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSyncLatestCommitTSTimes", reflect.TypeOf((*MockTxnClient)(nil).GetSyncLatestCommitTSTimes))
+}
+
+// IterTxns mocks base method.
+func (m *MockTxnClient) IterTxns(arg0 func(client.TxnOverview) bool) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "IterTxns", arg0)
+}
+
+// IterTxns indicates an expected call of IterTxns.
+func (mr *MockTxnClientMockRecorder) IterTxns(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IterTxns", reflect.TypeOf((*MockTxnClient)(nil).IterTxns), arg0)
+}
+
+// MinTimestamp mocks base method.
+func (m *MockTxnClient) MinTimestamp() timestamp.Timestamp {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "MinTimestamp")
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	return ret0
+}
+
+// MinTimestamp indicates an expected call of MinTimestamp.
+func (mr *MockTxnClientMockRecorder) MinTimestamp() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "MinTimestamp", reflect.TypeOf((*MockTxnClient)(nil).MinTimestamp))
+}
+
+// New mocks base method.
+func (m *MockTxnClient) New(ctx context.Context, commitTS timestamp.Timestamp, options ...client.TxnOption) (client.TxnOperator, error) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{ctx, commitTS}
 	for _, a := range options {
 		varargs = append(varargs, a)
 	}
@@ -67,13 +289,14 @@ func (m *MockTxnClient) New(options ...client.TxnOption) (client.TxnOperator, er
 }
 
 // New indicates an expected call of New.
-func (mr *MockTxnClientMockRecorder) New(options ...interface{}) *gomock.Call {
+func (mr *MockTxnClientMockRecorder) New(ctx, commitTS interface{}, options ...interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "New", reflect.TypeOf((*MockTxnClient)(nil).New), options...)
+	varargs := append([]interface{}{ctx, commitTS}, options...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "New", reflect.TypeOf((*MockTxnClient)(nil).New), varargs...)
 }
 
 // NewWithSnapshot mocks base method.
-func (m *MockTxnClient) NewWithSnapshot(snapshot []byte) (client.TxnOperator, error) {
+func (m *MockTxnClient) NewWithSnapshot(snapshot txn.CNTxnSnapshot) (client.TxnOperator, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "NewWithSnapshot", snapshot)
 	ret0, _ := ret[0].(client.TxnOperator)
@@ -85,6 +308,91 @@ func (m *MockTxnClient) NewWithSnapshot(snapshot []byte) (client.TxnOperator, er
 func (mr *MockTxnClientMockRecorder) NewWithSnapshot(snapshot interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NewWithSnapshot", reflect.TypeOf((*MockTxnClient)(nil).NewWithSnapshot), snapshot)
+}
+
+// Pause mocks base method.
+func (m *MockTxnClient) Pause() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Pause")
+}
+
+// Pause indicates an expected call of Pause.
+func (mr *MockTxnClientMockRecorder) Pause() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Pause", reflect.TypeOf((*MockTxnClient)(nil).Pause))
+}
+
+// RefreshExpressionEnabled mocks base method.
+func (m *MockTxnClient) RefreshExpressionEnabled() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RefreshExpressionEnabled")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// RefreshExpressionEnabled indicates an expected call of RefreshExpressionEnabled.
+func (mr *MockTxnClientMockRecorder) RefreshExpressionEnabled() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RefreshExpressionEnabled", reflect.TypeOf((*MockTxnClient)(nil).RefreshExpressionEnabled))
+}
+
+// RestartTxn mocks base method.
+func (m *MockTxnClient) RestartTxn(ctx context.Context, txnOp client.TxnOperator, commitTS timestamp.Timestamp, options ...client.TxnOption) (client.TxnOperator, error) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{ctx, txnOp, commitTS}
+	for _, a := range options {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "RestartTxn", varargs...)
+	ret0, _ := ret[0].(client.TxnOperator)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// RestartTxn indicates an expected call of RestartTxn.
+func (mr *MockTxnClientMockRecorder) RestartTxn(ctx, txnOp, commitTS interface{}, options ...interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]interface{}{ctx, txnOp, commitTS}, options...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RestartTxn", reflect.TypeOf((*MockTxnClient)(nil).RestartTxn), varargs...)
+}
+
+// Resume mocks base method.
+func (m *MockTxnClient) Resume() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Resume")
+}
+
+// Resume indicates an expected call of Resume.
+func (mr *MockTxnClientMockRecorder) Resume() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Resume", reflect.TypeOf((*MockTxnClient)(nil).Resume))
+}
+
+// SyncLatestCommitTS mocks base method.
+func (m *MockTxnClient) SyncLatestCommitTS(arg0 timestamp.Timestamp) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SyncLatestCommitTS", arg0)
+}
+
+// SyncLatestCommitTS indicates an expected call of SyncLatestCommitTS.
+func (mr *MockTxnClientMockRecorder) SyncLatestCommitTS(arg0 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SyncLatestCommitTS", reflect.TypeOf((*MockTxnClient)(nil).SyncLatestCommitTS), arg0)
+}
+
+// WaitLogTailAppliedAt mocks base method.
+func (m *MockTxnClient) WaitLogTailAppliedAt(ctx context.Context, ts timestamp.Timestamp) (timestamp.Timestamp, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "WaitLogTailAppliedAt", ctx, ts)
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// WaitLogTailAppliedAt indicates an expected call of WaitLogTailAppliedAt.
+func (mr *MockTxnClientMockRecorder) WaitLogTailAppliedAt(ctx, ts interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WaitLogTailAppliedAt", reflect.TypeOf((*MockTxnClient)(nil).WaitLogTailAppliedAt), ctx, ts)
 }
 
 // MockTxnOperator is a mock of TxnOperator interface.
@@ -124,6 +432,49 @@ func (mr *MockTxnOperatorMockRecorder) AddLockTable(locktable interface{}) *gomo
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddLockTable", reflect.TypeOf((*MockTxnOperator)(nil).AddLockTable), locktable)
 }
 
+// AddWaitLock mocks base method.
+func (m *MockTxnOperator) AddWaitLock(tableID uint64, rows [][]byte, opt lock.LockOptions) uint64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "AddWaitLock", tableID, rows, opt)
+	ret0, _ := ret[0].(uint64)
+	return ret0
+}
+
+// AddWaitLock indicates an expected call of AddWaitLock.
+func (mr *MockTxnOperatorMockRecorder) AddWaitLock(tableID, rows, opt interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddWaitLock", reflect.TypeOf((*MockTxnOperator)(nil).AddWaitLock), tableID, rows, opt)
+}
+
+// AddWorkspace mocks base method.
+func (m *MockTxnOperator) AddWorkspace(workspace client.Workspace) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "AddWorkspace", workspace)
+}
+
+// AddWorkspace indicates an expected call of AddWorkspace.
+func (mr *MockTxnOperatorMockRecorder) AddWorkspace(workspace interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddWorkspace", reflect.TypeOf((*MockTxnOperator)(nil).AddWorkspace), workspace)
+}
+
+// AppendEventCallback mocks base method.
+func (m *MockTxnOperator) AppendEventCallback(event client.EventType, callbacks ...func(client.TxnEvent)) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{event}
+	for _, a := range callbacks {
+		varargs = append(varargs, a)
+	}
+	m.ctrl.Call(m, "AppendEventCallback", varargs...)
+}
+
+// AppendEventCallback indicates an expected call of AppendEventCallback.
+func (mr *MockTxnOperatorMockRecorder) AppendEventCallback(event interface{}, callbacks ...interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]interface{}{event}, callbacks...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AppendEventCallback", reflect.TypeOf((*MockTxnOperator)(nil).AppendEventCallback), varargs...)
+}
+
 // ApplySnapshot mocks base method.
 func (m *MockTxnOperator) ApplySnapshot(data []byte) error {
 	m.ctrl.T.Helper()
@@ -138,6 +489,20 @@ func (mr *MockTxnOperatorMockRecorder) ApplySnapshot(data interface{}) *gomock.C
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ApplySnapshot", reflect.TypeOf((*MockTxnOperator)(nil).ApplySnapshot), data)
 }
 
+// CloneSnapshotOp mocks base method.
+func (m *MockTxnOperator) CloneSnapshotOp(snapshot timestamp.Timestamp) client.TxnOperator {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CloneSnapshotOp", snapshot)
+	ret0, _ := ret[0].(client.TxnOperator)
+	return ret0
+}
+
+// CloneSnapshotOp indicates an expected call of CloneSnapshotOp.
+func (mr *MockTxnOperatorMockRecorder) CloneSnapshotOp(snapshot interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CloneSnapshotOp", reflect.TypeOf((*MockTxnOperator)(nil).CloneSnapshotOp), snapshot)
+}
+
 // Commit mocks base method.
 func (m *MockTxnOperator) Commit(ctx context.Context) error {
 	m.ctrl.T.Helper()
@@ -150,6 +515,205 @@ func (m *MockTxnOperator) Commit(ctx context.Context) error {
 func (mr *MockTxnOperatorMockRecorder) Commit(ctx interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Commit", reflect.TypeOf((*MockTxnOperator)(nil).Commit), ctx)
+}
+
+// CreateTS mocks base method.
+func (m *MockTxnOperator) CreateTS() timestamp.Timestamp {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CreateTS")
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	return ret0
+}
+
+// CreateTS indicates an expected call of CreateTS.
+func (mr *MockTxnOperatorMockRecorder) CreateTS() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CreateTS", reflect.TypeOf((*MockTxnOperator)(nil).CreateTS))
+}
+
+// Debug mocks base method.
+func (m *MockTxnOperator) Debug(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Debug", ctx, ops)
+	ret0, _ := ret[0].(*rpc.SendResult)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Debug indicates an expected call of Debug.
+func (mr *MockTxnOperatorMockRecorder) Debug(ctx, ops interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Debug", reflect.TypeOf((*MockTxnOperator)(nil).Debug), ctx, ops)
+}
+
+// EnterIncrStmt mocks base method.
+func (m *MockTxnOperator) EnterIncrStmt() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "EnterIncrStmt")
+}
+
+// EnterIncrStmt indicates an expected call of EnterIncrStmt.
+func (mr *MockTxnOperatorMockRecorder) EnterIncrStmt() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnterIncrStmt", reflect.TypeOf((*MockTxnOperator)(nil).EnterIncrStmt))
+}
+
+// EnterRollbackStmt mocks base method.
+func (m *MockTxnOperator) EnterRollbackStmt() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "EnterRollbackStmt")
+}
+
+// EnterRollbackStmt indicates an expected call of EnterRollbackStmt.
+func (mr *MockTxnOperatorMockRecorder) EnterRollbackStmt() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnterRollbackStmt", reflect.TypeOf((*MockTxnOperator)(nil).EnterRollbackStmt))
+}
+
+// EnterRunSql mocks base method.
+func (m *MockTxnOperator) EnterRunSql() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "EnterRunSql")
+}
+
+// EnterRunSql indicates an expected call of EnterRunSql.
+func (mr *MockTxnOperatorMockRecorder) EnterRunSql() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EnterRunSql", reflect.TypeOf((*MockTxnOperator)(nil).EnterRunSql))
+}
+
+// ExitIncrStmt mocks base method.
+func (m *MockTxnOperator) ExitIncrStmt() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ExitIncrStmt")
+}
+
+// ExitIncrStmt indicates an expected call of ExitIncrStmt.
+func (mr *MockTxnOperatorMockRecorder) ExitIncrStmt() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExitIncrStmt", reflect.TypeOf((*MockTxnOperator)(nil).ExitIncrStmt))
+}
+
+// ExitRollbackStmt mocks base method.
+func (m *MockTxnOperator) ExitRollbackStmt() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ExitRollbackStmt")
+}
+
+// ExitRollbackStmt indicates an expected call of ExitRollbackStmt.
+func (mr *MockTxnOperatorMockRecorder) ExitRollbackStmt() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExitRollbackStmt", reflect.TypeOf((*MockTxnOperator)(nil).ExitRollbackStmt))
+}
+
+// ExitRunSql mocks base method.
+func (m *MockTxnOperator) ExitRunSql() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "ExitRunSql")
+}
+
+// ExitRunSql indicates an expected call of ExitRunSql.
+func (mr *MockTxnOperatorMockRecorder) ExitRunSql() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ExitRunSql", reflect.TypeOf((*MockTxnOperator)(nil).ExitRunSql))
+}
+
+// GetOverview mocks base method.
+func (m *MockTxnOperator) GetOverview() client.TxnOverview {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetOverview")
+	ret0, _ := ret[0].(client.TxnOverview)
+	return ret0
+}
+
+// GetOverview indicates an expected call of GetOverview.
+func (mr *MockTxnOperatorMockRecorder) GetOverview() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetOverview", reflect.TypeOf((*MockTxnOperator)(nil).GetOverview))
+}
+
+// GetWaitActiveCost mocks base method.
+func (m *MockTxnOperator) GetWaitActiveCost() time.Duration {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetWaitActiveCost")
+	ret0, _ := ret[0].(time.Duration)
+	return ret0
+}
+
+// GetWaitActiveCost indicates an expected call of GetWaitActiveCost.
+func (mr *MockTxnOperatorMockRecorder) GetWaitActiveCost() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWaitActiveCost", reflect.TypeOf((*MockTxnOperator)(nil).GetWaitActiveCost))
+}
+
+// GetWorkspace mocks base method.
+func (m *MockTxnOperator) GetWorkspace() client.Workspace {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetWorkspace")
+	ret0, _ := ret[0].(client.Workspace)
+	return ret0
+}
+
+// GetWorkspace indicates an expected call of GetWorkspace.
+func (mr *MockTxnOperatorMockRecorder) GetWorkspace() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetWorkspace", reflect.TypeOf((*MockTxnOperator)(nil).GetWorkspace))
+}
+
+// HasLockTable mocks base method.
+func (m *MockTxnOperator) HasLockTable(table uint64) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "HasLockTable", table)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// HasLockTable indicates an expected call of HasLockTable.
+func (mr *MockTxnOperatorMockRecorder) HasLockTable(table interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "HasLockTable", reflect.TypeOf((*MockTxnOperator)(nil).HasLockTable), table)
+}
+
+// IsSnapOp mocks base method.
+func (m *MockTxnOperator) IsSnapOp() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IsSnapOp")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// IsSnapOp indicates an expected call of IsSnapOp.
+func (mr *MockTxnOperatorMockRecorder) IsSnapOp() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IsSnapOp", reflect.TypeOf((*MockTxnOperator)(nil).IsSnapOp))
+}
+
+// LockSkipped mocks base method.
+func (m *MockTxnOperator) LockSkipped(tableID uint64, mode lock.LockMode) bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "LockSkipped", tableID, mode)
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// LockSkipped indicates an expected call of LockSkipped.
+func (mr *MockTxnOperatorMockRecorder) LockSkipped(tableID, mode interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LockSkipped", reflect.TypeOf((*MockTxnOperator)(nil).LockSkipped), tableID, mode)
+}
+
+// NextSequence mocks base method.
+func (m *MockTxnOperator) NextSequence() uint64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "NextSequence")
+	ret0, _ := ret[0].(uint64)
+	return ret0
+}
+
+// NextSequence indicates an expected call of NextSequence.
+func (mr *MockTxnOperatorMockRecorder) NextSequence() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NextSequence", reflect.TypeOf((*MockTxnOperator)(nil).NextSequence))
 }
 
 // Read mocks base method.
@@ -167,6 +731,18 @@ func (mr *MockTxnOperatorMockRecorder) Read(ctx, ops interface{}) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Read", reflect.TypeOf((*MockTxnOperator)(nil).Read), ctx, ops)
 }
 
+// RemoveWaitLock mocks base method.
+func (m *MockTxnOperator) RemoveWaitLock(key uint64) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "RemoveWaitLock", key)
+}
+
+// RemoveWaitLock indicates an expected call of RemoveWaitLock.
+func (mr *MockTxnOperatorMockRecorder) RemoveWaitLock(key interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RemoveWaitLock", reflect.TypeOf((*MockTxnOperator)(nil).RemoveWaitLock), key)
+}
+
 // Rollback mocks base method.
 func (m *MockTxnOperator) Rollback(ctx context.Context) error {
 	m.ctrl.T.Helper()
@@ -181,11 +757,23 @@ func (mr *MockTxnOperatorMockRecorder) Rollback(ctx interface{}) *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Rollback", reflect.TypeOf((*MockTxnOperator)(nil).Rollback), ctx)
 }
 
+// SetFootPrints mocks base method.
+func (m *MockTxnOperator) SetFootPrints(id int, enter bool) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetFootPrints", id, enter)
+}
+
+// SetFootPrints indicates an expected call of SetFootPrints.
+func (mr *MockTxnOperatorMockRecorder) SetFootPrints(id, enter interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetFootPrints", reflect.TypeOf((*MockTxnOperator)(nil).SetFootPrints), id, enter)
+}
+
 // Snapshot mocks base method.
-func (m *MockTxnOperator) Snapshot() ([]byte, error) {
+func (m *MockTxnOperator) Snapshot() (txn.CNTxnSnapshot, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "Snapshot")
-	ret0, _ := ret[0].([]byte)
+	ret0, _ := ret[0].(txn.CNTxnSnapshot)
 	ret1, _ := ret[1].(error)
 	return ret0, ret1
 }
@@ -194,6 +782,34 @@ func (m *MockTxnOperator) Snapshot() ([]byte, error) {
 func (mr *MockTxnOperatorMockRecorder) Snapshot() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Snapshot", reflect.TypeOf((*MockTxnOperator)(nil).Snapshot))
+}
+
+// SnapshotTS mocks base method.
+func (m *MockTxnOperator) SnapshotTS() timestamp.Timestamp {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "SnapshotTS")
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	return ret0
+}
+
+// SnapshotTS indicates an expected call of SnapshotTS.
+func (mr *MockTxnOperatorMockRecorder) SnapshotTS() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SnapshotTS", reflect.TypeOf((*MockTxnOperator)(nil).SnapshotTS))
+}
+
+// Status mocks base method.
+func (m *MockTxnOperator) Status() txn.TxnStatus {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Status")
+	ret0, _ := ret[0].(txn.TxnStatus)
+	return ret0
+}
+
+// Status indicates an expected call of Status.
+func (mr *MockTxnOperatorMockRecorder) Status() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Status", reflect.TypeOf((*MockTxnOperator)(nil).Status))
 }
 
 // Txn mocks base method.
@@ -210,18 +826,46 @@ func (mr *MockTxnOperatorMockRecorder) Txn() *gomock.Call {
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Txn", reflect.TypeOf((*MockTxnOperator)(nil).Txn))
 }
 
-// UpdateSnapshot mocks base method.
-func (m *MockTxnOperator) UpdateSnapshot(ts timestamp.Timestamp) error {
+// TxnOptions mocks base method.
+func (m *MockTxnOperator) TxnOptions() txn.TxnOptions {
 	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateSnapshot", ts)
+	ret := m.ctrl.Call(m, "TxnOptions")
+	ret0, _ := ret[0].(txn.TxnOptions)
+	return ret0
+}
+
+// TxnOptions indicates an expected call of TxnOptions.
+func (mr *MockTxnOperatorMockRecorder) TxnOptions() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TxnOptions", reflect.TypeOf((*MockTxnOperator)(nil).TxnOptions))
+}
+
+// TxnRef mocks base method.
+func (m *MockTxnOperator) TxnRef() *txn.TxnMeta {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "TxnRef")
+	ret0, _ := ret[0].(*txn.TxnMeta)
+	return ret0
+}
+
+// TxnRef indicates an expected call of TxnRef.
+func (mr *MockTxnOperatorMockRecorder) TxnRef() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "TxnRef", reflect.TypeOf((*MockTxnOperator)(nil).TxnRef))
+}
+
+// UpdateSnapshot mocks base method.
+func (m *MockTxnOperator) UpdateSnapshot(ctx context.Context, ts timestamp.Timestamp) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "UpdateSnapshot", ctx, ts)
 	ret0, _ := ret[0].(error)
 	return ret0
 }
 
 // UpdateSnapshot indicates an expected call of UpdateSnapshot.
-func (mr *MockTxnOperatorMockRecorder) UpdateSnapshot(ts interface{}) *gomock.Call {
+func (mr *MockTxnOperatorMockRecorder) UpdateSnapshot(ctx, ts interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateSnapshot", reflect.TypeOf((*MockTxnOperator)(nil).UpdateSnapshot), ts)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateSnapshot", reflect.TypeOf((*MockTxnOperator)(nil).UpdateSnapshot), ctx, ts)
 }
 
 // Write mocks base method.
@@ -252,188 +896,6 @@ func (m *MockTxnOperator) WriteAndCommit(ctx context.Context, ops []txn.TxnReque
 func (mr *MockTxnOperatorMockRecorder) WriteAndCommit(ctx, ops interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WriteAndCommit", reflect.TypeOf((*MockTxnOperator)(nil).WriteAndCommit), ctx, ops)
-}
-
-// MockDebugableTxnOperator is a mock of DebugableTxnOperator interface.
-type MockDebugableTxnOperator struct {
-	ctrl     *gomock.Controller
-	recorder *MockDebugableTxnOperatorMockRecorder
-}
-
-// MockDebugableTxnOperatorMockRecorder is the mock recorder for MockDebugableTxnOperator.
-type MockDebugableTxnOperatorMockRecorder struct {
-	mock *MockDebugableTxnOperator
-}
-
-// NewMockDebugableTxnOperator creates a new mock instance.
-func NewMockDebugableTxnOperator(ctrl *gomock.Controller) *MockDebugableTxnOperator {
-	mock := &MockDebugableTxnOperator{ctrl: ctrl}
-	mock.recorder = &MockDebugableTxnOperatorMockRecorder{mock}
-	return mock
-}
-
-// EXPECT returns an object that allows the caller to indicate expected use.
-func (m *MockDebugableTxnOperator) EXPECT() *MockDebugableTxnOperatorMockRecorder {
-	return m.recorder
-}
-
-// AddLockTable mocks base method.
-func (m *MockDebugableTxnOperator) AddLockTable(locktable lock.LockTable) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "AddLockTable", locktable)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// AddLockTable indicates an expected call of AddLockTable.
-func (mr *MockDebugableTxnOperatorMockRecorder) AddLockTable(locktable interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "AddLockTable", reflect.TypeOf((*MockDebugableTxnOperator)(nil).AddLockTable), locktable)
-}
-
-// ApplySnapshot mocks base method.
-func (m *MockDebugableTxnOperator) ApplySnapshot(data []byte) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "ApplySnapshot", data)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// ApplySnapshot indicates an expected call of ApplySnapshot.
-func (mr *MockDebugableTxnOperatorMockRecorder) ApplySnapshot(data interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "ApplySnapshot", reflect.TypeOf((*MockDebugableTxnOperator)(nil).ApplySnapshot), data)
-}
-
-// Commit mocks base method.
-func (m *MockDebugableTxnOperator) Commit(ctx context.Context) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Commit", ctx)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// Commit indicates an expected call of Commit.
-func (mr *MockDebugableTxnOperatorMockRecorder) Commit(ctx interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Commit", reflect.TypeOf((*MockDebugableTxnOperator)(nil).Commit), ctx)
-}
-
-// Debug mocks base method.
-func (m *MockDebugableTxnOperator) Debug(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Debug", ctx, ops)
-	ret0, _ := ret[0].(*rpc.SendResult)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// Debug indicates an expected call of Debug.
-func (mr *MockDebugableTxnOperatorMockRecorder) Debug(ctx, ops interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Debug", reflect.TypeOf((*MockDebugableTxnOperator)(nil).Debug), ctx, ops)
-}
-
-// Read mocks base method.
-func (m *MockDebugableTxnOperator) Read(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Read", ctx, ops)
-	ret0, _ := ret[0].(*rpc.SendResult)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// Read indicates an expected call of Read.
-func (mr *MockDebugableTxnOperatorMockRecorder) Read(ctx, ops interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Read", reflect.TypeOf((*MockDebugableTxnOperator)(nil).Read), ctx, ops)
-}
-
-// Rollback mocks base method.
-func (m *MockDebugableTxnOperator) Rollback(ctx context.Context) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Rollback", ctx)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// Rollback indicates an expected call of Rollback.
-func (mr *MockDebugableTxnOperatorMockRecorder) Rollback(ctx interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Rollback", reflect.TypeOf((*MockDebugableTxnOperator)(nil).Rollback), ctx)
-}
-
-// Snapshot mocks base method.
-func (m *MockDebugableTxnOperator) Snapshot() ([]byte, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Snapshot")
-	ret0, _ := ret[0].([]byte)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// Snapshot indicates an expected call of Snapshot.
-func (mr *MockDebugableTxnOperatorMockRecorder) Snapshot() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Snapshot", reflect.TypeOf((*MockDebugableTxnOperator)(nil).Snapshot))
-}
-
-// Txn mocks base method.
-func (m *MockDebugableTxnOperator) Txn() txn.TxnMeta {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Txn")
-	ret0, _ := ret[0].(txn.TxnMeta)
-	return ret0
-}
-
-// Txn indicates an expected call of Txn.
-func (mr *MockDebugableTxnOperatorMockRecorder) Txn() *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Txn", reflect.TypeOf((*MockDebugableTxnOperator)(nil).Txn))
-}
-
-// UpdateSnapshot mocks base method.
-func (m *MockDebugableTxnOperator) UpdateSnapshot(ts timestamp.Timestamp) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "UpdateSnapshot", ts)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// UpdateSnapshot indicates an expected call of UpdateSnapshot.
-func (mr *MockDebugableTxnOperatorMockRecorder) UpdateSnapshot(ts interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateSnapshot", reflect.TypeOf((*MockDebugableTxnOperator)(nil).UpdateSnapshot), ts)
-}
-
-// Write mocks base method.
-func (m *MockDebugableTxnOperator) Write(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "Write", ctx, ops)
-	ret0, _ := ret[0].(*rpc.SendResult)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// Write indicates an expected call of Write.
-func (mr *MockDebugableTxnOperatorMockRecorder) Write(ctx, ops interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Write", reflect.TypeOf((*MockDebugableTxnOperator)(nil).Write), ctx, ops)
-}
-
-// WriteAndCommit mocks base method.
-func (m *MockDebugableTxnOperator) WriteAndCommit(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "WriteAndCommit", ctx, ops)
-	ret0, _ := ret[0].(*rpc.SendResult)
-	ret1, _ := ret[1].(error)
-	return ret0, ret1
-}
-
-// WriteAndCommit indicates an expected call of WriteAndCommit.
-func (mr *MockDebugableTxnOperatorMockRecorder) WriteAndCommit(ctx, ops interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "WriteAndCommit", reflect.TypeOf((*MockDebugableTxnOperator)(nil).WriteAndCommit), ctx, ops)
 }
 
 // MockTxnIDGenerator is a mock of TxnIDGenerator interface.
@@ -471,4 +933,330 @@ func (m *MockTxnIDGenerator) Generate() []byte {
 func (mr *MockTxnIDGeneratorMockRecorder) Generate() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Generate", reflect.TypeOf((*MockTxnIDGenerator)(nil).Generate))
+}
+
+// MockTimestampWaiter is a mock of TimestampWaiter interface.
+type MockTimestampWaiter struct {
+	ctrl     *gomock.Controller
+	recorder *MockTimestampWaiterMockRecorder
+}
+
+// MockTimestampWaiterMockRecorder is the mock recorder for MockTimestampWaiter.
+type MockTimestampWaiterMockRecorder struct {
+	mock *MockTimestampWaiter
+}
+
+// NewMockTimestampWaiter creates a new mock instance.
+func NewMockTimestampWaiter(ctrl *gomock.Controller) *MockTimestampWaiter {
+	mock := &MockTimestampWaiter{ctrl: ctrl}
+	mock.recorder = &MockTimestampWaiterMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockTimestampWaiter) EXPECT() *MockTimestampWaiterMockRecorder {
+	return m.recorder
+}
+
+// Close mocks base method.
+func (m *MockTimestampWaiter) Close() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "Close")
+}
+
+// Close indicates an expected call of Close.
+func (mr *MockTimestampWaiterMockRecorder) Close() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Close", reflect.TypeOf((*MockTimestampWaiter)(nil).Close))
+}
+
+// GetTimestamp mocks base method.
+func (m *MockTimestampWaiter) GetTimestamp(arg0 context.Context, arg1 timestamp.Timestamp) (timestamp.Timestamp, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetTimestamp", arg0, arg1)
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetTimestamp indicates an expected call of GetTimestamp.
+func (mr *MockTimestampWaiterMockRecorder) GetTimestamp(arg0, arg1 interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetTimestamp", reflect.TypeOf((*MockTimestampWaiter)(nil).GetTimestamp), arg0, arg1)
+}
+
+// LatestTS mocks base method.
+func (m *MockTimestampWaiter) LatestTS() timestamp.Timestamp {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "LatestTS")
+	ret0, _ := ret[0].(timestamp.Timestamp)
+	return ret0
+}
+
+// LatestTS indicates an expected call of LatestTS.
+func (mr *MockTimestampWaiterMockRecorder) LatestTS() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "LatestTS", reflect.TypeOf((*MockTimestampWaiter)(nil).LatestTS))
+}
+
+// NotifyLatestCommitTS mocks base method.
+func (m *MockTimestampWaiter) NotifyLatestCommitTS(appliedTS timestamp.Timestamp) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "NotifyLatestCommitTS", appliedTS)
+}
+
+// NotifyLatestCommitTS indicates an expected call of NotifyLatestCommitTS.
+func (mr *MockTimestampWaiterMockRecorder) NotifyLatestCommitTS(appliedTS interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "NotifyLatestCommitTS", reflect.TypeOf((*MockTimestampWaiter)(nil).NotifyLatestCommitTS), appliedTS)
+}
+
+// MockWorkspace is a mock of Workspace interface.
+type MockWorkspace struct {
+	ctrl     *gomock.Controller
+	recorder *MockWorkspaceMockRecorder
+}
+
+// MockWorkspaceMockRecorder is the mock recorder for MockWorkspace.
+type MockWorkspaceMockRecorder struct {
+	mock *MockWorkspace
+}
+
+// NewMockWorkspace creates a new mock instance.
+func NewMockWorkspace(ctrl *gomock.Controller) *MockWorkspace {
+	mock := &MockWorkspace{ctrl: ctrl}
+	mock.recorder = &MockWorkspaceMockRecorder{mock}
+	return mock
+}
+
+// EXPECT returns an object that allows the caller to indicate expected use.
+func (m *MockWorkspace) EXPECT() *MockWorkspaceMockRecorder {
+	return m.recorder
+}
+
+// Adjust mocks base method.
+func (m *MockWorkspace) Adjust(writeOffset uint64) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Adjust", writeOffset)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Adjust indicates an expected call of Adjust.
+func (mr *MockWorkspaceMockRecorder) Adjust(writeOffset interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Adjust", reflect.TypeOf((*MockWorkspace)(nil).Adjust), writeOffset)
+}
+
+// BindTxnOp mocks base method.
+func (m *MockWorkspace) BindTxnOp(op client.TxnOperator) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "BindTxnOp", op)
+}
+
+// BindTxnOp indicates an expected call of BindTxnOp.
+func (mr *MockWorkspaceMockRecorder) BindTxnOp(op interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BindTxnOp", reflect.TypeOf((*MockWorkspace)(nil).BindTxnOp), op)
+}
+
+// CloneSnapshotWS mocks base method.
+func (m *MockWorkspace) CloneSnapshotWS() client.Workspace {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CloneSnapshotWS")
+	ret0, _ := ret[0].(client.Workspace)
+	return ret0
+}
+
+// CloneSnapshotWS indicates an expected call of CloneSnapshotWS.
+func (mr *MockWorkspaceMockRecorder) CloneSnapshotWS() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CloneSnapshotWS", reflect.TypeOf((*MockWorkspace)(nil).CloneSnapshotWS))
+}
+
+// Commit mocks base method.
+func (m *MockWorkspace) Commit(ctx context.Context) ([]txn.TxnRequest, error) {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Commit", ctx)
+	ret0, _ := ret[0].([]txn.TxnRequest)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// Commit indicates an expected call of Commit.
+func (mr *MockWorkspaceMockRecorder) Commit(ctx interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Commit", reflect.TypeOf((*MockWorkspace)(nil).Commit), ctx)
+}
+
+// EndStatement mocks base method.
+func (m *MockWorkspace) EndStatement() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "EndStatement")
+}
+
+// EndStatement indicates an expected call of EndStatement.
+func (mr *MockWorkspaceMockRecorder) EndStatement() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "EndStatement", reflect.TypeOf((*MockWorkspace)(nil).EndStatement))
+}
+
+// GetHaveDDL mocks base method.
+func (m *MockWorkspace) GetHaveDDL() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetHaveDDL")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// GetHaveDDL indicates an expected call of GetHaveDDL.
+func (mr *MockWorkspaceMockRecorder) GetHaveDDL() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetHaveDDL", reflect.TypeOf((*MockWorkspace)(nil).GetHaveDDL))
+}
+
+// GetSQLCount mocks base method.
+func (m *MockWorkspace) GetSQLCount() uint64 {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetSQLCount")
+	ret0, _ := ret[0].(uint64)
+	return ret0
+}
+
+// GetSQLCount indicates an expected call of GetSQLCount.
+func (mr *MockWorkspaceMockRecorder) GetSQLCount() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSQLCount", reflect.TypeOf((*MockWorkspace)(nil).GetSQLCount))
+}
+
+// GetSnapshotWriteOffset mocks base method.
+func (m *MockWorkspace) GetSnapshotWriteOffset() int {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "GetSnapshotWriteOffset")
+	ret0, _ := ret[0].(int)
+	return ret0
+}
+
+// GetSnapshotWriteOffset indicates an expected call of GetSnapshotWriteOffset.
+func (mr *MockWorkspaceMockRecorder) GetSnapshotWriteOffset() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetSnapshotWriteOffset", reflect.TypeOf((*MockWorkspace)(nil).GetSnapshotWriteOffset))
+}
+
+// IncrSQLCount mocks base method.
+func (m *MockWorkspace) IncrSQLCount() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "IncrSQLCount")
+}
+
+// IncrSQLCount indicates an expected call of IncrSQLCount.
+func (mr *MockWorkspaceMockRecorder) IncrSQLCount() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IncrSQLCount", reflect.TypeOf((*MockWorkspace)(nil).IncrSQLCount))
+}
+
+// IncrStatementID mocks base method.
+func (m *MockWorkspace) IncrStatementID(ctx context.Context, commit bool) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "IncrStatementID", ctx, commit)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// IncrStatementID indicates an expected call of IncrStatementID.
+func (mr *MockWorkspaceMockRecorder) IncrStatementID(ctx, commit interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "IncrStatementID", reflect.TypeOf((*MockWorkspace)(nil).IncrStatementID), ctx, commit)
+}
+
+// PPString mocks base method.
+func (m *MockWorkspace) PPString() string {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "PPString")
+	ret0, _ := ret[0].(string)
+	return ret0
+}
+
+// PPString indicates an expected call of PPString.
+func (mr *MockWorkspaceMockRecorder) PPString() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "PPString", reflect.TypeOf((*MockWorkspace)(nil).PPString))
+}
+
+// Readonly mocks base method.
+func (m *MockWorkspace) Readonly() bool {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Readonly")
+	ret0, _ := ret[0].(bool)
+	return ret0
+}
+
+// Readonly indicates an expected call of Readonly.
+func (mr *MockWorkspaceMockRecorder) Readonly() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Readonly", reflect.TypeOf((*MockWorkspace)(nil).Readonly))
+}
+
+// Rollback mocks base method.
+func (m *MockWorkspace) Rollback(ctx context.Context) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "Rollback", ctx)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// Rollback indicates an expected call of Rollback.
+func (mr *MockWorkspaceMockRecorder) Rollback(ctx interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Rollback", reflect.TypeOf((*MockWorkspace)(nil).Rollback), ctx)
+}
+
+// RollbackLastStatement mocks base method.
+func (m *MockWorkspace) RollbackLastStatement(ctx context.Context) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "RollbackLastStatement", ctx)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// RollbackLastStatement indicates an expected call of RollbackLastStatement.
+func (mr *MockWorkspaceMockRecorder) RollbackLastStatement(ctx interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "RollbackLastStatement", reflect.TypeOf((*MockWorkspace)(nil).RollbackLastStatement), ctx)
+}
+
+// SetHaveDDL mocks base method.
+func (m *MockWorkspace) SetHaveDDL(flag bool) {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "SetHaveDDL", flag)
+}
+
+// SetHaveDDL indicates an expected call of SetHaveDDL.
+func (mr *MockWorkspaceMockRecorder) SetHaveDDL(flag interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetHaveDDL", reflect.TypeOf((*MockWorkspace)(nil).SetHaveDDL), flag)
+}
+
+// StartStatement mocks base method.
+func (m *MockWorkspace) StartStatement() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "StartStatement")
+}
+
+// StartStatement indicates an expected call of StartStatement.
+func (mr *MockWorkspaceMockRecorder) StartStatement() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "StartStatement", reflect.TypeOf((*MockWorkspace)(nil).StartStatement))
+}
+
+// UpdateSnapshotWriteOffset mocks base method.
+func (m *MockWorkspace) UpdateSnapshotWriteOffset() {
+	m.ctrl.T.Helper()
+	m.ctrl.Call(m, "UpdateSnapshotWriteOffset")
+}
+
+// UpdateSnapshotWriteOffset indicates an expected call of UpdateSnapshotWriteOffset.
+func (mr *MockWorkspaceMockRecorder) UpdateSnapshotWriteOffset() *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "UpdateSnapshotWriteOffset", reflect.TypeOf((*MockWorkspace)(nil).UpdateSnapshotWriteOffset))
 }

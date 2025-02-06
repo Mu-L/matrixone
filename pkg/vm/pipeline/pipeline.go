@@ -16,148 +16,71 @@ package pipeline
 
 import (
 	"bytes"
+	"context"
 
-	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/table_scan"
 	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func New(attrs []string, ins vm.Instructions, reg *process.WaitRegister) *Pipeline {
+func New(tableID uint64, attrs []string, op vm.Operator) *Pipeline {
 	return &Pipeline{
-		reg:          reg,
-		instructions: ins,
-		attrs:        attrs,
+		rootOp:  op,
+		attrs:   attrs,
+		tableID: tableID,
 	}
 }
 
-func NewMerge(ins vm.Instructions, reg *process.WaitRegister) *Pipeline {
+func NewMerge(op vm.Operator) *Pipeline {
 	return &Pipeline{
-		reg:          reg,
-		instructions: ins,
+		rootOp: op,
 	}
 }
 
 func (p *Pipeline) String() string {
 	var buf bytes.Buffer
 
-	vm.String(p.instructions, &buf)
+	vm.String(p.rootOp, &buf)
 	return buf.String()
 }
 
-func (p *Pipeline) Run(r engine.Reader, proc *process.Process) (end bool, err error) {
-	// performance counter
-	perfCounterSet := new(perfcounter.CounterSet)
-	proc.Ctx = perfcounter.WithCounterSet(proc.Ctx, perfCounterSet)
-	defer func() {
-		_ = perfCounterSet //TODO
-	}()
+func (p *Pipeline) RunWithReader(r engine.Reader, topValueMsgTag int32, proc *process.Process) (end bool, err error) {
 
-	var bat *batch.Batch
-	// used to handle some push-down request
-	if p.reg != nil {
-		select {
-		case <-p.reg.Ctx.Done():
-		case <-p.reg.Ch:
-		}
-	}
-	if err = vm.Prepare(p.instructions, proc); err != nil {
-		p.cleanup(proc, true)
-		return false, err
+	if tableScanOperator, ok := vm.GetLeafOp(p.rootOp).(*table_scan.TableScan); ok {
+		tableScanOperator.Reader = r
+		tableScanOperator.TopValueMsgTag = topValueMsgTag
+		tableScanOperator.Attrs = p.attrs
+		tableScanOperator.TableID = p.tableID
 	}
 
-	for {
-		select {
-		case <-proc.Ctx.Done():
-			proc.SetInputBatch(nil)
-			return true, nil
-		default:
-		}
-		// read data from storage engine
-		if bat, err = r.Read(proc.Ctx, p.attrs, nil, proc.Mp()); err != nil {
-			p.cleanup(proc, true)
-			return false, err
-		}
-		if bat != nil {
-			bat.Cnt = 1
-
-			analyzeIdx := p.instructions[0].Idx
-			a := proc.GetAnalyze(analyzeIdx)
-			a.S3IOByte(bat)
-			a.Alloc(int64(bat.Size()))
-		}
-
-		proc.SetInputBatch(bat)
-		end, err = vm.Run(p.instructions, proc)
-		if err != nil {
-			p.cleanup(proc, true)
-			return end, err
-		}
-		if end {
-			// end is true means pipeline successfully completed
-			p.cleanup(proc, false)
-			return end, nil
-		}
-	}
+	return p.Run(proc)
 }
 
-func (p *Pipeline) ConstRun(bat *batch.Batch, proc *process.Process) (end bool, err error) {
-	// used to handle some push-down request
-	if p.reg != nil {
-		select {
-		case <-p.reg.Ctx.Done():
-		case <-p.reg.Ch:
-		}
-	}
+func (p *Pipeline) Run(proc *process.Process) (end bool, err error) {
+	defer catchPanic(proc.Ctx, &err)
 
-	if err = vm.Prepare(p.instructions, proc); err != nil {
-		p.cleanup(proc, true)
+	if err = vm.Prepare(p.rootOp, proc); err != nil {
 		return false, err
 	}
-	bat.Cnt = 1
-	pipelineInputBatches := []*batch.Batch{bat, nil}
-	for {
-		for i := range pipelineInputBatches {
-			proc.SetInputBatch(pipelineInputBatches[i])
-			end, err = vm.Run(p.instructions, proc)
-			if err != nil {
-				p.cleanup(proc, true)
-				return end, err
-			}
-			if end {
-				p.cleanup(proc, false)
-				return end, nil
-			}
+	vm.ModifyOutputOpNodeIdx(p.rootOp, proc)
+
+	for end = false; !end; {
+		result, er := vm.Exec(p.rootOp, proc)
+		if er != nil {
+			return true, er
 		}
+		end = result.Status == vm.ExecStop || result.Batch == nil
 	}
+
+	return true, err
 }
 
-func (p *Pipeline) MergeRun(proc *process.Process) (end bool, err error) {
-	// used to handle some push-down request
-	if p.reg != nil {
-		select {
-		case <-p.reg.Ctx.Done():
-		case <-p.reg.Ch:
-		}
-	}
-
-	if err = vm.Prepare(p.instructions, proc); err != nil {
-		proc.Cancel()
-		p.cleanup(proc, true)
-		return false, err
-	}
-	for {
-		end, err = vm.Run(p.instructions, proc)
-		if err != nil {
-			proc.Cancel()
-			p.cleanup(proc, true)
-			return end, err
-		}
-		if end {
-			proc.Cancel()
-			p.cleanup(proc, false)
-			return end, nil
-		}
+func catchPanic(ctx context.Context, errPtr *error) {
+	if e := recover(); e != nil {
+		*errPtr = moerr.ConvertPanicError(ctx, e)
+		logutil.Errorf("panic in pipeline: %v", *errPtr)
 	}
 }

@@ -16,64 +16,64 @@ package table_function
 
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func currentAccountPrepare(proc *process.Process, arg *Argument) error {
-	if len(arg.Args) > 0 {
-		return moerr.NewInvalidInput(proc.Ctx, "current_account: no argument is required")
+type currentAccountState struct {
+	simpleOneBatchState
+}
+
+func (s *currentAccountState) reset(tf *TableFunction, proc *process.Process) {
+	s.called = false
+	// do not reset batch
+}
+
+func currentAccountPrepare(_ *process.Process, _ *TableFunction) (tvfState, error) {
+	return &currentAccountState{}, nil
+}
+
+func (s *currentAccountState) start(tf *TableFunction, proc *process.Process, nthRow int, analyzer process.Analyzer) error {
+	// we do not call startPreamble here,
+	// there are very specific way of constructing the batch, below.
+	var err error
+
+	//-------------------------------------------------------
+	accountId, err := defines.GetAccountId(proc.Ctx)
+	if err != nil {
+		return err
 	}
-	return nil
-}
+	userId := defines.GetUserId(proc.Ctx)
+	roleId := defines.GetRoleId(proc.Ctx)
+	//-------------------------------------------------------
 
-func getAccountName(proc *process.Process) *vector.Vector {
-	return vector.NewConstBytes(types.T_varchar.ToType(), []byte(proc.SessionInfo.Account), 1, proc.Mp())
-}
-
-func getRoleName(proc *process.Process) *vector.Vector {
-	return vector.NewConstBytes(types.T_varchar.ToType(), []byte(proc.SessionInfo.Role), 1, proc.Mp())
-}
-
-func getUserName(proc *process.Process) *vector.Vector {
-	return vector.NewConstBytes(types.T_varchar.ToType(), []byte(proc.SessionInfo.User), 1, proc.Mp())
-}
-
-func getAccountId(proc *process.Process) *vector.Vector {
-	return vector.NewConstFixed(types.T_uint32.ToType(), proc.SessionInfo.AccountId, 1, proc.Mp())
-}
-
-func getRoleId(proc *process.Process) *vector.Vector {
-	return vector.NewConstFixed(types.T_uint32.ToType(), proc.SessionInfo.RoleId, 1, proc.Mp())
-}
-
-func getUserId(proc *process.Process) *vector.Vector {
-	return vector.NewConstFixed(types.T_uint32.ToType(), proc.SessionInfo.UserId, 1, proc.Mp())
-}
-
-func currentAccountCall(_ int, proc *process.Process, arg *Argument) (bool, error) {
-	rbat := batch.New(false, arg.Attrs)
-	for i, attr := range arg.Attrs {
-		switch attr {
-		case "account_name":
-			rbat.Vecs[i] = getAccountName(proc)
-		case "account_id":
-			rbat.Vecs[i] = getAccountId(proc)
-		case "user_name":
-			rbat.Vecs[i] = getUserName(proc)
-		case "user_id":
-			rbat.Vecs[i] = getUserId(proc)
-		case "role_name":
-			rbat.Vecs[i] = getRoleName(proc)
-		case "role_id":
-			rbat.Vecs[i] = getRoleId(proc)
-		default:
-			return false, moerr.NewInvalidInput(proc.Ctx, "%v is not supported by current_account()", attr)
+	if s.batch == nil {
+		s.batch = tf.createResultBatch()
+		for i, attr := range tf.Attrs {
+			switch attr {
+			case "account_name":
+				s.batch.Vecs[i], err = vector.NewConstBytes(types.T_varchar.ToType(), []byte(proc.GetSessionInfo().Account), 1, proc.Mp())
+			case "account_id":
+				s.batch.Vecs[i], err = vector.NewConstFixed(types.T_uint32.ToType(), accountId, 1, proc.Mp())
+			case "user_name":
+				s.batch.Vecs[i], err = vector.NewConstBytes(types.T_varchar.ToType(), []byte(proc.GetSessionInfo().User), 1, proc.Mp())
+			case "user_id":
+				s.batch.Vecs[i], err = vector.NewConstFixed(types.T_uint32.ToType(), userId, 1, proc.Mp())
+			case "role_name":
+				s.batch.Vecs[i], err = vector.NewConstBytes(types.T_varchar.ToType(), []byte(proc.GetSessionInfo().Role), 1, proc.Mp())
+			case "role_id":
+				s.batch.Vecs[i], err = vector.NewConstFixed(types.T_uint32.ToType(), roleId, 1, proc.Mp())
+			default:
+				err = moerr.NewInvalidInputf(proc.Ctx, "%v is not supported by current_account()", attr)
+			}
+			if err != nil {
+				return err
+			}
 		}
+		s.batch.SetRowCount(1)
 	}
-	rbat.InitZsOne(1)
-	proc.SetInputBatch(rbat)
-	return true, nil
+	s.called = false
+	return nil
 }

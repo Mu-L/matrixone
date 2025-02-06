@@ -15,50 +15,37 @@
 package tables
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/objectio"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer/base"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
 )
 
 type DataFactory struct {
-	AppendBufMgr base.INodeManager
-	Scheduler    tasks.TaskScheduler
-	dir          string
-	Fs           *objectio.ObjectFS
+	dir string
+	rt  *dbutils.Runtime
 }
 
-func NewDataFactory(fs *objectio.ObjectFS,
-	appendBufMgr base.INodeManager,
-	scheduler tasks.TaskScheduler,
-	dir string) *DataFactory {
+func NewDataFactory(
+	rt *dbutils.Runtime, dir string,
+) *DataFactory {
 	return &DataFactory{
-		AppendBufMgr: appendBufMgr,
-		Scheduler:    scheduler,
-		dir:          dir,
-		Fs:           fs,
+		dir: dir,
+		rt:  rt,
 	}
 }
 
 func (factory *DataFactory) MakeTableFactory() catalog.TableDataFactory {
 	return func(meta *catalog.TableEntry) data.Table {
-		return newTable(meta, factory.AppendBufMgr)
+		return newTable(meta, factory.rt)
 	}
 }
 
-func (factory *DataFactory) MakeSegmentFactory() catalog.SegmentDataFactory {
-	return func(meta *catalog.SegmentEntry) data.Segment {
-		return newSegment(meta, factory.AppendBufMgr, factory.dir)
-	}
-}
-
-func (factory *DataFactory) MakeBlockFactory() catalog.BlockDataFactory {
-	return func(meta *catalog.BlockEntry) data.Block {
+func (factory *DataFactory) MakeObjectFactory() catalog.ObjectDataFactory {
+	return func(meta *catalog.ObjectEntry) data.Object {
 		if meta.IsAppendable() {
-			return newABlock(meta, factory.Fs, factory.AppendBufMgr, factory.Scheduler)
+			return newAObject(meta, factory.rt, meta.IsTombstone)
 		} else {
-			return newBlock(meta, factory.Fs, factory.AppendBufMgr, factory.Scheduler)
+			return newObject(meta, factory.rt)
 		}
 	}
 }

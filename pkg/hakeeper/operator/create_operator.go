@@ -25,11 +25,19 @@ import (
 )
 
 func CreateAddReplica(uuid string, shardInfo pb.LogShardInfo, replicaID uint64) (*Operator, error) {
-	return NewBuilder("", shardInfo).AddPeer(string(uuid), replicaID).Build()
+	return NewBuilder("", shardInfo).AddPeer(uuid, replicaID).Build()
+}
+
+func CreateAddNonVotingReplica(uuid string, shardInfo pb.LogShardInfo, replicaID uint64) (*Operator, error) {
+	return NewBuilder("", shardInfo).AddNonVotingPeer(uuid, replicaID).Build()
 }
 
 func CreateRemoveReplica(uuid string, shardInfo pb.LogShardInfo) (*Operator, error) {
-	return NewBuilder("", shardInfo).RemovePeer(string(uuid)).Build()
+	return NewBuilder("", shardInfo).RemovePeer(uuid).Build()
+}
+
+func CreateRemoveNonVotingReplica(uuid string, shardInfo pb.LogShardInfo) (*Operator, error) {
+	return NewBuilder("", shardInfo).RemoveNonVotingPeer(uuid).Build()
 }
 
 func CreateStopReplica(brief string, uuid string, shardID uint64, epoch uint64) *Operator {
@@ -47,6 +55,28 @@ func CreateStartReplica(brief, uuid string, shardID, replicaID uint64) *Operator
 		StartLogService{Replica{UUID: uuid, ShardID: shardID, ReplicaID: replicaID}})
 }
 
+func CreateBootstrapShard(
+	brief, uuid string, shardID, replicaID uint64, initialMembers map[uint64]string,
+) *Operator {
+	return NewOperator(
+		brief,
+		shardID,
+		0,
+		BootstrapShard{
+			UUID:           uuid,
+			ShardID:        shardID,
+			ReplicaID:      replicaID,
+			InitialMembers: initialMembers,
+			Join:           false,
+		},
+	)
+}
+
+func CreateStartNonVotingReplica(brief, uuid string, shardID, replicaID uint64) *Operator {
+	return NewOperator(brief, shardID, 0,
+		StartNonVotingLogService{Replica{UUID: uuid, ShardID: shardID, ReplicaID: replicaID}})
+}
+
 func CreateTaskServiceOp(brief, uuid string, serviceType pb.ServiceType, user pb.TaskTableUser) *Operator {
 	return NewOperator(brief, 0, 0,
 		CreateTaskService{StoreID: uuid, StoreType: serviceType, TaskUser: user},
@@ -55,4 +85,26 @@ func CreateTaskServiceOp(brief, uuid string, serviceType pb.ServiceType, user pb
 
 func CreateDeleteCNOp(brief, uuid string) *Operator {
 	return NewOperator(brief, 0, 0, DeleteCNStore{StoreID: uuid})
+}
+
+func JoinGossipClusterOp(brief, uuid string, existing []string) *Operator {
+	return NewOperator(brief, 0, 0,
+		JoinGossipCluster{StoreID: uuid, Existing: existing},
+	)
+}
+
+func CreateDeleteProxyOp(brief, uuid string) *Operator {
+	return NewOperator(brief, 0, 0, DeleteProxyStore{StoreID: uuid})
+}
+
+func CreateAddShardOp(brief string, uuid string, shardID uint64) *Operator {
+	return NewOperator(
+		brief,
+		shardID,
+		0,
+		AddLogShard{
+			UUID:    uuid,
+			ShardID: shardID,
+		},
+	)
 }

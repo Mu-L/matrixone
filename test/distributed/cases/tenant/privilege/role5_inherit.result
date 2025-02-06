@@ -1,3 +1,4 @@
+set global enable_privilege_cache = off;
 drop user if exists anne,bill;
 create user anne identified by '111' , bill identified by '111';
 drop role if exists intern,lead,newrole,rolex,dev,test,rx;
@@ -31,7 +32,6 @@ internal error: do not have privilege to execute the statement
 grant drop database on account * to rx;
 internal error: do not have privilege to execute the statement
 grant drop table on database * to rx;
-internal error: do not have privilege to execute the statement
 grant test to rx,bill;
 internal error: do not have privilege to execute the statement
 grant dev to rx,bill;
@@ -65,7 +65,6 @@ grant create database on account * to rx;
 internal error: do not have privilege to execute the statement
 grant drop database on account * to rx;
 grant drop table on database * to rx;
-internal error: do not have privilege to execute the statement
 grant test to rx,bill;
 internal error: do not have privilege to execute the statement
 grant dev to rx,bill;
@@ -96,7 +95,6 @@ grant create database on account * to rx;
 internal error: do not have privilege to execute the statement
 grant drop database on account * to rx;
 grant drop table on database * to rx;
-internal error: do not have privilege to execute the statement
 grant test to rx,bill;
 internal error: do not have privilege to execute the statement
 grant dev to rx,bill;
@@ -129,7 +127,6 @@ grant create database on account * to rx;
 internal error: do not have privilege to execute the statement
 grant drop database on account * to rx;
 grant drop table on database * to rx;
-internal error: do not have privilege to execute the statement
 grant test to rx,bill;
 internal error: do not have privilege to execute the statement
 grant dev to rx,bill;
@@ -153,3 +150,4 @@ internal error: do not have privilege to execute the statement
 drop database t;
 drop user anne,bill;
 drop role intern,lead,newrole,rolex,dev,test,rx;
+set global enable_privilege_cache = on;

@@ -17,28 +17,29 @@ package cnservice
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/config"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/frontend"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	logservicepb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/task"
+	"github.com/matrixorigin/matrixone/pkg/proxy"
+	moconnector "github.com/matrixorigin/matrixone/pkg/stream/connector"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
+	"github.com/matrixorigin/matrixone/pkg/util"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/matrixorigin/matrixone/pkg/util/export"
-	"github.com/matrixorigin/matrixone/pkg/util/file"
+	db_holder "github.com/matrixorigin/matrixone/pkg/util/export/etl/db"
 	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
-	"github.com/matrixorigin/matrixone/pkg/util/metric"
 	"github.com/matrixorigin/matrixone/pkg/util/metric/mometric"
-	"github.com/matrixorigin/matrixone/pkg/util/sysview"
-	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
 	"go.uber.org/zap"
-)
-
-const (
-	defaultSystemInitTimeout = time.Minute * 5
 )
 
 func (s *service) adjustSQLAddress() {
@@ -58,23 +59,31 @@ func (s *service) adjustSQLAddress() {
 func (s *service) initTaskServiceHolder() {
 	s.adjustSQLAddress()
 
+	getClient := func() util.HAKeeperClient {
+		client, _ := s.getHAKeeperClient()
+		return client
+	}
 	s.task.Lock()
 	defer s.task.Unlock()
 	if s.task.storageFactory == nil {
 		s.task.holder = taskservice.NewTaskServiceHolder(
-			runtime.ProcessLevelRuntime(),
-			func(context.Context) (string, error) { return s.cfg.SQLAddress, nil })
+			runtime.ServiceRuntime(s.cfg.UUID),
+			util.AddressFunc(
+				s.cfg.UUID,
+				getClient,
+			),
+		)
 	} else {
 		s.task.holder = taskservice.NewTaskServiceHolderWithTaskStorageFactorySelector(
-			runtime.ProcessLevelRuntime(),
-			func(context.Context) (string, error) { return s.cfg.SQLAddress, nil },
+			runtime.ServiceRuntime(s.cfg.UUID),
+			util.AddressFunc(
+				s.cfg.UUID,
+				getClient,
+			),
 			func(_, _, _ string) taskservice.TaskStorageFactory {
 				return s.task.storageFactory
-			})
-	}
-
-	if err := s.stopper.RunTask(s.waitSystemInitCompleted); err != nil {
-		panic(err)
+			},
+		)
 	}
 }
 
@@ -88,6 +97,90 @@ func (s *service) createTaskService(command *logservicepb.CreateTaskService) {
 		return
 	}
 	s.startTaskRunner()
+
+	ts, ok := s.task.holder.Get()
+	if !ok {
+		panic("no task service is initialized")
+	}
+	s.pu.TaskService = ts
+}
+
+func (s *service) initSqlWriterFactory() {
+	getClient := func() util.HAKeeperClient {
+		client, _ := s.getHAKeeperClient()
+		return client
+	}
+	db_holder.SetSQLWriterDBAddressFunc(
+		util.AddressFunc(
+			s.cfg.UUID,
+			getClient,
+		),
+	)
+}
+
+func (s *service) createSQLLogger(command *logservicepb.CreateTaskService) {
+	frontend.SetSpecialUser(db_holder.MOLoggerUser, []byte(command.User.Password))
+	db_holder.SetSQLWriterDBUser(db_holder.MOLoggerUser, command.User.Password)
+}
+
+func (s *service) canClaimDaemonTask(taskAccount string) bool {
+	const accountKey = "account"
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second*3, moerr.CauseCanClaimDaemonTask)
+	defer cancel()
+
+	state, err := s._hakeeperClient.GetClusterState(ctx)
+	if err != nil {
+		return false
+	}
+	stores := state.CNState.Stores
+
+	info, ok := stores[s.cfg.UUID]
+	// 1. Cannot find current CN service UUID in cluster state.
+	if !ok {
+		return false
+	}
+
+	// We assume that the runner is a shard runner.
+	localShared := true
+
+	// 2. If the current runner has the same account info, return true.
+	for _, account := range info.Labels[accountKey].Labels {
+		if account != "" {
+			// This CN node has account, so it is not a shared one.
+			localShared = false
+		}
+		if strings.EqualFold(account, taskAccount) {
+			return true
+		}
+	}
+
+	isSysTask := strings.EqualFold(taskAccount, frontend.GetDefaultTenant())
+
+	var taskHasRunner bool
+	for _, store := range stores {
+		for key, labelInfo := range store.Labels {
+			if strings.EqualFold(accountKey, key) {
+				for _, label := range labelInfo.Labels {
+					if strings.EqualFold(label, taskAccount) {
+						taskHasRunner = true
+					}
+				}
+			}
+		}
+	}
+
+	// 3. If there are no other runners for this task, and local runner is a shared one or the
+	// task is belongs to sys account, we could run it.
+	if !taskHasRunner && (localShared || isSysTask) {
+		return true
+	}
+
+	// 4. Otherwise, we could not run this task.
+	return false
+}
+
+func (s *service) createProxyUser(command *logservicepb.CreateTaskService) {
+	frontend.SetSpecialUser(proxy.SQLUsername, []byte(command.User.Password))
 }
 
 func (s *service) startTaskRunner() {
@@ -105,6 +198,7 @@ func (s *service) startTaskRunner() {
 
 	s.task.runner = taskservice.NewTaskRunner(s.cfg.UUID,
 		ts,
+		s.canClaimDaemonTask,
 		taskservice.WithRunnerLogger(s.logger),
 		taskservice.WithOptions(
 			s.cfg.TaskRunner.QueryLimit,
@@ -114,7 +208,14 @@ func (s *service) startTaskRunner() {
 			s.cfg.TaskRunner.FetchTimeout.Duration,
 			s.cfg.TaskRunner.RetryInterval.Duration,
 			s.cfg.TaskRunner.HeartbeatInterval.Duration,
+			s.cfg.TaskRunner.HeartbeatTimeout.Duration,
 		),
+		taskservice.WithHaKeeperClient(
+			func() util.HAKeeperClient {
+				client, _ := s.getHAKeeperClient()
+				return client
+			}),
+		taskservice.WithCnUUID(s.cfg.UUID),
 	)
 
 	s.registerExecutorsLocked()
@@ -136,58 +237,15 @@ func (s *service) GetTaskService() (taskservice.TaskService, bool) {
 	return s.task.holder.Get()
 }
 
-func (s *service) WaitSystemInitCompleted(ctx context.Context) error {
-	s.waitSystemInitCompleted(ctx)
-	return ctx.Err()
-}
-
-func (s *service) waitSystemInitCompleted(ctx context.Context) {
-	defer logutil.LogAsyncTask(s.logger, "cnservice/wait-system-init-task")()
-
-	startAt := time.Now()
-	s.logger.Debug("wait all init task completed task started")
-	wait := func() {
-		time.Sleep(time.Second)
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			s.logger.Debug("wait all init task completed task stopped")
-			return
-		default:
-			ts, ok := s.GetTaskService()
-			if ok {
-				tasks, err := ts.QueryTask(ctx,
-					taskservice.WithTaskExecutorCond(taskservice.EQ, task.TaskCode_SystemInit),
-					taskservice.WithTaskStatusCond(taskservice.EQ, task.TaskStatus_Completed))
-				if err != nil {
-					s.logger.Error("wait all init task completed failed", zap.Error(err))
-					break
-				}
-				s.logger.Debug("waiting all init task completed",
-					zap.Int("completed", len(tasks)))
-				if len(tasks) > 0 {
-					if err := file.WriteFile(s.metadataFS,
-						"./system_init_completed",
-						[]byte("OK")); err != nil {
-						panic(err)
-					}
-					return
-				}
-			}
-		}
-		wait()
-		if time.Since(startAt) > defaultSystemInitTimeout {
-			panic("wait system init timeout")
-		}
-	}
-}
-
 func (s *service) stopTask() error {
 	defer logutil.LogClose(s.logger, "cnservice/task")()
 
 	s.task.Lock()
 	defer s.task.Unlock()
+	if s.task.holder == nil {
+		return nil
+	}
+
 	if err := s.task.holder.Close(); err != nil {
 		return err
 	}
@@ -202,57 +260,131 @@ func (s *service) registerExecutorsLocked() {
 		return
 	}
 
-	pu := config.NewParameterUnit(
-		&s.cfg.Frontend,
-		nil,
-		nil,
-		nil)
-	pu.StorageEngine = s.storeEngine
-	pu.TxnClient = s._txnClient
-	s.cfg.Frontend.SetDefaultValues()
-	pu.FileService = s.fileService
-	pu.LockService = s.lockService
-	moServerCtx := context.WithValue(context.Background(), config.ParameterUnitKey, pu)
 	ieFactory := func() ie.InternalExecutor {
-		return frontend.NewInternalExecutor(pu, s.mo.GetRoutineManager().GetAutoIncrCache())
+		return frontend.NewInternalExecutor(s.cfg.UUID)
 	}
 
 	ts, ok := s.task.holder.Get()
 	if !ok {
 		panic(moerr.NewInternalErrorNoCtx("task Service not ok"))
 	}
-	s.task.runner.RegisterExecutor(task.TaskCode_SystemInit,
-		func(ctx context.Context, t task.Task) error {
-			if err := frontend.InitSysTenant(moServerCtx, s.mo.GetRoutineManager().GetAutoIncrCache()); err != nil {
-				return err
-			}
-			if err := sysview.InitSchema(moServerCtx, ieFactory); err != nil {
-				return err
-			}
-			if err := mometric.InitSchema(moServerCtx, ieFactory); err != nil {
-				return err
-			}
-			if err := motrace.InitSchema(moServerCtx, ieFactory); err != nil {
-				return err
-			}
-
-			// init metric/log merge task cron rule
-			if err := export.CreateCronTask(moServerCtx, task.TaskCode_MetricLogMerge, ts); err != nil {
-				return err
-			}
-
-			// init metric task
-			if err := metric.CreateCronTask(moServerCtx, task.TaskCode_MetricStorageUsage, ts); err != nil {
-				return err
-			}
-
-			return nil
-		})
 
 	// init metric/log merge task executor
-	s.task.runner.RegisterExecutor(task.TaskCode_MetricLogMerge,
-		export.MergeTaskExecutorFactory(export.WithFileService(s.etlFS)))
+	s.task.runner.RegisterExecutor(
+		task.TaskCode_MetricLogMerge,
+		export.MergeTaskExecutorFactory(
+			s.cfg.UUID,
+			export.WithFileService(s.etlFS),
+		),
+	)
+	// init mo table stats task
+	s.task.runner.RegisterExecutor(
+		task.TaskCode_MOTableStats,
+		disttae.GetMOTableStatsExecutor(s.cfg.UUID, s.storeEngine, ieFactory))
+
 	// init metric task
-	s.task.runner.RegisterExecutor(task.TaskCode_MetricStorageUsage,
-		metric.GetMetricStorageUsageExecutor(ieFactory))
+	s.task.runner.RegisterExecutor(
+		task.TaskCode_MetricStorageUsage,
+		mometric.GetMetricStorageUsageExecutor(s.cfg.UUID, ieFactory))
+	// streaming connector task
+	s.task.runner.RegisterExecutor(task.TaskCode_ConnectorKafkaSink,
+		moconnector.KafkaSinkConnectorExecutor(s.logger, ts, ieFactory, s.task.runner.Attach))
+	s.task.runner.RegisterExecutor(task.TaskCode_MergeObject,
+		func(ctx context.Context, task task.Task) error {
+			metadata := task.GetMetadata()
+			var mergeTask api.MergeTaskEntry
+			err := mergeTask.Unmarshal(metadata.Context)
+			if err != nil {
+				return err
+			}
+
+			objs := make([]string, len(mergeTask.ToMergeObjs))
+			for i, b := range mergeTask.ToMergeObjs {
+				stats := objectio.ObjectStats(b)
+				objs[i] = stats.ObjectName().String()
+			}
+			sql := fmt.Sprintf("select mo_ctl('CN', 'MERGEOBJECTS', 'o:%d.%d:%s')",
+				mergeTask.TblId, mergeTask.AccountId, strings.Join(objs, ","))
+			ctx, cancel := context.WithTimeoutCause(ctx, 10*time.Minute, moerr.CauseMergeObject)
+			defer cancel()
+			opts := executor.Options{}.WithWaitCommittedLogApplied()
+			_, err = s.sqlExecutor.Exec(ctx, sql, opts)
+			return moerr.AttachCause(ctx, err)
+		},
+	)
+
+	s.task.runner.RegisterExecutor(task.TaskCode_Retention, func(ctx context.Context, task task.Task) error {
+		ctx1, cancel1 := context.WithTimeoutCause(ctx, 10*time.Second, moerr.CauseRetention)
+		result, err := s.sqlExecutor.Exec(ctx1, "select account_id from mo_catalog.mo_account;",
+			executor.Options{}.WithWaitCommittedLogApplied())
+		cancel1()
+		if err != nil {
+			return moerr.AttachCause(ctx1, err)
+		}
+		accounts := make([]int32, 0)
+		result.ReadRows(func(rows int, cols []*vector.Vector) bool {
+			if len(cols) != 1 {
+				return false
+			}
+			for i := range cols[0].Length() {
+				accounts = append(accounts, vector.GetFixedAtNoTypeCheck[int32](cols[0], i))
+			}
+			return true
+		})
+
+		for _, accountID := range accounts {
+			ctx2, cancel2 := context.WithTimeoutCause(ctx, 15*time.Second, moerr.CauseRetention2)
+			err = s.sqlExecutor.ExecTxn(ctx2, func(txn executor.TxnExecutor) error {
+				results, err := txn.Exec("select database_name, table_name, retention_deadline from mo_catalog.mo_retention", executor.StatementOption{})
+				if err != nil {
+					return moerr.AttachCause(ctx2, err)
+				}
+
+				results.ReadRows(func(rows int, cols []*vector.Vector) bool {
+					if len(cols) != 3 {
+						return false
+					}
+
+					for i := range cols[0].Length() {
+						ddl := vector.GetFixedAtNoTypeCheck[uint64](cols[2], i)
+						if time.Unix(int64(ddl), 0).After(time.Now()) {
+							continue
+						}
+						dbName := cols[0].GetStringAt(i)
+						tableName := cols[1].GetStringAt(i)
+						_, err = txn.Exec(fmt.Sprintf(
+							"delete from mo_catalog.mo_retention where database_name='%s' and table_name='%s'",
+							dbName, tableName), executor.StatementOption{})
+						if err != nil {
+							return false
+						}
+						_, err = txn.Exec(fmt.Sprintf("drop table %s.%s", dbName, tableName), executor.StatementOption{})
+						if err != nil {
+							return false
+						}
+					}
+					return true
+				})
+				return nil
+			}, executor.Options{}.WithAccountID(uint32(accountID)).WithDisableTrace())
+			cancel2()
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	s.task.runner.RegisterExecutor(task.TaskCode_InitCdc,
+		frontend.RegisterCdcExecutor(
+			s.logger,
+			ts,
+			ieFactory,
+			s.task.runner.Attach,
+			s.cfg.UUID,
+			s.fileService,
+			s._txnClient,
+			s.storeEngine,
+			s.cdcMp,
+		))
 }

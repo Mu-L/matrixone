@@ -17,50 +17,70 @@ package process
 import (
 	"context"
 	"io"
+	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/partitionservice"
+	"github.com/matrixorigin/matrixone/pkg/stage"
+	"github.com/matrixorigin/matrixone/pkg/vm/message"
+
+	"github.com/confluentinc/confluent-kafka-go/v2/kafka"
 	"github.com/google/uuid"
+	"github.com/hayageek/threadsafe"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/matrixorigin/matrixone/pkg/common/buffer"
+	"github.com/matrixorigin/matrixone/pkg/common/log"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/incrservice"
 	"github.com/matrixorigin/matrixone/pkg/lockservice"
+	"github.com/matrixorigin/matrixone/pkg/logservice"
+	"github.com/matrixorigin/matrixone/pkg/pb/lock"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	qclient "github.com/matrixorigin/matrixone/pkg/queryservice/client"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/udf"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
 
-// Analyze analyzes information for operator
-type Analyze interface {
-	Stop()
-	Start()
-	Alloc(int64)
-	Input(*batch.Batch, bool)
-	Output(*batch.Batch, bool)
-	WaitStop(time.Time)
-	DiskIO(*batch.Batch)
-	S3IOByte(*batch.Batch)
-	S3IOInputCount(int)
-	S3IOOutputCount(int)
-	Network(*batch.Batch)
-	AddScanTime(t time.Time)
-	AddInsertTime(t time.Time)
+var (
+	NormalEndRegisterMessage = NewRegMsg(nil)
+)
+
+// RegisterMessage channel data
+// Err == nil means pipeline finish with error
+// Batch == nil means pipeline finish without error
+// Batch != nil means pipeline is running
+type RegisterMessage struct {
+	Batch *batch.Batch
+	Err   error
+}
+
+func NewRegMsg(bat *batch.Batch) *RegisterMessage {
+	return &RegisterMessage{
+		Batch: bat,
+	}
 }
 
 // WaitRegister channel
 type WaitRegister struct {
-	Ctx context.Context
-	Ch  chan *batch.Batch
+	// Ch2, data receiver's channel for receive-action-signal.
+	Ch2 chan PipelineSignal
+
+	// how many nil-batches this channel can receive, default 0 means every nil batch close channel
+	NilBatchCnt int
 }
 
 // Register used in execution pipeline and shared with all operators of the same pipeline.
 type Register struct {
-	// Ss, temporarily stores the row number list in the execution of operators,
-	// and it can be reused in the future execution.
-	Ss [][]int64
-	// InputBatch, stores the result of the previous operator.
-	InputBatch *batch.Batch
 	// MergeReceivers, receives result of multi previous operators from other pipelines
 	// e.g. merge operator.
 	MergeReceivers []*WaitRegister
@@ -84,138 +104,345 @@ type Limitation struct {
 
 // SessionInfo session information
 type SessionInfo struct {
-	Account           string
-	User              string
-	Host              string
-	Role              string
-	ConnectionID      uint64
-	AccountId         uint32
-	RoleId            uint32
-	UserId            uint32
-	LastInsertID      uint64
-	Database          string
-	Version           string
-	TimeZone          *time.Location
-	StorageEngine     engine.Engine
-	QueryId           []string
-	ResultColTypes    []types.Type
-	AutoIncrCaches    defines.AutoIncrCaches
-	AutoIncrCacheSize uint64
-	SeqCurValues      map[uint64]string
-	SeqDeleteKeys     []uint64
-	SeqAddValues      map[uint64]string
-	SeqLastValue      []string
-	SqlHelper         sqlHelper
+	Account              string
+	User                 string
+	Host                 string
+	Role                 string
+	ConnectionID         uint64
+	LastInsertID         uint64
+	Database             string
+	Version              string
+	TimeZone             *time.Location
+	StorageEngine        engine.Engine
+	QueryId              []string
+	ResultColTypes       []types.Type
+	SeqCurValues         map[uint64]string
+	SeqDeleteKeys        []uint64
+	SeqAddValues         map[uint64]string
+	SeqLastValue         []string
+	SqlHelper            sqlHelper
+	Buf                  *buffer.Buffer
+	SourceInMemScanBatch []*kafka.Message
+	LogLevel             zapcore.Level
+	SessionId            uuid.UUID
 }
 
-// AnalyzeInfo  analyze information for query
-type AnalyzeInfo struct {
-	// NodeId, index of query's node list
-	NodeId int32
-	// InputRows, number of rows accepted by node
-	InputRows int64
-	// OutputRows, number of rows output by node
-	OutputRows int64
-	// TimeConsumed, time taken by the node in milliseconds
-	TimeConsumed int64
-	// WaitTimeConsumed, time taken by the node waiting for channel in milliseconds
-	WaitTimeConsumed int64
-	// InputSize, data size accepted by node
-	InputSize int64
-	// OutputSize, data size output by node
-	OutputSize int64
-	// MemorySize, memory alloc by node
-	MemorySize int64
-	// DiskIO, data size read from disk
-	DiskIO int64
-	// S3IOByte, data size read from s3
-	S3IOByte int64
-	// S3IOInputCount, count for PUT, COPY, POST and LIST
-	S3IOInputCount int64
-	// S3IOOutputCount, count for GET, SELECT and other
-	S3IOOutputCount int64
-	// NetworkIO, message size send between CN node
-	NetworkIO int64
-	// ScanTime, scan cost time in external scan
-	ScanTime int64
-	// InsertTime, insert cost time in load flow
-	InsertTime int64
+type ExecStatus int
+
+const (
+	ExecStop = iota
+	ExecNext
+	ExecHasMore
+)
+
+// StmtProfile will be clear for every statement
+type StmtProfile struct {
+	mu sync.Mutex
+	// sqlSourceType denotes where the sql
+	sqlSourceType string
+	txnId         uuid.UUID
+	stmtId        uuid.UUID
+	// stmtType
+	stmtType string
+	// queryType
+	queryType string
+	// queryStart is the time when the query starts.
+	queryStart time.Time
+	//the sql from user may have multiple statements
+	//sqlOfStmt is the text part of one statement in the sql
+	sqlOfStmt string
+}
+
+func NewStmtProfile(txnId, stmtId uuid.UUID) *StmtProfile {
+	return &StmtProfile{
+		txnId:  txnId,
+		stmtId: stmtId,
+	}
+}
+
+func (sp *StmtProfile) Clear() {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.sqlSourceType = ""
+	sp.txnId = uuid.UUID{}
+	sp.stmtId = uuid.UUID{}
+	sp.stmtType = ""
+	sp.queryType = ""
+	sp.sqlOfStmt = ""
+}
+
+func (sp *StmtProfile) SetSqlOfStmt(sot string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.sqlOfStmt = sot
+}
+
+func (sp *StmtProfile) GetSqlOfStmt() string {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.sqlOfStmt
+}
+
+func (sp *StmtProfile) SetQueryStart(t time.Time) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.queryStart = t
+}
+
+func (sp *StmtProfile) GetQueryStart() time.Time {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.queryStart
+}
+
+func (sp *StmtProfile) SetSqlSourceType(st string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.sqlSourceType = st
+}
+
+func (sp *StmtProfile) GetSqlSourceType() string {
+	return sp.sqlSourceType
+}
+
+func (sp *StmtProfile) SetQueryType(qt string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.queryType = qt
+}
+
+func (sp *StmtProfile) GetQueryType() string {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.queryType
+}
+
+func (sp *StmtProfile) SetStmtType(st string) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	sp.stmtType = st
+}
+
+func (sp *StmtProfile) GetStmtType() string {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.stmtType
+}
+
+func (sp *StmtProfile) SetTxnId(id []byte) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	copy(sp.txnId[:], id)
+}
+
+func (sp *StmtProfile) GetTxnId() uuid.UUID {
+	if sp == nil {
+		return uuid.UUID{}
+	}
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.txnId
+}
+
+func (sp *StmtProfile) SetStmtId(id uuid.UUID) {
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	copy(sp.stmtId[:], id[:])
+}
+
+func (sp *StmtProfile) GetStmtId() uuid.UUID {
+	if sp == nil {
+		return uuid.UUID{}
+	}
+	sp.mu.Lock()
+	defer sp.mu.Unlock()
+	return sp.stmtId
+}
+
+type BaseProcess struct {
+	// sqlContext includes the client context and the query context.
+	sqlContext QueryBaseContext
+	// atRuntime indicates whether the process is running in runtime.
+	atRuntime bool
+	LoadTag   bool
+
+	StmtProfile *StmtProfile
+	// Id, query id.
+	Id  string
+	Lim Limitation
+	mp  *mpool.MPool
+	// unix timestamp
+	UnixTime         int64
+	TxnClient        client.TxnClient
+	SessionInfo      SessionInfo
+	FileService      fileservice.FileService
+	LockService      lockservice.LockService
+	PartitionService partitionservice.PartitionService
+	IncrService      incrservice.AutoIncrementService
+
+	LastInsertID        *uint64
+	LoadLocalReader     *io.PipeReader
+	Aicm                *defines.AutoIncrCacheManager
+	resolveVariableFunc func(varName string, isSystemVar, isGlobalVar bool) (interface{}, error)
+	prepareParams       *vector.Vector
+	QueryClient         qclient.QueryClient
+	Hakeeper            logservice.CNHAKeeperClient
+	UdfService          udf.Service
+	WaitPolicy          lock.WaitPolicy
+	messageBoard        *message.MessageBoard
+	logger              *log.MOLogger
+	TxnOperator         client.TxnOperator
+	CloneTxnOperator    client.TxnOperator
+
+	// post dml sqls run right after all pipelines finished.
+	PostDmlSqlList *threadsafe.Slice[string]
+
+	// stage cache to avoid to run same stage SQL repeatedly
+	StageCache *threadsafe.Map[string, stage.StageDef]
 }
 
 // Process contains context used in query execution
 // one or more pipeline will be generated for one query,
 // and one pipeline has one process instance.
 type Process struct {
-	// Id, query id.
-	Id  string
-	Reg Register
-	Lim Limitation
+	// BaseProcess is the common part of one process, and it's shared by all its children processes.
+	Base *BaseProcess
+	Reg  Register
 
-	mp *mpool.MPool
-
-	// unix timestamp
-	UnixTime int64
-
-	TxnClient client.TxnClient
-
-	TxnOperator client.TxnOperator
-
-	AnalInfos []*AnalyzeInfo
-
-	SessionInfo SessionInfo
-
-	Ctx context.Context
-
-	Cancel context.CancelFunc
-
-	FileService fileservice.FileService
-	LockService lockservice.LockService
-
-	LoadTag bool
-
-	LastInsertID *uint64
-
-	LoadLocalReader *io.PipeReader
-
-	DispatchNotifyCh chan WrapCs
+	// Ctx and Cancel are pipeline's context and cancel function.
+	// Every pipeline has its own context, and the lifecycle of the pipeline is controlled by the context.
+	Ctx    context.Context
+	Cancel context.CancelCauseFunc
 }
 
 type sqlHelper interface {
-	ExecSql(string) ([]interface{}, error)
+	GetCompilerContext() any
+	ExecSql(string) ([][]interface{}, error)
+	ExecSqlWithCtx(context.Context, string) ([][]interface{}, error)
+	GetSubscriptionMeta(string) (sub *plan.SubscriptionMeta, err error)
 }
 
+// WrapCs record information about pipeline's remote receiver.
 type WrapCs struct {
-	MsgId  uint64
-	Uid    uuid.UUID
-	Cs     morpc.ClientSession
-	DoneCh chan struct{}
+	sync.RWMutex
+	ReceiverDone bool
+	MsgId        uint64
+	Uid          uuid.UUID
+	Cs           morpc.ClientSession
+	Err          chan error
+}
+
+// RemotePipelineInformationChannel used to deliver remote receiver pipeline's information.
+//
+// remote run Server will use this channel to send information to dispatch operator.
+type RemotePipelineInformationChannel chan *WrapCs
+
+func (proc *Process) GetMessageBoard() *message.MessageBoard {
+	return proc.Base.messageBoard
+}
+
+func (proc *Process) SetMessageBoard(mb *message.MessageBoard) {
+	proc.Base.messageBoard = mb
+}
+
+func (proc *Process) SetStmtProfile(sp *StmtProfile) {
+	proc.Base.StmtProfile = sp
+}
+
+func (proc *Process) GetStmtProfile() *StmtProfile {
+	if proc.Base.StmtProfile != nil {
+		return proc.Base.StmtProfile
+	}
+	return &StmtProfile{}
 }
 
 func (proc *Process) InitSeq() {
-	proc.SessionInfo.SeqCurValues = make(map[uint64]string)
-	proc.SessionInfo.SeqLastValue = make([]string, 1)
-	proc.SessionInfo.SeqLastValue[0] = ""
-	proc.SessionInfo.SeqAddValues = make(map[uint64]string)
-	proc.SessionInfo.SeqDeleteKeys = make([]uint64, 0)
+	proc.Base.SessionInfo.SeqCurValues = make(map[uint64]string)
+	proc.Base.SessionInfo.SeqLastValue = make([]string, 1)
+	proc.Base.SessionInfo.SeqLastValue[0] = ""
+	proc.Base.SessionInfo.SeqAddValues = make(map[uint64]string)
+	proc.Base.SessionInfo.SeqDeleteKeys = make([]uint64, 0)
 }
 
-func (proc *Process) SetLastInsertID(num uint64) {
-	if proc.LastInsertID != nil {
-		*proc.LastInsertID = num
+func (proc *Process) SetMPool(mp *mpool.MPool) {
+	proc.Base.mp = mp
+}
+
+func (proc *Process) SetFileService(fs fileservice.FileService) {
+	proc.Base.FileService = fs
+}
+
+func (proc *Process) GetPrepareParamsAt(i int) ([]byte, error) {
+	if i < 0 || i >= proc.Base.prepareParams.Length() {
+		return nil, moerr.NewInternalErrorf(proc.Ctx, "get prepare params error, index %d not exists", i)
+	}
+	if proc.Base.prepareParams.IsNull(uint64(i)) {
+		return nil, nil
+	} else {
+		val := proc.Base.prepareParams.GetRawBytesAt(i)
+		return val, nil
 	}
 }
 
+func (proc *Process) SetResolveVariableFunc(f func(varName string, isSystemVar, isGlobalVar bool) (interface{}, error)) {
+	proc.Base.resolveVariableFunc = f
+}
+
+func (proc *Process) GetResolveVariableFunc() func(varName string, isSystemVar, isGlobalVar bool) (interface{}, error) {
+	return proc.Base.resolveVariableFunc
+}
+
+func (proc *Process) SetLastInsertID(num uint64) {
+	if proc.Base.LastInsertID != nil {
+		atomic.StoreUint64(proc.Base.LastInsertID, num)
+	}
+}
+
+func (proc *Process) GetSessionInfo() *SessionInfo {
+	return &proc.Base.SessionInfo
+}
+
 func (proc *Process) GetLastInsertID() uint64 {
-	if proc.LastInsertID != nil {
-		return *proc.LastInsertID
+	if proc.Base.LastInsertID != nil {
+		num := atomic.LoadUint64(proc.Base.LastInsertID)
+		return num
 	}
 	return 0
 }
 
-type analyze struct {
-	start    time.Time
-	wait     time.Duration
-	analInfo *AnalyzeInfo
+func (proc *Process) SetCacheForAutoCol(name string) {
+	aicm := proc.Base.Aicm
+	aicm.Mu.Lock()
+	defer aicm.Mu.Unlock()
+	aicm.AutoIncrCaches[name] = defines.AutoIncrCache{CurNum: 0, MaxNum: aicm.MaxSize, Step: 1}
+}
+
+func (proc *Process) SetCloneTxnOperator(op client.TxnOperator) {
+	proc.Base.CloneTxnOperator = op
+}
+
+func (proc *Process) GetCloneTxnOperator() client.TxnOperator {
+	return proc.Base.CloneTxnOperator
+}
+
+func (proc *Process) GetTxnOperator() client.TxnOperator {
+	return proc.Base.TxnOperator
+}
+
+func (proc *Process) GetBaseProcessRunningStatus() bool {
+	return proc.Base.atRuntime
+}
+
+func (proc *Process) SetBaseProcessRunningStatus(status bool) {
+	proc.Base.atRuntime = status
+}
+
+func (proc *Process) GetPostDmlSqlList() *threadsafe.Slice[string] {
+	return proc.Base.PostDmlSqlList
+}
+
+func (proc *Process) GetStageCache() *threadsafe.Map[string, stage.StageDef] {
+	return proc.Base.StageCache
 }
 
 func (si *SessionInfo) GetUser() string {
@@ -227,7 +454,8 @@ func (si *SessionInfo) GetHost() string {
 }
 
 func (si *SessionInfo) GetUserHost() string {
-	return si.User + "@" + si.Host
+	//currently, the host_name is 'localhost'
+	return si.User + "@localhost"
 }
 
 func (si *SessionInfo) GetRole() string {

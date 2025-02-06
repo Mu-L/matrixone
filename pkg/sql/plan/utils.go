@@ -15,27 +15,38 @@
 package plan
 
 import (
+	"bytes"
 	"container/list"
 	"context"
 	"encoding/csv"
+	"fmt"
 	"math"
 	"path"
+	"slices"
 	"strings"
+	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/vm/process"
+	"go.uber.org/zap"
 
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan/rule"
+	"github.com/matrixorigin/matrixone/pkg/sql/util"
+	"github.com/matrixorigin/matrixone/pkg/stage"
+	"github.com/matrixorigin/matrixone/pkg/stage/stageutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 func GetBindings(expr *plan.Expr) []int32 {
@@ -47,22 +58,48 @@ func GetBindings(expr *plan.Expr) []int32 {
 	return bindings
 }
 
-func doGetBindings(expr *plan.Expr) map[int32]any {
-	res := make(map[int32]any)
+func doGetBindings(expr *plan.Expr) map[int32]bool {
+	res := make(map[int32]bool)
 
 	switch expr := expr.Expr.(type) {
 	case *plan.Expr_Col:
-		res[expr.Col.RelPos] = nil
+		res[expr.Col.RelPos] = true
 
 	case *plan.Expr_F:
 		for _, child := range expr.F.Args {
 			for id := range doGetBindings(child) {
-				res[id] = nil
+				res[id] = true
 			}
 		}
 	}
 
 	return res
+}
+
+func hasParam(expr *plan.Expr) bool {
+	switch exprImpl := expr.Expr.(type) {
+	case *plan.Expr_P:
+		return true
+
+	case *plan.Expr_F:
+		for _, arg := range exprImpl.F.Args {
+			if hasParam(arg) {
+				return true
+			}
+		}
+		return false
+
+	case *plan.Expr_List:
+		for _, arg := range exprImpl.List.List {
+			if hasParam(arg) {
+				return true
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
 }
 
 func hasCorrCol(expr *plan.Expr) bool {
@@ -71,11 +108,72 @@ func hasCorrCol(expr *plan.Expr) bool {
 		return true
 
 	case *plan.Expr_F:
-		ret := false
 		for _, arg := range exprImpl.F.Args {
-			ret = ret || hasCorrCol(arg)
+			if hasCorrCol(arg) {
+				return true
+			}
 		}
-		return ret
+		return false
+
+	case *plan.Expr_List:
+		for _, arg := range exprImpl.List.List {
+			if hasCorrCol(arg) {
+				return true
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
+}
+
+func hasSubquery(expr *plan.Expr) bool {
+	switch exprImpl := expr.Expr.(type) {
+	case *plan.Expr_Sub:
+		return true
+
+	case *plan.Expr_F:
+		for _, arg := range exprImpl.F.Args {
+			if hasSubquery(arg) {
+				return true
+			}
+		}
+		return false
+
+	case *plan.Expr_List:
+		for _, arg := range exprImpl.List.List {
+			if hasSubquery(arg) {
+				return true
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
+}
+
+func HasTag(expr *plan.Expr, tag int32) bool {
+	switch exprImpl := expr.Expr.(type) {
+	case *plan.Expr_Col:
+		return exprImpl.Col.RelPos == tag
+
+	case *plan.Expr_F:
+		for _, arg := range exprImpl.F.Args {
+			if HasTag(arg, tag) {
+				return true
+			}
+		}
+		return false
+
+	case *plan.Expr_List:
+		for _, arg := range exprImpl.List.List {
+			if HasTag(arg, tag) {
+				return true
+			}
+		}
+		return false
 
 	default:
 		return false
@@ -126,7 +224,7 @@ func decreaseDepth(expr *plan.Expr) (*plan.Expr, bool) {
 	return expr, correlated
 }
 
-func getJoinSide(expr *plan.Expr, leftTags, rightTags map[int32]*Binding, markTag int32) (side int8) {
+func getJoinSide(expr *plan.Expr, leftTags, rightTags map[int32]bool, markTag int32) (side int8) {
 	switch exprImpl := expr.Expr.(type) {
 	case *plan.Expr_F:
 		for _, arg := range exprImpl.F.Args {
@@ -134,9 +232,9 @@ func getJoinSide(expr *plan.Expr, leftTags, rightTags map[int32]*Binding, markTa
 		}
 
 	case *plan.Expr_Col:
-		if _, ok := leftTags[exprImpl.Col.RelPos]; ok {
+		if leftTags[exprImpl.Col.RelPos] {
 			side = JoinSideLeft
-		} else if _, ok := rightTags[exprImpl.Col.RelPos]; ok {
+		} else if rightTags[exprImpl.Col.RelPos] {
 			side = JoinSideRight
 		} else if exprImpl.Col.RelPos == markTag {
 			side = JoinSideMark
@@ -177,6 +275,14 @@ func replaceColRefs(expr *plan.Expr, tag int32, projects []*plan.Expr) *plan.Exp
 		if colRef.RelPos == tag {
 			expr = DeepCopyExpr(projects[colRef.ColPos])
 		}
+	case *plan.Expr_W:
+		replaceColRefs(exprImpl.W.WindowFunc, tag, projects)
+		for _, arg := range exprImpl.W.PartitionBy {
+			replaceColRefs(arg, tag, projects)
+		}
+		for _, order := range exprImpl.W.OrderBy {
+			replaceColRefs(order.Expr, tag, projects)
+		}
 	}
 
 	return expr
@@ -196,12 +302,12 @@ func replaceColRefsForSet(expr *plan.Expr, projects []*plan.Expr) *plan.Expr {
 	return expr
 }
 
-func splitAndBindCondition(astExpr tree.Expr, ctx *BindContext) ([]*plan.Expr, error) {
+func splitAndBindCondition(astExpr tree.Expr, expandAlias ExpandAliasMode, ctx *BindContext) ([]*plan.Expr, error) {
 	conds := splitAstConjunction(astExpr)
 	exprs := make([]*plan.Expr, len(conds))
 
 	for i, cond := range conds {
-		cond, err := ctx.qualifyColumnNames(cond, nil, false)
+		cond, err := ctx.qualifyColumnNames(cond, expandAlias)
 		if err != nil {
 			return nil, err
 		}
@@ -213,7 +319,7 @@ func splitAndBindCondition(astExpr tree.Expr, ctx *BindContext) ([]*plan.Expr, e
 		// expr must be bool type, if not, try to do type convert
 		// but just ignore the subQuery. It will be solved at optimizer.
 		if expr.GetSub() == nil {
-			expr, err = makePlan2CastExpr(ctx.binder.GetContext(), expr, &plan.Type{Id: int32(types.T_bool)})
+			expr, err = makePlan2CastExpr(ctx.binder.GetContext(), expr, plan.Type{Id: int32(types.T_bool)})
 			if err != nil {
 				return nil, err
 			}
@@ -295,9 +401,9 @@ func applyDistributivity(ctx context.Context, expr *plan.Expr) *plan.Expr {
 		leftExpr, _ := combinePlanConjunction(ctx, leftOnlyConds)
 		rightExpr, _ := combinePlanConjunction(ctx, rightOnlyConds)
 
-		leftExpr, _ = bindFuncExprImplByPlanExpr(ctx, "or", []*plan.Expr{leftExpr, rightExpr})
+		leftExpr, _ = BindFuncExprImplByPlanExpr(ctx, "or", []*plan.Expr{leftExpr, rightExpr})
 
-		expr, _ = bindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{expr, leftExpr})
+		expr, _ = BindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{expr, leftExpr})
 	}
 
 	return expr
@@ -383,7 +489,7 @@ func walkThroughDNF(ctx context.Context, expr *plan.Expr, keywords string) *plan
 			left := walkThroughDNF(ctx, exprImpl.F.Args[0], keywords)
 			right := walkThroughDNF(ctx, exprImpl.F.Args[1], keywords)
 			if left != nil && right != nil {
-				retExpr, _ = bindFuncExprImplByPlanExpr(ctx, "or", []*plan.Expr{left, right})
+				retExpr, _ = BindFuncExprImplByPlanExpr(ctx, "or", []*plan.Expr{left, right})
 				return retExpr
 			}
 		} else if exprImpl.F.Func.ObjName == "and" {
@@ -394,7 +500,7 @@ func walkThroughDNF(ctx context.Context, expr *plan.Expr, keywords string) *plan
 			} else if right == nil {
 				return left
 			} else {
-				retExpr, _ = bindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{left, right})
+				retExpr, _ = BindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{left, right})
 				return retExpr
 			}
 		} else {
@@ -422,17 +528,39 @@ func walkThroughDNF(ctx context.Context, expr *plan.Expr, keywords string) *plan
 	return expr
 }
 
+// deduction of new predicates for join on list. for example join on a=b and b=c, then a=c can be deduced
+func deduceNewOnList(onList []*plan.Expr) []*plan.Expr {
+	var newPreds []*plan.Expr
+	lenOnlist := len(onList)
+	for i := range onList {
+		ok1, col1, col2 := checkStrictJoinPred(onList[i])
+		if !ok1 {
+			continue
+		}
+		for j := i + 1; j < lenOnlist; j++ {
+			ok2, col3, col4 := checkStrictJoinPred(onList[j])
+			if ok2 {
+				ok, newPred := deduceTranstivity(onList[i], col1, col2, col3, col4)
+				if ok {
+					newPreds = append(newPreds, newPred)
+				}
+			}
+		}
+	}
+	return newPreds
+}
+
 // deduction of new predicates. for example join on a=b where b=1, then a=1 can be deduced
-func predsDeduction(filters, onList []*plan.Expr) []*plan.Expr {
+func deduceNewFilterList(filters, onList []*plan.Expr) []*plan.Expr {
 	var newFilters []*plan.Expr
 	for _, onPred := range onList {
-		ret, col1, col2 := checkOnPred(onPred)
+		ret, col1, col2 := checkStrictJoinPred(onPred)
 		if !ret {
 			continue
 		}
 		for _, filter := range filters {
-			ret, col := CheckFilter(filter)
-			if ret && col != nil {
+			col := extractColRefInFilter(filter)
+			if col != nil {
 				newExpr := DeepCopyExpr(filter)
 				if substituteMatchColumn(newExpr, col1, col2) {
 					newFilters = append(newFilters, newExpr)
@@ -444,90 +572,123 @@ func predsDeduction(filters, onList []*plan.Expr) []*plan.Expr {
 }
 
 func canMergeToBetweenAnd(expr1, expr2 *plan.Expr) bool {
-	b1, col1, _, funcName1 := CheckStrictFilter(expr1)
-	b2, col2, _, funcName2 := CheckStrictFilter(expr2)
-	if !b1 || !b2 {
+	col1, _, _, _, _ := extractColRefAndLiteralsInFilter(expr1)
+	col2, _, _, _, _ := extractColRefAndLiteralsInFilter(expr2)
+	if col1 == nil || col2 == nil {
 		return false
 	}
 	if col1.ColPos != col2.ColPos || col1.RelPos != col2.RelPos {
 		return false
 	}
-	if funcName1 == ">" || funcName1 == ">=" {
-		return funcName2 == "<" || funcName2 == "<="
+
+	fnName1 := expr1.GetF().Func.ObjName
+	fnName2 := expr2.GetF().Func.ObjName
+	if fnName1 == ">" || fnName1 == ">=" {
+		return fnName2 == "<" || fnName2 == "<="
 	}
-	if funcName1 == "<" || funcName1 == "<=" {
-		return funcName2 == ">" || funcName2 == ">="
+	if fnName1 == "<" || fnName1 == "<=" {
+		return fnName2 == ">" || fnName2 == ">="
 	}
 	return false
 }
 
-// strict filter means col compared to const. for example col1>1
-// func(col1)=1 is not strict
-func CheckStrictFilter(expr *plan.Expr) (b bool, col *ColRef, constExpr *Const, funcName string) {
-	switch exprImpl := expr.Expr.(type) {
-	case *plan.Expr_F:
-		funcName = exprImpl.F.Func.ObjName
-		switch funcName {
-		case "=", ">", "<", ">=", "<=":
-			switch child0 := exprImpl.F.Args[0].Expr.(type) {
-			case *plan.Expr_Col:
-				col = child0.Col
-			default:
-				return false, nil, nil, funcName
-			}
-			switch child1 := exprImpl.F.Args[1].Expr.(type) {
-			case *plan.Expr_C:
-				constExpr = child1.C
-				b = true
-				return
-			default:
-				return false, nil, nil, funcName
-			}
-		default:
-			return false, nil, nil, funcName
-		}
-	default:
-		return false, nil, nil, funcName
+func extractColRefAndLiteralsInFilter(expr *plan.Expr) (col *ColRef, litType types.T, literals []*Const, colFnName string, hasDynamicParam bool) {
+	fn := expr.GetF()
+	if fn == nil || len(fn.Args) == 0 {
+		return
 	}
+	for i := range fn.Args {
+		if containsDynamicParam(fn.Args[i]) {
+			hasDynamicParam = true
+			break
+		}
+	}
+
+	col = fn.Args[0].GetCol()
+	if col == nil {
+		if fn0 := fn.Args[0].GetF(); fn0 != nil {
+			switch fn0.Func.ObjName {
+			case "year":
+				colFnName = "year"
+				col = fn0.Args[0].GetCol()
+			}
+		}
+	}
+	if col == nil {
+		return
+	}
+
+	switch fn.Func.ObjName {
+	case "=", ">", "<", ">=", "<=":
+		lit := fn.Args[1].GetLit()
+		if lit == nil {
+			return
+		}
+		litType = types.T(fn.Args[0].Typ.Id)
+		literals = []*Const{lit}
+
+	case "between":
+		litType = types.T(fn.Args[0].Typ.Id)
+		literals = []*Const{fn.Args[1].GetLit(), fn.Args[2].GetLit()}
+	}
+
+	return
 }
 
 // for predicate deduction, filter must be like func(col)>1 , or (col=1) or (col=2)
 // and only 1 colRef is allowd in the filter
-func CheckFilter(expr *plan.Expr) (bool, *ColRef) {
+func extractColRefInFilter(expr *plan.Expr) *ColRef {
 	switch exprImpl := expr.Expr.(type) {
 	case *plan.Expr_F:
 		switch exprImpl.F.Func.ObjName {
-		case "=", ">", "<", ">=", "<=":
-			switch exprImpl.F.Args[1].Expr.(type) {
-			case *plan.Expr_C:
-				return CheckFilter(exprImpl.F.Args[0])
+		case "=", ">", "<", ">=", "<=", "prefix_eq", "between", "in", "prefix_in", "cast":
+			switch e := exprImpl.F.Args[1].Expr.(type) {
+			case *plan.Expr_Lit, *plan.Expr_P, *plan.Expr_V, *plan.Expr_Vec, *plan.Expr_List, *plan.Expr_T:
+				return extractColRefInFilter(exprImpl.F.Args[0])
+			case *plan.Expr_F:
+				switch e.F.Func.ObjName {
+				case "cast", "serial", "date_sub":
+					return extractColRefInFilter(exprImpl.F.Args[0])
+				}
+				return nil
 			default:
-				return false, nil
+				return nil
 			}
 		default:
 			var col *ColRef
 			for _, arg := range exprImpl.F.Args {
-				ret, c := CheckFilter(arg)
-				if !ret {
-					return false, nil
-				} else if c != nil {
-					if col != nil {
-						if col.RelPos != c.RelPos || col.ColPos != c.ColPos {
-							return false, nil
-						}
-					} else {
-						col = c
+				c := extractColRefInFilter(arg)
+				if c == nil {
+					return nil
+				}
+				if col != nil {
+					if col.RelPos != c.RelPos || col.ColPos != c.ColPos {
+						return nil
 					}
+				} else {
+					col = c
 				}
 			}
-			return true, col
+			return col
 		}
 	case *plan.Expr_Col:
-		return true, exprImpl.Col
+		return exprImpl.Col
+	}
+	return nil
+}
+
+// for col1=col2 and col3 = col4, trying to deduce new pred
+// for example , if col1 and col3 are the same, then we can deduce that col2=col4
+func deduceTranstivity(expr *plan.Expr, col1, col2, col3, col4 *ColRef) (bool, *plan.Expr) {
+	if col1.String() == col3.String() || col1.String() == col4.String() || col2.String() == col3.String() || col2.String() == col4.String() {
+		retExpr := DeepCopyExpr(expr)
+		substituteMatchColumn(retExpr, col3, col4)
+		return true, retExpr
 	}
 	return false, nil
 }
 
+// if match col1 in expr, substitute it to col2. and othterwise
 func substituteMatchColumn(expr *plan.Expr, onPredCol1, onPredCol2 *ColRef) bool {
 	var ret bool
 	switch exprImpl := expr.Expr.(type) {
@@ -554,7 +715,7 @@ func substituteMatchColumn(expr *plan.Expr, onPredCol1, onPredCol2 *ColRef) bool
 	return ret
 }
 
-func checkOnPred(onPred *plan.Expr) (bool, *ColRef, *ColRef) {
+func checkStrictJoinPred(onPred *plan.Expr) (bool, *ColRef, *ColRef) {
 	//onPred must be equality, children must be column name
 	switch onPredImpl := onPred.Expr.(type) {
 	case *plan.Expr_F:
@@ -576,6 +737,14 @@ func checkOnPred(onPred *plan.Expr) (bool, *ColRef, *ColRef) {
 		}
 	}
 	return false, nil, nil
+}
+
+func splitPlanConjunctions(exprList []*plan.Expr) []*plan.Expr {
+	var exprs []*plan.Expr
+	for _, expr := range exprList {
+		exprs = append(exprs, splitPlanConjunction(expr)...)
+	}
+	return exprs
 }
 
 func splitPlanConjunction(expr *plan.Expr) []*plan.Expr {
@@ -600,7 +769,7 @@ func combinePlanConjunction(ctx context.Context, exprs []*plan.Expr) (expr *plan
 	expr = exprs[0]
 
 	for i := 1; i < len(exprs); i++ {
-		expr, err = bindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{expr, exprs[i]})
+		expr, err = BindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{expr, exprs[i]})
 
 		if err != nil {
 			break
@@ -611,21 +780,23 @@ func combinePlanConjunction(ctx context.Context, exprs []*plan.Expr) (expr *plan
 }
 
 func rejectsNull(filter *plan.Expr, proc *process.Process) bool {
+	if filter.GetF() != nil && filter.GetF().Func.ObjName == "in" && filter.GetF().Args[0].GetCol() != nil {
+		return true // in is always null rejecting
+	}
+
 	filter = replaceColRefWithNull(DeepCopyExpr(filter))
 
-	bat := batch.NewWithSize(0)
-	bat.Zs = []int64{1}
-	filter, err := ConstantFold(bat, filter, proc)
+	filter, err := ConstantFold(batch.EmptyForConstFoldBatch, filter, proc, false, true)
 	if err != nil {
 		return false
 	}
 
-	if f, ok := filter.Expr.(*plan.Expr_C); ok {
-		if f.C.Isnull {
+	if f, ok := filter.Expr.(*plan.Expr_Lit); ok {
+		if f.Lit.Isnull {
 			return true
 		}
 
-		if fbool, ok := f.C.Value.(*plan.Const_Bval); ok {
+		if fbool, ok := f.Lit.Value.(*plan.Literal_Bval); ok {
 			return !fbool.Bval
 		}
 	}
@@ -638,8 +809,8 @@ func replaceColRefWithNull(expr *plan.Expr) *plan.Expr {
 	case *plan.Expr_Col:
 		expr = &plan.Expr{
 			Typ: expr.Typ,
-			Expr: &plan.Expr_C{
-				C: &plan.Const{
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
 					Isnull: true,
 				},
 			},
@@ -654,34 +825,30 @@ func replaceColRefWithNull(expr *plan.Expr) *plan.Expr {
 	return expr
 }
 
-func increaseRefCnt(expr *plan.Expr, colRefCnt map[[2]int32]int) {
+func increaseRefCnt(expr *plan.Expr, inc int, colRefCnt map[[2]int32]int) {
 	switch exprImpl := expr.Expr.(type) {
 	case *plan.Expr_Col:
-		colRefCnt[[2]int32{exprImpl.Col.RelPos, exprImpl.Col.ColPos}]++
+		colRefCnt[[2]int32{exprImpl.Col.RelPos, exprImpl.Col.ColPos}] += inc
 
 	case *plan.Expr_F:
 		for _, arg := range exprImpl.F.Args {
-			increaseRefCnt(arg, colRefCnt)
+			increaseRefCnt(arg, inc, colRefCnt)
+		}
+	case *plan.Expr_W:
+		increaseRefCnt(exprImpl.W.WindowFunc, inc, colRefCnt)
+		//for _, arg := range exprImpl.W.PartitionBy {
+		//	increaseRefCnt(arg, inc, colRefCnt)
+		//}
+		for _, order := range exprImpl.W.OrderBy {
+			increaseRefCnt(order.Expr, inc, colRefCnt)
 		}
 	}
 }
 
-func decreaseRefCnt(expr *plan.Expr, colRefCnt map[[2]int32]int) {
+func getHyperEdgeFromExpr(expr *plan.Expr, leafByTag map[int32]int32, hyperEdge map[int32]bool) {
 	switch exprImpl := expr.Expr.(type) {
 	case *plan.Expr_Col:
-		colRefCnt[[2]int32{exprImpl.Col.RelPos, exprImpl.Col.ColPos}]--
-
-	case *plan.Expr_F:
-		for _, arg := range exprImpl.F.Args {
-			decreaseRefCnt(arg, colRefCnt)
-		}
-	}
-}
-
-func getHyperEdgeFromExpr(expr *plan.Expr, leafByTag map[int32]int32, hyperEdge map[int32]any) {
-	switch exprImpl := expr.Expr.(type) {
-	case *plan.Expr_Col:
-		hyperEdge[leafByTag[exprImpl.Col.RelPos]] = nil
+		hyperEdge[leafByTag[exprImpl.Col.RelPos]] = true
 
 	case *plan.Expr_F:
 		for _, arg := range exprImpl.F.Args {
@@ -707,10 +874,10 @@ func getUnionSelects(ctx context.Context, stmt *tree.UnionClause, selects *[]tre
 	case *tree.ParenSelect:
 		*selects = append(*selects, leftStmt.Select)
 	default:
-		return moerr.NewParseError(ctx, "unexpected statement in union: '%v'", tree.String(leftStmt, dialect.MYSQL))
+		return moerr.NewParseErrorf(ctx, "unexpected statement in union: '%v'", tree.String(leftStmt, dialect.MYSQL))
 	}
 
-	// right is not UNION allways
+	// right is not UNION always
 	switch rightStmt := stmt.Right.(type) {
 	case *tree.SelectClause:
 		if stmt.Type == tree.UNION && !stmt.All {
@@ -731,7 +898,7 @@ func getUnionSelects(ctx context.Context, stmt *tree.UnionClause, selects *[]tre
 
 		*selects = append(*selects, rightStmt.Select)
 	default:
-		return moerr.NewParseError(ctx, "unexpected statement in union2: '%v'", tree.String(rightStmt, dialect.MYSQL))
+		return moerr.NewParseErrorf(ctx, "unexpected statement in union2: '%v'", tree.String(rightStmt, dialect.MYSQL))
 	}
 
 	switch stmt.Type {
@@ -757,27 +924,14 @@ func getUnionSelects(ctx context.Context, stmt *tree.UnionClause, selects *[]tre
 	return nil
 }
 
-func containsParamRef(expr *plan.Expr) bool {
-	var ret bool
-	switch exprImpl := expr.Expr.(type) {
-	case *plan.Expr_F:
-		for _, arg := range exprImpl.F.Args {
-			ret = ret || containsParamRef(arg)
-		}
-	case *plan.Expr_P:
-		return true
-	}
-	return ret
-}
-
-func getColumnMapByExpr(expr *plan.Expr, tableDef *plan.TableDef, columnMap *map[int]int) {
+func GetColumnMapByExpr(expr *plan.Expr, tableDef *plan.TableDef, columnMap map[int]int) {
 	if expr == nil {
 		return
 	}
 	switch exprImpl := expr.Expr.(type) {
 	case *plan.Expr_F:
 		for _, arg := range exprImpl.F.Args {
-			getColumnMapByExpr(arg, tableDef, columnMap)
+			GetColumnMapByExpr(arg, tableDef, columnMap)
 		}
 
 	case *plan.Expr_Col:
@@ -786,51 +940,77 @@ func getColumnMapByExpr(expr *plan.Expr, tableDef *plan.TableDef, columnMap *map
 		dotIdx := strings.Index(colName, ".")
 		colName = colName[dotIdx+1:]
 		colIdx := tableDef.Name2ColIndex[colName]
-		(*columnMap)[int(idx)] = int(colIdx)
+		seqnum := int(colIdx) // for extenal scan case, tableDef has only Name2ColIndex, no Cols, leave seqnum as colIdx
+		if len(tableDef.Cols) > 0 {
+			seqnum = int(tableDef.Cols[colIdx].Seqnum)
+		}
+		columnMap[int(idx)] = seqnum
 	}
 }
 
-func GetColumnsByExpr(expr *plan.Expr, tableDef *plan.TableDef) (map[int]int, []int, int) {
-	columnMap := make(map[int]int)
-	// key = expr's ColPos,  value = tableDef's ColPos
-	getColumnMapByExpr(expr, tableDef, &columnMap)
+func GetColumnMapByExprs(exprs []*plan.Expr, tableDef *plan.TableDef, columnMap map[int]int) {
+	for _, expr := range exprs {
+		GetColumnMapByExpr(expr, tableDef, columnMap)
+	}
+}
 
-	maxCol := 0
-	useColumn := len(columnMap)
-	columns := make([]int, useColumn)
+func GetColumnsByExpr(
+	expr *plan.Expr,
+	tableDef *plan.TableDef,
+) (columnMap map[int]int, defColumns, exprColumns []int, maxCol int) {
+	columnMap = make(map[int]int)
+	// key = expr's ColPos,  value = tableDef's ColPos
+	GetColumnMapByExpr(expr, tableDef, columnMap)
+
+	if len(columnMap) == 0 {
+		return
+	}
+
+	defColumns = make([]int, len(columnMap))
+	exprColumns = make([]int, len(columnMap))
+
+	// k: col pos in expr
+	// v: col pos in def
 	i := 0
 	for k, v := range columnMap {
-		if k > maxCol {
-			maxCol = k
+		if v > maxCol {
+			maxCol = v
 		}
-		columns[i] = v //tableDef's ColPos
+		exprColumns[i] = k
+		defColumns[i] = v
 		i = i + 1
 	}
-	return columnMap, columns, maxCol
+	return
 }
 
 func EvalFilterExpr(ctx context.Context, expr *plan.Expr, bat *batch.Batch, proc *process.Process) (bool, error) {
 	if len(bat.Vecs) == 0 { //that's constant expr
-		e, err := ConstantFold(bat, expr, proc)
+		e, err := ConstantFold(bat, expr, proc, false, true)
 		if err != nil {
 			return false, err
 		}
 
-		if cExpr, ok := e.Expr.(*plan.Expr_C); ok {
-			if bVal, bOk := cExpr.C.Value.(*plan.Const_Bval); bOk {
+		if cExpr, ok := e.Expr.(*plan.Expr_Lit); ok {
+			if bVal, bOk := cExpr.Lit.Value.(*plan.Literal_Bval); bOk {
 				return bVal.Bval, nil
 			}
 		}
 		return false, moerr.NewInternalError(ctx, "cannot eval filter expr")
 	} else {
-		vec, err := colexec.EvalExprByZonemapBat(ctx, bat, proc, expr)
+		executor, err := colexec.NewExpressionExecutor(proc, expr)
+		if err != nil {
+			return false, err
+		}
+		defer executor.Free()
+
+		vec, err := executor.Eval(proc, []*batch.Batch{bat}, nil)
 		if err != nil {
 			return false, err
 		}
 		if vec.GetType().Oid != types.T_bool {
 			return false, moerr.NewInternalError(ctx, "cannot eval filter expr")
 		}
-		cols := vector.MustFixedCol[bool](vec)
+		cols := vector.MustFixedColWithTypeCheck[bool](vec)
 		for _, isNeed := range cols {
 			if isNeed {
 				return true, nil
@@ -865,21 +1045,40 @@ func BuildVectorsByData(datas [][2]any, dataTypes []uint8, mp *mpool.MPool) []*v
 	return vectors
 }
 
-func CheckExprIsMonotonic(ctx context.Context, expr *plan.Expr) bool {
+func ExprIsZonemappable(ctx context.Context, expr *plan.Expr) bool {
 	if expr == nil {
 		return false
 	}
 	switch exprImpl := expr.Expr.(type) {
 	case *plan.Expr_F:
+		isConst := true
 		for _, arg := range exprImpl.F.Args {
-			isMonotonic := CheckExprIsMonotonic(ctx, arg)
-			if !isMonotonic {
+			if isRuntimeConstExpr(arg) {
+				continue
+			} else {
+				isConst = false
+			}
+			isZonemappable := ExprIsZonemappable(ctx, arg)
+			if !isZonemappable {
 				return false
 			}
 		}
+		if isConst {
+			return true
+		}
 
-		isMonotonic, _ := function.GetFunctionIsMonotonicById(ctx, exprImpl.F.Func.GetObj())
-		if !isMonotonic {
+		if exprImpl.F.Func.ObjName == "cast" {
+			switch exprImpl.F.Args[0].Typ.Id {
+			case int32(types.T_date), int32(types.T_time), int32(types.T_datetime), int32(types.T_timestamp):
+				if exprImpl.F.Args[1].Typ.Id == int32(types.T_timestamp) {
+					//this cast is monotonic, can safely pushdown to block filters
+					return true
+				}
+			}
+		}
+
+		isZonemappable, _ := function.GetFunctionIsZonemappableById(ctx, exprImpl.F.Func.GetObj())
+		if !isZonemappable {
 			return false
 		}
 
@@ -889,196 +1088,163 @@ func CheckExprIsMonotonic(ctx context.Context, expr *plan.Expr) bool {
 	}
 }
 
-// handle the filter list for zonemap. rewrite and constFold
-// return monotonic filters and number of nonMonotonic filters
-func HandleFiltersForZM(exprList []*plan.Expr, proc *process.Process) (*plan.Expr, int) {
-	if proc == nil || proc.Ctx == nil {
-		return nil, 0
+func GetSortOrderByName(tableDef *plan.TableDef, colName string) int {
+	if tableDef.ClusterBy != nil {
+		return util.GetClusterByColumnOrder(tableDef.ClusterBy.Name, colName)
 	}
-	num := 0
-	var newExprList []*plan.Expr
-	bat := batch.NewWithSize(0)
-	bat.Zs = []int64{1}
-	for _, expr := range exprList {
-		tmpexpr, _ := ConstantFold(bat, DeepCopyExpr(expr), proc)
-		if tmpexpr != nil {
-			expr = tmpexpr
-		}
-		if !containsParamRef(expr) && CheckExprIsMonotonic(proc.Ctx, expr) {
-			newExprList = append(newExprList, expr)
-		} else {
-			num++
+
+	if tableDef.Pkey == nil {
+		// view has no pk
+		logutil.Warn("GetSortOrderByName table has no PK",
+			zap.String("dbName", tableDef.DbName),
+			zap.String("tableName", tableDef.Name),
+			zap.String("relKind", tableDef.TableType))
+		return -1
+	}
+
+	if catalog.IsFakePkName(tableDef.Pkey.PkeyColName) {
+		return -1
+	}
+
+	if colName == tableDef.Pkey.PkeyColName {
+		return 0
+	}
+	pkNames := tableDef.Pkey.Names
+	for i := range pkNames {
+		if pkNames[i] == colName {
+			return i
 		}
 	}
-	e := colexec.RewriteFilterExprList(newExprList)
-	return e, num
+	return -1
 }
 
-func ConstantFold(bat *batch.Batch, e *plan.Expr, proc *process.Process) (*plan.Expr, error) {
-	var err error
+func GetSortOrder(tableDef *plan.TableDef, colPos int32) int {
+	colName := tableDef.Cols[colPos].Name
+	return GetSortOrderByName(tableDef, colName)
+}
 
-	ef, ok := e.Expr.(*plan.Expr_F)
-	if !ok || proc == nil {
-		return e, nil
+func ConstantFold(bat *batch.Batch, expr *plan.Expr, proc *process.Process, varAndParamIsConst bool, foldInExpr bool) (*plan.Expr, error) {
+	if expr.Typ.Id == int32(types.T_interval) {
+		panic(moerr.NewInternalError(proc.Ctx, "not supported type INTERVAL"))
 	}
-	overloadID := ef.F.Func.GetObj()
-	f, err := function.GetFunctionByID(proc.Ctx, overloadID)
-	if err != nil {
-		return nil, err
-	}
-	if f.Volatile { // function cannot be fold
-		return e, nil
-	}
-	for i := range ef.F.Args {
-		ef.F.Args[i], err = ConstantFold(bat, ef.F.Args[i], proc)
+
+	// If it is Expr_List, perform constant folding on its elements
+	if elist := expr.GetList(); elist != nil {
+		exprList := elist.List
+		cannotFold := false
+		for i := range exprList {
+			foldExpr, err := ConstantFold(bat, exprList[i], proc, varAndParamIsConst, foldInExpr)
+			if err != nil {
+				return nil, err
+			}
+			exprList[i] = foldExpr
+			if foldExpr.GetLit() == nil {
+				cannotFold = true
+			}
+		}
+
+		if cannotFold || !foldInExpr {
+			return expr, nil
+		}
+
+		vec, err := colexec.GenerateConstListExpressionExecutor(proc, exprList)
 		if err != nil {
 			return nil, err
 		}
+		defer vec.Free(proc.Mp())
+
+		vec.InplaceSortAndCompact()
+		data, err := vec.MarshalBinary()
+		if err != nil {
+			return nil, err
+		}
+
+		return &plan.Expr{
+			Typ: expr.Typ,
+			Expr: &plan.Expr_Vec{
+				Vec: &plan.LiteralVec{
+					Len:  int32(vec.Length()),
+					Data: data,
+				},
+			},
+		}, nil
 	}
-	if !rule.IsConstant(e) {
-		return e, nil
+
+	fn := expr.GetF()
+	if fn == nil || proc == nil {
+		return expr, nil
 	}
-	vec, err := colexec.EvalExpr(bat, proc, e)
+
+	overloadID := fn.Func.GetObj()
+	f, err := function.GetFunctionById(proc.Ctx, overloadID)
 	if err != nil {
 		return nil, err
 	}
-	c := rule.GetConstantValue(vec, false)
-	vec.Free(proc.Mp())
-	if c == nil {
-		return e, nil
+	if f.CannotFold() {
+		return expr, nil
 	}
-	ec := &plan.Expr_C{
-		C: c,
+	if f.IsRealTimeRelated() && !varAndParamIsConst {
+		return expr, nil
 	}
-	e.Expr = ec
-	return e, nil
-}
-
-func rewriteTableFunction(tblFunc *tree.TableFunction, leftCtx *BindContext) error {
-	//var err error
-	//newTableAliasMap := make(map[string]string)
-	//newColAliasMap := make(map[string]string)
-	//col2Table := make(map[string]string)
-	//for i := range tblFunc.SelectStmt.Select.(*tree.SelectClause).From.Tables {
-	//	alias := string(tblFunc.SelectStmt.Select.(*tree.SelectClause).From.Tables[i].(*tree.AliasedTableExpr).As.Alias)
-	//	if len(alias) == 0 {
-	//		alias = string(tblFunc.SelectStmt.Select.(*tree.SelectClause).From.Tables[i].(*tree.AliasedTableExpr).Expr.(*tree.TableName).ObjectName)
-	//	}
-	//	newAlias := fmt.Sprintf("%s_tbl_%d", alias, i)
-	//	tblFunc.SelectStmt.Select.(*tree.SelectClause).From.Tables[i].(*tree.AliasedTableExpr).As.Alias = tree.Identifier(newAlias)
-	//	//newTableAliasMap[alias] = newAlias
-	//}
-	for i := range tblFunc.SelectStmt.Select.(*tree.SelectClause).Exprs {
-		selectExpr := tblFunc.SelectStmt.Select.(*tree.SelectClause).Exprs[i] //take care, this is not a pointer
-		expr := selectExpr.Expr.(*tree.UnresolvedName)
-		_, tableName, colName := expr.GetNames()
-		if len(tableName) == 0 {
-			if binding, ok := leftCtx.bindingByCol[colName]; ok {
-				tableName = binding.table
-				expr.Parts[1] = tableName
-			} else {
-				return moerr.NewInternalError(leftCtx.binder.GetContext(), "cannot find column '%s'", colName)
-			}
+	isVec := false
+	for i := range fn.Args {
+		foldExpr, errFold := ConstantFold(bat, fn.Args[i], proc, varAndParamIsConst, foldInExpr)
+		if errFold != nil {
+			return nil, errFold
 		}
-		//newTableName = newTableAliasMap[tableName]
-		//newColAlias = fmt.Sprintf("%s_%d", colName, i)
-		//newColAliasMap[colName] = newColAlias
-		//col2Table[newColAlias] = newTableName
-		//newName, err := tree.NewUnresolvedName(newTableName, colName)
-		//if err != nil {
-		//	return err
-		//}
-		//tblFunc.SelectStmt.Select.(*tree.SelectClause).Exprs[i].Expr = newName
-		//tblFunc.SelectStmt.Select.(*tree.SelectClause).Exprs[i].As = tree.UnrestrictedIdentifier(newColAlias)
+		fn.Args[i] = foldExpr
+		isVec = isVec || foldExpr.GetVec() != nil
+	}
+	if f.IsAgg() || f.IsWin() {
+		return expr, nil
+	}
+	if !rule.IsConstant(expr, varAndParamIsConst) {
+		return expr, nil
 	}
 
-	//for i, _ := range tblFunc.Func.Exprs {
-	//	tblFunc.Func.Exprs[i], err = rewriteTableFunctionExpr(tblFunc.Func.Exprs[i], newTableAliasMap, newColAliasMap, col2Table)
-	//	if err != nil {
-	//		return err
-	//	}
-	//}
-	return nil
-}
+	vec, free, err := colexec.GetReadonlyResultFromExpression(proc, expr, []*batch.Batch{bat})
+	if err != nil {
+		return nil, err
+	}
+	defer free()
 
-//
-//func rewriteTableFunctionExpr(ast tree.Expr, tableAlias map[string]string, colAlias map[string]string, col2Table map[string]string) (tree.Expr, error) {
-//	var err error
-//	switch item := ast.(type) {
-//	case *tree.UnresolvedName:
-//		_, tblName, colName := item.GetNames()
-//		if len(tblName) > 0 {
-//			if alias, ok := tableAlias[tblName]; ok {
-//				item.Parts[1] = alias
-//			}
-//		} else {
-//			newColName := colAlias[colName]
-//			newTblName := col2Table[newColName]
-//			item.Parts[1] = newTblName
-//		}
-//	case *tree.FuncExpr:
-//		for i, _ := range item.Exprs {
-//			item.Exprs[i], err = rewriteTableFunctionExpr(item.Exprs[i], tableAlias, colAlias, col2Table)
-//			if err != nil {
-//				return nil, err
-//			}
-//		}
-//	case *tree.NumVal:
-//		break
-//	default:
-//		return nil, moerr.NewNotSupported("table function expr '%s' not supported", item)
-//	}
-//	return ast, nil
-//}
-
-// lookUpFnCols looks up the columns in the function expression
-func lookUpFnCols(ret tree.SelectExprs, fn interface{}) tree.SelectExprs {
-	switch fnExpr := fn.(type) { //TODO add more cases
-	case *tree.UnresolvedName:
-		ret = append(ret, tree.SelectExpr{Expr: fnExpr})
-	case *tree.FuncExpr:
-		for _, arg := range fnExpr.Exprs {
-			ret = lookUpFnCols(ret, arg)
+	if isVec {
+		data, err := vec.MarshalBinary()
+		if err != nil {
+			return expr, nil
 		}
-	case *tree.BinaryExpr:
-		ret = lookUpFnCols(ret, fnExpr.Left)
-		ret = lookUpFnCols(ret, fnExpr.Right)
-	case *tree.UnaryExpr:
-		ret = lookUpFnCols(ret, fnExpr.Expr)
-	}
-	return ret
-}
-func buildTableFunctionStmt(tbl *tree.TableFunction, left tree.TableExpr, leftCtx *BindContext) error {
-	var selectExprs tree.SelectExprs
-	selectExprs = lookUpFnCols(selectExprs, tbl.Func)
-	tbl.SelectStmt = &tree.Select{
-		Select: &tree.SelectClause{
-			From: &tree.From{
-				Tables: []tree.TableExpr{left},
+
+		return &plan.Expr{
+			Typ: expr.Typ,
+			Expr: &plan.Expr_Vec{
+				Vec: &plan.LiteralVec{
+					Len:  int32(vec.Length()),
+					Data: data,
+				},
 			},
-			Exprs: selectExprs,
-		},
+		}, nil
 	}
-	return rewriteTableFunction(tbl, leftCtx)
-}
 
-func clearBinding(ctx *BindContext) {
-	ctx.bindingByCol = make(map[string]*Binding)
-	ctx.bindingByTable = make(map[string]*Binding)
-	ctx.bindingByTag = make(map[int32]*Binding)
-	ctx.bindingTree = &BindingTreeNode{}
-	ctx.bindings = make([]*Binding, 0)
+	c := rule.GetConstantValue(vec, false, 0)
+	if c == nil {
+		return expr, nil
+	}
+	ec := &plan.Expr_Lit{
+		Lit: c,
+	}
+	expr.Expr = ec
+	return expr, nil
 }
 
 func unwindTupleComparison(ctx context.Context, nonEqOp, op string, leftExprs, rightExprs []*plan.Expr, idx int) (*plan.Expr, error) {
 	if idx == len(leftExprs)-1 {
-		return bindFuncExprImplByPlanExpr(ctx, op, []*plan.Expr{
+		return BindFuncExprImplByPlanExpr(ctx, op, []*plan.Expr{
 			leftExprs[idx],
 			rightExprs[idx],
 		})
 	}
 
-	expr, err := bindFuncExprImplByPlanExpr(ctx, nonEqOp, []*plan.Expr{
+	expr, err := BindFuncExprImplByPlanExpr(ctx, nonEqOp, []*plan.Expr{
 		DeepCopyExpr(leftExprs[idx]),
 		DeepCopyExpr(rightExprs[idx]),
 	})
@@ -1086,7 +1252,7 @@ func unwindTupleComparison(ctx context.Context, nonEqOp, op string, leftExprs, r
 		return nil, err
 	}
 
-	eqExpr, err := bindFuncExprImplByPlanExpr(ctx, "=", []*plan.Expr{
+	eqExpr, err := BindFuncExprImplByPlanExpr(ctx, "=", []*plan.Expr{
 		leftExprs[idx],
 		rightExprs[idx],
 	})
@@ -1099,28 +1265,37 @@ func unwindTupleComparison(ctx context.Context, nonEqOp, op string, leftExprs, r
 		return nil, err
 	}
 
-	tailExpr, err = bindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{eqExpr, tailExpr})
+	tailExpr, err = BindFuncExprImplByPlanExpr(ctx, "and", []*plan.Expr{eqExpr, tailExpr})
 	if err != nil {
 		return nil, err
 	}
 
-	return bindFuncExprImplByPlanExpr(ctx, "or", []*plan.Expr{expr, tailExpr})
+	return BindFuncExprImplByPlanExpr(ctx, "or", []*plan.Expr{expr, tailExpr})
 }
 
 // checkNoNeedCast
 // if constant's type higher than column's type
 // and constant's value in range of column's type, then no cast was needed
-func checkNoNeedCast(constT, columnT types.Type, constExpr *plan.Expr_C) bool {
+func checkNoNeedCast(constT, columnT types.Type, constExpr *plan.Expr) bool {
+	if constExpr.GetP() != nil && columnT.IsNumeric() {
+		return true
+	}
+
+	lit := constExpr.GetLit()
+	if lit == nil {
+		return false
+	}
+
+	//TODO: Check if T_array is required here?
+	if constT.Eq(columnT) {
+		return true
+	}
 	switch constT.Oid {
-	case types.T_char, types.T_varchar, types.T_text:
+	case types.T_char, types.T_varchar, types.T_text, types.T_datalink:
 		switch columnT.Oid {
 		case types.T_char, types.T_varchar:
-			if constT.Width <= columnT.Width {
-				return true
-			} else {
-				return false
-			}
-		case types.T_text:
+			return constT.Width <= columnT.Width
+		case types.T_text, types.T_datalink:
 			return true
 		default:
 			return false
@@ -1141,12 +1316,14 @@ func checkNoNeedCast(constT, columnT types.Type, constExpr *plan.Expr_C) bool {
 		}
 
 	case types.T_int8, types.T_int16, types.T_int32, types.T_int64:
-		val, valOk := constExpr.C.Value.(*plan.Const_I64Val)
+		val, valOk := lit.Value.(*plan.Literal_I64Val)
 		if !valOk {
 			return false
 		}
 		constVal := val.I64Val
 		switch columnT.Oid {
+		case types.T_bit:
+			return constVal >= 0 && uint64(constVal) <= uint64(1<<columnT.Width-1)
 		case types.T_int8:
 			return constVal <= int64(math.MaxInt8) && constVal >= int64(math.MinInt8)
 		case types.T_int16:
@@ -1163,27 +1340,27 @@ func checkNoNeedCast(constT, columnT types.Type, constExpr *plan.Expr_C) bool {
 			return constVal <= math.MaxUint32 && constVal >= 0
 		case types.T_uint64:
 			return constVal >= 0
-		case types.T_varchar:
-			return true
 		case types.T_float32:
 			//float32 has 6 significant digits.
 			return constVal <= 100000 && constVal >= -100000
 		case types.T_float64:
 			//float64 has 15 significant digits.
-			//return constVal <= int64(math.MaxInt32) && constVal >= int64(math.MinInt32)
-			return false // filtering zonemap is slow for now. will change this in the future
+			return constVal <= int64(math.MaxInt32) && constVal >= int64(math.MinInt32)
 		case types.T_decimal64:
 			return constVal <= int64(math.MaxInt32) && constVal >= int64(math.MinInt32)
 		default:
 			return false
 		}
+
 	case types.T_uint8, types.T_uint16, types.T_uint32, types.T_uint64:
-		val_u, valOk := constExpr.C.Value.(*plan.Const_U64Val)
+		val_u, valOk := lit.Value.(*plan.Literal_U64Val)
 		if !valOk {
 			return false
 		}
 		constVal := val_u.U64Val
 		switch columnT.Oid {
+		case types.T_bit:
+			return constVal <= uint64(1<<columnT.Width-1)
 		case types.T_int8:
 			return constVal <= math.MaxInt8
 		case types.T_int16:
@@ -1205,13 +1382,16 @@ func checkNoNeedCast(constT, columnT types.Type, constExpr *plan.Expr_C) bool {
 			return constVal <= 100000
 		case types.T_float64:
 			//float64 has 15 significant digits.
-			//return constVal <= math.MaxUint32
-			return false // filtering zonemap is slow for now. will change this in the future
+			return constVal <= math.MaxUint32
 		case types.T_decimal64:
 			return constVal <= math.MaxInt32
 		default:
 			return false
 		}
+
+	case types.T_decimal64, types.T_decimal128:
+		return columnT.Oid == types.T_decimal64 || columnT.Oid == types.T_decimal128
+
 	default:
 		return false
 	}
@@ -1227,19 +1407,19 @@ func InitInfileParam(param *tree.ExternParam) error {
 			param.CompressType = param.Option[i+1]
 		case "format":
 			format := strings.ToLower(param.Option[i+1])
-			if format != tree.CSV && format != tree.JSONLINE {
-				return moerr.NewBadConfig(param.Ctx, "the format '%s' is not supported", format)
+			if format != tree.CSV && format != tree.JSONLINE && format != tree.PARQUET {
+				return moerr.NewBadConfigf(param.Ctx, "the format '%s' is not supported", format)
 			}
 			param.Format = format
 		case "jsondata":
 			jsondata := strings.ToLower(param.Option[i+1])
 			if jsondata != tree.OBJECT && jsondata != tree.ARRAY {
-				return moerr.NewBadConfig(param.Ctx, "the jsondata '%s' is not supported", jsondata)
+				return moerr.NewBadConfigf(param.Ctx, "the jsondata '%s' is not supported", jsondata)
 			}
 			param.JsonData = jsondata
 			param.Format = tree.JSONLINE
 		default:
-			return moerr.NewBadConfig(param.Ctx, "the keyword '%s' is not support", strings.ToLower(param.Option[i]))
+			return moerr.NewBadConfigf(param.Ctx, "the keyword '%s' is not support", strings.ToLower(param.Option[i]))
 		}
 	}
 	if len(param.Filepath) == 0 {
@@ -1281,19 +1461,19 @@ func InitS3Param(param *tree.ExternParam) error {
 		case "format":
 			format := strings.ToLower(param.Option[i+1])
 			if format != tree.CSV && format != tree.JSONLINE {
-				return moerr.NewBadConfig(param.Ctx, "the format '%s' is not supported", format)
+				return moerr.NewBadConfigf(param.Ctx, "the format '%s' is not supported", format)
 			}
 			param.Format = format
 		case "jsondata":
 			jsondata := strings.ToLower(param.Option[i+1])
 			if jsondata != tree.OBJECT && jsondata != tree.ARRAY {
-				return moerr.NewBadConfig(param.Ctx, "the jsondata '%s' is not supported", jsondata)
+				return moerr.NewBadConfigf(param.Ctx, "the jsondata '%s' is not supported", jsondata)
 			}
 			param.JsonData = jsondata
 			param.Format = tree.JSONLINE
 
 		default:
-			return moerr.NewBadConfig(param.Ctx, "the keyword '%s' is not support", strings.ToLower(param.Option[i]))
+			return moerr.NewBadConfigf(param.Ctx, "the keyword '%s' is not support", strings.ToLower(param.Option[i]))
 		}
 	}
 	if param.Format == tree.JSONLINE && len(param.JsonData) == 0 {
@@ -1305,22 +1485,168 @@ func InitS3Param(param *tree.ExternParam) error {
 	return nil
 }
 
+func GetFilePathFromParam(param *tree.ExternParam) string {
+	fpath := param.Filepath
+	for i := 0; i < len(param.Option); i += 2 {
+		name := strings.ToLower(param.Option[i])
+		if name == "filepath" {
+			fpath = param.Option[i+1]
+			break
+		}
+	}
+
+	return fpath
+}
+
+func InitStageS3Param(param *tree.ExternParam, s stage.StageDef) error {
+
+	param.ScanType = tree.S3
+	param.S3Param = &tree.S3Parameter{}
+
+	if len(s.Url.RawQuery) > 0 {
+		return moerr.NewBadConfig(param.Ctx, "S3 URL Query does not support in ExternParam")
+	}
+
+	if s.Url.Scheme != stage.S3_PROTOCOL {
+		return moerr.NewBadConfig(param.Ctx, "URL protocol is not S3")
+	}
+
+	bucket, prefix, _, err := stage.ParseS3Url(s.Url)
+	if err != nil {
+		return err
+	}
+
+	var found bool
+	param.S3Param.Bucket = bucket
+	param.Filepath = prefix
+
+	// mandatory
+	param.S3Param.APIKey, found = s.GetCredentials(stage.PARAMKEY_AWS_KEY_ID, "")
+	if !found {
+		return moerr.NewBadConfigf(param.Ctx, "Credentials %s not found", stage.PARAMKEY_AWS_KEY_ID)
+	}
+	param.S3Param.APISecret, found = s.GetCredentials(stage.PARAMKEY_AWS_SECRET_KEY, "")
+	if !found {
+		return moerr.NewBadConfigf(param.Ctx, "Credentials %s not found", stage.PARAMKEY_AWS_SECRET_KEY)
+	}
+
+	param.S3Param.Region, found = s.GetCredentials(stage.PARAMKEY_AWS_REGION, "")
+	if !found {
+		return moerr.NewBadConfigf(param.Ctx, "Credentials %s not found", stage.PARAMKEY_AWS_REGION)
+	}
+
+	param.S3Param.Endpoint, found = s.GetCredentials(stage.PARAMKEY_ENDPOINT, "")
+	if !found {
+		return moerr.NewBadConfigf(param.Ctx, "Credentials %s not found", stage.PARAMKEY_ENDPOINT)
+	}
+
+	// optional
+	param.S3Param.Provider, _ = s.GetCredentials(stage.PARAMKEY_PROVIDER, stage.S3_PROVIDER_AMAZON)
+	param.CompressType, _ = s.GetCredentials(stage.PARAMKEY_COMPRESSION, "auto")
+
+	for i := 0; i < len(param.Option); i += 2 {
+		switch strings.ToLower(param.Option[i]) {
+		case "format":
+			format := strings.ToLower(param.Option[i+1])
+			if format != tree.CSV && format != tree.JSONLINE {
+				return moerr.NewBadConfigf(param.Ctx, "the format '%s' is not supported", format)
+			}
+			param.Format = format
+		case "jsondata":
+			jsondata := strings.ToLower(param.Option[i+1])
+			if jsondata != tree.OBJECT && jsondata != tree.ARRAY {
+				return moerr.NewBadConfigf(param.Ctx, "the jsondata '%s' is not supported", jsondata)
+			}
+			param.JsonData = jsondata
+			param.Format = tree.JSONLINE
+
+		default:
+			return moerr.NewBadConfigf(param.Ctx, "the keyword '%s' is not support", strings.ToLower(param.Option[i]))
+		}
+	}
+
+	if param.Format == tree.JSONLINE && len(param.JsonData) == 0 {
+		return moerr.NewBadConfig(param.Ctx, "the jsondata must be specified")
+	}
+	if len(param.Format) == 0 {
+		param.Format = tree.CSV
+	}
+
+	return nil
+
+}
+
+func InitInfileOrStageParam(param *tree.ExternParam, proc *process.Process) error {
+
+	fpath := GetFilePathFromParam(param)
+
+	if !strings.HasPrefix(fpath, stage.STAGE_PROTOCOL+"://") {
+		return InitInfileParam(param)
+	}
+
+	s, err := stageutil.UrlToStageDef(fpath, proc)
+	if err != nil {
+		return err
+	}
+
+	if len(s.Url.RawQuery) > 0 {
+		return moerr.NewBadConfig(param.Ctx, "Invalid URL: query not supported in ExternParam")
+	}
+
+	if s.Url.Scheme == stage.S3_PROTOCOL {
+		return InitStageS3Param(param, s)
+	} else if s.Url.Scheme == stage.FILE_PROTOCOL {
+
+		err := InitInfileParam(param)
+		if err != nil {
+			return err
+		}
+
+		param.Filepath = s.Url.Path
+
+	} else {
+		return moerr.NewBadConfigf(param.Ctx, "invalid URL: protocol %s not supported", s.Url.Scheme)
+	}
+
+	return nil
+}
 func GetForETLWithType(param *tree.ExternParam, prefix string) (res fileservice.ETLFileService, readPath string, err error) {
 	if param.ScanType == tree.S3 {
 		buf := new(strings.Builder)
 		w := csv.NewWriter(buf)
 		opts := []string{"s3-opts", "endpoint=" + param.S3Param.Endpoint, "region=" + param.S3Param.Region, "key=" + param.S3Param.APIKey, "secret=" + param.S3Param.APISecret,
 			"bucket=" + param.S3Param.Bucket, "role-arn=" + param.S3Param.RoleArn, "external-id=" + param.S3Param.ExternalId}
-		if param.S3Param.Provider == "minio" {
+		if strings.ToLower(param.S3Param.Provider) == "minio" {
 			opts = append(opts, "is-minio=true")
 		}
 		if err = w.Write(opts); err != nil {
 			return nil, "", err
 		}
 		w.Flush()
-		return fileservice.GetForETL(nil, fileservice.JoinPath(buf.String(), prefix))
+		return fileservice.GetForETL(context.TODO(), nil, fileservice.JoinPath(buf.String(), prefix))
 	}
-	return fileservice.GetForETL(param.FileService, prefix)
+	return fileservice.GetForETL(context.TODO(), param.FileService, prefix)
+}
+
+func StatFile(param *tree.ExternParam) error {
+	filePath := strings.TrimSpace(param.Filepath)
+	if strings.HasPrefix(filePath, "etl:") {
+		filePath = path.Clean(filePath)
+	} else {
+		filePath = path.Clean("/" + filePath)
+	}
+	param.Filepath = filePath
+	fs, readPath, err := GetForETLWithType(param, filePath)
+	if err != nil {
+		return err
+	}
+	st, err := fs.StatFile(param.Ctx, readPath)
+	if err != nil {
+		return err
+	}
+	param.Ctx = nil
+	param.FileSize = st.Size
+	return nil
 }
 
 // ReadDir support "etl:" and "/..." absolute path, NOT support relative path.
@@ -1350,11 +1676,10 @@ func ReadDir(param *tree.ExternParam) (fileList []string, fileSize []int64, err 
 			if err != nil {
 				return nil, nil, err
 			}
-			entries, err := fs.List(param.Ctx, readPath)
-			if err != nil {
-				return nil, nil, err
-			}
-			for _, entry := range entries {
+			for entry, err := range fs.List(param.Ctx, readPath) {
+				if err != nil {
+					return nil, nil, err
+				}
 				if !entry.IsDir && i+1 != len(pathDir) {
 					continue
 				}
@@ -1376,8 +1701,8 @@ func ReadDir(param *tree.ExternParam) (fileList []string, fileSize []int64, err 
 			l.Remove(l.Front())
 		}
 	}
-	len := l.Len()
-	for j := 0; j < len; j++ {
+	length := l.Len()
+	for j := 0; j < length; j++ {
 		fileList = append(fileList, l.Front().Value.(string))
 		l.Remove(l.Front())
 		fileSize = append(fileSize, l2.Front().Value.(int64))
@@ -1389,12 +1714,14 @@ func ReadDir(param *tree.ExternParam) (fileList []string, fileSize []int64, err 
 // GetUniqueColAndIdxFromTableDef
 // if get table:  t1(a int primary key, b int, c int, d int, unique key(b,c));
 // return : []map[string]int { {'a'=1},  {'b'=2,'c'=3} }
-func GetUniqueColAndIdxFromTableDef(tableDef *TableDef) []map[string]int {
+func GetUniqueColAndIdxFromTableDef(tableDef *TableDef) ([]map[string]int, map[string]bool) {
 	uniqueCols := make([]map[string]int, 0, len(tableDef.Cols))
-	if tableDef.Pkey != nil {
+	uniqueColNames := make(map[string]bool)
+	if tableDef.Pkey != nil && !onlyHasHiddenPrimaryKey(tableDef) {
 		pkMap := make(map[string]int)
 		for _, colName := range tableDef.Pkey.Names {
 			pkMap[colName] = int(tableDef.Name2ColIndex[colName])
+			uniqueColNames[colName] = true
 		}
 		uniqueCols = append(uniqueCols, pkMap)
 	}
@@ -1404,11 +1731,12 @@ func GetUniqueColAndIdxFromTableDef(tableDef *TableDef) []map[string]int {
 			pkMap := make(map[string]int)
 			for _, part := range index.Parts {
 				pkMap[part] = int(tableDef.Name2ColIndex[part])
+				uniqueColNames[part] = true
 			}
 			uniqueCols = append(uniqueCols, pkMap)
 		}
 	}
-	return uniqueCols
+	return uniqueCols, uniqueColNames
 }
 
 // GenUniqueColJoinExpr
@@ -1442,14 +1770,14 @@ func GenUniqueColJoinExpr(ctx context.Context, tableDef *TableDef, uniqueCols []
 					},
 				},
 			}
-			eqExpr, err := bindFuncExprImplByPlanExpr(ctx, "=", []*Expr{leftExpr, rightExpr})
+			eqExpr, err := BindFuncExprImplByPlanExpr(ctx, "=", []*Expr{leftExpr, rightExpr})
 			if err != nil {
 				return nil, err
 			}
 			if condIdx == 0 {
 				condExpr = eqExpr
 			} else {
-				condExpr, err = bindFuncExprImplByPlanExpr(ctx, "and", []*Expr{condExpr, eqExpr})
+				condExpr, err = BindFuncExprImplByPlanExpr(ctx, "and", []*Expr{condExpr, eqExpr})
 				if err != nil {
 					return nil, err
 				}
@@ -1460,7 +1788,7 @@ func GenUniqueColJoinExpr(ctx context.Context, tableDef *TableDef, uniqueCols []
 		if i == 0 {
 			checkExpr = condExpr
 		} else {
-			checkExpr, err = bindFuncExprImplByPlanExpr(ctx, "or", []*Expr{checkExpr, condExpr})
+			checkExpr, err = BindFuncExprImplByPlanExpr(ctx, "or", []*Expr{checkExpr, condExpr})
 			if err != nil {
 				return nil, err
 			}
@@ -1474,9 +1802,8 @@ func GenUniqueColJoinExpr(ctx context.Context, tableDef *TableDef, uniqueCols []
 // if get table:  t1(a int primary key, b int, c int, d int, unique key(b,c));
 // we get batch like [1,2,3,4, origin_a, origin_b, origin_c, origin_d, row_id ....]。
 // we get expr like:  []*Expr{ 1=origin_a ,  (2 = origin_b and 3 = origin_c) }
-func GenUniqueColCheckExpr(ctx context.Context, tableDef *TableDef, uniqueCols []map[string]int) ([]*Expr, error) {
+func GenUniqueColCheckExpr(ctx context.Context, tableDef *TableDef, uniqueCols []map[string]int, colCount int) ([]*Expr, error) {
 	checkExpr := make([]*Expr, len(uniqueCols))
-	colCount := len(tableDef.Cols)
 
 	for i, uniqueColMap := range uniqueCols {
 		var condExpr *Expr
@@ -1502,14 +1829,14 @@ func GenUniqueColCheckExpr(ctx context.Context, tableDef *TableDef, uniqueCols [
 					},
 				},
 			}
-			eqExpr, err := bindFuncExprImplByPlanExpr(ctx, "=", []*Expr{leftExpr, rightExpr})
+			eqExpr, err := BindFuncExprImplByPlanExpr(ctx, "=", []*Expr{leftExpr, rightExpr})
 			if err != nil {
 				return nil, err
 			}
 			if condIdx == 0 {
 				condExpr = eqExpr
 			} else {
-				condExpr, err = bindFuncExprImplByPlanExpr(ctx, "and", []*Expr{condExpr, eqExpr})
+				condExpr, err = BindFuncExprImplByPlanExpr(ctx, "and", []*Expr{condExpr, eqExpr})
 				if err != nil {
 					return nil, err
 				}
@@ -1520,4 +1847,908 @@ func GenUniqueColCheckExpr(ctx context.Context, tableDef *TableDef, uniqueCols [
 	}
 
 	return checkExpr, nil
+}
+func onlyContainsTag(filter *Expr, tag int32) bool {
+	switch ex := filter.Expr.(type) {
+	case *plan.Expr_Col:
+		return ex.Col.RelPos == tag
+	case *plan.Expr_F:
+		for _, arg := range ex.F.Args {
+			if !onlyContainsTag(arg, tag) {
+				return false
+			}
+		}
+		return true
+	default:
+		return true
+	}
+}
+
+func AssignAuxIdForExpr(expr *plan.Expr, start int32) int32 {
+	expr.AuxId = start
+	vertexCnt := int32(1)
+
+	if f, ok := expr.Expr.(*plan.Expr_F); ok {
+		for _, child := range f.F.Args {
+			vertexCnt += AssignAuxIdForExpr(child, start+vertexCnt)
+		}
+	}
+
+	return vertexCnt
+}
+
+func ResetAuxIdForExpr(expr *plan.Expr) {
+	expr.AuxId = 0
+
+	if f, ok := expr.Expr.(*plan.Expr_F); ok {
+		for _, child := range f.F.Args {
+			ResetAuxIdForExpr(child)
+		}
+	}
+}
+
+// func SubstitueParam(expr *plan.Expr, proc *process.Process) *plan.Expr {
+// 	switch t := expr.Expr.(type) {
+// 	case *plan.Expr_F:
+// 		for _, arg := range t.F.Args {
+// 			SubstitueParam(arg, proc)
+// 		}
+// 	case *plan.Expr_P:
+// 		vec, _ := proc.GetPrepareParamsAt(int(t.P.Pos))
+// 		c := rule.GetConstantValue(vec, false)
+// 		ec := &plan.Expr_C{
+// 			C: c,
+// 		}
+// 		expr.Typ = &plan.Type{Id: int32(vec.GetType().Oid), Scale: vec.GetType().Scale, Width: vec.GetType().Width}
+// 		expr.Expr = ec
+// 	case *plan.Expr_V:
+// 		val, _ := proc.GetResolveVariableFunc()(t.V.Name, t.V.System, t.V.Global)
+// 		typ := types.New(types.T(expr.Typ.Id), expr.Typ.Width, expr.Typ.Scale)
+// 		vec, _ := util.GenVectorByVarValue(proc, typ, val)
+// 		c := rule.GetConstantValue(vec, false)
+// 		ec := &plan.Expr_C{
+// 			C: c,
+// 		}
+// 		expr.Typ = &plan.Type{Id: int32(vec.GetType().Oid), Scale: vec.GetType().Scale, Width: vec.GetType().Width}
+// 		expr.Expr = ec
+// 	}
+// 	return expr
+// }
+
+func ExprType2Type(typ *plan.Type) types.Type {
+	return types.New(types.T(typ.Id), typ.Width, typ.Scale)
+}
+
+func FormatExprs(exprs []*plan.Expr) string {
+	var w bytes.Buffer
+	for _, expr := range exprs {
+		w.WriteString(FormatExpr(expr))
+		w.WriteByte('\n')
+	}
+	return w.String()
+}
+
+func FormatExpr(expr *plan.Expr) string {
+	var w bytes.Buffer
+	doFormatExpr(expr, &w, 0)
+	return w.String()
+}
+
+func doFormatExpr(expr *plan.Expr, out *bytes.Buffer, depth int) {
+	out.WriteByte('\n')
+	prefix := strings.Repeat("\t", depth)
+	switch t := expr.Expr.(type) {
+	case *plan.Expr_Col:
+		out.WriteString(fmt.Sprintf("%sExpr_Col(%s)", prefix, t.Col.Name))
+	case *plan.Expr_Lit:
+		out.WriteString(fmt.Sprintf("%sExpr_C(%s)", prefix, t.Lit.String()))
+	case *plan.Expr_F:
+		out.WriteString(fmt.Sprintf("%sExpr_F(\n%s\tFunc[\"%s\"](nargs=%d)", prefix, prefix, t.F.Func.ObjName, len(t.F.Args)))
+		for _, arg := range t.F.Args {
+			doFormatExpr(arg, out, depth+1)
+		}
+		out.WriteString(fmt.Sprintf("\n%s)", prefix))
+	case *plan.Expr_P:
+		out.WriteString(fmt.Sprintf("%sExpr_P(%d)", prefix, t.P.Pos))
+	case *plan.Expr_T:
+		out.WriteString(fmt.Sprintf("%sExpr_T(%s)", prefix, t.T.String()))
+	case *plan.Expr_Vec:
+		out.WriteString(fmt.Sprintf("%sExpr_Vec(len=%d)", prefix, t.Vec.Len))
+	case *plan.Expr_Fold:
+		out.WriteString(fmt.Sprintf("%sExpr_Fold(id=%d)", prefix, t.Fold.Id))
+	default:
+		out.WriteString(fmt.Sprintf("%sExpr_Unknown(%s)", prefix, expr.String()))
+	}
+	out.WriteString(fmt.Sprintf("%sExpr_Selectivity(%v)", prefix, expr.Selectivity))
+}
+
+// databaseIsValid checks whether the database exists or not.
+func databaseIsValid(dbName string, ctx CompilerContext, snapshot *Snapshot) (string, error) {
+	connectDBFirst := false
+	if len(dbName) == 0 {
+		connectDBFirst = true
+	}
+	if dbName == "" {
+		dbName = ctx.DefaultDatabase()
+	}
+
+	// In order to be compatible with various GUI clients and BI tools, lower case db and table name if it's a mysql system table
+	if slices.Contains(mysql.CaseInsensitiveDbs, strings.ToLower(dbName)) {
+		dbName = strings.ToLower(dbName)
+	}
+
+	if len(dbName) == 0 || !ctx.DatabaseExists(dbName, snapshot) {
+		if connectDBFirst {
+			return "", moerr.NewNoDB(ctx.GetContext())
+		} else {
+			return "", moerr.NewBadDB(ctx.GetContext(), dbName)
+		}
+	}
+	return dbName, nil
+}
+
+/*
+*
+getSuitableDBName get the database name which need to be used in next steps.
+
+For Cases:
+
+	SHOW XXX FROM [DB_NAME1].TABLE_NAME [FROM [DB_NAME2]];
+
+	In mysql,
+		if the second FROM clause exists, the DB_NAME1 in first FROM clause if it exists will be ignored.
+		if the second FROM clause does not exist, the DB_NAME1 in first FROM clause if it exists  will be used.
+		if the DB_NAME1 and DB_NAME2 neither does not exist, the current connected database (by USE statement) will be used.
+		if neither case above succeeds, an error is reported.
+*/
+func getSuitableDBName(dbName1 string, dbName2 string) string {
+	if len(dbName2) != 0 {
+		return dbName2
+	}
+	return dbName1
+}
+
+func detectedExprWhetherTimeRelated(expr *plan.Expr) bool {
+	if ef, ok := expr.Expr.(*plan.Expr_F); !ok {
+		return false
+	} else {
+		overloadID := ef.F.Func.GetObj()
+		f, exists := function.GetFunctionByIdWithoutError(overloadID)
+		// current_timestamp()
+		if !exists {
+			return false
+		}
+		if f.IsRealTimeRelated() {
+			return true
+		}
+
+		// current_timestamp() + 1
+		for _, arg := range ef.F.Args {
+			if detectedExprWhetherTimeRelated(arg) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func ResetPreparePlan(ctx CompilerContext, preparePlan *Plan) ([]*plan.ObjectRef, []int32, error) {
+	// dcl tcl is not support
+	var schemas []*plan.ObjectRef
+	var paramTypes []int32
+
+	switch pp := preparePlan.Plan.(type) {
+	case *plan.Plan_Tcl:
+		return nil, nil, moerr.NewInvalidInput(ctx.GetContext(), "cannot prepare TCL and DCL statement")
+	case *plan.Plan_Dcl:
+		switch pp.Dcl.GetDclType() {
+		case plan.DataControl_CREATE_ACCOUNT,
+			plan.DataControl_ALTER_ACCOUNT,
+			plan.DataControl_DROP_ACCOUNT:
+			return nil, pp.Dcl.GetOther().GetParamTypes(), nil
+		default:
+			return nil, nil, moerr.NewInvalidInput(ctx.GetContext(), "cannot prepare TCL and DCL statement")
+		}
+	case *plan.Plan_Ddl:
+		if pp.Ddl.Query != nil {
+			getParamRule := NewGetParamRule()
+			VisitQuery := NewVisitPlan(preparePlan, []VisitPlanRule{getParamRule})
+			err := VisitQuery.Visit(ctx.GetContext())
+			if err != nil {
+				return nil, nil, err
+			}
+			// TODO : need confirm
+			if len(getParamRule.params) > 0 {
+				return nil, nil, moerr.NewInvalidInput(ctx.GetContext(), "cannot plan DDL statement")
+			}
+		}
+
+	case *plan.Plan_Query:
+		// collect args
+		getParamRule := NewGetParamRule()
+		VisitQuery := NewVisitPlan(preparePlan, []VisitPlanRule{getParamRule})
+		err := VisitQuery.Visit(ctx.GetContext())
+		if err != nil {
+			return nil, nil, err
+		}
+
+		// sort arg
+		getParamRule.SetParamOrder()
+		args := getParamRule.params
+		schemas = getParamRule.schemas
+		paramTypes = getParamRule.paramTypes
+
+		// reset arg order
+		resetParamRule := NewResetParamOrderRule(args)
+		VisitQuery = NewVisitPlan(preparePlan, []VisitPlanRule{resetParamRule})
+		err = VisitQuery.Visit(ctx.GetContext())
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return schemas, paramTypes, nil
+}
+
+func getParamTypes(params []tree.Expr, ctx CompilerContext, isPrepareStmt bool) ([]int32, error) {
+	paramTypes := make([]int32, 0, len(params))
+	for _, p := range params {
+		switch ast := p.(type) {
+		case *tree.NumVal:
+			if ast.ValType != tree.P_char {
+				return nil, moerr.NewInvalidInputf(ctx.GetContext(), "unsupport value '%s'", ast.String())
+			}
+		case *tree.ParamExpr:
+			if !isPrepareStmt {
+				return nil, moerr.NewInvalidInputf(ctx.GetContext(), "only prepare statement can use ? expr")
+			}
+			paramTypes = append(paramTypes, int32(types.T_varchar))
+			if ast.Offset != len(paramTypes) {
+				return nil, moerr.NewInternalError(ctx.GetContext(), "offset not match")
+			}
+		default:
+			return nil, moerr.NewInvalidInputf(ctx.GetContext(), "unsupport value '%s'", ast.String())
+		}
+	}
+	return paramTypes, nil
+}
+
+// HasMoCtrl checks whether the expression has mo_ctrl(..,..,..)
+func HasMoCtrl(expr *plan.Expr) bool {
+	switch exprImpl := expr.Expr.(type) {
+	case *plan.Expr_F:
+		if exprImpl.F.Func.ObjName == "mo_ctl" || exprImpl.F.Func.ObjName == "fault_inject" {
+			return true
+		}
+		for _, arg := range exprImpl.F.Args {
+			if HasMoCtrl(arg) {
+				return true
+			}
+		}
+		return false
+
+	case *plan.Expr_List:
+		for _, arg := range exprImpl.List.List {
+			if HasMoCtrl(arg) {
+				return true
+			}
+		}
+		return false
+
+	default:
+		return false
+	}
+}
+
+// IsFkSelfRefer checks the foreign key referencing itself
+func IsFkSelfRefer(fkDbName, fkTableName, curDbName, curTableName string) bool {
+	return fkDbName == curDbName && fkTableName == curTableName
+}
+
+// HasFkSelfReferOnly checks the foreign key referencing itself only.
+// If there is no children tables, it also returns true
+// the tbleId 0 is special. it always denotes the table itself.
+func HasFkSelfReferOnly(tableDef *TableDef) bool {
+	for _, tbl := range tableDef.RefChildTbls {
+		if tbl != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func IsFalseExpr(e *Expr) bool {
+	if e == nil || e.GetTyp().Id != int32(types.T_bool) || e.GetLit() == nil {
+		return false
+	}
+	if x, ok := e.GetLit().GetValue().(*plan.Literal_Bval); ok {
+		return !x.Bval
+	}
+	return false
+}
+func MakeFalseExpr() *Expr {
+	return &plan.Expr{
+		Typ: plan.Type{
+			Id: int32(types.T_bool),
+		},
+		Expr: &plan.Expr_Lit{
+			Lit: &plan.Literal{
+				Isnull: false,
+				Value:  &plan.Literal_Bval{Bval: false},
+			},
+		},
+	}
+}
+
+func MakeCPKEYRuntimeFilter(tag int32, upperlimit int32, expr *Expr, tableDef *plan.TableDef) *plan.RuntimeFilterSpec {
+	cpkeyIdx, ok := tableDef.Name2ColIndex[catalog.CPrimaryKeyColName]
+	if !ok {
+		panic("fail to convert runtime filter to composite primary key!")
+	}
+	col := expr.GetCol()
+	col.ColPos = cpkeyIdx
+	expr.Typ = tableDef.Cols[cpkeyIdx].Typ
+	return &plan.RuntimeFilterSpec{
+		Tag:         tag,
+		UpperLimit:  upperlimit,
+		Expr:        expr,
+		MatchPrefix: true,
+	}
+}
+
+func MakeSerialRuntimeFilter(ctx context.Context, tag int32, matchPrefix bool, upperlimit int32, expr *Expr) *plan.RuntimeFilterSpec {
+	serialExpr, _ := BindFuncExprImplByPlanExpr(ctx, "serial", []*plan.Expr{expr})
+	return &plan.RuntimeFilterSpec{
+		Tag:         tag,
+		UpperLimit:  upperlimit,
+		Expr:        serialExpr,
+		MatchPrefix: matchPrefix,
+	}
+}
+
+func MakeRuntimeFilter(tag int32, matchPrefix bool, upperlimit int32, expr *Expr) *plan.RuntimeFilterSpec {
+	return &plan.RuntimeFilterSpec{
+		Tag:         tag,
+		UpperLimit:  upperlimit,
+		Expr:        expr,
+		MatchPrefix: matchPrefix,
+	}
+}
+
+func MakeIntervalExpr(num int64, str string) *Expr {
+	arg0 := makePlan2Int64ConstExprWithType(num)
+	arg1 := makePlan2StringConstExprWithType(str, false)
+	return &plan.Expr{
+		Typ: plan.Type{
+			Id: int32(types.T_interval),
+		},
+		Expr: &plan.Expr_List{
+			List: &plan.ExprList{
+				List: []*Expr{arg0, arg1},
+			},
+		},
+	}
+}
+
+func GetColExpr(typ Type, relpos int32, colpos int32) *plan.Expr {
+	return &plan.Expr{
+		Typ: typ,
+		Expr: &plan.Expr_Col{
+			Col: &plan.ColRef{
+				RelPos: relpos,
+				ColPos: colpos,
+			},
+		},
+	}
+}
+
+func MakeSerialExtractExpr(ctx context.Context, fromExpr *Expr, origType Type, serialIdx int64) (*Expr, error) {
+	return BindFuncExprImplByPlanExpr(ctx, "serial_extract", []*plan.Expr{
+		fromExpr,
+		{
+			Typ: plan.Type{
+				Id: int32(types.T_int64),
+			},
+			Expr: &plan.Expr_Lit{
+				Lit: &plan.Literal{
+					Value: &plan.Literal_I64Val{I64Val: serialIdx},
+				},
+			},
+		},
+		{
+			Typ: origType,
+			Expr: &plan.Expr_T{
+				T: &plan.TargetType{},
+			},
+		},
+	})
+}
+
+func MakeInExpr(ctx context.Context, left *Expr, length int32, data []byte, matchPrefix bool) *Expr {
+	rightArg := &plan.Expr{
+		Typ: left.Typ,
+		Expr: &plan.Expr_Vec{
+			Vec: &plan.LiteralVec{
+				Len:  length,
+				Data: data,
+			},
+		},
+	}
+
+	funcID := function.InFunctionEncodedID
+	funcName := function.InFunctionName
+	if matchPrefix {
+		funcID = function.PrefixInFunctionEncodedID
+		funcName = function.PrefixInFunctionName
+	}
+	args := []types.Type{makeTypeByPlan2Expr(left), makeTypeByPlan2Expr(rightArg)}
+	fGet, err := function.GetFunctionByName(ctx, funcName, args)
+	if err == nil {
+		funcID = fGet.GetEncodedOverloadID()
+	}
+	inExpr := &plan.Expr{
+		Typ: plan.Type{
+			Id:          int32(types.T_bool),
+			NotNullable: left.Typ.NotNullable,
+		},
+		Expr: &plan.Expr_F{
+			F: &plan.Function{
+				Func: &plan.ObjectRef{
+					Obj:     funcID,
+					ObjName: funcName,
+				},
+				Args: []*plan.Expr{
+					left,
+					rightArg,
+				},
+			},
+		},
+	}
+	return inExpr
+}
+
+// FillValuesOfParamsInPlan replaces the params by their values
+func FillValuesOfParamsInPlan(ctx context.Context, preparePlan *Plan, paramVals []any) (*Plan, error) {
+	copied := preparePlan
+
+	switch pp := copied.Plan.(type) {
+	case *plan.Plan_Tcl, *plan.Plan_Dcl:
+		return nil, moerr.NewInvalidInput(ctx, "cannot prepare TCL and DCL statement")
+
+	case *plan.Plan_Ddl:
+		if pp.Ddl.Query != nil {
+			err := replaceParamVals(ctx, preparePlan, paramVals)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+	case *plan.Plan_Query:
+		err := replaceParamVals(ctx, preparePlan, paramVals)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return copied, nil
+}
+
+func replaceParamVals(ctx context.Context, plan0 *Plan, paramVals []any) error {
+	params := make([]*Expr, len(paramVals))
+	for i, val := range paramVals {
+		pc := &plan.Literal{}
+		pc.Value = &plan.Literal_Sval{Sval: fmt.Sprintf("%v", val)}
+		params[i] = &plan.Expr{
+			Expr: &plan.Expr_Lit{
+				Lit: pc,
+			},
+		}
+	}
+	paramRule := NewResetParamRefRule(ctx, params)
+	VisitQuery := NewVisitPlan(plan0, []VisitPlanRule{paramRule})
+	err := VisitQuery.Visit(ctx)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// XXX: Any code relying on Name in ColRef, except for "explain", is bad design and practically buggy.
+func (builder *QueryBuilder) addNameByColRef(tag int32, tableDef *plan.TableDef) {
+	for i, col := range tableDef.Cols {
+		builder.nameByColRef[[2]int32{tag, int32(i)}] = tableDef.Name + "." + col.Name
+	}
+}
+
+func GetRowSizeFromTableDef(tableDef *TableDef, ignoreHiddenKey bool) float64 {
+	size := int32(0)
+	for _, col := range tableDef.Cols {
+		if col.Hidden && ignoreHiddenKey {
+			continue
+		}
+		if col.Typ.Width > 0 {
+			size += col.Typ.Width
+			continue
+		}
+		typ := types.T(col.Typ.Id).ToType()
+		if typ.Width > 0 {
+			size += typ.Width
+		} else {
+			size += typ.Size
+		}
+	}
+	return float64(size)
+}
+
+type UnorderedSet[T ~string | ~int] map[T]int
+
+func (set UnorderedSet[T]) Insert(val T) {
+	set[val] = 0
+}
+
+func (set UnorderedSet[T]) Find(val T) bool {
+	if _, ok := set[val]; ok {
+		return ok
+	}
+	return false
+}
+
+// RemoveIf removes the elements that pred is true.
+func RemoveIf[T any](data []T, pred func(t T) bool) []T {
+	if len(data) == 0 {
+		return data
+	}
+	res := 0
+	for i := 0; i < len(data); i++ {
+		if !pred(data[i]) {
+			if res != i {
+				data[res] = data[i]
+			}
+			res++
+		}
+	}
+	return data[:res]
+}
+
+func Find[T ~string | ~int, S any](data map[T]S, val T) bool {
+	if len(data) == 0 {
+		return false
+	}
+	if _, exists := data[val]; exists {
+		return true
+	}
+	return false
+}
+
+func containGrouping(expr *Expr) bool {
+	var ret bool
+
+	switch exprImpl := expr.Expr.(type) {
+	case *plan.Expr_F:
+		for _, arg := range exprImpl.F.Args {
+			ret = ret || containGrouping(arg)
+		}
+		ret = ret || (exprImpl.F.Func.ObjName == "grouping")
+	case *plan.Expr_Col:
+		ret = false
+	}
+
+	return ret
+}
+
+func checkGrouping(ctx context.Context, expr *Expr) error {
+	if containGrouping(expr) {
+		return moerr.NewSyntaxError(ctx, "aggregate function grouping not allowed in WHERE clause")
+	}
+	return nil
+}
+
+// a > current_time() + 1 and b < ? + c and d > ? + 2
+// =>
+// a > foldVal1 and b < foldVal2 + c and d > foldVal3
+func ReplaceFoldExpr(proc *process.Process, expr *Expr, exes *[]colexec.ExpressionExecutor) (bool, error) {
+	allCanFold := true
+	var err error
+
+	fn := expr.GetF()
+	if fn == nil {
+		switch expr.Expr.(type) {
+		case *plan.Expr_List:
+			return true, nil
+		case *plan.Expr_Col:
+			return false, nil
+		case *plan.Expr_Vec:
+			return false, nil
+		default:
+			return true, nil
+		}
+	}
+
+	overloadID := fn.Func.GetObj()
+	f, exists := function.GetFunctionByIdWithoutError(overloadID)
+	if !exists {
+		panic("ReplaceFoldVal: function not exist")
+	}
+	if f.IsAgg() || f.IsWin() {
+		panic("ReplaceFoldVal: agg or window function")
+	}
+
+	argFold := make([]bool, len(fn.Args))
+	for i := range fn.Args {
+		argFold[i], err = ReplaceFoldExpr(proc, fn.Args[i], exes)
+		if err != nil {
+			return false, err
+		}
+		if !argFold[i] {
+			allCanFold = false
+		}
+	}
+
+	if allCanFold {
+		return true, nil
+	} else {
+		for i, canFold := range argFold {
+			if canFold {
+				fn.Args[i], err = ConstantFold(batch.EmptyForConstFoldBatch, fn.Args[i], proc, false, true)
+				if err != nil {
+					return false, err
+				}
+				if _, ok := fn.Args[i].Expr.(*plan.Expr_Vec); ok {
+					continue
+				}
+
+				exprExecutor, err := colexec.NewExpressionExecutor(proc, fn.Args[i])
+				if err != nil {
+					return false, err
+				}
+				newID := len(*exes)
+				*exes = append(*exes, exprExecutor)
+
+				fn.Args[i] = &plan.Expr{
+					Typ: fn.Args[i].Typ,
+					Expr: &plan.Expr_Fold{
+						Fold: &plan.FoldVal{
+							Id: int32(newID),
+						},
+					},
+					AuxId:       fn.Args[i].AuxId,
+					Ndv:         fn.Args[i].Ndv,
+					Selectivity: fn.Args[i].Selectivity,
+				}
+
+			}
+		}
+		return false, nil
+	}
+}
+
+func EvalFoldExpr(proc *process.Process, expr *Expr, executors *[]colexec.ExpressionExecutor) (err error) {
+	switch ef := expr.Expr.(type) {
+	case *plan.Expr_Fold:
+		var vec *vector.Vector
+		idx := int(ef.Fold.Id)
+		if idx >= len(*executors) {
+			panic("EvalFoldVal: fold id not exist")
+		}
+		exe := (*executors)[idx]
+		var data []byte
+		var err error
+
+		if _, ok := exe.(*colexec.ListExpressionExecutor); ok {
+			vec, err = exe.Eval(proc, []*batch.Batch{batch.EmptyForConstFoldBatch}, nil)
+			if err != nil {
+				return err
+			}
+			vec.InplaceSortAndCompact()
+			data, err = vec.MarshalBinary()
+			if err != nil {
+				return err
+			}
+			ef.Fold.IsConst = false
+		} else {
+			vec, err = exe.Eval(proc, []*batch.Batch{batch.EmptyForConstFoldBatch}, nil)
+			if err != nil {
+				return err
+			}
+			data, _ = getConstantBytes(vec, false, 0)
+			ef.Fold.IsConst = true
+		}
+		ef.Fold.Data = data
+	case *plan.Expr_F:
+		for i := range ef.F.Args {
+			err = EvalFoldExpr(proc, ef.F.Args[i], executors)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func HasFoldExprForList(exprs []*Expr) bool {
+	for _, e := range exprs {
+		hasFoldExpr := HasFoldValExpr(e)
+		if hasFoldExpr {
+			return true
+		}
+	}
+	return false
+}
+
+func HasFoldValExpr(expr *Expr) bool {
+	switch ef := expr.Expr.(type) {
+	case *plan.Expr_Fold:
+		return true
+	case *plan.Expr_F:
+		for i := range ef.F.Args {
+			hasFoldExpr := HasFoldValExpr(ef.F.Args[i])
+			if hasFoldExpr {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func getConstantBytes(vec *vector.Vector, transAll bool, row uint64) (ret []byte, can bool) {
+	if vec.IsConstNull() || vec.GetNulls().Contains(row) {
+		return
+	}
+	can = true
+	switch vec.GetType().Oid {
+	case types.T_bool:
+		val := vector.MustFixedColNoTypeCheck[bool](vec)[row]
+		ret = types.EncodeBool(&val)
+
+	case types.T_bit:
+		val := vector.MustFixedColNoTypeCheck[uint64](vec)[row]
+		ret = types.EncodeUint64(&val)
+
+	case types.T_int8:
+		val := vector.MustFixedColNoTypeCheck[int8](vec)[row]
+		ret = types.EncodeInt8(&val)
+
+	case types.T_int16:
+		val := vector.MustFixedColNoTypeCheck[int16](vec)[row]
+		ret = types.EncodeInt16(&val)
+
+	case types.T_int32:
+		val := vector.MustFixedColNoTypeCheck[int32](vec)[row]
+		ret = types.EncodeInt32(&val)
+
+	case types.T_int64:
+		val := vector.MustFixedColNoTypeCheck[int64](vec)[row]
+		ret = types.EncodeInt64(&val)
+
+	case types.T_uint8:
+		val := vector.MustFixedColNoTypeCheck[uint8](vec)[row]
+		ret = types.EncodeUint8(&val)
+
+	case types.T_uint16:
+		val := vector.MustFixedColNoTypeCheck[uint16](vec)[row]
+		ret = types.EncodeUint16(&val)
+
+	case types.T_uint32:
+		val := vector.MustFixedColNoTypeCheck[uint32](vec)[row]
+		ret = types.EncodeUint32(&val)
+
+	case types.T_uint64:
+		val := vector.MustFixedColNoTypeCheck[uint64](vec)[row]
+		ret = types.EncodeUint64(&val)
+
+	case types.T_float32:
+		val := vector.MustFixedColNoTypeCheck[float32](vec)[row]
+		ret = types.EncodeFloat32(&val)
+
+	case types.T_float64:
+		val := vector.MustFixedColNoTypeCheck[float64](vec)[row]
+		ret = types.EncodeFloat64(&val)
+
+	case types.T_varchar, types.T_char,
+		types.T_binary, types.T_varbinary, types.T_text, types.T_blob, types.T_datalink:
+		ret = []byte(vec.GetStringAt(int(row)))
+
+	case types.T_json:
+		if !transAll {
+			can = false
+			return
+		}
+		ret = []byte(vec.GetStringAt(int(row)))
+
+	case types.T_timestamp:
+		val := vector.MustFixedColNoTypeCheck[types.Timestamp](vec)[row]
+		ret = types.EncodeTimestamp(&val)
+
+	case types.T_date:
+		val := vector.MustFixedColNoTypeCheck[types.Date](vec)[row]
+		ret = types.EncodeDate(&val)
+
+	case types.T_time:
+		val := vector.MustFixedColNoTypeCheck[types.Time](vec)[row]
+		ret = types.EncodeTime(&val)
+
+	case types.T_datetime:
+		val := vector.MustFixedColNoTypeCheck[types.Datetime](vec)[row]
+		ret = types.EncodeDatetime(&val)
+
+	case types.T_enum:
+		if !transAll {
+			can = false
+			return
+		}
+		val := vector.MustFixedColNoTypeCheck[types.Enum](vec)[row]
+		ret = types.EncodeEnum(&val)
+
+	case types.T_decimal64:
+		val := vector.MustFixedColNoTypeCheck[types.Decimal64](vec)[row]
+		ret = types.EncodeDecimal64(&val)
+
+	case types.T_decimal128:
+		val := vector.MustFixedColNoTypeCheck[types.Decimal128](vec)[row]
+		ret = types.EncodeDecimal128(&val)
+
+	case types.T_uuid:
+		val := vector.MustFixedColNoTypeCheck[types.Uuid](vec)[row]
+		ret = types.EncodeUuid(&val)
+
+	default:
+		can = false
+	}
+
+	return
+}
+
+func getOffsetFromUTC() string {
+	now := time.Now()
+	_, localOffset := now.Zone()
+	return offsetToString(localOffset)
+}
+
+func offsetToString(offset int) string {
+	hours := offset / 3600
+	minutes := (offset % 3600) / 60
+	if hours < 0 {
+		return fmt.Sprintf("-%02d:%02d", -hours, -minutes)
+	}
+	return fmt.Sprintf("+%02d:%02d", hours, minutes)
+}
+
+// do not lock table if lock no rows now.
+// if need to lock table, uncomment these codes
+// func getLockTableAtTheEnd(tableDef *TableDef) bool {
+// if tableDef.Pkey.PkeyColName == catalog.FakePrimaryKeyColName || //fake pk, skip
+// 	tableDef.Partition != nil { // unsupport partition table
+// 	return false
+// }
+// return !strings.HasPrefix(tableDef.Name, catalog.IndexTableNamePrefix)
+// }
+
+// DbNameOfObjRef return subscription name of ObjectRef if exists, to avoid the mismatching of account id and db name
+func DbNameOfObjRef(objRef *ObjectRef) string {
+	if objRef.SubscriptionName == "" {
+		return objRef.SchemaName
+	}
+	return objRef.SubscriptionName
+}
+func doResolveTimeStamp(timeStamp string) (ts int64, err error) {
+	loc, err := time.LoadLocation("Local")
+	if err != nil {
+		return 0, err
+	}
+	if len(timeStamp) == 0 {
+		return 0, moerr.NewInvalidInputNoCtx("timestamp is empty")
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", timeStamp, loc)
+	if err != nil {
+		return 0, moerr.NewInvalidInputNoCtxf("invalid timestamp format: %s", timeStamp)
+	}
+	ts = t.UTC().UnixNano()
+	return ts, nil
+}
+
+func onlyHasHiddenPrimaryKey(tableDef *TableDef) bool {
+	if tableDef == nil {
+		return false
+	}
+	pk := tableDef.GetPkey()
+	return pk != nil && pk.GetPkeyColName() == catalog.FakePrimaryKeyColName
 }

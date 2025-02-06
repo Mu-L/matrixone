@@ -22,8 +22,10 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
 
@@ -35,23 +37,36 @@ func (s *Service) handleCommands(cmds []pb.ScheduleCommand) {
 			switch cmd.ConfigChange.ChangeType {
 			case pb.AddReplica:
 				s.handleAddReplica(cmd)
+			case pb.AddNonVotingReplica:
+				s.handleAddNonVotingReplica(cmd)
 			case pb.RemoveReplica:
+				s.handleRemoveReplica(cmd)
+			case pb.RemoveNonVotingReplica:
 				s.handleRemoveReplica(cmd)
 			case pb.StartReplica:
 				s.handleStartReplica(cmd)
+			case pb.StartNonVotingReplica:
+				s.handleStartNonVotingReplica(cmd)
 			case pb.StopReplica:
+				s.handleStopReplica(cmd)
+			case pb.StopNonVotingReplica:
 				s.handleStopReplica(cmd)
 			case pb.KillZombie:
 				s.handleKillZombie(cmd)
 			default:
-				panic("unknown config change cmd type")
+				panic(fmt.Sprintf("unknown config change cmd type %d", cmd.ConfigChange.ChangeType))
 			}
 		} else if cmd.GetShutdownStore() != nil {
 			s.handleShutdownStore(cmd)
 		} else if cmd.GetCreateTaskService() != nil {
 			s.createTaskService(cmd.CreateTaskService)
+			s.createSQLLogger(cmd.CreateTaskService)
+		} else if cmd.GetAddLogShard() != nil {
+			s.handleAddLogShard(cmd)
+		} else if cmd.GetBootstrapShard() != nil {
+			s.handleBootstrapShard(cmd)
 		} else {
-			panic("unknown schedule command type")
+			panic(fmt.Sprintf("unknown schedule command type: %+v", cmd))
 		}
 	}
 }
@@ -63,6 +78,16 @@ func (s *Service) handleAddReplica(cmd pb.ScheduleCommand) {
 	target := cmd.ConfigChange.Replica.UUID
 	if err := s.store.addReplica(shardID, replicaID, target, epoch); err != nil {
 		s.runtime.Logger().Error("failed to add replica", zap.Error(err))
+	}
+}
+
+func (s *Service) handleAddNonVotingReplica(cmd pb.ScheduleCommand) {
+	shardID := cmd.ConfigChange.Replica.ShardID
+	replicaID := cmd.ConfigChange.Replica.ReplicaID
+	epoch := cmd.ConfigChange.Replica.Epoch
+	target := cmd.ConfigChange.Replica.UUID
+	if err := s.store.addNonVotingReplica(shardID, replicaID, target, epoch); err != nil {
+		s.runtime.Logger().Error("failed to add non-voting replica", zap.Error(err))
 	}
 }
 
@@ -92,6 +117,31 @@ func (s *Service) handleStartReplica(cmd pb.ScheduleCommand) {
 	}
 }
 
+func (s *Service) handleStartNonVotingReplica(cmd pb.ScheduleCommand) {
+	shardID := cmd.ConfigChange.Replica.ShardID
+	replicaID := cmd.ConfigChange.Replica.ReplicaID
+	join := len(cmd.ConfigChange.InitialMembers) == 0
+	if shardID == hakeeper.DefaultHAKeeperShardID {
+		if err := s.store.startHAKeeperNonVotingReplica(replicaID,
+			cmd.ConfigChange.InitialMembers, join); err != nil {
+			s.runtime.Logger().Error("failed to start HAKeeper replica",
+				zap.Uint64("shard ID", shardID),
+				zap.Uint64("replica ID", replicaID),
+				zap.Error(err),
+			)
+		}
+	} else {
+		if err := s.store.startNonVotingReplica(shardID,
+			replicaID, cmd.ConfigChange.InitialMembers, join); err != nil {
+			s.runtime.Logger().Error("failed to start log replica",
+				zap.Uint64("shard ID", shardID),
+				zap.Uint64("replica ID", replicaID),
+				zap.Error(err),
+			)
+		}
+	}
+}
+
 func (s *Service) handleStopReplica(cmd pb.ScheduleCommand) {
 	shardID := cmd.ConfigChange.Replica.ShardID
 	replicaID := cmd.ConfigChange.Replica.ReplicaID
@@ -108,8 +158,10 @@ func (s *Service) handleKillZombie(cmd pb.ScheduleCommand) {
 }
 
 func (s *Service) handleShutdownStore(_ pb.ScheduleCommand) {
-	if err := s.Close(); err != nil {
-		s.runtime.Logger().Error("failed to shutdown replica", zap.Error(err))
+	// notify main routine that have received shutdown cmd
+	select {
+	case s.shutdownC <- struct{}{}:
+	default:
 	}
 }
 
@@ -143,16 +195,47 @@ func (s *Service) heartbeatWorker(ctx context.Context) {
 	}
 }
 
+func (s *Service) checkReplicaHealth(ctx context.Context) {
+	details, err := s.store.getClusterDetails(ctx)
+	if err != nil {
+		s.runtime.Logger().Error("failed to get cluster details",
+			zap.Error(err))
+		return
+	}
+	var tnShardID uint64
+	for _, tnStore := range details.TNStores {
+		for _, shard := range tnStore.Shards {
+			tnShardID = shard.ShardID
+		}
+	}
+	if tnShardID == 0 {
+		s.runtime.Logger().Error("failed to get tn shard ID",
+			zap.Uint64("shardID", tnShardID))
+		return
+	}
+	if err := s.store.checkHealth(tnShardID); err != nil {
+		s.runtime.Logger().Error("failed to check health", zap.Error(err))
+		v2.LogServiceReplicaHealthGauge.Set(0)
+	} else {
+		v2.LogServiceReplicaHealthGauge.Set(1)
+	}
+}
+
 func (s *Service) heartbeat(ctx context.Context) {
-	ctx2, cancel := context.WithTimeout(ctx, 3*time.Second)
+	start := time.Now()
+	defer func() {
+		v2.LogHeartbeatHistogram.Observe(time.Since(start).Seconds())
+	}()
+	ctx2, cancel := context.WithTimeoutCause(ctx, 3*time.Second, moerr.CauseLogServiceHeartbeat)
 	defer cancel()
 
 	if s.haClient == nil {
 		if reflect.DeepEqual(s.cfg.HAKeeperClientConfig, HAKeeperClientConfig{}) {
 			panic("empty HAKeeper client config")
 		}
-		cc, err := NewLogHAKeeperClient(ctx2, s.cfg.GetHAKeeperClientConfig())
+		cc, err := NewLogHAKeeperClient(ctx2, s.cfg.UUID, s.cfg.GetHAKeeperClientConfig())
 		if err != nil {
+			err = moerr.AttachCause(ctx2, err)
 			s.runtime.Logger().Error("failed to create HAKeeper client", zap.Error(err))
 			return
 		}
@@ -161,10 +244,22 @@ func (s *Service) heartbeat(ctx context.Context) {
 
 	hb := s.store.getHeartbeatMessage()
 	hb.TaskServiceCreated = s.taskServiceCreated()
+	hb.ConfigData = s.config.GetData()
+
 	cb, err := s.haClient.SendLogHeartbeat(ctx2, hb)
 	if err != nil {
+		err = moerr.AttachCause(ctx2, err)
+		v2.LogHeartbeatFailureCounter.Inc()
+		v2.LogServiceReplicaHealthGauge.Set(0)
 		s.runtime.Logger().Error("failed to send log service heartbeat", zap.Error(err))
 		return
 	}
+
+	// check the logService TN replica's health on this store.
+	// NB: do the health checking after heartbeat
+	s.checkReplicaHealth(ctx2)
+
+	s.config.DecrCount()
+
 	s.handleCommands(cb.Commands)
 }

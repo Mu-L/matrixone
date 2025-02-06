@@ -23,9 +23,12 @@ The Impl of InternalExecutor is in frontend package
 */
 
 type SessionOverrideOptions struct {
-	Database   *string
-	Username   *string
-	IsInternal *bool
+	Database      *string
+	Username      *string
+	IsInternal    *bool
+	AccountId     *uint32
+	UserId        *uint32
+	DefaultRoleId *uint32
 }
 
 type OptsBuilder struct {
@@ -53,6 +56,21 @@ func (s *OptsBuilder) Internal(b bool) *OptsBuilder {
 	return s
 }
 
+func (s *OptsBuilder) AccountId(id uint32) *OptsBuilder {
+	s.opts.AccountId = &id
+	return s
+}
+
+func (s *OptsBuilder) UserId(id uint32) *OptsBuilder {
+	s.opts.UserId = &id
+	return s
+}
+
+func (s *OptsBuilder) DefaultRoleId(id uint32) *OptsBuilder {
+	s.opts.DefaultRoleId = &id
+	return s
+}
+
 func (s *OptsBuilder) Finish() SessionOverrideOptions {
 	return *s.opts
 }
@@ -64,9 +82,9 @@ type InternalExecResult interface {
 	RowCount() uint64
 	Row(context.Context, uint64) ([]interface{}, error)
 	Value(context.Context, uint64, uint64) (interface{}, error)
-	ValueByName(context.Context, uint64, string) (interface{}, error)
-	StringValueByName(context.Context, uint64, string) (string, error)
-	Float64ValueByName(context.Context, uint64, string) (float64, error)
+	GetUint64(context.Context, uint64, uint64) (uint64, error)
+	GetFloat64(context.Context, uint64, uint64) (float64, error)
+	GetString(context.Context, uint64, uint64) (string, error)
 }
 
 type InternalExecutor interface {

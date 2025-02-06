@@ -30,22 +30,30 @@ type ServiceType int32
 const (
 	// CN cn service
 	ServiceType_CN ServiceType = 0
-	// DN dn service
-	ServiceType_DN ServiceType = 1
+	// TN tn service
+	ServiceType_TN ServiceType = 1
 	// LOG log service
 	ServiceType_LOG ServiceType = 2
+	// Proxy proxy service
+	ServiceType_PROXY ServiceType = 3
+	// PYTHON_UDF python udf service
+	ServiceType_PYTHON_UDF ServiceType = 4
 )
 
 var ServiceType_name = map[int32]string{
 	0: "CN",
-	1: "DN",
+	1: "TN",
 	2: "LOG",
+	3: "PROXY",
+	4: "PYTHON_UDF",
 }
 
 var ServiceType_value = map[string]int32{
-	"CN":  0,
-	"DN":  1,
-	"LOG": 2,
+	"CN":         0,
+	"TN":         1,
+	"LOG":        2,
+	"PROXY":      3,
+	"PYTHON_UDF": 4,
 }
 
 func (x ServiceType) String() string {
@@ -84,31 +92,63 @@ func (CNRole) EnumDescriptor() ([]byte, []int) {
 	return fileDescriptor_56d9f74966f40d04, []int{1}
 }
 
-// DNShardRecord is DN shard metadata describing what is a DN shard. It
-// is internally used by HAKeeper to maintain how many DNs available in
+// WorkState is the work state of CN service.
+type WorkState int32
+
+const (
+	WorkState_Unknown  WorkState = 0
+	WorkState_Working  WorkState = 1
+	WorkState_Draining WorkState = 2
+	WorkState_Drained  WorkState = 3
+)
+
+var WorkState_name = map[int32]string{
+	0: "Unknown",
+	1: "Working",
+	2: "Draining",
+	3: "Drained",
+}
+
+var WorkState_value = map[string]int32{
+	"Unknown":  0,
+	"Working":  1,
+	"Draining": 2,
+	"Drained":  3,
+}
+
+func (x WorkState) String() string {
+	return proto.EnumName(WorkState_name, int32(x))
+}
+
+func (WorkState) EnumDescriptor() ([]byte, []int) {
+	return fileDescriptor_56d9f74966f40d04, []int{2}
+}
+
+// TNShardRecord is TN shard metadata describing what is a TN shard. It
+// is internally used by HAKeeper to maintain how many TNs available in
 // the system.
-type DNShardRecord struct {
-	// ShardID the id of the DN shard.
+type TNShardRecord struct {
+	// ShardID the id of the TN shard.
 	ShardID uint64 `protobuf:"varint,1,opt,name=ShardID,proto3" json:"ShardID,omitempty"`
-	// LogShardID a DN corresponds to a unique Shard of LogService.
+	// LogShardID a TN corresponds to a unique Shard of LogService.
 	LogShardID           uint64   `protobuf:"varint,2,opt,name=LogShardID,proto3" json:"LogShardID,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *DNShardRecord) Reset()         { *m = DNShardRecord{} }
-func (m *DNShardRecord) String() string { return proto.CompactTextString(m) }
-func (*DNShardRecord) ProtoMessage()    {}
-func (*DNShardRecord) Descriptor() ([]byte, []int) {
+func (m *TNShardRecord) Reset()         { *m = TNShardRecord{} }
+func (m *TNShardRecord) String() string { return proto.CompactTextString(m) }
+func (*TNShardRecord) ProtoMessage()    {}
+func (*TNShardRecord) Descriptor() ([]byte, []int) {
 	return fileDescriptor_56d9f74966f40d04, []int{0}
 }
-func (m *DNShardRecord) XXX_Unmarshal(b []byte) error {
+func (m *TNShardRecord) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *DNShardRecord) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TNShardRecord) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_DNShardRecord.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TNShardRecord.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -118,59 +158,59 @@ func (m *DNShardRecord) XXX_Marshal(b []byte, deterministic bool) ([]byte, error
 		return b[:n], nil
 	}
 }
-func (m *DNShardRecord) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_DNShardRecord.Merge(m, src)
+func (m *TNShardRecord) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TNShardRecord.Merge(m, src)
 }
-func (m *DNShardRecord) XXX_Size() int {
-	return m.Size()
+func (m *TNShardRecord) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *DNShardRecord) XXX_DiscardUnknown() {
-	xxx_messageInfo_DNShardRecord.DiscardUnknown(m)
+func (m *TNShardRecord) XXX_DiscardUnknown() {
+	xxx_messageInfo_TNShardRecord.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_DNShardRecord proto.InternalMessageInfo
+var xxx_messageInfo_TNShardRecord proto.InternalMessageInfo
 
-func (m *DNShardRecord) GetShardID() uint64 {
+func (m *TNShardRecord) GetShardID() uint64 {
 	if m != nil {
 		return m.ShardID
 	}
 	return 0
 }
 
-func (m *DNShardRecord) GetLogShardID() uint64 {
+func (m *TNShardRecord) GetLogShardID() uint64 {
 	if m != nil {
 		return m.LogShardID
 	}
 	return 0
 }
 
-// DNShard
-type DNShard struct {
-	// DNShard extends DNShardRecord
-	DNShardRecord `protobuf:"bytes,1,opt,name=DNShardRecord,proto3,embedded=DNShardRecord" json:"DNShardRecord"`
-	// ReplicaID only one replica for one DN. The ReplicaID is specified at
-	// the time the DN is created. DN restart ReplicaID will not change, when
-	// a DN is migrated to another node, the ReplicaID will be reset.
+// TNShard
+type TNShard struct {
+	// TNShard extends TNShardRecord
+	TNShardRecord `protobuf:"bytes,1,opt,name=TNShardRecord,proto3,embedded=TNShardRecord" json:"TNShardRecord"`
+	// ReplicaID only one replica for one TN. The ReplicaID is specified at
+	// the time the TN is created. TN restart ReplicaID will not change, when
+	// a TN is migrated to another node, the ReplicaID will be reset.
 	ReplicaID uint64 `protobuf:"varint,2,opt,name=ReplicaID,proto3" json:"ReplicaID,omitempty"`
-	// Address is DN's external service address.
+	// Address is TN's external service address.
 	Address              string   `protobuf:"bytes,3,opt,name=Address,proto3" json:"Address,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *DNShard) Reset()         { *m = DNShard{} }
-func (m *DNShard) String() string { return proto.CompactTextString(m) }
-func (*DNShard) ProtoMessage()    {}
-func (*DNShard) Descriptor() ([]byte, []int) {
+func (m *TNShard) Reset()         { *m = TNShard{} }
+func (m *TNShard) String() string { return proto.CompactTextString(m) }
+func (*TNShard) ProtoMessage()    {}
+func (*TNShard) Descriptor() ([]byte, []int) {
 	return fileDescriptor_56d9f74966f40d04, []int{1}
 }
-func (m *DNShard) XXX_Unmarshal(b []byte) error {
+func (m *TNShard) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *DNShard) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TNShard) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_DNShard.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TNShard.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -180,26 +220,26 @@ func (m *DNShard) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 		return b[:n], nil
 	}
 }
-func (m *DNShard) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_DNShard.Merge(m, src)
+func (m *TNShard) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TNShard.Merge(m, src)
 }
-func (m *DNShard) XXX_Size() int {
-	return m.Size()
+func (m *TNShard) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *DNShard) XXX_DiscardUnknown() {
-	xxx_messageInfo_DNShard.DiscardUnknown(m)
+func (m *TNShard) XXX_DiscardUnknown() {
+	xxx_messageInfo_TNShard.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_DNShard proto.InternalMessageInfo
+var xxx_messageInfo_TNShard proto.InternalMessageInfo
 
-func (m *DNShard) GetReplicaID() uint64 {
+func (m *TNShard) GetReplicaID() uint64 {
 	if m != nil {
 		return m.ReplicaID
 	}
 	return 0
 }
 
-func (m *DNShard) GetAddress() string {
+func (m *TNShard) GetAddress() string {
 	if m != nil {
 		return m.Address
 	}
@@ -244,7 +284,7 @@ func (m *LogShardRecord) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_LogShardRecord.Merge(m, src)
 }
 func (m *LogShardRecord) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *LogShardRecord) XXX_DiscardUnknown() {
 	xxx_messageInfo_LogShardRecord.DiscardUnknown(m)
@@ -271,7 +311,9 @@ type LogShard struct {
 	// LogShard extends LogShardRecord
 	LogShardRecord `protobuf:"bytes,1,opt,name=LogShardRecord,proto3,embedded=LogShardRecord" json:"LogShardRecord"`
 	// ReplicaID is the replica ID of the replica running on the LogStore.
-	ReplicaID            uint64   `protobuf:"varint,2,opt,name=ReplicaID,proto3" json:"ReplicaID,omitempty"`
+	ReplicaID uint64 `protobuf:"varint,2,opt,name=ReplicaID,proto3" json:"ReplicaID,omitempty"`
+	// NonVoting indicates if the replica is a non-voting one.
+	NonVoting            bool     `protobuf:"varint,3,opt,name=NonVoting,proto3" json:"NonVoting,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -302,7 +344,7 @@ func (m *LogShard) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_LogShard.Merge(m, src)
 }
 func (m *LogShard) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *LogShard) XXX_DiscardUnknown() {
 	xxx_messageInfo_LogShard.DiscardUnknown(m)
@@ -317,29 +359,36 @@ func (m *LogShard) GetReplicaID() uint64 {
 	return 0
 }
 
-// DNStore DN store metadata
-type DNStore struct {
-	// UUID DNStore uuid id
+func (m *LogShard) GetNonVoting() bool {
+	if m != nil {
+		return m.NonVoting
+	}
+	return false
+}
+
+// TNStore TN store metadata
+type TNStore struct {
+	// UUID TNStore uuid id
 	UUID string `protobuf:"bytes,1,opt,name=UUID,proto3" json:"UUID,omitempty"`
-	// Shards DNShards
-	Shards               []DNShard `protobuf:"bytes,2,rep,name=Shards,proto3" json:"Shards"`
+	// Shards TNShards
+	Shards               []TNShard `protobuf:"bytes,2,rep,name=Shards,proto3" json:"Shards"`
 	XXX_NoUnkeyedLiteral struct{}  `json:"-"`
 	XXX_unrecognized     []byte    `json:"-"`
 	XXX_sizecache        int32     `json:"-"`
 }
 
-func (m *DNStore) Reset()         { *m = DNStore{} }
-func (m *DNStore) String() string { return proto.CompactTextString(m) }
-func (*DNStore) ProtoMessage()    {}
-func (*DNStore) Descriptor() ([]byte, []int) {
+func (m *TNStore) Reset()         { *m = TNStore{} }
+func (m *TNStore) String() string { return proto.CompactTextString(m) }
+func (*TNStore) ProtoMessage()    {}
+func (*TNStore) Descriptor() ([]byte, []int) {
 	return fileDescriptor_56d9f74966f40d04, []int{4}
 }
-func (m *DNStore) XXX_Unmarshal(b []byte) error {
+func (m *TNStore) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *DNStore) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TNStore) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_DNStore.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TNStore.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -349,26 +398,26 @@ func (m *DNStore) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 		return b[:n], nil
 	}
 }
-func (m *DNStore) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_DNStore.Merge(m, src)
+func (m *TNStore) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TNStore.Merge(m, src)
 }
-func (m *DNStore) XXX_Size() int {
-	return m.Size()
+func (m *TNStore) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *DNStore) XXX_DiscardUnknown() {
-	xxx_messageInfo_DNStore.DiscardUnknown(m)
+func (m *TNStore) XXX_DiscardUnknown() {
+	xxx_messageInfo_TNStore.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_DNStore proto.InternalMessageInfo
+var xxx_messageInfo_TNStore proto.InternalMessageInfo
 
-func (m *DNStore) GetUUID() string {
+func (m *TNStore) GetUUID() string {
 	if m != nil {
 		return m.UUID
 	}
 	return ""
 }
 
-func (m *DNStore) GetShards() []DNShard {
+func (m *TNStore) GetShards() []TNShard {
 	if m != nil {
 		return m.Shards
 	}
@@ -411,7 +460,7 @@ func (m *LogStore) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_LogStore.Merge(m, src)
 }
 func (m *LogStore) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *LogStore) XXX_DiscardUnknown() {
 	xxx_messageInfo_LogStore.DiscardUnknown(m)
@@ -469,7 +518,7 @@ func (m *CNStore) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_CNStore.Merge(m, src)
 }
 func (m *CNStore) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *CNStore) XXX_DiscardUnknown() {
 	xxx_messageInfo_CNStore.DiscardUnknown(m)
@@ -501,11 +550,22 @@ type CNService struct {
 	PipelineServiceAddress string `protobuf:"bytes,3,opt,name=PipelineServiceAddress,proto3" json:"PipelineServiceAddress,omitempty"`
 	// SQLAddress is used to provide SQL input.
 	SQLAddress string `protobuf:"bytes,4,opt,name=SQLAddress,proto3" json:"SQLAddress,omitempty"`
-	// Labels lables on service
-	Labels               map[string]string `protobuf:"bytes,5,rep,name=Labels,proto3" json:"Labels" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_unrecognized     []byte            `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	// Labels are labels on CN service.
+	Labels map[string]LabelList `protobuf:"bytes,6,rep,name=Labels,proto3" json:"Labels" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	// WorkState is the work state of CN service.
+	WorkState WorkState `protobuf:"varint,7,opt,name=WorkState,proto3,enum=metadata.WorkState" json:"WorkState,omitempty"`
+	// QueryAddress is the address of queryservice.QueryService.
+	QueryAddress        string `protobuf:"bytes,8,opt,name=QueryAddress,proto3" json:"QueryAddress,omitempty"`
+	ShardServiceAddress string `protobuf:"bytes,9,opt,name=ShardServiceAddress,proto3" json:"ShardServiceAddress,omitempty"`
+	// CommitID is the git commit ID of the cn node.
+	CommitID string `protobuf:"bytes,10,opt,name=CommitID,proto3" json:"CommitID,omitempty"`
+	// CPUTotal is cpu quota from logservicepb.CNStore
+	CPUTotal uint64 `protobuf:"varint,11,opt,name=CPUTotal,proto3" json:"CPUTotal,omitempty"`
+	// MemTotal is mem quota from logservicepb.CNStore
+	MemTotal             uint64   `protobuf:"varint,12,opt,name=MemTotal,proto3" json:"MemTotal,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
 func (m *CNService) Reset()         { *m = CNService{} }
@@ -533,7 +593,7 @@ func (m *CNService) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_CNService.Merge(m, src)
 }
 func (m *CNService) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *CNService) XXX_DiscardUnknown() {
 	xxx_messageInfo_CNService.DiscardUnknown(m)
@@ -569,15 +629,57 @@ func (m *CNService) GetSQLAddress() string {
 	return ""
 }
 
-func (m *CNService) GetLabels() map[string]string {
+func (m *CNService) GetLabels() map[string]LabelList {
 	if m != nil {
 		return m.Labels
 	}
 	return nil
 }
 
-// DNService dn service metadata
-type DNService struct {
+func (m *CNService) GetWorkState() WorkState {
+	if m != nil {
+		return m.WorkState
+	}
+	return WorkState_Unknown
+}
+
+func (m *CNService) GetQueryAddress() string {
+	if m != nil {
+		return m.QueryAddress
+	}
+	return ""
+}
+
+func (m *CNService) GetShardServiceAddress() string {
+	if m != nil {
+		return m.ShardServiceAddress
+	}
+	return ""
+}
+
+func (m *CNService) GetCommitID() string {
+	if m != nil {
+		return m.CommitID
+	}
+	return ""
+}
+
+func (m *CNService) GetCPUTotal() uint64 {
+	if m != nil {
+		return m.CPUTotal
+	}
+	return 0
+}
+
+func (m *CNService) GetMemTotal() uint64 {
+	if m != nil {
+		return m.MemTotal
+	}
+	return 0
+}
+
+// TNService tn service metadata
+type TNService struct {
 	// ServiceID service ID
 	ServiceID string `protobuf:"bytes,1,opt,name=ServiceID,proto3" json:"ServiceID,omitempty"`
 	// TxnServiceAddress is used to provide txn service
@@ -586,27 +688,30 @@ type DNService struct {
 	LogTailServiceAddress string `protobuf:"bytes,3,opt,name=LogTailServiceAddress,proto3" json:"LogTailServiceAddress,omitempty"`
 	// LockServiceAddress lock service address for lock table allocator
 	LockServiceAddress string `protobuf:"bytes,4,opt,name=LockServiceAddress,proto3" json:"LockServiceAddress,omitempty"`
-	// Shards DN shards on service
-	Shards []DNShard `protobuf:"bytes,5,rep,name=Shards,proto3" json:"Shards"`
-	// Labels lables on service
-	Labels               map[string]string `protobuf:"bytes,6,rep,name=Labels,proto3" json:"Labels" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
-	XXX_NoUnkeyedLiteral struct{}          `json:"-"`
-	XXX_unrecognized     []byte            `json:"-"`
-	XXX_sizecache        int32             `json:"-"`
+	// Shards TN shards on service
+	Shards []TNShard `protobuf:"bytes,6,rep,name=Shards,proto3" json:"Shards"`
+	// Labels labels on service
+	Labels map[string]LabelList `protobuf:"bytes,7,rep,name=Labels,proto3" json:"Labels" protobuf_key:"bytes,1,opt,name=key,proto3" protobuf_val:"bytes,2,opt,name=value,proto3"`
+	// QueryAddress it the address of query service on the tn
+	QueryAddress         string   `protobuf:"bytes,8,opt,name=QueryAddress,proto3" json:"QueryAddress,omitempty"`
+	ShardServiceAddress  string   `protobuf:"bytes,9,opt,name=ShardServiceAddress,proto3" json:"ShardServiceAddress,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *DNService) Reset()         { *m = DNService{} }
-func (m *DNService) String() string { return proto.CompactTextString(m) }
-func (*DNService) ProtoMessage()    {}
-func (*DNService) Descriptor() ([]byte, []int) {
+func (m *TNService) Reset()         { *m = TNService{} }
+func (m *TNService) String() string { return proto.CompactTextString(m) }
+func (*TNService) ProtoMessage()    {}
+func (*TNService) Descriptor() ([]byte, []int) {
 	return fileDescriptor_56d9f74966f40d04, []int{8}
 }
-func (m *DNService) XXX_Unmarshal(b []byte) error {
+func (m *TNService) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *DNService) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TNService) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_DNService.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TNService.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -616,54 +721,116 @@ func (m *DNService) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 		return b[:n], nil
 	}
 }
-func (m *DNService) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_DNService.Merge(m, src)
+func (m *TNService) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TNService.Merge(m, src)
 }
-func (m *DNService) XXX_Size() int {
-	return m.Size()
+func (m *TNService) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *DNService) XXX_DiscardUnknown() {
-	xxx_messageInfo_DNService.DiscardUnknown(m)
+func (m *TNService) XXX_DiscardUnknown() {
+	xxx_messageInfo_TNService.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_DNService proto.InternalMessageInfo
+var xxx_messageInfo_TNService proto.InternalMessageInfo
 
-func (m *DNService) GetServiceID() string {
+func (m *TNService) GetServiceID() string {
 	if m != nil {
 		return m.ServiceID
 	}
 	return ""
 }
 
-func (m *DNService) GetTxnServiceAddress() string {
+func (m *TNService) GetTxnServiceAddress() string {
 	if m != nil {
 		return m.TxnServiceAddress
 	}
 	return ""
 }
 
-func (m *DNService) GetLogTailServiceAddress() string {
+func (m *TNService) GetLogTailServiceAddress() string {
 	if m != nil {
 		return m.LogTailServiceAddress
 	}
 	return ""
 }
 
-func (m *DNService) GetLockServiceAddress() string {
+func (m *TNService) GetLockServiceAddress() string {
 	if m != nil {
 		return m.LockServiceAddress
 	}
 	return ""
 }
 
-func (m *DNService) GetShards() []DNShard {
+func (m *TNService) GetShards() []TNShard {
 	if m != nil {
 		return m.Shards
 	}
 	return nil
 }
 
-func (m *DNService) GetLabels() map[string]string {
+func (m *TNService) GetLabels() map[string]LabelList {
+	if m != nil {
+		return m.Labels
+	}
+	return nil
+}
+
+func (m *TNService) GetQueryAddress() string {
+	if m != nil {
+		return m.QueryAddress
+	}
+	return ""
+}
+
+func (m *TNService) GetShardServiceAddress() string {
+	if m != nil {
+		return m.ShardServiceAddress
+	}
+	return ""
+}
+
+// LabelList defines the labels on CN store.
+type LabelList struct {
+	Labels               []string `protobuf:"bytes,1,rep,name=Labels,proto3" json:"Labels,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
+}
+
+func (m *LabelList) Reset()         { *m = LabelList{} }
+func (m *LabelList) String() string { return proto.CompactTextString(m) }
+func (*LabelList) ProtoMessage()    {}
+func (*LabelList) Descriptor() ([]byte, []int) {
+	return fileDescriptor_56d9f74966f40d04, []int{9}
+}
+func (m *LabelList) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *LabelList) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_LabelList.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *LabelList) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_LabelList.Merge(m, src)
+}
+func (m *LabelList) XXX_Size() int {
+	return m.ProtoSize()
+}
+func (m *LabelList) XXX_DiscardUnknown() {
+	xxx_messageInfo_LabelList.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_LabelList proto.InternalMessageInfo
+
+func (m *LabelList) GetLabels() []string {
 	if m != nil {
 		return m.Labels
 	}
@@ -673,65 +840,80 @@ func (m *DNService) GetLabels() map[string]string {
 func init() {
 	proto.RegisterEnum("metadata.ServiceType", ServiceType_name, ServiceType_value)
 	proto.RegisterEnum("metadata.CNRole", CNRole_name, CNRole_value)
-	proto.RegisterType((*DNShardRecord)(nil), "metadata.DNShardRecord")
-	proto.RegisterType((*DNShard)(nil), "metadata.DNShard")
+	proto.RegisterEnum("metadata.WorkState", WorkState_name, WorkState_value)
+	proto.RegisterType((*TNShardRecord)(nil), "metadata.TNShardRecord")
+	proto.RegisterType((*TNShard)(nil), "metadata.TNShard")
 	proto.RegisterType((*LogShardRecord)(nil), "metadata.LogShardRecord")
 	proto.RegisterType((*LogShard)(nil), "metadata.LogShard")
-	proto.RegisterType((*DNStore)(nil), "metadata.DNStore")
+	proto.RegisterType((*TNStore)(nil), "metadata.TNStore")
 	proto.RegisterType((*LogStore)(nil), "metadata.LogStore")
 	proto.RegisterType((*CNStore)(nil), "metadata.CNStore")
 	proto.RegisterType((*CNService)(nil), "metadata.CNService")
-	proto.RegisterMapType((map[string]string)(nil), "metadata.CNService.LabelsEntry")
-	proto.RegisterType((*DNService)(nil), "metadata.DNService")
-	proto.RegisterMapType((map[string]string)(nil), "metadata.DNService.LabelsEntry")
+	proto.RegisterMapType((map[string]LabelList)(nil), "metadata.CNService.LabelsEntry")
+	proto.RegisterType((*TNService)(nil), "metadata.TNService")
+	proto.RegisterMapType((map[string]LabelList)(nil), "metadata.TNService.LabelsEntry")
+	proto.RegisterType((*LabelList)(nil), "metadata.LabelList")
 }
 
 func init() { proto.RegisterFile("metadata.proto", fileDescriptor_56d9f74966f40d04) }
 
 var fileDescriptor_56d9f74966f40d04 = []byte{
-	// 598 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x54, 0xcb, 0x6e, 0xd3, 0x40,
-	0x14, 0xed, 0x38, 0xae, 0xd3, 0xdc, 0x88, 0xca, 0x1d, 0xf1, 0xb0, 0x2a, 0x94, 0x56, 0x16, 0x42,
-	0x51, 0x04, 0x31, 0x04, 0x84, 0x00, 0x89, 0x45, 0xe3, 0xa0, 0xaa, 0xc8, 0x72, 0x83, 0x93, 0xb2,
-	0x60, 0x67, 0x27, 0x53, 0xd7, 0x8a, 0x93, 0xb1, 0x1c, 0xa7, 0x6a, 0x7e, 0x81, 0x5f, 0xe1, 0x47,
-	0xba, 0xcc, 0x17, 0x54, 0x90, 0x15, 0x9f, 0x81, 0x3c, 0x1e, 0x27, 0xae, 0x93, 0x94, 0x6e, 0x58,
-	0x79, 0xee, 0x39, 0xd7, 0x67, 0xee, 0x39, 0xbe, 0x32, 0xec, 0x0e, 0x49, 0x64, 0xf7, 0xed, 0xc8,
-	0xae, 0x07, 0x21, 0x8d, 0x28, 0xde, 0x49, 0xeb, 0xfd, 0x97, 0xae, 0x17, 0x5d, 0x4c, 0x9c, 0x7a,
-	0x8f, 0x0e, 0x35, 0x97, 0xba, 0x54, 0x63, 0x0d, 0xce, 0xe4, 0x9c, 0x55, 0xac, 0x60, 0xa7, 0xe4,
-	0x45, 0xf5, 0x04, 0x1e, 0xb4, 0xcc, 0xce, 0x85, 0x1d, 0xf6, 0x2d, 0xd2, 0xa3, 0x61, 0x1f, 0x2b,
-	0x50, 0x64, 0xe5, 0x49, 0x4b, 0x41, 0x87, 0xa8, 0x2a, 0x5a, 0x69, 0x89, 0x2b, 0x00, 0x06, 0x75,
-	0x53, 0x52, 0x60, 0x64, 0x06, 0x51, 0x7f, 0x20, 0x28, 0x72, 0x2d, 0x7c, 0x9c, 0x93, 0x65, 0x5a,
-	0xe5, 0xc6, 0x93, 0xfa, 0x62, 0xee, 0x5b, 0x74, 0x73, 0xe7, 0xfa, 0xe6, 0x60, 0x6b, 0x76, 0x73,
-	0x80, 0xac, 0xdc, 0x38, 0x4f, 0xa1, 0x64, 0x91, 0xc0, 0xf7, 0x7a, 0xf6, 0xe2, 0xce, 0x25, 0x10,
-	0x0f, 0x7b, 0xd4, 0xef, 0x87, 0x64, 0x3c, 0x56, 0x0a, 0x87, 0xa8, 0x5a, 0xb2, 0xd2, 0x52, 0xfd,
-	0x06, 0xbb, 0xe9, 0x68, 0xff, 0x34, 0x56, 0x03, 0xd9, 0x9c, 0x0c, 0x1d, 0x12, 0x9e, 0x9e, 0x73,
-	0xe9, 0x31, 0xbf, 0x6a, 0x05, 0x57, 0x23, 0xd8, 0x49, 0x75, 0xf1, 0x97, 0xfc, 0x1d, 0xdc, 0xa5,
-	0xb2, 0x74, 0x79, 0x9b, 0xcf, 0xd8, 0xcc, 0x4f, 0x77, 0xa7, 0x4f, 0xd5, 0x64, 0xc9, 0x46, 0x34,
-	0x24, 0x18, 0x83, 0x78, 0x76, 0xc6, 0x3d, 0x94, 0x2c, 0x76, 0xc6, 0x1a, 0x48, 0x4c, 0x2b, 0x1e,
-	0xbb, 0x50, 0x2d, 0x37, 0xf6, 0x56, 0x62, 0x6e, 0x8a, 0xf1, 0xcd, 0x16, 0x6f, 0x53, 0xdb, 0x89,
-	0x8b, 0x8d, 0x82, 0xaf, 0x72, 0x82, 0x78, 0xd5, 0x51, 0x4e, 0x51, 0x87, 0xa2, 0x7e, 0xc7, 0x84,
-	0xcf, 0x40, 0xb4, 0xa8, 0x4f, 0x98, 0xb3, 0xdd, 0x86, 0xbc, 0x94, 0xd3, 0xcd, 0x18, 0xb7, 0x18,
-	0xab, 0xfe, 0x14, 0xa0, 0xa4, 0x9b, 0x1d, 0x12, 0x5e, 0x7a, 0x3d, 0x12, 0x47, 0xc2, 0x8f, 0x0b,
-	0xb1, 0x25, 0x80, 0xeb, 0x80, 0x0d, 0xda, 0x1b, 0x70, 0x20, 0xdd, 0x02, 0x81, 0xb5, 0xad, 0x61,
-	0xf0, 0x3b, 0x78, 0xdc, 0xf6, 0x02, 0xe2, 0x7b, 0x23, 0x92, 0x7b, 0x27, 0xd9, 0x9c, 0x0d, 0x6c,
-	0xbc, 0xf5, 0x9d, 0xaf, 0x46, 0xda, 0x2b, 0xb2, 0xde, 0x0c, 0x82, 0x3f, 0x81, 0x64, 0xd8, 0x0e,
-	0xf1, 0xc7, 0xca, 0x36, 0x8b, 0xea, 0x20, 0xeb, 0x8d, 0x6b, 0xd5, 0x93, 0x8e, 0xcf, 0xa3, 0x28,
-	0x9c, 0xa6, 0xb9, 0x25, 0xd0, 0xfe, 0x07, 0x28, 0x67, 0x48, 0x2c, 0x43, 0x61, 0x40, 0xa6, 0xdc,
-	0x6d, 0x7c, 0xc4, 0x0f, 0x61, 0xfb, 0xd2, 0xf6, 0x27, 0x84, 0x5b, 0x4b, 0x8a, 0x8f, 0xc2, 0x7b,
-	0xa4, 0xfe, 0x11, 0xa0, 0xd4, 0xba, 0x67, 0x5a, 0x2f, 0x60, 0xaf, 0x7b, 0x35, 0x5a, 0x1b, 0xd6,
-	0x2a, 0x81, 0xdf, 0xc2, 0x23, 0x83, 0xba, 0x5d, 0xdb, 0xf3, 0xd7, 0x46, 0xb5, 0x9e, 0xdc, 0xf0,
-	0x45, 0xc4, 0x8d, 0x5f, 0x64, 0xb9, 0xb5, 0xdb, 0xf7, 0xda, 0xda, 0x4c, 0xd4, 0x52, 0x3e, 0xea,
-	0xd6, 0x7f, 0x8d, 0xba, 0xf6, 0x1c, 0xca, 0x5c, 0xbf, 0x3b, 0x0d, 0x08, 0x96, 0x40, 0xd0, 0x4d,
-	0x79, 0x2b, 0x7e, 0xb6, 0x4c, 0x19, 0xe1, 0x22, 0x14, 0x8c, 0xd3, 0x63, 0x59, 0xa8, 0x29, 0x20,
-	0x25, 0x0b, 0x1d, 0x53, 0xdd, 0x76, 0xd2, 0x72, 0xd4, 0x96, 0x51, 0x53, 0x9f, 0xfd, 0xae, 0xa0,
-	0xeb, 0x79, 0x05, 0xcd, 0xe6, 0x15, 0xf4, 0x6b, 0x5e, 0x41, 0xdf, 0x5f, 0x67, 0x7e, 0xd4, 0x43,
-	0x3b, 0x0a, 0xbd, 0x2b, 0x1a, 0x7a, 0xae, 0x37, 0x4a, 0x8b, 0x11, 0xd1, 0x82, 0x81, 0xab, 0x05,
-	0x8e, 0x96, 0xba, 0x74, 0x24, 0xf6, 0xcf, 0x7e, 0xf3, 0x37, 0x00, 0x00, 0xff, 0xff, 0x01, 0xe8,
-	0x5a, 0x60, 0xfe, 0x05, 0x00, 0x00,
+	// 804 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xb4, 0x55, 0xdd, 0x4e, 0xe3, 0x46,
+	0x14, 0x8e, 0x63, 0xe3, 0xd8, 0x27, 0x34, 0x32, 0x83, 0x4a, 0x2d, 0x84, 0x02, 0x72, 0x7b, 0x91,
+	0x46, 0x6d, 0x02, 0xb4, 0xaa, 0xaa, 0x4a, 0x95, 0x0a, 0x49, 0x4b, 0x41, 0xa9, 0x13, 0x1c, 0x87,
+	0x2e, 0x7b, 0xb3, 0x72, 0x92, 0xc1, 0x58, 0x49, 0x3c, 0x91, 0xe3, 0xb0, 0xe4, 0x15, 0xf6, 0x72,
+	0x9f, 0x60, 0xa5, 0x7d, 0x19, 0x2e, 0xb9, 0xdd, 0x1b, 0xb4, 0xcb, 0xbe, 0xc8, 0xca, 0xe3, 0x5f,
+	0x9c, 0x84, 0xe5, 0x86, 0xab, 0xcc, 0x77, 0xbe, 0x33, 0x67, 0xce, 0x77, 0xe6, 0x9b, 0x18, 0x0a,
+	0x23, 0xec, 0x1a, 0x7d, 0xc3, 0x35, 0x2a, 0x63, 0x87, 0xb8, 0x04, 0x09, 0x21, 0xde, 0xfc, 0xd9,
+	0xb4, 0xdc, 0xcb, 0x69, 0xb7, 0xd2, 0x23, 0xa3, 0xaa, 0x49, 0x4c, 0x52, 0xa5, 0x09, 0xdd, 0xe9,
+	0x05, 0x45, 0x14, 0xd0, 0x95, 0xbf, 0x51, 0x39, 0x86, 0x6f, 0x74, 0xb5, 0x7d, 0x69, 0x38, 0x7d,
+	0x0d, 0xf7, 0x88, 0xd3, 0x47, 0x32, 0xe4, 0x28, 0x3c, 0xae, 0xcb, 0xcc, 0x0e, 0x53, 0xe2, 0xb4,
+	0x10, 0xa2, 0x22, 0x40, 0x83, 0x98, 0x21, 0x99, 0xa5, 0x64, 0x22, 0xa2, 0xbc, 0x61, 0x20, 0x17,
+	0xd4, 0x42, 0x47, 0xa9, 0xb2, 0xb4, 0x56, 0x7e, 0xff, 0xbb, 0x4a, 0xd4, 0xf7, 0x03, 0xfa, 0x50,
+	0xb8, 0xb9, 0xdb, 0xce, 0xdc, 0xde, 0x6d, 0x33, 0x5a, 0xaa, 0x9d, 0x2d, 0x10, 0x35, 0x3c, 0x1e,
+	0x5a, 0x3d, 0x23, 0x3a, 0x33, 0x0e, 0x78, 0xcd, 0x1e, 0xf4, 0xfb, 0x0e, 0x9e, 0x4c, 0x64, 0x76,
+	0x87, 0x29, 0x89, 0x5a, 0x08, 0x95, 0x33, 0x28, 0x84, 0xad, 0x7d, 0x55, 0x58, 0x19, 0x24, 0x75,
+	0x3a, 0xea, 0x62, 0xa7, 0x79, 0x11, 0x94, 0x9e, 0x04, 0x47, 0xcd, 0xc5, 0x95, 0xb7, 0x0c, 0x08,
+	0x61, 0x61, 0x74, 0x92, 0x3e, 0x24, 0x90, 0x29, 0xc7, 0x32, 0x1f, 0xf2, 0x09, 0x9d, 0xe9, 0xf6,
+	0x1e, 0x17, 0xba, 0x05, 0xa2, 0x4a, 0xec, 0x33, 0xe2, 0x5a, 0xb6, 0x49, 0xa5, 0x0a, 0x5a, 0x1c,
+	0x50, 0x54, 0x3a, 0x78, 0x97, 0x38, 0x18, 0x21, 0xe0, 0x3a, 0x9d, 0x40, 0xa2, 0xa8, 0xd1, 0x35,
+	0xaa, 0x02, 0x4f, 0x4f, 0xf2, 0x54, 0xb1, 0xa5, 0xfc, 0xfe, 0xda, 0xdc, 0x2d, 0x1c, 0x72, 0x5e,
+	0x5f, 0x5a, 0x90, 0xa6, 0xb4, 0x7c, 0x8d, 0x4b, 0x0b, 0xee, 0xa6, 0x0a, 0xa2, 0x79, 0xbd, 0xa9,
+	0x8a, 0x35, 0xc8, 0xd5, 0x1e, 0xe9, 0xf0, 0x07, 0xe0, 0x34, 0x32, 0xc4, 0x54, 0x77, 0x61, 0x5f,
+	0x8a, 0xcb, 0xd5, 0x54, 0x2f, 0xae, 0x51, 0x56, 0x79, 0xcf, 0x81, 0x58, 0x53, 0xdb, 0xd8, 0xb9,
+	0xb2, 0x7a, 0xd8, 0x1b, 0x49, 0xb0, 0x8c, 0x8a, 0xc5, 0x01, 0x54, 0x01, 0xd4, 0x20, 0xbd, 0x41,
+	0x10, 0x08, 0x4d, 0x92, 0xa5, 0x69, 0x0b, 0x18, 0xf4, 0x1b, 0x6c, 0xb4, 0xac, 0x31, 0x1e, 0x5a,
+	0x36, 0x4e, 0xed, 0xf1, 0x8d, 0xb5, 0x84, 0xf5, 0x1e, 0x45, 0xfb, 0xb4, 0x11, 0xe6, 0x72, 0x34,
+	0x37, 0x11, 0x41, 0x7f, 0x02, 0xdf, 0x30, 0xba, 0x78, 0x38, 0x91, 0x79, 0x3a, 0xaa, 0xed, 0xa4,
+	0xb6, 0xa0, 0x56, 0xc5, 0xcf, 0xf8, 0xdb, 0x76, 0x9d, 0x59, 0x38, 0x37, 0x3f, 0x84, 0xf6, 0x40,
+	0xfc, 0x9f, 0x38, 0x83, 0xb6, 0x6b, 0xb8, 0x58, 0xce, 0xd1, 0xe9, 0xac, 0xc7, 0x15, 0x22, 0x4a,
+	0x8b, 0xb3, 0x90, 0x02, 0xab, 0xa7, 0x53, 0xec, 0xcc, 0xc2, 0x9e, 0x04, 0xda, 0xd3, 0x83, 0x18,
+	0xda, 0x85, 0x75, 0x7a, 0x31, 0x29, 0xa9, 0x22, 0x4d, 0x5d, 0x44, 0xa1, 0x4d, 0x10, 0x6a, 0x64,
+	0x34, 0xb2, 0xdc, 0xe3, 0xba, 0x0c, 0x34, 0x2d, 0xc2, 0x94, 0x6b, 0x75, 0x74, 0xe2, 0x1a, 0x43,
+	0x39, 0x4f, 0x9d, 0x1b, 0x61, 0x8f, 0xfb, 0x0f, 0x8f, 0x7c, 0x6e, 0xd5, 0xe7, 0x42, 0xbc, 0xa9,
+	0x42, 0x3e, 0xa1, 0x1c, 0x49, 0xc0, 0x0e, 0xf0, 0x2c, 0xb8, 0x4a, 0x6f, 0x89, 0x7e, 0x84, 0x95,
+	0x2b, 0x63, 0x38, 0xf5, 0x7d, 0x91, 0x4f, 0x2a, 0xa7, 0xfb, 0x1a, 0xd6, 0xc4, 0xd5, 0xfc, 0x8c,
+	0x3f, 0xb2, 0xbf, 0x33, 0x27, 0x9c, 0xb0, 0x22, 0xf1, 0xca, 0x07, 0x16, 0x44, 0xfd, 0x89, 0x2e,
+	0xf9, 0x09, 0xd6, 0xf4, 0x6b, 0x7b, 0xa1, 0x49, 0xe6, 0x09, 0xf4, 0x2b, 0x7c, 0xdb, 0x20, 0xa6,
+	0x6e, 0x58, 0xc3, 0x85, 0x16, 0x59, 0x4c, 0x2e, 0x71, 0x22, 0xb7, 0xd4, 0x89, 0xf1, 0x6b, 0xe5,
+	0x9f, 0xf4, 0x5a, 0x13, 0x16, 0xcb, 0xa5, 0x2d, 0xa6, 0x3f, 0xc1, 0x62, 0xcf, 0xe2, 0x97, 0x67,
+	0xba, 0xdb, 0xef, 0x41, 0x8c, 0x58, 0xb4, 0x11, 0xe9, 0x66, 0x76, 0xd8, 0x92, 0x18, 0x0a, 0x2a,
+	0x1f, 0x40, 0x3e, 0x68, 0x46, 0x9f, 0x8d, 0x31, 0xe2, 0x21, 0x5b, 0x53, 0xa5, 0x8c, 0xf7, 0xab,
+	0xab, 0x12, 0x83, 0x72, 0xc0, 0x36, 0x9a, 0x47, 0x52, 0x16, 0x89, 0xb0, 0xd2, 0xd2, 0x9a, 0x2f,
+	0xce, 0x25, 0x16, 0x15, 0x00, 0x5a, 0xe7, 0xfa, 0xbf, 0x4d, 0xf5, 0x55, 0xa7, 0xfe, 0x8f, 0xc4,
+	0x95, 0x65, 0xe0, 0xfd, 0x7f, 0x1e, 0xba, 0xab, 0xe5, 0xef, 0x3e, 0x68, 0x49, 0x4c, 0xf9, 0xaf,
+	0xc4, 0x83, 0x44, 0x79, 0xc8, 0x75, 0xec, 0x81, 0x4d, 0x5e, 0xdb, 0x52, 0xc6, 0x03, 0x1e, 0x63,
+	0xd9, 0xa6, 0xc4, 0xa0, 0x55, 0x10, 0xea, 0x8e, 0x61, 0xd9, 0x1e, 0xca, 0x7a, 0x14, 0x45, 0xb8,
+	0x2f, 0xb1, 0x87, 0x47, 0xb7, 0x9f, 0x8a, 0xcc, 0xcd, 0x7d, 0x91, 0xb9, 0xbd, 0x2f, 0x32, 0x1f,
+	0xef, 0x8b, 0x99, 0x77, 0x9f, 0x8b, 0xcc, 0xcb, 0xbd, 0xc4, 0x67, 0x7b, 0x64, 0xb8, 0x8e, 0x75,
+	0x4d, 0x1c, 0xcb, 0xb4, 0xec, 0x10, 0xd8, 0xb8, 0x3a, 0x1e, 0x98, 0xd5, 0x71, 0xb7, 0x1a, 0xce,
+	0xa9, 0xcb, 0xd3, 0x2f, 0xf8, 0x2f, 0x5f, 0x02, 0x00, 0x00, 0xff, 0xff, 0x81, 0x7c, 0x9c, 0x56,
+	0x0c, 0x08, 0x00, 0x00,
 }
 
-func (m *DNShardRecord) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TNShardRecord) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -740,12 +922,12 @@ func (m *DNShardRecord) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *DNShardRecord) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TNShardRecord) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *DNShardRecord) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TNShardRecord) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -767,8 +949,8 @@ func (m *DNShardRecord) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *DNShard) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TNShard) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -777,12 +959,12 @@ func (m *DNShard) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *DNShard) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TNShard) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *DNShard) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TNShard) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -804,7 +986,7 @@ func (m *DNShard) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		dAtA[i] = 0x10
 	}
 	{
-		size, err := m.DNShardRecord.MarshalToSizedBuffer(dAtA[:i])
+		size, err := m.TNShardRecord.MarshalToSizedBuffer(dAtA[:i])
 		if err != nil {
 			return 0, err
 		}
@@ -817,7 +999,7 @@ func (m *DNShard) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *LogShardRecord) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -827,7 +1009,7 @@ func (m *LogShardRecord) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *LogShardRecord) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -854,7 +1036,7 @@ func (m *LogShardRecord) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *LogShard) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -864,7 +1046,7 @@ func (m *LogShard) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *LogShard) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -876,6 +1058,16 @@ func (m *LogShard) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	if m.XXX_unrecognized != nil {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if m.NonVoting {
+		i--
+		if m.NonVoting {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x18
 	}
 	if m.ReplicaID != 0 {
 		i = encodeVarintMetadata(dAtA, i, uint64(m.ReplicaID))
@@ -895,8 +1087,8 @@ func (m *LogShard) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *DNStore) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TNStore) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -905,12 +1097,12 @@ func (m *DNStore) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *DNStore) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TNStore) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *DNStore) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TNStore) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -944,7 +1136,7 @@ func (m *DNStore) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *LogStore) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -954,7 +1146,7 @@ func (m *LogStore) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *LogStore) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -992,7 +1184,7 @@ func (m *LogStore) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *CNStore) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -1002,7 +1194,7 @@ func (m *CNStore) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *CNStore) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -1031,7 +1223,7 @@ func (m *CNStore) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *CNService) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -1041,7 +1233,7 @@ func (m *CNService) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *CNService) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -1054,13 +1246,54 @@ func (m *CNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
+	if m.MemTotal != 0 {
+		i = encodeVarintMetadata(dAtA, i, uint64(m.MemTotal))
+		i--
+		dAtA[i] = 0x60
+	}
+	if m.CPUTotal != 0 {
+		i = encodeVarintMetadata(dAtA, i, uint64(m.CPUTotal))
+		i--
+		dAtA[i] = 0x58
+	}
+	if len(m.CommitID) > 0 {
+		i -= len(m.CommitID)
+		copy(dAtA[i:], m.CommitID)
+		i = encodeVarintMetadata(dAtA, i, uint64(len(m.CommitID)))
+		i--
+		dAtA[i] = 0x52
+	}
+	if len(m.ShardServiceAddress) > 0 {
+		i -= len(m.ShardServiceAddress)
+		copy(dAtA[i:], m.ShardServiceAddress)
+		i = encodeVarintMetadata(dAtA, i, uint64(len(m.ShardServiceAddress)))
+		i--
+		dAtA[i] = 0x4a
+	}
+	if len(m.QueryAddress) > 0 {
+		i -= len(m.QueryAddress)
+		copy(dAtA[i:], m.QueryAddress)
+		i = encodeVarintMetadata(dAtA, i, uint64(len(m.QueryAddress)))
+		i--
+		dAtA[i] = 0x42
+	}
+	if m.WorkState != 0 {
+		i = encodeVarintMetadata(dAtA, i, uint64(m.WorkState))
+		i--
+		dAtA[i] = 0x38
+	}
 	if len(m.Labels) > 0 {
 		for k := range m.Labels {
 			v := m.Labels[k]
 			baseI := i
-			i -= len(v)
-			copy(dAtA[i:], v)
-			i = encodeVarintMetadata(dAtA, i, uint64(len(v)))
+			{
+				size, err := (&v).MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintMetadata(dAtA, i, uint64(size))
+			}
 			i--
 			dAtA[i] = 0x12
 			i -= len(k)
@@ -1070,7 +1303,7 @@ func (m *CNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			dAtA[i] = 0xa
 			i = encodeVarintMetadata(dAtA, i, uint64(baseI-i))
 			i--
-			dAtA[i] = 0x2a
+			dAtA[i] = 0x32
 		}
 	}
 	if len(m.SQLAddress) > 0 {
@@ -1104,8 +1337,8 @@ func (m *CNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *DNService) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TNService) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -1114,12 +1347,12 @@ func (m *DNService) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *DNService) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TNService) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *DNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -1128,13 +1361,32 @@ func (m *DNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
+	if len(m.ShardServiceAddress) > 0 {
+		i -= len(m.ShardServiceAddress)
+		copy(dAtA[i:], m.ShardServiceAddress)
+		i = encodeVarintMetadata(dAtA, i, uint64(len(m.ShardServiceAddress)))
+		i--
+		dAtA[i] = 0x4a
+	}
+	if len(m.QueryAddress) > 0 {
+		i -= len(m.QueryAddress)
+		copy(dAtA[i:], m.QueryAddress)
+		i = encodeVarintMetadata(dAtA, i, uint64(len(m.QueryAddress)))
+		i--
+		dAtA[i] = 0x42
+	}
 	if len(m.Labels) > 0 {
 		for k := range m.Labels {
 			v := m.Labels[k]
 			baseI := i
-			i -= len(v)
-			copy(dAtA[i:], v)
-			i = encodeVarintMetadata(dAtA, i, uint64(len(v)))
+			{
+				size, err := (&v).MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintMetadata(dAtA, i, uint64(size))
+			}
 			i--
 			dAtA[i] = 0x12
 			i -= len(k)
@@ -1144,7 +1396,7 @@ func (m *DNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			dAtA[i] = 0xa
 			i = encodeVarintMetadata(dAtA, i, uint64(baseI-i))
 			i--
-			dAtA[i] = 0x32
+			dAtA[i] = 0x3a
 		}
 	}
 	if len(m.Shards) > 0 {
@@ -1158,7 +1410,7 @@ func (m *DNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 				i = encodeVarintMetadata(dAtA, i, uint64(size))
 			}
 			i--
-			dAtA[i] = 0x2a
+			dAtA[i] = 0x32
 		}
 	}
 	if len(m.LockServiceAddress) > 0 {
@@ -1192,6 +1444,42 @@ func (m *DNService) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
+func (m *LabelList) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *LabelList) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *LabelList) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.XXX_unrecognized != nil {
+		i -= len(m.XXX_unrecognized)
+		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if len(m.Labels) > 0 {
+		for iNdEx := len(m.Labels) - 1; iNdEx >= 0; iNdEx-- {
+			i -= len(m.Labels[iNdEx])
+			copy(dAtA[i:], m.Labels[iNdEx])
+			i = encodeVarintMetadata(dAtA, i, uint64(len(m.Labels[iNdEx])))
+			i--
+			dAtA[i] = 0xa
+		}
+	}
+	return len(dAtA) - i, nil
+}
+
 func encodeVarintMetadata(dAtA []byte, offset int, v uint64) int {
 	offset -= sovMetadata(v)
 	base := offset
@@ -1203,7 +1491,7 @@ func encodeVarintMetadata(dAtA []byte, offset int, v uint64) int {
 	dAtA[offset] = uint8(v)
 	return base
 }
-func (m *DNShardRecord) Size() (n int) {
+func (m *TNShardRecord) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1221,13 +1509,13 @@ func (m *DNShardRecord) Size() (n int) {
 	return n
 }
 
-func (m *DNShard) Size() (n int) {
+func (m *TNShard) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	l = m.DNShardRecord.Size()
+	l = m.TNShardRecord.ProtoSize()
 	n += 1 + l + sovMetadata(uint64(l))
 	if m.ReplicaID != 0 {
 		n += 1 + sovMetadata(uint64(m.ReplicaID))
@@ -1242,7 +1530,7 @@ func (m *DNShard) Size() (n int) {
 	return n
 }
 
-func (m *LogShardRecord) Size() (n int) {
+func (m *LogShardRecord) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1260,24 +1548,27 @@ func (m *LogShardRecord) Size() (n int) {
 	return n
 }
 
-func (m *LogShard) Size() (n int) {
+func (m *LogShard) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	l = m.LogShardRecord.Size()
+	l = m.LogShardRecord.ProtoSize()
 	n += 1 + l + sovMetadata(uint64(l))
 	if m.ReplicaID != 0 {
 		n += 1 + sovMetadata(uint64(m.ReplicaID))
 	}
+	if m.NonVoting {
+		n += 2
+	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
 
-func (m *DNStore) Size() (n int) {
+func (m *TNStore) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1289,7 +1580,7 @@ func (m *DNStore) Size() (n int) {
 	}
 	if len(m.Shards) > 0 {
 		for _, e := range m.Shards {
-			l = e.Size()
+			l = e.ProtoSize()
 			n += 1 + l + sovMetadata(uint64(l))
 		}
 	}
@@ -1299,7 +1590,7 @@ func (m *DNStore) Size() (n int) {
 	return n
 }
 
-func (m *LogStore) Size() (n int) {
+func (m *LogStore) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1311,7 +1602,7 @@ func (m *LogStore) Size() (n int) {
 	}
 	if len(m.Shards) > 0 {
 		for _, e := range m.Shards {
-			l = e.Size()
+			l = e.ProtoSize()
 			n += 1 + l + sovMetadata(uint64(l))
 		}
 	}
@@ -1321,7 +1612,7 @@ func (m *LogStore) Size() (n int) {
 	return n
 }
 
-func (m *CNStore) Size() (n int) {
+func (m *CNStore) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1340,7 +1631,7 @@ func (m *CNStore) Size() (n int) {
 	return n
 }
 
-func (m *CNService) Size() (n int) {
+func (m *CNService) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1366,9 +1657,31 @@ func (m *CNService) Size() (n int) {
 		for k, v := range m.Labels {
 			_ = k
 			_ = v
-			mapEntrySize := 1 + len(k) + sovMetadata(uint64(len(k))) + 1 + len(v) + sovMetadata(uint64(len(v)))
+			l = v.ProtoSize()
+			mapEntrySize := 1 + len(k) + sovMetadata(uint64(len(k))) + 1 + l + sovMetadata(uint64(l))
 			n += mapEntrySize + 1 + sovMetadata(uint64(mapEntrySize))
 		}
+	}
+	if m.WorkState != 0 {
+		n += 1 + sovMetadata(uint64(m.WorkState))
+	}
+	l = len(m.QueryAddress)
+	if l > 0 {
+		n += 1 + l + sovMetadata(uint64(l))
+	}
+	l = len(m.ShardServiceAddress)
+	if l > 0 {
+		n += 1 + l + sovMetadata(uint64(l))
+	}
+	l = len(m.CommitID)
+	if l > 0 {
+		n += 1 + l + sovMetadata(uint64(l))
+	}
+	if m.CPUTotal != 0 {
+		n += 1 + sovMetadata(uint64(m.CPUTotal))
+	}
+	if m.MemTotal != 0 {
+		n += 1 + sovMetadata(uint64(m.MemTotal))
 	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -1376,7 +1689,7 @@ func (m *CNService) Size() (n int) {
 	return n
 }
 
-func (m *DNService) Size() (n int) {
+func (m *TNService) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -1400,7 +1713,7 @@ func (m *DNService) Size() (n int) {
 	}
 	if len(m.Shards) > 0 {
 		for _, e := range m.Shards {
-			l = e.Size()
+			l = e.ProtoSize()
 			n += 1 + l + sovMetadata(uint64(l))
 		}
 	}
@@ -1408,8 +1721,35 @@ func (m *DNService) Size() (n int) {
 		for k, v := range m.Labels {
 			_ = k
 			_ = v
-			mapEntrySize := 1 + len(k) + sovMetadata(uint64(len(k))) + 1 + len(v) + sovMetadata(uint64(len(v)))
+			l = v.ProtoSize()
+			mapEntrySize := 1 + len(k) + sovMetadata(uint64(len(k))) + 1 + l + sovMetadata(uint64(l))
 			n += mapEntrySize + 1 + sovMetadata(uint64(mapEntrySize))
+		}
+	}
+	l = len(m.QueryAddress)
+	if l > 0 {
+		n += 1 + l + sovMetadata(uint64(l))
+	}
+	l = len(m.ShardServiceAddress)
+	if l > 0 {
+		n += 1 + l + sovMetadata(uint64(l))
+	}
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
+	}
+	return n
+}
+
+func (m *LabelList) ProtoSize() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.Labels) > 0 {
+		for _, s := range m.Labels {
+			l = len(s)
+			n += 1 + l + sovMetadata(uint64(l))
 		}
 	}
 	if m.XXX_unrecognized != nil {
@@ -1424,7 +1764,7 @@ func sovMetadata(x uint64) (n int) {
 func sozMetadata(x uint64) (n int) {
 	return sovMetadata(uint64((x << 1) ^ uint64((int64(x) >> 63))))
 }
-func (m *DNShardRecord) Unmarshal(dAtA []byte) error {
+func (m *TNShardRecord) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1447,10 +1787,10 @@ func (m *DNShardRecord) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: DNShardRecord: wiretype end group for non-group")
+			return fmt.Errorf("proto: TNShardRecord: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: DNShardRecord: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TNShardRecord: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -1513,7 +1853,7 @@ func (m *DNShardRecord) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *DNShard) Unmarshal(dAtA []byte) error {
+func (m *TNShard) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1536,15 +1876,15 @@ func (m *DNShard) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: DNShard: wiretype end group for non-group")
+			return fmt.Errorf("proto: TNShard: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: DNShard: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TNShard: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DNShardRecord", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TNShardRecord", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -1571,7 +1911,7 @@ func (m *DNShard) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.DNShardRecord.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.TNShardRecord.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -1818,6 +2158,26 @@ func (m *LogShard) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 3:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field NonVoting", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.NonVoting = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipMetadata(dAtA[iNdEx:])
@@ -1840,7 +2200,7 @@ func (m *LogShard) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *DNStore) Unmarshal(dAtA []byte) error {
+func (m *TNStore) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -1863,10 +2223,10 @@ func (m *DNStore) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: DNStore: wiretype end group for non-group")
+			return fmt.Errorf("proto: TNStore: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: DNStore: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TNStore: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -1930,7 +2290,7 @@ func (m *DNStore) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Shards = append(m.Shards, DNShard{})
+			m.Shards = append(m.Shards, TNShard{})
 			if err := m.Shards[len(m.Shards)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
@@ -2333,7 +2693,7 @@ func (m *CNService) Unmarshal(dAtA []byte) error {
 			}
 			m.SQLAddress = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
-		case 5:
+		case 6:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Labels", wireType)
 			}
@@ -2363,10 +2723,10 @@ func (m *CNService) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Labels == nil {
-				m.Labels = make(map[string]string)
+				m.Labels = make(map[string]LabelList)
 			}
 			var mapkey string
-			var mapvalue string
+			mapvalue := &LabelList{}
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -2415,7 +2775,7 @@ func (m *CNService) Unmarshal(dAtA []byte) error {
 					mapkey = string(dAtA[iNdEx:postStringIndexmapkey])
 					iNdEx = postStringIndexmapkey
 				} else if fieldNum == 2 {
-					var stringLenmapvalue uint64
+					var mapmsglen int
 					for shift := uint(0); ; shift += 7 {
 						if shift >= 64 {
 							return ErrIntOverflowMetadata
@@ -2425,24 +2785,26 @@ func (m *CNService) Unmarshal(dAtA []byte) error {
 						}
 						b := dAtA[iNdEx]
 						iNdEx++
-						stringLenmapvalue |= uint64(b&0x7F) << shift
+						mapmsglen |= int(b&0x7F) << shift
 						if b < 0x80 {
 							break
 						}
 					}
-					intStringLenmapvalue := int(stringLenmapvalue)
-					if intStringLenmapvalue < 0 {
+					if mapmsglen < 0 {
 						return ErrInvalidLengthMetadata
 					}
-					postStringIndexmapvalue := iNdEx + intStringLenmapvalue
-					if postStringIndexmapvalue < 0 {
+					postmsgIndex := iNdEx + mapmsglen
+					if postmsgIndex < 0 {
 						return ErrInvalidLengthMetadata
 					}
-					if postStringIndexmapvalue > l {
+					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = string(dAtA[iNdEx:postStringIndexmapvalue])
-					iNdEx = postStringIndexmapvalue
+					mapvalue = &LabelList{}
+					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
+						return err
+					}
+					iNdEx = postmsgIndex
 				} else {
 					iNdEx = entryPreIndex
 					skippy, err := skipMetadata(dAtA[iNdEx:])
@@ -2458,8 +2820,161 @@ func (m *CNService) Unmarshal(dAtA []byte) error {
 					iNdEx += skippy
 				}
 			}
-			m.Labels[mapkey] = mapvalue
+			m.Labels[mapkey] = *mapvalue
 			iNdEx = postIndex
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field WorkState", wireType)
+			}
+			m.WorkState = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.WorkState |= WorkState(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field QueryAddress", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.QueryAddress = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 9:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ShardServiceAddress", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.ShardServiceAddress = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 10:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CommitID", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.CommitID = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 11:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CPUTotal", wireType)
+			}
+			m.CPUTotal = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.CPUTotal |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 12:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field MemTotal", wireType)
+			}
+			m.MemTotal = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.MemTotal |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipMetadata(dAtA[iNdEx:])
@@ -2482,7 +2997,7 @@ func (m *CNService) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *DNService) Unmarshal(dAtA []byte) error {
+func (m *TNService) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -2505,10 +3020,10 @@ func (m *DNService) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: DNService: wiretype end group for non-group")
+			return fmt.Errorf("proto: TNService: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: DNService: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TNService: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
@@ -2639,7 +3154,7 @@ func (m *DNService) Unmarshal(dAtA []byte) error {
 			}
 			m.LockServiceAddress = string(dAtA[iNdEx:postIndex])
 			iNdEx = postIndex
-		case 5:
+		case 6:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Shards", wireType)
 			}
@@ -2668,12 +3183,12 @@ func (m *DNService) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.Shards = append(m.Shards, DNShard{})
+			m.Shards = append(m.Shards, TNShard{})
 			if err := m.Shards[len(m.Shards)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
-		case 6:
+		case 7:
 			if wireType != 2 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Labels", wireType)
 			}
@@ -2703,10 +3218,10 @@ func (m *DNService) Unmarshal(dAtA []byte) error {
 				return io.ErrUnexpectedEOF
 			}
 			if m.Labels == nil {
-				m.Labels = make(map[string]string)
+				m.Labels = make(map[string]LabelList)
 			}
 			var mapkey string
-			var mapvalue string
+			mapvalue := &LabelList{}
 			for iNdEx < postIndex {
 				entryPreIndex := iNdEx
 				var wire uint64
@@ -2755,7 +3270,7 @@ func (m *DNService) Unmarshal(dAtA []byte) error {
 					mapkey = string(dAtA[iNdEx:postStringIndexmapkey])
 					iNdEx = postStringIndexmapkey
 				} else if fieldNum == 2 {
-					var stringLenmapvalue uint64
+					var mapmsglen int
 					for shift := uint(0); ; shift += 7 {
 						if shift >= 64 {
 							return ErrIntOverflowMetadata
@@ -2765,24 +3280,26 @@ func (m *DNService) Unmarshal(dAtA []byte) error {
 						}
 						b := dAtA[iNdEx]
 						iNdEx++
-						stringLenmapvalue |= uint64(b&0x7F) << shift
+						mapmsglen |= int(b&0x7F) << shift
 						if b < 0x80 {
 							break
 						}
 					}
-					intStringLenmapvalue := int(stringLenmapvalue)
-					if intStringLenmapvalue < 0 {
+					if mapmsglen < 0 {
 						return ErrInvalidLengthMetadata
 					}
-					postStringIndexmapvalue := iNdEx + intStringLenmapvalue
-					if postStringIndexmapvalue < 0 {
+					postmsgIndex := iNdEx + mapmsglen
+					if postmsgIndex < 0 {
 						return ErrInvalidLengthMetadata
 					}
-					if postStringIndexmapvalue > l {
+					if postmsgIndex > l {
 						return io.ErrUnexpectedEOF
 					}
-					mapvalue = string(dAtA[iNdEx:postStringIndexmapvalue])
-					iNdEx = postStringIndexmapvalue
+					mapvalue = &LabelList{}
+					if err := mapvalue.Unmarshal(dAtA[iNdEx:postmsgIndex]); err != nil {
+						return err
+					}
+					iNdEx = postmsgIndex
 				} else {
 					iNdEx = entryPreIndex
 					skippy, err := skipMetadata(dAtA[iNdEx:])
@@ -2798,7 +3315,154 @@ func (m *DNService) Unmarshal(dAtA []byte) error {
 					iNdEx += skippy
 				}
 			}
-			m.Labels[mapkey] = mapvalue
+			m.Labels[mapkey] = *mapvalue
+			iNdEx = postIndex
+		case 8:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field QueryAddress", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.QueryAddress = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 9:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ShardServiceAddress", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.ShardServiceAddress = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		default:
+			iNdEx = preIndex
+			skippy, err := skipMetadata(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *LabelList) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowMetadata
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: LabelList: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: LabelList: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Labels", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowMetadata
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthMetadata
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Labels = append(m.Labels, string(dAtA[iNdEx:postIndex]))
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex

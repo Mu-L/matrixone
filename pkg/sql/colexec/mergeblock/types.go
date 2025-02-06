@@ -14,85 +14,261 @@
 package mergeblock
 
 import (
-	"strconv"
-	"strings"
+	"go.uber.org/zap"
 
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/defines"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
+var _ vm.Operator = new(MergeBlock)
+
 type Container struct {
-	// mp is used to store the metaLoc Batch
+	// mp is used to store the metaLoc Batch.
+	// Notice that batches in mp should be free, since the memory of these batches be allocated from mpool.
 	mp map[int]*batch.Batch
 	// mp2 is used to store the normal data batches
-	mp2 map[int][]*batch.Batch
+	mp2          map[int][]*batch.Batch
+	source       engine.Relation
+	affectedRows uint64
 }
 
-type Argument struct {
-	// 1. main table
-	Tbl engine.Relation
-	// 2. unique index tables
-	Unique_tbls  []engine.Relation
-	AffectedRows uint64
-	// 3. used for ut_test, otherwise the batch will free,
-	// and we can't get the result to check
-	notFreeBatch bool
-	container    *Container
+type MergeBlock struct {
+	AddAffectedRows bool
+	Engine          engine.Engine
+	Ref             *plan.ObjectRef
+	container       Container
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	for k := range arg.container.mp {
-		arg.container.mp[k].Clean(proc.GetMPool())
-		arg.container.mp[k] = nil
+func (mergeBlock *MergeBlock) GetOperatorBase() *vm.OperatorBase {
+	return &mergeBlock.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[MergeBlock](
+		func() *MergeBlock {
+			return &MergeBlock{}
+		},
+		func(a *MergeBlock) {
+			*a = MergeBlock{}
+		},
+		reuse.DefaultOptions[MergeBlock]().
+			WithEnableChecker(),
+	)
+}
+
+func (mergeBlock MergeBlock) TypeName() string {
+	return opName
+}
+
+func NewArgument() *MergeBlock {
+	return reuse.Alloc[MergeBlock](nil)
+}
+
+func (mergeBlock *MergeBlock) WithObjectRef(ref *plan.ObjectRef) *MergeBlock {
+	mergeBlock.Ref = ref
+	return mergeBlock
+}
+
+func (mergeBlock *MergeBlock) WithEngine(eng engine.Engine) *MergeBlock {
+	mergeBlock.Engine = eng
+	return mergeBlock
+}
+
+func (mergeBlock *MergeBlock) WithAddAffectedRows(addAffectedRows bool) *MergeBlock {
+	mergeBlock.AddAffectedRows = addAffectedRows
+	return mergeBlock
+}
+
+func (mergeBlock *MergeBlock) Release() {
+	if mergeBlock != nil {
+		reuse.Free[MergeBlock](mergeBlock, nil)
 	}
 }
 
-func (arg *Argument) GetMetaLocBat(name string) {
-	bat := batch.New(true, []string{name})
-	bat.Cnt = 1
-	bat.Vecs[0] = vector.NewVec(types.New(types.T_text,
-		0, 0))
-	arg.container.mp[0] = bat
-	for i := range arg.Unique_tbls {
-		bat := batch.New(true, []string{name})
-		bat.Cnt = 1
-		bat.Vecs[0] = vector.NewVec(types.New(types.T_text,
-			0, 0))
-		arg.container.mp[i+1] = bat
-	}
+func (mergeBlock *MergeBlock) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	//can not reset affectRows, because MO need get affectRows after reset
+	mergeBlock.resetMp(proc)
 }
 
-func (arg *Argument) Split(proc *process.Process, bat *batch.Batch) error {
-	arg.GetMetaLocBat(bat.Attrs[1])
-	tblIdx := vector.MustFixedCol[int16](bat.GetVector(0))
-	metaLocs := vector.MustBytesCol(bat.GetVector(1))
-	for i := range tblIdx {
-		if tblIdx[i] >= 0 {
-			if tblIdx[i] == 0 {
-				val, err := strconv.ParseUint(strings.Split(string(metaLocs[i]), ":")[2], 0, 64)
-				if err != nil {
-					return err
-				}
-				arg.AffectedRows += val
-			}
-			vector.AppendBytes(arg.container.mp[int(tblIdx[i])].Vecs[0], []byte(metaLocs[i]), false, proc.GetMPool())
-		} else {
-			idx := int(-(tblIdx[i] + 1))
-			bat := &batch.Batch{}
-			if err := bat.UnmarshalBinary([]byte(metaLocs[i])); err != nil {
+func (mergeBlock *MergeBlock) Free(proc *process.Process, pipelineFailed bool, err error) {
+	mergeBlock.cleanMp(proc)
+}
+
+func (mergeBlock *MergeBlock) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
+}
+
+func (mergeBlock *MergeBlock) GetMetaLocBat(src *batch.Batch, proc *process.Process) {
+	if len(mergeBlock.container.mp) > 0 {
+		for _, bat := range mergeBlock.container.mp {
+			bat.CleanOnlyData()
+		}
+		return
+	}
+
+	var typs []types.Type
+	// exclude the table id column
+	attrs := src.Attrs[1:]
+
+	for idx := 1; idx < len(src.Vecs); idx++ {
+		typs = append(typs, *src.Vecs[idx].GetType())
+	}
+
+	// src comes from old CN which haven't object stats column
+	if src.Attrs[len(src.Attrs)-1] != catalog.ObjectMeta_ObjectStats {
+		attrs = append(attrs, catalog.ObjectMeta_ObjectStats)
+		typs = append(typs, types.T_binary.ToType())
+	}
+
+	bat := batch.NewWithSize(len(attrs))
+	bat.Attrs = attrs
+	for idx := 0; idx < len(attrs); idx++ {
+		bat.Vecs[idx] = vector.NewVec(typs[idx])
+	}
+	mergeBlock.container.mp[0] = bat
+}
+
+func splitObjectStats(mergeBlock *MergeBlock, proc *process.Process,
+	analyzer process.Analyzer,
+	bat *batch.Batch, blkVec *vector.Vector, tblIdx []int16,
+) error {
+	// bat comes from old CN, no object stats vec in it.
+	// to ensure all bats the TN received contain the object stats column, we should
+	// construct the object stats from block info here.
+	needLoad := bat.Attrs[len(bat.Attrs)-1] != catalog.ObjectMeta_ObjectStats
+
+	fs, err := fileservice.Get[fileservice.FileService](proc.Base.FileService, defines.SharedFileServiceName)
+	if err != nil {
+		logutil.Error("get fs failed when split object stats. ", zap.Error(err))
+		return err
+	}
+
+	objDataMeta := objectio.BuildObjectMeta(uint16(blkVec.Length()))
+	var objStats objectio.ObjectStats
+	statsVec := bat.Vecs[2]
+	statsIdx := 0
+
+	for idx := 0; idx < len(tblIdx); idx++ {
+		if tblIdx[idx] < 0 {
+			// will the data and blk infos mixed together in one batch?
+			// batch [ data | data | blk info | blk info | .... ]
+			continue
+		}
+
+		blkInfo := objectio.DecodeBlockInfo(blkVec.GetBytesAt(idx))
+		if objectio.IsSameObjectLocVsMeta(blkInfo.MetaLocation(), objDataMeta) {
+			continue
+		}
+
+		destVec := mergeBlock.container.mp[int(tblIdx[idx])].Vecs[1]
+
+		if needLoad {
+			crs := analyzer.GetOpCounterSet()
+			newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
+
+			// comes from old version cn
+			objStats, objDataMeta, err = disttae.ConstructObjStatsByLoadObjMeta(newCtx, blkInfo.MetaLocation(), fs)
+			if err != nil {
 				return err
 			}
-			if idx == 0 {
-				arg.AffectedRows += uint64(bat.Length())
-			}
-			arg.container.mp2[idx] = append(arg.container.mp2[idx], bat)
+			analyzer.AddS3RequestCount(crs)
+			analyzer.AddDiskIO(crs)
+
+			vector.AppendBytes(destVec, objStats.Marshal(), false, proc.GetMPool())
+		} else {
+			// not comes from old version cn
+			vector.AppendBytes(destVec, statsVec.GetBytesAt(statsIdx), false, proc.GetMPool())
+			objDataMeta.BlockHeader().SetBlockID(&blkInfo.BlockID)
+			statsIdx++
 		}
 	}
-	for _, bat := range arg.container.mp {
-		bat.SetZs(bat.Vecs[0].Length(), proc.GetMPool())
+
+	return nil
+}
+
+func (mergeBlock *MergeBlock) Split(proc *process.Process, bat *batch.Batch, analyzer process.Analyzer) error {
+	// meta loc and object stats
+	mergeBlock.GetMetaLocBat(bat, proc)
+	tblIdx := vector.MustFixedColWithTypeCheck[int16](bat.GetVector(0))
+	blkInfosVec := bat.GetVector(1)
+
+	hasObject := false
+	for i := range tblIdx { // append s3 writer returned blk info
+		if tblIdx[i] >= 0 {
+			if mergeBlock.AddAffectedRows {
+				blkInfo := objectio.DecodeBlockInfo(blkInfosVec.GetBytesAt(i))
+				mergeBlock.container.affectedRows += uint64(blkInfo.MetaLocation().Rows())
+			}
+			vector.AppendBytes(mergeBlock.container.mp[int(tblIdx[i])].Vecs[0],
+				blkInfosVec.GetBytesAt(i), false, proc.GetMPool())
+			hasObject = true
+		} else { // append data
+			idx := int(-(tblIdx[i] + 1))
+			newBat := &batch.Batch{}
+			if err := newBat.UnmarshalBinary(blkInfosVec.GetBytesAt(i)); err != nil {
+				return err
+			}
+			if mergeBlock.AddAffectedRows {
+				mergeBlock.container.affectedRows += uint64(newBat.RowCount())
+			}
+			mergeBlock.container.mp2[idx] = append(mergeBlock.container.mp2[idx], newBat)
+		}
+	}
+
+	// exist blk info, split it
+	if hasObject {
+		if err := splitObjectStats(mergeBlock, proc, analyzer, bat, blkInfosVec, tblIdx); err != nil {
+			return err
+		}
+	}
+
+	for _, b := range mergeBlock.container.mp {
+		b.SetRowCount(b.Vecs[0].Length())
 	}
 	return nil
+}
+
+func (mergeBlock *MergeBlock) resetMp(proc *process.Process) {
+	for k := range mergeBlock.container.mp {
+		mergeBlock.container.mp[k].CleanOnlyData()
+	}
+	for i, bats := range mergeBlock.container.mp2 {
+		for _, bat := range bats {
+			bat.Clean(proc.GetMPool())
+		}
+		mergeBlock.container.mp2[i] = mergeBlock.container.mp2[i][:0]
+	}
+}
+
+func (mergeBlock *MergeBlock) cleanMp(proc *process.Process) {
+	for k := range mergeBlock.container.mp {
+		mergeBlock.container.mp[k].Clean(proc.GetMPool())
+		mergeBlock.container.mp[k] = nil
+	}
+	mergeBlock.container.mp = nil
+	for _, bats := range mergeBlock.container.mp2 {
+		for _, bat := range bats {
+			bat.Clean(proc.GetMPool())
+		}
+	}
+	mergeBlock.container.mp2 = nil
+}
+
+func (mergeBlock *MergeBlock) GetAffectedRows() uint64 {
+	return mergeBlock.container.affectedRows
 }

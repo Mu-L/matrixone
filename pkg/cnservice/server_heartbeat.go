@@ -18,9 +18,14 @@ import (
 	"context"
 	"time"
 
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/system"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	logservicepb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
-	"go.uber.org/zap"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/matrixorigin/matrixone/pkg/version"
 )
 
 func (s *service) startCNStoreHeartbeat() error {
@@ -61,22 +66,53 @@ func (s *service) heartbeatTask(ctx context.Context) {
 }
 
 func (s *service) heartbeat(ctx context.Context) {
-	ctx2, cancel := context.WithTimeout(ctx, s.cfg.HAKeeper.HeatbeatTimeout.Duration)
+	start := time.Now()
+	defer func() {
+		v2.CNHeartbeatHistogram.Observe(time.Since(start).Seconds())
+	}()
+
+	ctx2, cancel := context.WithTimeoutCause(ctx, s.cfg.HAKeeper.HeatbeatTimeout.Duration, moerr.CauseHeartbeat)
 	defer cancel()
 
 	hb := logservicepb.CNStoreHeartbeat{
-		UUID:               s.cfg.UUID,
-		ServiceAddress:     s.cfg.ServiceAddress,
-		SQLAddress:         s.cfg.SQLAddress,
-		LockServiceAddress: s.cfg.LockService.ServiceAddress,
-		Role:               s.metadata.Role,
-		TaskServiceCreated: s.GetTaskRunner() != nil,
+		UUID:                s.cfg.UUID,
+		ServiceAddress:      s.pipelineServiceServiceAddr(),
+		SQLAddress:          s.cfg.SQLAddress,
+		LockServiceAddress:  s.lockServiceServiceAddr(),
+		ShardServiceAddress: s.shardServiceServiceAddr(),
+		Role:                s.metadata.Role,
+		TaskServiceCreated:  s.GetTaskRunner() != nil,
+		QueryAddress:        s.queryServiceServiceAddr(),
+		InitWorkState:       s.cfg.InitWorkState,
+		ConfigData:          s.config.GetData(),
+		Resource: logservicepb.Resource{
+			CPUTotal:     uint64(system.NumCPU()),
+			CPUAvailable: system.CPUAvailable(),
+			MemTotal:     system.MemoryTotal(),
+			MemAvailable: system.MemoryAvailable(),
+		},
+		CommitID: version.CommitID,
 	}
+	if s.gossipNode != nil {
+		hb.GossipAddress = s.gossipServiceAddr()
+		hb.GossipJoined = s.gossipNode.Joined()
+	}
+
 	cb, err := s._hakeeperClient.SendCNHeartbeat(ctx2, hb)
 	if err != nil {
+		err = moerr.AttachCause(ctx2, err)
+		v2.CNHeartbeatFailureCounter.Inc()
 		s.logger.Error("failed to send cn heartbeat", zap.Error(err))
 		return
 	}
+
+	select {
+	case <-s.hakeeperConnected:
+	default:
+		s.initTaskServiceHolder()
+		close(s.hakeeperConnected)
+	}
+	s.config.DecrCount()
 	s.handleCommands(cb.Commands)
 }
 
@@ -88,6 +124,23 @@ func (s *service) handleCommands(cmds []logservicepb.ScheduleCommand) {
 		s.logger.Info("applying schedule command", zap.String("command", cmd.LogString()))
 		if cmd.CreateTaskService != nil {
 			s.createTaskService(cmd.CreateTaskService)
+			s.createSQLLogger(cmd.CreateTaskService)
+			s.createProxyUser(cmd.CreateTaskService)
+		} else if s.gossipNode.Created() && cmd.JoinGossipCluster != nil {
+			s.gossipNode.SetJoined()
+
+			// Start an async task to join the gossip cluster to avoid the long time joining, and if
+			// it fails to join cluster, unset the joined state to give it another try.
+			if err := s.stopper.RunNamedTask("join gossip cluster", func(ctx context.Context) {
+				// The local state may be large, so do not set a timeout context.
+				if err := s.gossipNode.Join(cmd.JoinGossipCluster.Existing); err != nil {
+					s.logger.Error("failed to join gossip cluster", zap.Error(err))
+					s.gossipNode.UnsetJoined()
+				}
+			}); err != nil {
+				s.logger.Error("failed to start task to join gossip cluster", zap.Error(err))
+				s.gossipNode.UnsetJoined()
+			}
 		}
 	}
 }

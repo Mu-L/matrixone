@@ -15,6 +15,8 @@
 package db
 
 import (
+	"context"
+
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
@@ -39,34 +41,35 @@ func NewScheduledTxnTask(ctx *tasks.Context, db *DB, taskType tasks.TaskType, sc
 
 func (task *ScheduledTxnTask) Scopes() []common.ID { return task.scopes }
 func (task *ScheduledTxnTask) Scope() *common.ID {
-	if task.scopes == nil || len(task.scopes) == 0 {
+	if len(task.scopes) == 0 {
 		return nil
 	}
 	return &task.scopes[0]
 }
 
-func (task *ScheduledTxnTask) Execute() (err error) {
-	txn, err := task.db.StartTxn(nil)
+func (task *ScheduledTxnTask) Execute(ctx context.Context) (err error) {
+	txn, err := task.db.TxnMgr.StartTxn(nil)
 	if err != nil {
 		return
 	}
-	txnTask, err := task.factory(nil, txn)
+	txnTask, err := task.factory(&tasks.Context{ID: task.ID()}, txn)
 	if err != nil {
-		err2 := txn.Rollback()
+		err2 := txn.Rollback(ctx)
 		if err2 != nil {
 			panic(err2)
 		}
 		logutil.Warnf("Execute ScheduleTxnTask: %v. Rollbacked", err)
 		return
 	}
-	err = txnTask.OnExec()
+	err = txnTask.OnExec(task.db.Opts.Ctx)
 	if err != nil {
-		err2 := txn.Rollback()
+		logutil.Warnf("Task[%d] exec error: %v", task.ID(), err)
+		err2 := txn.Rollback(ctx)
 		if err2 != nil {
 			panic(err)
 		}
 	} else {
-		err = txn.Commit()
+		err = txn.Commit(ctx)
 		if err != nil {
 			return
 		}

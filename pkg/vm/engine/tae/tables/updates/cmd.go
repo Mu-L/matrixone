@@ -16,42 +16,106 @@ package updates
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"io"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
+const (
+	IOET_WALTxnCommand_AppendNode          uint16 = 3004
+	IOET_WALTxnCommand_DeleteNode          uint16 = 3005
+	IOET_WALTxnCommand_PersistedDeleteNode uint16 = 3013
+
+	IOET_WALTxnCommand_AppendNode_V1          uint16 = 1
+	IOET_WALTxnCommand_DeleteNode_V1          uint16 = 1
+	IOET_WALTxnCommand_DeleteNode_V2          uint16 = 2
+	IOET_WALTxnCommand_PersistedDeleteNode_V1 uint16 = 1
+
+	IOET_WALTxnCommand_AppendNode_CurrVer          = IOET_WALTxnCommand_AppendNode_V1
+	IOET_WALTxnCommand_DeleteNode_CurrVer          = IOET_WALTxnCommand_DeleteNode_V2
+	IOET_WALTxnCommand_PersistedDeleteNode_CurrVer = IOET_WALTxnCommand_PersistedDeleteNode_V1
+)
+
 func init() {
-	txnif.RegisterCmdFactory(txnbase.CmdDelete, func(int16) txnif.TxnCmd {
-		return NewEmptyCmd(txnbase.CmdDelete)
-	})
-	txnif.RegisterCmdFactory(txnbase.CmdAppend, func(int16) txnif.TxnCmd {
-		return NewEmptyCmd(txnbase.CmdAppend)
-	})
+	objectio.RegisterIOEnrtyCodec(
+		objectio.IOEntryHeader{
+			Type:    IOET_WALTxnCommand_AppendNode,
+			Version: IOET_WALTxnCommand_AppendNode_V1,
+		},
+		nil,
+		func(b []byte) (any, error) {
+			txnCmd := NewEmptyCmd(IOET_WALTxnCommand_AppendNode,
+				IOET_WALTxnCommand_AppendNode_V1)
+			err := txnCmd.UnmarshalBinary(b)
+			return txnCmd, err
+		},
+	)
+	objectio.RegisterIOEnrtyCodec(
+		objectio.IOEntryHeader{
+			Type:    IOET_WALTxnCommand_DeleteNode,
+			Version: IOET_WALTxnCommand_DeleteNode_V1,
+		},
+		nil,
+		func(b []byte) (any, error) {
+			txnCmd := NewEmptyCmd(IOET_WALTxnCommand_DeleteNode,
+				IOET_WALTxnCommand_DeleteNode_V1)
+			err := txnCmd.UnmarshalBinary(b)
+			return txnCmd, err
+		},
+	)
+	objectio.RegisterIOEnrtyCodec(
+		objectio.IOEntryHeader{
+			Type:    IOET_WALTxnCommand_DeleteNode,
+			Version: IOET_WALTxnCommand_DeleteNode_V2,
+		},
+		nil,
+		func(b []byte) (any, error) {
+			txnCmd := NewEmptyCmd(IOET_WALTxnCommand_DeleteNode,
+				IOET_WALTxnCommand_DeleteNode_V2)
+			err := txnCmd.UnmarshalBinary(b)
+			return txnCmd, err
+		},
+	)
+	objectio.RegisterIOEnrtyCodec(
+		objectio.IOEntryHeader{
+			Type:    IOET_WALTxnCommand_PersistedDeleteNode,
+			Version: IOET_WALTxnCommand_PersistedDeleteNode_V1,
+		},
+		nil,
+		func(b []byte) (any, error) {
+			txnCmd := NewEmptyCmd(IOET_WALTxnCommand_PersistedDeleteNode,
+				IOET_WALTxnCommand_PersistedDeleteNode_V1)
+			err := txnCmd.UnmarshalBinary(b)
+			return txnCmd, err
+		},
+	)
 }
 
 type UpdateCmd struct {
 	*txnbase.BaseCustomizedCmd
-	dbid    uint64
 	dest    *common.ID
-	delete  *DeleteNode
 	append  *AppendNode
-	cmdType int16
+	cmdType uint16
 }
 
-func NewEmptyCmd(cmdType int16) *UpdateCmd {
+func NewEmptyCmd(cmdType uint16, version uint16) *UpdateCmd {
 	cmd := &UpdateCmd{}
 	cmd.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(0, cmd)
 	cmd.cmdType = cmdType
-	if cmdType == txnbase.CmdDelete {
-		cmd.delete = NewDeleteNode(nil, 0)
-	} else if cmdType == txnbase.CmdAppend {
-		cmd.append = NewAppendNode(nil, 0, 0, nil)
+	if cmdType == IOET_WALTxnCommand_DeleteNode {
+		// cmd.delete = NewDeleteNode(nil, 0, version)
+		panic(fmt.Sprintf("%d", cmdType))
+	} else if cmdType == IOET_WALTxnCommand_AppendNode {
+		cmd.append = NewAppendNode(nil, 0, 0, false, nil)
+	} else if cmdType == IOET_WALTxnCommand_PersistedDeleteNode {
+		// cmd.delete = NewEmptyPersistedDeleteNode()
+		panic(fmt.Sprintf("%d", cmdType))
 	}
 	return cmd
 }
@@ -59,20 +123,8 @@ func NewEmptyCmd(cmdType int16) *UpdateCmd {
 func NewAppendCmd(id uint32, app *AppendNode) *UpdateCmd {
 	impl := &UpdateCmd{
 		append:  app,
-		cmdType: txnbase.CmdAppend,
+		cmdType: IOET_WALTxnCommand_AppendNode,
 		dest:    app.mvcc.meta.AsCommonID(),
-		dbid:    app.mvcc.meta.GetSegment().GetTable().GetDB().ID,
-	}
-	impl.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(id, impl)
-	return impl
-}
-
-func NewDeleteCmd(id uint32, del *DeleteNode) *UpdateCmd {
-	impl := &UpdateCmd{
-		delete:  del,
-		cmdType: txnbase.CmdDelete,
-		dest:    del.chain.mvcc.meta.AsCommonID(),
-		dbid:    del.chain.mvcc.meta.GetSegment().GetTable().GetDB().ID,
 	}
 	impl.BaseCustomizedCmd = txnbase.NewBaseCustomizedCmd(id, impl)
 	return impl
@@ -81,34 +133,34 @@ func NewDeleteCmd(id uint32, del *DeleteNode) *UpdateCmd {
 func (c *UpdateCmd) GetAppendNode() *AppendNode {
 	return c.append
 }
-func (c *UpdateCmd) GetDeleteNode() *DeleteNode {
-	return c.delete
-}
-func (c *UpdateCmd) GetDBID() uint64 {
-	return c.dbid
-}
 
 func (c *UpdateCmd) GetDest() *common.ID {
 	return c.dest
 }
 func (c *UpdateCmd) SetReplayTxn(txn txnif.AsyncTxn) {
 	switch c.cmdType {
-	case txnbase.CmdAppend:
+	case IOET_WALTxnCommand_AppendNode:
 		c.append.Txn = txn
-	case txnbase.CmdDelete:
-		c.delete.Txn = txn
+	default:
+		panic(fmt.Sprintf("invalid command type %d", c.cmdType))
+	}
+}
+func (c *UpdateCmd) GetCurrentVersion() uint16 {
+	switch c.cmdType {
+	case IOET_WALTxnCommand_AppendNode:
+		return IOET_WALTxnCommand_AppendNode_CurrVer
+	case IOET_WALTxnCommand_DeleteNode:
+		return IOET_WALTxnCommand_DeleteNode_CurrVer
+	case IOET_WALTxnCommand_PersistedDeleteNode:
+		return IOET_WALTxnCommand_PersistedDeleteNode_CurrVer
 	default:
 		panic(fmt.Sprintf("invalid command type %d", c.cmdType))
 	}
 }
 func (c *UpdateCmd) ApplyCommit() {
 	switch c.cmdType {
-	case txnbase.CmdAppend:
-		if _, err := c.append.TxnMVCCNode.ApplyCommit(nil); err != nil {
-			panic(err)
-		}
-	case txnbase.CmdDelete:
-		if _, err := c.delete.TxnMVCCNode.ApplyCommit(nil); err != nil {
+	case IOET_WALTxnCommand_AppendNode:
+		if _, err := c.append.TxnMVCCNode.ApplyCommit(c.append.Txn.GetID()); err != nil {
 			panic(err)
 		}
 	default:
@@ -117,12 +169,8 @@ func (c *UpdateCmd) ApplyCommit() {
 }
 func (c *UpdateCmd) ApplyRollback() {
 	switch c.cmdType {
-	case txnbase.CmdAppend:
-		if err := c.append.ApplyRollback(nil); err != nil {
-			panic(err)
-		}
-	case txnbase.CmdDelete:
-		if err := c.delete.ApplyRollback(nil); err != nil {
+	case IOET_WALTxnCommand_AppendNode:
+		if err := c.append.ApplyRollback(); err != nil {
 			panic(err)
 		}
 	default:
@@ -130,92 +178,74 @@ func (c *UpdateCmd) ApplyRollback() {
 	}
 }
 func (c *UpdateCmd) Desc() string {
-	if c.cmdType == txnbase.CmdAppend {
+	switch c.cmdType {
+	case IOET_WALTxnCommand_AppendNode:
 		return fmt.Sprintf("CmdName=Append;Dest=%s;%s;CSN=%d", c.dest.BlockString(), c.append.GeneralDesc(), c.ID)
-	} else if c.cmdType == txnbase.CmdDelete {
-		return fmt.Sprintf("CmdName=Delete;Dest=%s;%s;CSN=%d", c.dest.BlockString(), c.delete.GeneralDesc(), c.ID)
 	}
-	panic(moerr.NewInternalErrorNoCtx("unknown cmd type: %d", c.cmdType))
+	panic(moerr.NewInternalErrorNoCtxf("unknown cmd type: %d", c.cmdType))
 }
 
 func (c *UpdateCmd) String() string {
-	if c.cmdType == txnbase.CmdAppend {
+	switch c.cmdType {
+	case IOET_WALTxnCommand_AppendNode:
 		return fmt.Sprintf("CmdName=Append;Dest=%s;%s;CSN=%d", c.dest.BlockString(), c.append.GeneralString(), c.ID)
-	} else if c.cmdType == txnbase.CmdDelete {
-		return fmt.Sprintf("CmdName=Delete;Dest=%s;%s;CSN=%d", c.dest.BlockString(), c.delete.GeneralString(), c.ID)
 	}
-	panic(moerr.NewInternalErrorNoCtx("unknown cmd type: %d", c.cmdType))
+	panic(moerr.NewInternalErrorNoCtxf("unknown cmd type: %d", c.cmdType))
 }
 
 func (c *UpdateCmd) VerboseString() string {
-	if c.cmdType == txnbase.CmdAppend {
+	switch c.cmdType {
+	case IOET_WALTxnCommand_AppendNode:
 		return fmt.Sprintf("CmdName=Append;Dest=%s;CSN=%d;%s", c.dest.BlockString(), c.ID, c.append.GeneralVerboseString())
-	} else if c.cmdType == txnbase.CmdDelete {
-		return fmt.Sprintf("CmdName=Delete;Dest=%s;CSN=%d;%s", c.dest.BlockString(), c.ID, c.delete.GeneralVerboseString())
 	}
-	panic(moerr.NewInternalErrorNoCtx("unknown cmd type: %d", c.cmdType))
+	panic(moerr.NewInternalErrorNoCtxf("unknown cmd type: %d", c.cmdType))
 }
 
-func (c *UpdateCmd) GetType() int16 { return c.cmdType }
+func (c *UpdateCmd) GetType() uint16 { return c.cmdType }
 
 func (c *UpdateCmd) WriteTo(w io.Writer) (n int64, err error) {
 	var sn int64
-	if err = binary.Write(w, binary.BigEndian, c.GetType()); err != nil {
+	if _, err = w.Write(types.EncodeUint16(&c.cmdType)); err != nil {
 		return
 	}
-	if err = binary.Write(w, binary.BigEndian, c.ID); err != nil {
+	ver := c.GetCurrentVersion()
+	if _, err = w.Write(types.EncodeUint16(&ver)); err != nil {
 		return
 	}
-	if err = binary.Write(w, binary.BigEndian, c.dbid); err != nil {
+
+	if _, err = w.Write(types.EncodeUint32(&c.ID)); err != nil {
 		return
 	}
-	if err = binary.Write(w, binary.BigEndian, c.dest.TableID); err != nil {
+	n += 6
+	if _, err = w.Write(common.EncodeID(c.dest)); err != nil {
 		return
 	}
-	if err = binary.Write(w, binary.BigEndian, c.dest.SegmentID); err != nil {
-		return
-	}
-	if err = binary.Write(w, binary.BigEndian, c.dest.BlockID); err != nil {
-		return
-	}
+	n += common.IDSize
 	switch c.GetType() {
-	case txnbase.CmdDelete:
-		sn, err = c.delete.WriteTo(w)
-	case txnbase.CmdAppend:
+	case IOET_WALTxnCommand_AppendNode:
 		sn, err = c.append.WriteTo(w)
 	}
-	n += sn + 2 + 4
+	n += sn
 	return
 }
 
 func (c *UpdateCmd) ReadFrom(r io.Reader) (n int64, err error) {
-	if err = binary.Read(r, binary.BigEndian, &c.ID); err != nil {
-		return
-	}
-	if err = binary.Read(r, binary.BigEndian, &c.dbid); err != nil {
+	if _, err = r.Read(types.EncodeUint32(&c.ID)); err != nil {
 		return
 	}
 	c.dest = &common.ID{}
-	if err = binary.Read(r, binary.BigEndian, &c.dest.TableID); err != nil {
-		return
-	}
-	if err = binary.Read(r, binary.BigEndian, &c.dest.SegmentID); err != nil {
-		return
-	}
-	if err = binary.Read(r, binary.BigEndian, &c.dest.BlockID); err != nil {
+	if _, err = r.Read(common.EncodeID(c.dest)); err != nil {
 		return
 	}
 	switch c.GetType() {
-	case txnbase.CmdDelete:
-		n, err = c.delete.ReadFrom(r)
-	case txnbase.CmdAppend:
+	case IOET_WALTxnCommand_AppendNode:
 		n, err = c.append.ReadFrom(r)
 	}
-	n += 4
+	n += 4 + common.IDSize
 	return
 }
 
-func (c *UpdateCmd) Marshal() (buf []byte, err error) {
+func (c *UpdateCmd) MarshalBinary() (buf []byte, err error) {
 	var bbuf bytes.Buffer
 	if _, err = c.WriteTo(&bbuf); err != nil {
 		return
@@ -224,7 +254,7 @@ func (c *UpdateCmd) Marshal() (buf []byte, err error) {
 	return
 }
 
-func (c *UpdateCmd) Unmarshal(buf []byte) error {
+func (c *UpdateCmd) UnmarshalBinary(buf []byte) error {
 	bbuf := bytes.NewBuffer(buf)
 	_, err := c.ReadFrom(bbuf)
 	return err

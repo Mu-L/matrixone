@@ -1,3 +1,10 @@
+set global enable_privilege_cache = off;
+select enable_fault_injection();
+enable_fault_injection()
+true
+select add_fault_point('fj/trace/partitionstate', ':::', 'echo', 20, 'mo_tables');
+add_fault_point(fj/trace/partitionstate, :::, echo, 20, mo_tables)
+true
 drop account if exists `test@123456`;
 drop account if exists testaccount;
 drop account if exists 123_acc;
@@ -22,6 +29,7 @@ drop account if exists user_strip_01;
 drop account if exists account_1;
 drop account if exists aaa;
 drop account if exists account;
+drop account if exists ccc;
 create account `test@123456` ADMIN_NAME 'admin' IDENTIFIED BY '123456';
 internal error: the name "test@123456" is invalid
 select account_name from mo_catalog.mo_account where account_name='test@123456';
@@ -106,7 +114,7 @@ cm2    abcddddddfsfafaffsefsfsefljofiseosfjosissssssssssssssssssssssssssssssssss
 create account cm3 ADMIN_NAME 'admin' IDENTIFIED BY '123456' comment '';
 select account_name,comments from mo_catalog.mo_account where account_name='cm3';
 account_name    comments
-cm3    
+cm3
 create accout a1 ADMIN_NAME ' admin' IDENTIFIED BY '123456';
 SQL parser error: You have an error in your SQL syntax; check the manual that corresponds to your MatrixOne server version for the right syntax to use. syntax error at line 1 column 13 near " accout a1 ADMIN_NAME ' admin' IDENTIFIED BY '123456';";
 create account a1;
@@ -157,6 +165,7 @@ use mo_catalog;
 show tables;
 Tables_in_mo_catalog
 mo_indexes
+mo_table_partitions
 mo_tables
 mo_user
 mo_role
@@ -164,13 +173,23 @@ mo_user_grant
 mo_role_grant
 mo_role_privs
 mo_user_defined_function
-mo_mysql_compatbility_mode
-mo_pubs
+mo_mysql_compatibility_mode
+mo_retention
+mo_stored_procedure
+mo_stages
+mo_snapshots
 mo_database
 mo_columns
+mo_sessions
+mo_configurations
+mo_locks
+mo_variables
+mo_transactions
+mo_cache
+mo_foreign_keys
 select user_name,authentication_string,owner from mo_user;
 user_name    authentication_string    owner
-admin    123456    2
+admin    *6BB4837EB74329105EE4568DDA7DC67ED2CA2AD9    2
 select role_name,obj_type,privilege_name,privilege_level from mo_role_privs;
 role_name    obj_type    privilege_name    privilege_level
 accountadmin    account    create user    *
@@ -202,7 +221,7 @@ accountadmin    table    reference    *.*
 accountadmin    table    index    *.*
 accountadmin    table    table all    *.*
 accountadmin    table    table ownership    *.*
-accountadmin    table    values    t
+accountadmin    table    values    *.*
 public    account    connect    *
 create database account_1_db;
 CREATE USER account_1_user IDENTIFIED BY '123456';
@@ -224,6 +243,24 @@ create account if not exists accout_Xingming_insert ADMIN_NAME 'root' IDENTIFIED
 select account_name from mo_catalog.mo_account where account_name='accout_xingming_insert';
 account_name
 accout_xingming_insert
+PREPARE s1 FROM "create account ? ADMIN_NAME ? IDENTIFIED BY ?";
+set @a_var = 'ccc';
+set @b_var = 'admin';
+set @c_var = '111';
+EXECUTE s1 USING @a_var, @b_var, @c_var;
+DEALLOCATE PREPARE s1;
+select account_name from mo_catalog.mo_account where account_name='ccc';
+account_name
+ccc
+drop account ccc;
+PREPARE s1 FROM "create account ? ADMIN_NAME 'admin' IDENTIFIED BY ?";
+set @a_var = 'ccc';
+set @c_var = '222';
+EXECUTE s1 USING @a_var, @c_var;
+DEALLOCATE PREPARE s1;
+select 1;
+1
+1
 drop account if exists `test@123456`;
 drop account if exists testaccount;
 drop account if exists 123_acc;
@@ -248,3 +285,8 @@ drop account if exists user_strip_01;
 drop account if exists account_1;
 drop account if exists aaa;
 drop account if exists account;
+drop account if exists ccc;
+select disable_fault_injection();
+disable_fault_injection()
+true
+set global enable_privilege_cache = on;

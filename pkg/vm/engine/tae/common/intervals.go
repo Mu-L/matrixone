@@ -15,10 +15,10 @@
 package common
 
 import (
-	"encoding/binary"
 	"io"
 	"sort"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 )
 
@@ -42,7 +42,7 @@ func (intervals *ClosedIntervals) GetMin() uint64 {
 	}
 	return intervals.Intervals[0].Start
 }
-func (intervals *ClosedIntervals) TryMerge(o ClosedIntervals) {
+func (intervals *ClosedIntervals) TryMerge(o *ClosedIntervals) {
 	intervals.Intervals = append(intervals.Intervals, o.Intervals...)
 	sort.Slice(intervals.Intervals, func(i, j int) bool {
 		return intervals.Intervals[i].Start < intervals.Intervals[j].Start
@@ -143,7 +143,7 @@ func (intervals *ClosedIntervals) ContainsInterval(oIntervals ClosedInterval) bo
 }
 
 func (intervals *ClosedIntervals) IsCoveredByInt(i uint64) bool {
-	if intervals.Intervals == nil || len(intervals.Intervals) == 0 {
+	if len(intervals.Intervals) == 0 {
 		return true
 	}
 	return i >= intervals.Intervals[len(intervals.Intervals)-1].End
@@ -158,45 +158,39 @@ func (intervals *ClosedIntervals) GetCardinality() int {
 }
 func (intervals *ClosedIntervals) WriteTo(w io.Writer) (n int64, err error) {
 	if intervals == nil {
-		if err = binary.Write(w, binary.BigEndian, uint64(0)); err != nil {
+		length := uint64(0)
+		if _, err = w.Write(types.EncodeUint64(&length)); err != nil {
 			return
 		}
 		n += 8
 		return n, nil
 	}
-	if err = binary.Write(w, binary.BigEndian, uint64(len(intervals.Intervals))); err != nil {
+	length := uint64(len(intervals.Intervals))
+	if _, err = w.Write(types.EncodeUint64(&length)); err != nil {
 		return
 	}
 	n += 8
 	for _, interval := range intervals.Intervals {
-		if err = binary.Write(w, binary.BigEndian, interval.Start); err != nil {
+		if _, err = w.Write(EncodeCloseInterval(interval)); err != nil {
 			return
 		}
-		n += 8
-		if err = binary.Write(w, binary.BigEndian, interval.End); err != nil {
-			return
-		}
-		n += 8
+		n += CloseIntervalSize
 	}
 	return
 }
 func (intervals *ClosedIntervals) ReadFrom(r io.Reader) (n int64, err error) {
 	length := uint64(0)
-	if err = binary.Read(r, binary.BigEndian, &length); err != nil {
+	if _, err = r.Read(types.EncodeUint64(&length)); err != nil {
 		return
 	}
 	n += 8
 	intervals.Intervals = make([]*ClosedInterval, length)
 	for i := 0; i < int(length); i++ {
 		intervals.Intervals[i] = &ClosedInterval{}
-		if err = binary.Read(r, binary.BigEndian, &intervals.Intervals[i].Start); err != nil {
+		if _, err = r.Read(EncodeCloseInterval(intervals.Intervals[i])); err != nil {
 			return
 		}
-		n += 8
-		if err = binary.Read(r, binary.BigEndian, &intervals.Intervals[i].End); err != nil {
-			return
-		}
-		n += 8
+		n += CloseIntervalSize
 	}
 	return
 }
@@ -204,12 +198,12 @@ func (intervals *ClosedIntervals) ReadFrom(r io.Reader) (n int64, err error) {
 // Equal is for test
 func (intervals *ClosedIntervals) Equal(o *ClosedIntervals) bool {
 	if len(intervals.Intervals) != len(o.Intervals) {
-		logutil.Infof("%v\n%v", intervals.Intervals, o.Intervals)
+		logutil.Debugf("%v\n%v", intervals.Intervals, o.Intervals)
 		return false
 	}
 	for i, interval := range intervals.Intervals {
 		if interval.Start != o.Intervals[i].Start || interval.End != o.Intervals[i].End {
-			logutil.Infof("%v\n%v", intervals.Intervals, o.Intervals)
+			logutil.Debugf("%v\n%v", intervals.Intervals, o.Intervals)
 			return false
 		}
 	}

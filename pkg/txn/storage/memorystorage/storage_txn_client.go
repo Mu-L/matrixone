@@ -17,8 +17,10 @@ package memorystorage
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/pb/lock"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
@@ -46,10 +48,14 @@ func NewStorageTxnClient(
 
 var _ client.TxnClient = new(StorageTxnClient)
 
-func (s *StorageTxnClient) New(options ...client.TxnOption) (client.TxnOperator, error) {
+func (s *StorageTxnClient) New(
+	ctx context.Context,
+	ts timestamp.Timestamp,
+	options ...client.TxnOption) (client.TxnOperator, error) {
 	now, _ := s.clock.Now()
+	uid, _ := uuid.NewV7()
 	meta := txn.TxnMeta{
-		ID:         []byte(uuid.NewString()),
+		ID:         []byte(uid.String()),
 		SnapshotTS: now,
 	}
 	return &StorageTxnOperator{
@@ -58,7 +64,27 @@ func (s *StorageTxnClient) New(options ...client.TxnOption) (client.TxnOperator,
 	}, nil
 }
 
-func (*StorageTxnClient) NewWithSnapshot(snapshot []byte) (client.TxnOperator, error) {
+func (s *StorageTxnClient) RestartTxn(
+	ctx context.Context,
+	op client.TxnOperator,
+	ts timestamp.Timestamp,
+	options ...client.TxnOption) (client.TxnOperator, error) {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnClient) GetState() client.TxnState {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnClient) IterTxns(func(client.TxnOverview) bool) {
+	panic("unimplemented")
+}
+
+func (*StorageTxnClient) NewWithSnapshot(snapshot txn.CNTxnSnapshot) (client.TxnOperator, error) {
+	panic("unimplemented")
+}
+
+func (*StorageTxnClient) AbortAllRunningTxn() {
 	panic("unimplemented")
 }
 
@@ -66,20 +92,113 @@ func (*StorageTxnClient) Close() error {
 	return nil
 }
 
+func (*StorageTxnClient) MinTimestamp() timestamp.Timestamp {
+	return timestamp.Timestamp{}
+}
+
+func (*StorageTxnClient) WaitLogTailAppliedAt(
+	ctx context.Context,
+	ts timestamp.Timestamp) (timestamp.Timestamp, error) {
+	return timestamp.Timestamp{}, nil
+}
+
+func (*StorageTxnClient) GetLatestCommitTS() timestamp.Timestamp { panic("unimplemented") }
+func (*StorageTxnClient) SyncLatestCommitTS(timestamp.Timestamp) { panic("unimplemented") }
+func (*StorageTxnClient) GetSyncLatestCommitTSTimes() uint64     { panic("unimplemented") }
+func (*StorageTxnClient) Pause()                                 { panic("unimplemented") }
+func (*StorageTxnClient) Resume()                                { panic("unimplemented") }
+func (*StorageTxnClient) RefreshExpressionEnabled() bool         { panic("unimplemented") }
+func (*StorageTxnClient) CNBasedConsistencyEnabled() bool        { panic("unimplemented") }
+
 type StorageTxnOperator struct {
 	storages map[string]*Storage
 	meta     txn.TxnMeta
 }
 
+func (s *StorageTxnOperator) EnterIncrStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *StorageTxnOperator) ExitIncrStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *StorageTxnOperator) EnterRollbackStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *StorageTxnOperator) ExitRollbackStmt() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *StorageTxnOperator) SetFootPrints(id int, enter bool) {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *StorageTxnOperator) IsSnapOp() bool {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) CloneSnapshotOp(snapshot timestamp.Timestamp) client.TxnOperator {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) EnterRunSql() {
+	//TODO implement me
+	panic("implement me")
+}
+
+func (s *StorageTxnOperator) ExitRunSql() {
+	//TODO implement me
+	panic("implement me")
+}
+
 var _ client.TxnOperator = new(StorageTxnOperator)
+
+func (s *StorageTxnOperator) AddWorkspace(_ client.Workspace) {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) GetWorkspace() client.Workspace {
+	panic("unimplemented")
+}
 
 func (s *StorageTxnOperator) ApplySnapshot(data []byte) error {
 	panic("unimplemented")
 }
 
+func (s *StorageTxnOperator) ResetRetry(retry bool) {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) IsRetry() bool {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) SetOpenLog(retry bool) {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) IsOpenLog() bool {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) AppendEventCallback(event client.EventType, callbacks ...func(client.TxnEvent)) {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) Debug(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
+	panic("unimplemented")
+}
+
 func (s *StorageTxnOperator) Commit(ctx context.Context) error {
 	for _, storage := range s.storages {
-		if _, err := storage.Commit(ctx, s.meta); err != nil {
+		if _, err := storage.Commit(ctx, s.meta, nil, nil); err != nil {
 			return err
 		}
 	}
@@ -136,12 +255,32 @@ func (s *StorageTxnOperator) Rollback(ctx context.Context) error {
 	return nil
 }
 
-func (*StorageTxnOperator) Snapshot() ([]byte, error) {
+func (*StorageTxnOperator) Snapshot() (txn.CNTxnSnapshot, error) {
 	panic("unimplemented")
 }
 
 func (s *StorageTxnOperator) Txn() txn.TxnMeta {
 	return s.meta
+}
+
+func (s *StorageTxnOperator) SnapshotTS() timestamp.Timestamp {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) CreateTS() timestamp.Timestamp {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) Status() txn.TxnStatus {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) PKDedupCount() int {
+	panic("unimplemented")
+}
+
+func (s *StorageTxnOperator) TxnRef() *txn.TxnMeta {
+	return &s.meta
 }
 
 func (s *StorageTxnOperator) Write(ctx context.Context, ops []txn.TxnRequest) (*rpc.SendResult, error) {
@@ -211,6 +350,38 @@ func (s *StorageTxnOperator) AddLockTable(lock.LockTable) error {
 	panic("should not call")
 }
 
-func (s *StorageTxnOperator) UpdateSnapshot(ts timestamp.Timestamp) error {
+func (s *StorageTxnOperator) HasLockTable(table uint64) bool {
 	panic("should not call")
+}
+
+func (s *StorageTxnOperator) UpdateSnapshot(ctx context.Context, ts timestamp.Timestamp) error {
+	panic("should not call")
+}
+
+func (s *StorageTxnOperator) AddWaitLock(tableID uint64, rows [][]byte, opt lock.LockOptions) uint64 {
+	panic("should not call")
+}
+
+func (s *StorageTxnOperator) RemoveWaitLock(key uint64) {
+	panic("should not call")
+}
+
+func (s *StorageTxnOperator) GetOverview() client.TxnOverview {
+	panic("should not call")
+}
+
+func (s *StorageTxnOperator) LockSkipped(tableID uint64, mode lock.LockMode) bool {
+	panic("should not call")
+}
+
+func (s *StorageTxnOperator) TxnOptions() txn.TxnOptions {
+	panic("should not call")
+}
+
+func (s *StorageTxnOperator) NextSequence() uint64 {
+	panic("should not call")
+}
+
+func (s *StorageTxnOperator) GetWaitActiveCost() time.Duration {
+	return time.Duration(0)
 }

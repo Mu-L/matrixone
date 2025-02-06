@@ -21,8 +21,11 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
@@ -39,16 +42,31 @@ type IterInfo struct {
 	IterID ID
 }
 
-func (t *Table) NewReader(
+func (t *Table) BuildShardingReaders(
 	ctx context.Context,
-	parallel int,
+	_ any,
 	expr *plan.Expr,
-	shardIDs [][]byte,
-) (
-	readers []engine.Reader,
-	err error,
-) {
+	relData engine.RelData,
+	parallel int,
+	_ int,
+	_ bool,
+	_ engine.TombstoneApplyPolicy) (readers []engine.Reader, err error) {
+	panic("Not Support")
+}
+
+func (t *Table) BuildReaders(
+	ctx context.Context,
+	_ any,
+	expr *plan.Expr,
+	relData engine.RelData,
+	parallel int,
+	_ int,
+	_ bool,
+	_ engine.TombstoneApplyPolicy,
+	_ engine.FilterHint) (readers []engine.Reader, err error) {
+
 	readers = make([]engine.Reader, parallel)
+	var shardIDs = relData.GetShardIDList()
 
 	var shards []Shard
 	if len(shardIDs) == 0 {
@@ -76,17 +94,16 @@ func (t *Table) NewReader(
 	} else {
 		// some
 		idSet := make(map[uint64]bool)
-		for _, bs := range shardIDs {
-			id := binary.LittleEndian.Uint64(bs)
-			idSet[id] = true
+		for i := 0; i < len(shardIDs); i++ {
+			idSet[shardIDs[i]] = true
 		}
-		for _, store := range getDNServices(t.engine.cluster) {
+		for _, store := range getTNServices(t.engine.cluster) {
 			for _, shard := range store.Shards {
 				if !idSet[shard.ShardID] {
 					continue
 				}
 				shards = append(shards, Shard{
-					DNShardRecord: metadata.DNShardRecord{
+					TNShardRecord: metadata.TNShardRecord{
 						ShardID: shard.ShardID,
 					},
 					ReplicaID: shard.ReplicaID,
@@ -102,7 +119,7 @@ func (t *Table) NewReader(
 		true,
 		theseShards(shards),
 		OpNewTableIter,
-		NewTableIterReq{
+		&NewTableIterReq{
 			TableID: t.id,
 			Expr:    expr,
 		},
@@ -142,15 +159,20 @@ func (t *Table) NewReader(
 
 var _ engine.Reader = new(TableReader)
 
-func (t *TableReader) Read(ctx context.Context, colNames []string, plan *plan.Expr, mp *mpool.MPool) (*batch.Batch, error) {
+func (t *TableReader) Read(
+	ctx context.Context,
+	colNames []string,
+	plan *plan.Expr,
+	mp *mpool.MPool,
+	bat *batch.Batch) (bool, error) {
 	if t == nil {
-		return nil, nil
+		return true, nil
 	}
 
 	for {
 
 		if len(t.iterInfos) == 0 {
-			return nil, nil
+			return true, nil
 		}
 
 		resps, err := DoTxnRequest[ReadResp](
@@ -159,13 +181,13 @@ func (t *TableReader) Read(ctx context.Context, colNames []string, plan *plan.Ex
 			true,
 			thisShard(t.iterInfos[0].Shard),
 			OpRead,
-			ReadReq{
+			&ReadReq{
 				IterID:   t.iterInfos[0].IterID,
 				ColNames: colNames,
 			},
 		)
 		if err != nil {
-			return nil, err
+			return true, err
 		}
 
 		resp := resps[0]
@@ -176,9 +198,25 @@ func (t *TableReader) Read(ctx context.Context, colNames []string, plan *plan.Ex
 			continue
 		}
 
-		return resp.Batch, nil
+		logutil.Debug(testutil.OperatorCatchBatch("table reader", resp.Batch))
+		_, err = bat.Append(t.ctx, mp, resp.Batch)
+		resp.Batch.Clean(mp)
+		if err != nil {
+			return true, err
+		}
+		return false, nil
 	}
 
+}
+
+func (t *TableReader) SetFilterZM(objectio.ZoneMap) {
+}
+
+func (t *TableReader) GetOrderBy() []*plan.OrderBySpec {
+	return nil
+}
+
+func (t *TableReader) SetOrderBy([]*plan.OrderBySpec) {
 }
 
 func (t *TableReader) Close() error {
@@ -192,7 +230,7 @@ func (t *TableReader) Close() error {
 			true,
 			thisShard(info.Shard),
 			OpCloseTableIter,
-			CloseTableIterReq{
+			&CloseTableIterReq{
 				IterID: info.IterID,
 			},
 		)
@@ -201,16 +239,164 @@ func (t *TableReader) Close() error {
 	return nil
 }
 
-func (t *Table) Ranges(ctx context.Context, _ *plan.Expr) ([][]byte, error) {
-	// return encoded shard ids
-	nodes := getDNServices(t.engine.cluster)
-	shards := make([][]byte, 0, len(nodes))
+func (t *Table) GetEngineType() engine.EngineType {
+	return engine.Memory
+}
+
+func (t *Table) GetProcess() any {
+	panic("Not Support")
+}
+
+func (t *Table) Ranges(_ context.Context, _ engine.RangesParam) (engine.RelData, error) {
+	rd := &MemRelationData{}
+	nodes := getTNServices(t.engine.cluster)
+	shards := make(ShardIdSlice, 0, len(nodes)*8)
 	for _, node := range nodes {
 		for _, shard := range node.Shards {
 			id := make([]byte, 8)
 			binary.LittleEndian.PutUint64(id, shard.ShardID)
-			shards = append(shards, id)
+			shards = append(shards, id...)
 		}
 	}
-	return shards, nil
+	rd.Shards = shards
+	return rd, nil
+}
+
+func (t *Table) CollectTombstones(
+	_ context.Context,
+	_ int,
+	_ engine.TombstoneCollectPolicy,
+) (engine.Tombstoner, error) {
+	panic("implement me")
+}
+
+// for memory engine.
+type MemRelationData struct {
+	Shards ShardIdSlice
+}
+
+func (rd *MemRelationData) String() string {
+	return "RelData[M]"
+}
+
+func (rd *MemRelationData) GetBlockInfoSlice() objectio.BlockInfoSlice {
+	panic("not supported")
+}
+
+func (rd *MemRelationData) GetBlockInfo(i int) objectio.BlockInfo {
+	panic("not supported")
+}
+
+func (rd *MemRelationData) SetBlockInfo(i int, blk *objectio.BlockInfo) {
+	panic("not supported")
+}
+
+func (rd *MemRelationData) AppendBlockInfo(blk *objectio.BlockInfo) {
+	panic("not supported")
+}
+
+func (rd *MemRelationData) AppendBlockInfoSlice(objectio.BlockInfoSlice) {
+	panic("not supported")
+}
+
+func (rd *MemRelationData) GetShardIDList() []uint64 {
+	ids := make([]uint64, rd.Shards.Len())
+	idsLen := rd.Shards.Len()
+
+	for idx := range idsLen {
+		ids[idx] = rd.Shards.Get(idx)
+	}
+
+	return ids
+}
+
+func (rd *MemRelationData) GetShardID(i int) uint64 {
+	return rd.Shards.Get(i)
+}
+
+func (rd *MemRelationData) SetShardID(i int, id uint64) {
+	rd.Shards.Set(i, id)
+}
+
+func (rd *MemRelationData) AppendShardID(id uint64) {
+	bb := make([]byte, 8)
+	binary.LittleEndian.PutUint64(bb, id)
+	rd.Shards.Append(bb)
+}
+
+func (rd *MemRelationData) MarshalBinary() ([]byte, error) {
+	panic("Not Support")
+}
+
+func (rd *MemRelationData) GetType() engine.RelDataType {
+	return engine.RelDataShardIDList
+}
+
+func (rd MemRelationData) UnmarshalBinary(buf []byte) error {
+	panic("Not Support")
+}
+
+func (rd *MemRelationData) AttachTombstones(tombstones engine.Tombstoner) error {
+	panic("Not Support")
+}
+
+func (rd *MemRelationData) GetTombstones() engine.Tombstoner {
+	panic("Not Support")
+}
+
+func (rd *MemRelationData) DataSlice(i, j int) engine.RelData {
+	panic("Not Support")
+}
+
+func (rd *MemRelationData) BuildEmptyRelData(i int) engine.RelData {
+	return &MemRelationData{}
+}
+
+func (rd *MemRelationData) Split(i int) []engine.RelData {
+	panic("not supported")
+}
+
+func (rd *MemRelationData) DataCnt() int {
+	return rd.Shards.Len()
+}
+
+type ShardIdSlice []byte
+
+var _ engine.Ranges = (*ShardIdSlice)(nil)
+
+func (s *ShardIdSlice) Set(i int, id uint64) {
+	buf := (*s)[i*8:]
+	binary.LittleEndian.PutUint64(buf, id)
+}
+
+func (s *ShardIdSlice) GetBytes(i int) []byte {
+	return (*s)[i*8 : (i+1)*8]
+}
+
+func (s *ShardIdSlice) Len() int {
+	return len(*s) / 8
+}
+
+func (s *ShardIdSlice) Append(bs []byte) {
+	*s = append(*s, bs...)
+}
+
+func (s *ShardIdSlice) Size() int {
+	return len(*s)
+}
+
+func (s *ShardIdSlice) SetBytes(bs []byte) {
+	*s = bs
+}
+
+func (s *ShardIdSlice) GetAllBytes() []byte {
+	return *s
+}
+
+func (s *ShardIdSlice) Slice(i, j int) []byte {
+	return (*s)[i*8 : j*8]
+}
+
+func (s *ShardIdSlice) Get(i int) uint64 {
+	return binary.LittleEndian.Uint64(s.GetBytes(i))
 }

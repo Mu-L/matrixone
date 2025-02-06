@@ -137,7 +137,7 @@ count(b)
 2
 select count(b) from t1 where b >= 10;
 count(b)
-2
+0
 select count(c) from t1 where c = 10;
 count(c)
 0
@@ -384,11 +384,14 @@ INSERT INTO t1 SELECT a, b+8192    FROM t1;
 INSERT INTO t1 SELECT a, b+16384   FROM t1;
 INSERT INTO t1 SELECT a, b+32768   FROM t1;
 SELECT a,COUNT(DISTINCT b) AS cnt FROM t1 GROUP BY a HAVING cnt > 50;
-SQL syntax error: column "cnt" must appear in the GROUP BY clause or be used in an aggregate function
+a    cnt
+1    65536
 SELECT a, SUM( b) AS sumation FROM t1 GROUP BY a HAVING sumation > 50;
-SQL syntax error: column "sumation" must appear in the GROUP BY clause or be used in an aggregate function
+a    sumation
+1    2147516416
 SELECT a, AVG( b) AS average FROM t1 GROUP BY a HAVING average > 50;
-SQL syntax error: column "average" must appear in the GROUP BY clause or be used in an aggregate function
+a    average
+1    32768.5
 SELECT a,COUNT(DISTINCT b) FROM t1 GROUP BY a HAVING COUNT(DISTINCT b) > 50;
 a	COUNT(DISTINCT b)
 1	65536
@@ -398,4 +401,21 @@ a	SUM( b)
 SELECT DISTINCT a, AVG( b) FROM t1 GROUP BY a HAVING AVG( b) > 50;
 a	AVG( b)
 1	32768.5000
+DROP TABLE t1;
+CREATE TABLE t1 (a INT);
+INSERT INTO t1 SELECT result FROM generate_series(1,100000) g;
+SELECT COUNT(*) FROM t1;
+count(*)
+100000
+DELETE FROM t1 WHERE a>50000;
+SELECT COUNT(*) FROM t1;
+count(*)
+50000
+SELECT COUNT(a) FROM t1;
+count(a)
+50000
+DELETE FROM t1 WHERE a%2=1;
+SELECT COUNT(*) FROM t1;
+count(*)
+25000
 DROP TABLE t1;

@@ -15,31 +15,42 @@
 package lockservice
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
 	"fmt"
-	"runtime"
-	"sync"
+	"os"
+	"strings"
 	"sync/atomic"
+	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/common/log"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/lock"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	"go.uber.org/zap"
 )
 
-var (
-	waiterPool = sync.Pool{
-		New: func() any {
-			return newWaiter()
-		},
-	}
+type waiterStatus int32
+
+const (
+	ready waiterStatus = iota
+	blocking
+	notified
+	completed
 )
 
 func acquireWaiter(
-	serviceID string,
-	txnID []byte) *waiter {
-	w := waiterPool.Get().(*waiter)
-	logWaiterContactPool(serviceID, w, "get")
-	w.txnID = txnID
-	if w.ref() != 1 {
+	txn pb.WaitTxn,
+	info string,
+	logger *log.MOLogger,
+) *waiter {
+	w := reuse.Alloc[waiter](nil)
+	w.txn = txn
+	if w.enableChecker {
+		logRefWaiter(logger, "acquire waiter from pool", w.txn.TxnID, w)
+	}
+	if w.ref(info, logger) != 1 {
 		panic("BUG: invalid ref count")
 	}
 	w.beforeSwapStatusAdjustFunc = func() {}
@@ -47,51 +58,44 @@ func acquireWaiter(
 }
 
 func newWaiter() *waiter {
-	w := &waiter{
-		c:       make(chan notifyValue, 1),
-		waiters: newWaiterQueue(),
+	enableChecker := false
+	enable, ok := os.LookupEnv("mo_reuse_enable_checker")
+	if ok {
+		switch strings.ToLower(enable) {
+		case "true":
+			enableChecker = true
+		}
 	}
-	w.setFinalizer()
-	w.setStatus("", waiting)
+	w := &waiter{
+		conflictKey:   &atomic.Pointer[[]byte]{},
+		lt:            &atomic.Pointer[localLockTable]{},
+		status:        &atomic.Int32{},
+		refCount:      &atomic.Int32{},
+		c:             make(chan notifyValue, 1),
+		enableChecker: enableChecker,
+	}
+	w.setStatus(ready)
 	return w
 }
 
-type waiterStatus int32
-
-const (
-	waiting waiterStatus = iota
-	notified
-	completed
-)
+func (w waiter) TypeName() string {
+	return "lockservice.wait"
+}
 
 // waiter is used to allow locking operations to wait for the previous
 // lock to be released if a conflict is encountered.
-// Each Lock holds one instance of waiter to hold all waiters. Suppose
-// we have 3 transactions A, B and a record k1, the pseudocode of how to
-// use waiter is as follows:
-// 1. A get LockStorage s1
-// 2. s1.Lock()
-// 3. use s1.Seek(k1) to check conflict, s1.add(Lock(k1, waiter-k1-A))
-// 4. s1.Unlock()
-// 5. B get LockStorage s1
-// 6. s1.Lock
-// 7. use s1.Seek(k1) to check conflict, and found Lock(k1, waiter-k1-A)
-// 8. so waiter-k1-A.add(waiter-k1-B)
-// 9. s1.Unlock
-// 10. waiter-k1-B.wait()
-// 11. A completed
-// 12. s1.Lock()
-// 14. replace Lock(k1, waiter-k1-A) to Lock(k1, waiter-k1-B)
-// 15. waiter-k1-A.close(), move all others waiters into waiter-k1-B.
-// 16. s1.Unlock()
-// 17. waiter-k1-B.wait() returned and get the lock
 type waiter struct {
-	txnID          []byte
-	status         atomic.Int32
-	c              chan notifyValue
-	waiters        waiterQueue
-	refCount       atomic.Int32
-	latestCommitTS timestamp.Timestamp
+	// belong to which txn
+	txn           pb.WaitTxn
+	waitFor       [][]byte
+	conflictKey   *atomic.Pointer[[]byte]
+	lt            *atomic.Pointer[localLockTable]
+	status        *atomic.Int32
+	refCount      *atomic.Int32
+	c             chan notifyValue
+	event         event
+	waitAt        atomic.Value
+	enableChecker bool
 
 	// just used for testing
 	beforeSwapStatusAdjustFunc func()
@@ -103,43 +107,39 @@ func (w *waiter) String() string {
 		return "nil"
 	}
 	return fmt.Sprintf("%s-%p(%d)",
-		hex.EncodeToString(w.txnID),
+		hex.EncodeToString(w.txn.TxnID),
 		w,
 		w.refCount.Load())
 }
 
-func (w *waiter) setFinalizer() {
-	// close the channel if gc
-	runtime.SetFinalizer(w, func(w *waiter) {
-		close(w.c)
-	})
+func (w *waiter) isTxn(txnID []byte) bool {
+	if w == nil {
+		return false
+	}
+	return bytes.Equal(w.txn.TxnID, txnID)
 }
 
-func (w *waiter) ref() int32 {
+func (w *waiter) ref(info string, logger *log.MOLogger) int32 {
+	if w.enableChecker {
+		logRefWaiter(logger, info, w.txn.TxnID, w)
+	}
 	return w.refCount.Add(1)
 }
 
-func (w *waiter) unref(serviceID string) {
+func (w *waiter) close(
+	info string,
+	logger *log.MOLogger,
+) {
+	if w.enableChecker {
+		logCloseWaiter(logger, info, w.txn.TxnID, w)
+	}
 	n := w.refCount.Add(-1)
 	if n < 0 {
 		panic("BUG: invalid ref count, " + w.String())
 	}
 	if n == 0 {
-		w.reset(serviceID)
+		reuse.Free(w, nil)
 	}
-}
-
-func (w *waiter) add(
-	serviceID string,
-	waiters ...*waiter) {
-	if len(waiters) == 0 {
-		return
-	}
-	for i := range waiters {
-		waiters[i].ref()
-	}
-	w.waiters.put(waiters...)
-	logWaitersAdded(serviceID, w, waiters...)
 }
 
 func (w *waiter) getStatus() waiterStatus {
@@ -147,17 +147,17 @@ func (w *waiter) getStatus() waiterStatus {
 }
 
 func (w *waiter) setStatus(
-	serviceID string,
-	status waiterStatus) {
+	status waiterStatus,
+) {
 	w.status.Store(int32(status))
-	logWaiterStatusUpdate(serviceID, w, status)
 }
 
 func (w *waiter) casStatus(
-	serviceID string,
-	old, new waiterStatus) bool {
+	old, new waiterStatus,
+	logger *log.MOLogger,
+) bool {
 	if w.status.CompareAndSwap(int32(old), int32(new)) {
-		logWaiterStatusChanged(serviceID, w, old, new)
+		logWaiterStatusChanged(logger, w, old, new)
 		return true
 	}
 	return false
@@ -165,10 +165,11 @@ func (w *waiter) casStatus(
 
 func (w *waiter) mustRecvNotification(
 	ctx context.Context,
-	serviceID string) notifyValue {
+	logger *log.MOLogger,
+) notifyValue {
 	select {
 	case v := <-w.c:
-		logWaiterGetNotify(serviceID, w, v)
+		logWaiterGetNotify(logger, w, v)
 		return v
 	case <-ctx.Done():
 		return notifyValue{err: ctx.Err()}
@@ -176,16 +177,12 @@ func (w *waiter) mustRecvNotification(
 }
 
 func (w *waiter) mustSendNotification(
-	serviceID string,
-	value notifyValue) {
-	logWaiterNotified(serviceID, w, value)
+	value notifyValue,
+	logger *log.MOLogger,
+) {
+	logWaiterNotified(logger, w, value)
 
-	// update latest max commit ts in waiter queue
-	if w.latestCommitTS.Less(value.ts) {
-		w.latestCommitTS = value.ts
-	} else {
-		value.ts = w.latestCommitTS
-	}
+	w.event.notified()
 	select {
 	case w.c <- value:
 		return
@@ -194,8 +191,11 @@ func (w *waiter) mustSendNotification(
 	panic("BUG: must send value to channel, " + w.String())
 }
 
-func (w *waiter) resetWait(serviceID string) {
-	if w.casStatus(serviceID, completed, waiting) {
+func (w *waiter) resetWait(
+	logger *log.MOLogger,
+) {
+	if w.casStatus(completed, ready, logger) {
+		w.event = event{}
 		return
 	}
 	panic("invalid reset wait")
@@ -203,131 +203,108 @@ func (w *waiter) resetWait(serviceID string) {
 
 func (w *waiter) wait(
 	ctx context.Context,
-	serviceID string) notifyValue {
+	logger *log.MOLogger,
+) notifyValue {
 	status := w.getStatus()
-	if status != waiting &&
+	if status != blocking &&
 		status != notified {
 		panic(fmt.Sprintf("BUG: waiter's status cannot be %d", status))
 	}
 
 	w.beforeSwapStatusAdjustFunc()
 
+	apply := func(v notifyValue) {
+		logWaiterGetNotify(logger, w, v)
+		w.setStatus(completed)
+	}
 	select {
 	case v := <-w.c:
-		logWaiterGetNotify(serviceID, w, v)
-		w.setStatus(serviceID, completed)
+		apply(v)
 		return v
 	case <-ctx.Done():
+		select {
+		case v := <-w.c:
+			apply(v)
+			return v
+		default:
+		}
 	}
 
 	w.beforeSwapStatusAdjustFunc()
 
 	// context is timeout, and status not changed, no concurrent happen
-	if w.casStatus(serviceID, status, completed) {
+	if w.casStatus(status, completed, logger) {
 		return notifyValue{err: ctx.Err()}
 	}
-
 	// notify and timeout are concurrently issued, we use real result to replace
 	// timeout error
-	w.setStatus(serviceID, completed)
-	return w.mustRecvNotification(ctx, serviceID)
+	w.setStatus(completed)
+	return w.mustRecvNotification(ctx, logger)
+}
+
+func (w *waiter) disableNotify() {
+	w.setStatus(completed)
+	select {
+	case <-w.c:
+	default:
+	}
 }
 
 // notify return false means this waiter is completed, cannot be used to notify
-func (w *waiter) notify(serviceID string, value notifyValue) bool {
+func (w *waiter) notify(
+	value notifyValue,
+	logger *log.MOLogger,
+) bool {
+	debug := ""
+	if logger != nil && logger.Enabled(zap.DebugLevel) {
+		debug = w.String()
+	}
+
 	for {
 		status := w.getStatus()
-		// already notified, no wait on w
-		if status == notified {
-			logWaiterNotifySkipped(serviceID, w, "already notified")
-			return false
-		}
-		if status == completed {
-			// wait already completed, wait timeout or wait a result.
-			logWaiterNotifySkipped(serviceID, w, "already completed")
+		// not on wait, no need to notify
+		if status != blocking {
+			logWaiterNotifySkipped(logger, debug, "waiter not in blocking")
 			return false
 		}
 
 		w.beforeSwapStatusAdjustFunc()
 		// if status changed, notify and timeout are concurrently issued, need
 		// retry.
-		if w.casStatus(serviceID, status, notified) {
-			w.mustSendNotification(serviceID, value)
+		if w.casStatus(status, notified, logger) {
+			w.mustSendNotification(value, logger)
 			return true
 		}
-		logWaiterNotifySkipped(serviceID, w, "concurrently issued")
+		logWaiterNotifySkipped(logger, debug, "concurrently issued")
 	}
 }
 
-func (w *waiter) clearAllNotify(
-	serviceID string,
-	reason string) {
-	for {
-		select {
-		case <-w.c:
-		default:
-			logWaiterClearNotify(serviceID, w, reason)
-			return
-		}
-	}
+func (w *waiter) startWait() {
+	w.waitAt.Store(time.Now())
 }
 
-// close returns the next waiter to hold the lock, and others waiters will move
-// into the next waiter.
-func (w *waiter) close(
-	serviceID string,
-	value notifyValue) *waiter {
-	if value.ts.Less(w.latestCommitTS) {
-		value.ts = w.latestCommitTS
-	}
-	nextWaiter := w.fetchNextWaiter(serviceID, value)
-	logWaiterClose(serviceID, w)
-	w.unref(serviceID)
-	return nextWaiter
-}
-
-func (w *waiter) fetchNextWaiter(
-	serviceID string,
-	value notifyValue) *waiter {
-	if w.waiters.len() == 0 {
-		logWaiterFetchNextWaiter(serviceID, w, nil)
-		return nil
-	}
-	next := w.awakeNextWaiter(serviceID)
-	logWaiterFetchNextWaiter(serviceID, w, next)
-	for {
-		if next.notify(serviceID, value) {
-			next.unref(serviceID)
-			return next
-		}
-		if next.waiters.len() == 0 {
-			return nil
-		}
-		next = next.awakeNextWaiter(serviceID)
-	}
-}
-
-func (w *waiter) awakeNextWaiter(serviceID string) *waiter {
-	next, remains := w.waiters.pop()
-	next.add(serviceID, remains...)
-	w.waiters.reset()
-	return next
-}
-
-func (w *waiter) reset(serviceID string) {
-	if w.waiters.len() > 0 || len(w.c) > 0 {
-		panic("BUG: waiter should be empty.")
+func (w *waiter) reset() {
+	notifies := len(w.c)
+	if notifies > 0 {
+		panic(fmt.Sprintf("BUG: waiter should be empty. %s, notifies %d",
+			w.String(),
+			notifies))
 	}
 
-	logWaiterContactPool(serviceID, w, "put")
-	w.txnID = nil
-	w.latestCommitTS = timestamp.Timestamp{}
-	w.setStatus(serviceID, waiting)
-	w.waiters.reset()
-	waiterPool.Put(w)
+	w.txn = pb.WaitTxn{}
+	w.event = event{}
+	w.waitFor = w.waitFor[:0]
+	w.conflictKey.Store(nil)
+	w.lt.Store(nil)
+	w.setStatus(ready)
 }
 
 type notifyValue struct {
-	err error
-	ts  timestamp.Timestamp
+	err        error
+	ts         timestamp.Timestamp
+	defChanged bool
+}
+
+func (v notifyValue) String() string {
+	return fmt.Sprintf("ts %s, error %+v", v.ts.DebugString(), v.err)
 }

@@ -145,6 +145,12 @@ func (aot *AOT[B, R]) Max() (b B) {
 	return
 }
 
+func (aot *AOT[B, R]) GetBlocks() *btree.BTreeG[B] {
+	aot.Lock()
+	defer aot.Unlock()
+	return aot.blocks
+}
+
 // Truncate prunes the blocks.
 // Deletable blocks are those have all txns prepared before the given timestamp
 // For example: truncate the table by timestamp
@@ -212,6 +218,9 @@ func (aot *AOT[B, R]) Append(rows R) (err error) {
 		appended int
 		toAppend int
 	)
+	if rows.Length() == 0 {
+		return
+	}
 	for !done {
 		toAppend, done = aot.prepareAppend(rows.Length() - appended)
 		if toAppend == 0 {
@@ -288,13 +297,8 @@ type BatchBlock struct {
 	ID uint64
 }
 
-func NewBatchBlock(
-	id uint64,
-	attrs []string,
-	colTypes []types.Type,
-	nullables []bool,
-	opts containers.Options) *BatchBlock {
-	bat := containers.BuildBatch(attrs, colTypes, nullables, opts)
+func NewBatchBlock(id uint64, attrs []string, colTypes []types.Type, opts containers.Options) *BatchBlock {
+	bat := containers.BuildBatch(attrs, colTypes, opts)
 	block := &BatchBlock{
 		Batch: bat,
 		ID:    id,

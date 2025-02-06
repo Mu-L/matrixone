@@ -27,7 +27,7 @@ echo "GOPATH: ${GOPATH}"
 res=$(program_exists goimports)
 echo "res: ${res}"
 if [ "${res}" == "ok" ];then
-  echo "goimports exits"
+  echo "goimports exist"
 else
   echo "install goimports"
   go install golang.org/x/tools/cmd/goimports@latest
@@ -36,7 +36,7 @@ fi
 res=$(program_exists protoc)
 echo "res: ${res}"
 if [ "${res}" == "ok" ];then
-  echo "protoc exits"
+  echo "protoc exist"
   version=$(protoc --version)
   if [[ "${version}" == *"${PROTO_SYNTAX_VERSION}.${PROTOC_VERSION}"* ]];then
     echo "protoc version matches ${PROTOC_VERSION}"
@@ -85,28 +85,46 @@ else
   ${GOPATH}/bin/protoc --version
 fi
 
-res=$(program_exists protoc-gen-gogofast)
-echo "res: ${res}"
-if [ "${res}" == "ok" ];then
-  echo "protoc-gen-gogofast exits"
+res1=$(program_exists protoc-gen-gogofast)
+res2=$(program_exists protoc-gen-gogofaster)
+echo "res1: ${res1}, res2: ${res2}"
+if [ "${res1}" == "ok" -a "${res2}" == "ok" ];then
+  echo "protoc-gen-gogofast and protoc-gen-gogofaster exist"
 else
   echo "install protoc-gen-gogofast"
-  if [ -f protobuf/ ];then rm -rf protobuf/;fi
+  if [ -d protobuf/ ];then rm -rf protobuf/;fi
   git clone https://github.com/gogo/protobuf.git
   cd protobuf
   git checkout v1.3.2
   cd protoc-gen-gogofast
   go build -o $GOPATH/bin/protoc-gen-gogofast
+  cd ..
+  cd protoc-gen-gogofaster
+  go build -o $GOPATH/bin/protoc-gen-gogofaster
   cd ../..
 fi
 
 
 for file in `ls $PROTOC_DIR/*.proto`
 do
+  outArgName="gogofast_out"
+  # For query.proto and statsinfo.proto, extra fields are redundant.
+  if echo $file | egrep "query.proto|statsinfo.proto" >/dev/null; then
+    outArgName="gogofaster_out"
+  fi
 	dir=$(basename $file .proto)
 	mkdir -p $PB_DIR/$dir
-	${GOPATH}/bin/protoc -I=.:$PROTOC_DIR:$VENDOR_DIR --gogofast_out=paths=source_relative:./pkg/pb/$dir  $file
+	${GOPATH}/bin/protoc -I=.:$PROTOC_DIR:$VENDOR_DIR --$outArgName=paths=source_relative:./pkg/pb/$dir  $file
     goimports -w $PB_DIR/$dir/*pb.go
+done
+
+
+# Generate pb file for each package's own
+for fp in $(find pkg -name protogen.sh)
+do
+    cd $(dirname ${fp})
+    bash $(basename ${fp})
+    cd - > /dev/null
 done
 
 if [ -f protobuf/ ];then rm -rf protobuf/;fi

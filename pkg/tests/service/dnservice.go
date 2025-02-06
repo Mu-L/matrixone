@@ -26,16 +26,16 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/dnservice"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
+	"github.com/matrixorigin/matrixone/pkg/tnservice"
 	"github.com/matrixorigin/matrixone/pkg/util/toml"
 )
 
-// DNService describes expected behavior for dn service.
-type DNService interface {
+// TNService describes expected behavior for tn service.
+type TNService interface {
 	// Start sends heartbeat and start to handle command.
 	Start() error
 	// Close stops store
@@ -46,26 +46,26 @@ type DNService interface {
 	// ID returns uuid of store
 	ID() string
 
-	// StartDNReplica start the DNShard replica
-	StartDNReplica(shard metadata.DNShard) error
-	// CloseDNReplica close the DNShard replica.
-	CloseDNReplica(shard metadata.DNShard) error
+	// StartTNReplica start the TNShard replica
+	StartTNReplica(shard metadata.TNShard) error
+	// CloseTNReplica close the TNShard replica.
+	CloseTNReplica(shard metadata.TNShard) error
 
 	// GetTaskService returns the taskservice
 	GetTaskService() (taskservice.TaskService, bool)
 }
 
-// dnService wraps dnservice.Service.
+// tnService wraps tnservice.Service.
 //
 // The main purpose of this structure is to maintain status.
-type dnService struct {
+type tnService struct {
 	sync.Mutex
 	status ServiceStatus
 	uuid   string
-	svc    dnservice.Service
+	svc    tnservice.Service
 }
 
-func (ds *dnService) Start() error {
+func (ds *tnService) Start() error {
 	ds.Lock()
 	defer ds.Unlock()
 
@@ -80,7 +80,7 @@ func (ds *dnService) Start() error {
 	return nil
 }
 
-func (ds *dnService) Close() error {
+func (ds *tnService) Close() error {
 	ds.Lock()
 	defer ds.Unlock()
 
@@ -95,19 +95,19 @@ func (ds *dnService) Close() error {
 	return nil
 }
 
-func (ds *dnService) Status() ServiceStatus {
+func (ds *tnService) Status() ServiceStatus {
 	ds.Lock()
 	defer ds.Unlock()
 	return ds.status
 }
 
-func (ds *dnService) ID() string {
+func (ds *tnService) ID() string {
 	ds.Lock()
 	defer ds.Unlock()
 	return ds.uuid
 }
 
-func (ds *dnService) StartDNReplica(shard metadata.DNShard) error {
+func (ds *tnService) StartTNReplica(shard metadata.TNShard) error {
 	ds.Lock()
 	defer ds.Unlock()
 
@@ -115,10 +115,10 @@ func (ds *dnService) StartDNReplica(shard metadata.DNShard) error {
 		return moerr.NewNoServiceNoCtx(ds.uuid)
 	}
 
-	return ds.svc.StartDNReplica(shard)
+	return ds.svc.StartTNReplica(shard)
 }
 
-func (ds *dnService) CloseDNReplica(shard metadata.DNShard) error {
+func (ds *tnService) CloseTNReplica(shard metadata.TNShard) error {
 	ds.Lock()
 	defer ds.Unlock()
 
@@ -126,49 +126,53 @@ func (ds *dnService) CloseDNReplica(shard metadata.DNShard) error {
 		return moerr.NewNoServiceNoCtx(ds.uuid)
 	}
 
-	return ds.svc.CloseDNReplica(shard)
+	return ds.svc.CloseTNReplica(shard)
 }
 
-func (ds *dnService) GetTaskService() (taskservice.TaskService, bool) {
+func (ds *tnService) GetTaskService() (taskservice.TaskService, bool) {
 	return ds.svc.GetTaskService()
 }
 
-// dnOptions is options for a dn service.
-type dnOptions []dnservice.Option
+// tnOptions is options for a tn service.
+type tnOptions []tnservice.Option
 
-// newDNService initializes an instance of `DNService`.
-func newDNService(
-	cfg *dnservice.Config,
+// newTNService initializes an instance of `TNService`.
+func newTNService(
+	cfg *tnservice.Config,
 	rt runtime.Runtime,
 	fs fileservice.FileService,
-	opts dnOptions,
-) (DNService, error) {
-	svc, err := dnservice.NewService(cfg, rt, fs, opts...)
+	opts tnOptions,
+) (TNService, error) {
+	svc, err := tnservice.NewService(cfg, rt, fs, nil, opts...)
 	if err != nil {
 		return nil, err
 	}
-	return &dnService{
+	return &tnService{
 		status: ServiceInitialized,
 		uuid:   cfg.UUID,
 		svc:    svc,
 	}, nil
 }
 
-// buildDNConfig builds configuration for a dn service.
-func buildDNConfig(
-	index int, opt Options, address serviceAddresses,
-) *dnservice.Config {
-	cfg := &dnservice.Config{
-		UUID:          uuid.New().String(),
-		ListenAddress: address.getDnListenAddress(index),
+// buildTNConfig builds configuration for a tn service.
+func buildTNConfig(
+	index int, opt Options, address *serviceAddresses,
+) *tnservice.Config {
+	uid, _ := uuid.NewV7()
+	cfg := &tnservice.Config{
+		UUID:          uid.String(),
+		ListenAddress: address.getTnListenAddress(index),
 	}
 	cfg.ServiceAddress = cfg.ListenAddress
-	cfg.LogtailServer.ListenAddress = address.getDnLogtailAddress(index)
+	cfg.LogtailServer.ListenAddress = address.getTnLogtailAddress(index)
+	cfg.LogtailServer.ServiceAddress = cfg.LogtailServer.ListenAddress
+	cfg.LockService.ListenAddress = address.getTNLockListenAddress(index)
+	cfg.LockService.ServiceAddress = cfg.LockService.ListenAddress
+	cfg.LockService.KeepBindTimeout.Duration = time.Second * 30
 	cfg.DataDir = filepath.Join(opt.rootDataDir, cfg.UUID)
 	cfg.HAKeeper.ClientConfig.ServiceAddresses = address.listHAKeeperListenAddresses()
-	cfg.HAKeeper.HeatbeatInterval.Duration = opt.heartbeat.dn
-	cfg.Txn.Storage.Backend = opt.storage.dnStorage
-	cfg.Txn.Storage.LogBackend = "logservice"
+	cfg.HAKeeper.HeatbeatInterval.Duration = opt.heartbeat.tn
+	cfg.Txn.Storage.Backend = opt.storage.tnStorage
 
 	// FIXME: disable tae flush
 	cfg.Ckp.MinCount = 2000000
@@ -179,65 +183,71 @@ func buildDNConfig(
 
 	// logtail push service config for tae storage
 	cfg.LogtailServer.RpcMaxMessageSize = toml.ByteSize(opt.logtailPushServer.rpcMaxMessageSize)
-	cfg.LogtailServer.RpcPayloadCopyBufferSize = toml.ByteSize(opt.logtailPushServer.rpcPayloadCopyBufferSize)
 	cfg.LogtailServer.LogtailCollectInterval.Duration = opt.logtailPushServer.logtailCollectInterval
+	cfg.LogtailServer.LogtailRPCStreamPoisonTime.Duration = opt.logtailPushServer.logtailRPCStreamPoisonTIme
 	cfg.LogtailServer.LogtailResponseSendTimeout.Duration = opt.logtailPushServer.logtailResponseSendTimeout
-	cfg.LogtailServer.MaxLogtailFetchFailure = opt.logtailPushServer.maxLogtailFetchFailure
+	cfg.LogtailServer.PullWorkerPoolSize = toml.ByteSize(opt.logtailPushServer.pullWorkerPoolSize)
 
 	// We need the filled version of configuration.
-	// It's necessary when building dnservice.Option.
+	// It's necessary when building tnservice.Option.
 	if err := cfg.Validate(); err != nil {
-		panic(fmt.Sprintf("fatal when building dnservice.Config: %s", err))
+		panic(fmt.Sprintf("fatal when building tnservice.Config: %s", err))
 	}
 
 	return cfg
 }
 
-// buildDNOptions builds options for a dn service.
+// buildTNOptions builds options for a tn service.
 //
-// NB: We need the filled version of dnservice.Config.
-func buildDNOptions(cfg *dnservice.Config, filter FilterFunc) dnOptions {
+// NB: We need the filled version of tnservice.Config.
+func buildTNOptions(cfg *tnservice.Config, filter FilterFunc) tnOptions {
 	// factory to construct client for hakeeper
-	hakeeperClientFactory := func() (logservice.DNHAKeeperClient, error) {
-		ctx, cancel := context.WithTimeout(
+	hakeeperClientFactory := func() (logservice.TNHAKeeperClient, error) {
+		ctx, cancel := context.WithTimeoutCause(
 			context.Background(), cfg.HAKeeper.DiscoveryTimeout.Duration,
+			moerr.CauseBuildTNOptions,
 		)
 		defer cancel()
 
 		// transfer morpc.BackendOption via context
 		ctx = logservice.SetBackendOptions(ctx, morpc.WithBackendFilter(filter))
 
-		client, err := logservice.NewDNHAKeeperClient(
-			ctx, cfg.HAKeeper.ClientConfig,
+		client, err := logservice.NewTNHAKeeperClient(
+			ctx, cfg.UUID, cfg.HAKeeper.ClientConfig,
 		)
 		if err != nil {
-			return nil, err
+			return nil, moerr.AttachCause(ctx, err)
 		}
 		return client, nil
 	}
 
 	// factory to construct client for log service
-	logServiceClientFactory := func(shard metadata.DNShard) (logservice.Client, error) {
-		ctx, cancel := context.WithTimeout(
+	logServiceClientFactory := func(shard metadata.TNShard) (logservice.Client, error) {
+		ctx, cancel := context.WithTimeoutCause(
 			context.Background(), cfg.LogService.ConnectTimeout.Duration,
+			moerr.CauseBuildTNOptions2,
 		)
 		defer cancel()
 
 		// transfer morpc.BackendOption via context
 		ctx = logservice.SetBackendOptions(ctx, morpc.WithBackendFilter(filter))
 
-		return logservice.NewClient(ctx, logservice.ClientConfig{
-			Tag:              "Test-DN",
+		client, err := logservice.NewClient(ctx, cfg.UUID, logservice.ClientConfig{
+			Tag:              "Test-TN",
 			ReadOnly:         false,
 			LogShardID:       shard.LogShardID,
-			DNReplicaID:      shard.ReplicaID,
+			TNReplicaID:      shard.ReplicaID,
 			ServiceAddresses: cfg.HAKeeper.ClientConfig.ServiceAddresses,
 		})
+		if err != nil {
+			return nil, moerr.AttachCause(ctx, err)
+		}
+		return client, nil
 	}
 
-	return []dnservice.Option{
-		dnservice.WithHAKeeperClientFactory(hakeeperClientFactory),
-		dnservice.WithLogServiceClientFactory(logServiceClientFactory),
-		dnservice.WithBackendFilter(filter),
+	return []tnservice.Option{
+		tnservice.WithHAKeeperClientFactory(hakeeperClientFactory),
+		tnservice.WithLogServiceClientFactory(logServiceClientFactory),
+		tnservice.WithBackendFilter(filter),
 	}
 }

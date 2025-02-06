@@ -14,15 +14,8 @@
 
 package plan
 
-import (
-	"context"
-	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+const (
+	moEnumCastIndexToValueFun      = "cast_index_to_value"
+	moEnumCastValueToIndexFun      = "cast_value_to_index"
+	moEnumCastIndexValueToIndexFun = "cast_index_value_to_index"
 )
-
-func MakeExpr(ctx context.Context, name string, args []*Expr) *plan.Expr {
-	expr, err := bindFuncExprImplByPlanExpr(ctx, name, args)
-	if err != nil {
-		panic(err)
-	}
-	return expr
-}

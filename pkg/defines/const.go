@@ -14,6 +14,8 @@
 
 package defines
 
+import "math"
+
 // Header information.
 const (
 	OKHeader          byte = 0x00
@@ -23,9 +25,13 @@ const (
 )
 
 const (
-	SharedFileServiceName = "SHARED"
-	LocalFileServiceName  = "LOCAL"
-	ETLFileServiceName    = "ETL"
+	SharedFileServiceName  = "SHARED"
+	LocalFileServiceName   = "LOCAL"
+	ETLFileServiceName     = "ETL"
+	StandbyFileServiceName = "STANDBY"
+
+	// sub fileservices
+	SpillFileServiceName = "__spill"
 )
 
 const (
@@ -33,8 +39,17 @@ const (
 	// when a user tries to create a database with this name, will be rejected at the plan stage.
 	TEMPORARY_DBNAME = "%!%mo_temp_db"
 
-	// TEMPORARY_TABLE_DN_ADDR marked as virtual dn address only for temporary table
-	// When a TargetDN.address in TxnRequest is TEMPORARY_TABLE_DN_ADDR, this TxnRequest is for temporary table
+	// TEMPORARY_TABLE_TN_ADDR marked as virtual tn address only for temporary table
+	// When a TargetDN.address in TxnRequest is TEMPORARY_TABLE_TN_ADDR, this TxnRequest is for temporary table
 	// and execution flow will go to the func in handleTemp
-	TEMPORARY_TABLE_DN_ADDR = "%!%mo_temp_db_dn_address"
+	TEMPORARY_TABLE_TN_ADDR = "%!%mo_temp_db_dn_address"
+)
+
+const (
+	MORPCMinVersion    int64 = math.MinInt64
+	MORPCVersion1      int64 = 1
+	MORPCVersion2      int64 = 2
+	MORPCVersion3      int64 = 3 // start from 1.3.0
+	MORPCVersion4      int64 = 4 // start from 2.0.1
+	MORPCLatestVersion       = MORPCVersion4
 )

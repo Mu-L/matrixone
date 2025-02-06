@@ -20,8 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
-
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
@@ -34,6 +32,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
 	taelogtail "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
+	"github.com/stretchr/testify/require"
 )
 
 func TestService(t *testing.T) {
@@ -52,18 +51,20 @@ func TestService(t *testing.T) {
 	defer stop()
 
 	/* ---- construct logtail client ---- */
-	codec := morpc.NewMessageCodec(func() morpc.Message { return &LogtailResponseSegment{} },
+	codec := morpc.NewMessageCodec(
+		"",
+		func() morpc.Message { return &LogtailResponseSegment{} },
 		morpc.WithCodecEnableChecksum(),
 		morpc.WithCodecMaxBodySize(16*mpool.KB),
 	)
 	bf := morpc.NewGoettyBasedBackendFactory(codec)
-	rpcClient, err := morpc.NewClient(bf, morpc.WithClientMaxBackendPerHost(1))
+	rpcClient, err := morpc.NewClient("", bf, morpc.WithClientMaxBackendPerHost(1))
 	require.NoError(t, err)
 
 	rpcStream, err := rpcClient.NewStream(address, false)
 	require.NoError(t, err)
 
-	logtailClient, err := NewLogtailClient(rpcStream, WithClientRequestPerSecond(100))
+	logtailClient, err := NewLogtailClient(context.TODO(), rpcStream, WithClientRequestPerSecond(100))
 	require.NoError(t, err)
 	defer func() {
 		err := logtailClient.Close()
@@ -82,7 +83,7 @@ func TestService(t *testing.T) {
 	/* ---- wait subscription response via logtail client ---- */
 	{
 		t.Log("===> wait subscription response via logtail client")
-		resp, err := logtailClient.Receive()
+		resp, err := logtailClient.Receive(context.Background())
 		require.NoError(t, err)
 		require.NotNil(t, resp.GetSubscribeResponse())
 		require.Equal(t, tableA.String(), resp.GetSubscribeResponse().Logtail.Table.String())
@@ -91,7 +92,7 @@ func TestService(t *testing.T) {
 	/* ---- wait update response via logtail client ---- */
 	{
 		t.Log("===> wait update response via logtail client")
-		resp, err := logtailClient.Receive()
+		resp, err := logtailClient.Receive(context.Background())
 		require.NoError(t, err)
 		require.NotNil(t, resp.GetUpdateResponse())
 		require.Equal(t, 1, len(resp.GetUpdateResponse().LogtailList))
@@ -111,7 +112,7 @@ func TestService(t *testing.T) {
 	{
 		t.Log("===> wait unsubscription response via logtail client")
 		for {
-			resp, err := logtailClient.Receive()
+			resp, err := logtailClient.Receive(context.Background())
 			require.NoError(t, err)
 			if resp.GetUnsubscribeResponse() != nil {
 				require.Equal(t, tableA.String(), resp.GetUnsubscribeResponse().Table.String())
@@ -133,26 +134,26 @@ func mockLocktailer(tables ...api.TableID) taelogtail.Logtailer {
 
 func (m *logtailer) RangeLogtail(
 	ctx context.Context, from, to timestamp.Timestamp,
-) ([]logtail.TableLogtail, error) {
+) ([]logtail.TableLogtail, []func(), error) {
 	tails := make([]logtail.TableLogtail, 0, len(m.tables))
 	for _, table := range m.tables {
 		tails = append(tails, mockLogtail(table, to))
 	}
-	return tails, nil
+	return tails, nil, nil
 }
 
-func (m *logtailer) RegisterCallback(cb func(from, to timestamp.Timestamp, tails ...logtail.TableLogtail) error) {
+func (m *logtailer) RegisterCallback(cb func(from, to timestamp.Timestamp, closeCB func(), tails ...logtail.TableLogtail) error) {
 }
 
 func (m *logtailer) TableLogtail(
 	ctx context.Context, table api.TableID, from, to timestamp.Timestamp,
-) (logtail.TableLogtail, error) {
+) (logtail.TableLogtail, func(), error) {
 	for _, t := range m.tables {
 		if t.String() == table.String() {
-			return mockLogtail(table, to), nil
+			return mockLogtail(table, to), nil, nil
 		}
 	}
-	return logtail.TableLogtail{CkpLocation: "checkpoint", Table: &table, Ts: &to}, nil
+	return logtail.TableLogtail{CkpLocation: "checkpoint", Table: &table, Ts: &to}, nil, nil
 }
 
 func (m *logtailer) Now() (timestamp.Timestamp, timestamp.Timestamp) {
@@ -161,8 +162,8 @@ func (m *logtailer) Now() (timestamp.Timestamp, timestamp.Timestamp) {
 
 func mockRuntime() runtime.Runtime {
 	return runtime.NewRuntime(
-		metadata.ServiceType_DN,
-		"uuid",
+		metadata.ServiceType_TN,
+		"",
 		logutil.GetLogger(),
 		runtime.WithClock(
 			clock.NewHLCClock(
@@ -194,13 +195,11 @@ func startLogtailServer(
 
 	/* ---- construct logtail server ---- */
 	logtailServer, err := NewLogtailServer(
-		address, options.NewDefaultLogtailServerCfg(), logtailer, rt,
+		address, options.NewDefaultLogtailServerCfg(), logtailer, rt, nil,
 		WithServerCollectInterval(20*time.Millisecond),
 		WithServerSendTimeout(5*time.Second),
 		WithServerEnableChecksum(true),
 		WithServerMaxMessageSize(32+7),
-		WithServerPayloadCopyBufferSize(16*mpool.KB),
-		WithServerMaxLogtailFetchFailure(5),
 	)
 	require.NoError(t, err)
 
@@ -220,7 +219,7 @@ func startLogtailServer(
 				tails = append(tails, mockLogtail(table, now))
 			}
 
-			err := logtailServer.NotifyLogtail(from, now, tails...)
+			err := logtailServer.NotifyLogtail(from, now, nil, tails...)
 			if err != nil {
 				return
 			}

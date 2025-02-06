@@ -18,15 +18,20 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
-	"github.com/stretchr/testify/assert"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
 )
 
 func TestBuildAlterView(t *testing.T) {
@@ -50,7 +55,7 @@ func TestBuildAlterView(t *testing.T) {
 	})
 	assert.NoError(t, err)
 
-	store["db.v"] = arg{&plan.ObjectRef{PubAccountId: -1},
+	store["db.v"] = arg{&plan.ObjectRef{},
 		&plan.TableDef{
 			TableType: catalog.SystemViewRel,
 			ViewSql: &plan.ViewDef{
@@ -72,13 +77,13 @@ func TestBuildAlterView(t *testing.T) {
 	}
 
 	store["db.a"] = arg{
-		&plan.ObjectRef{PubAccountId: -1},
+		&plan.ObjectRef{},
 		&plan.TableDef{
 			TableType: catalog.SystemOrdinaryRel,
 			Cols: []*ColDef{
 				{
 					Name: "a",
-					Typ: &plan.Type{
+					Typ: plan.Type{
 						Id:    int32(types.T_varchar),
 						Width: types.MaxVarcharLen,
 						Table: "a",
@@ -87,15 +92,16 @@ func TestBuildAlterView(t *testing.T) {
 			},
 		}}
 
-	store["db.verror"] = arg{&plan.ObjectRef{PubAccountId: -1},
+	store["db.verror"] = arg{&plan.ObjectRef{},
 		&plan.TableDef{
 			TableType: catalog.SystemViewRel},
 	}
 
 	ctx := NewMockCompilerContext2(ctrl)
+	ctx.EXPECT().GetUserName().Return("sys:dump").AnyTimes()
 	ctx.EXPECT().DefaultDatabase().Return("db").AnyTimes()
-	ctx.EXPECT().Resolve(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(schemaName string, tableName string) (*ObjectRef, *TableDef) {
+	ctx.EXPECT().Resolve(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(schemaName string, tableName string, snapshot *Snapshot) (*ObjectRef, *TableDef) {
 			if schemaName == "" {
 				schemaName = "db"
 			}
@@ -104,11 +110,19 @@ func TestBuildAlterView(t *testing.T) {
 		}).AnyTimes()
 	ctx.EXPECT().SetBuildingAlterView(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 	ctx.EXPECT().ResolveVariable(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
-	ctx.EXPECT().GetAccountId().Return(catalog.System_Account).AnyTimes()
+	ctx.EXPECT().GetAccountId().Return(catalog.System_Account, nil).AnyTimes()
 	ctx.EXPECT().GetContext().Return(context.Background()).AnyTimes()
 	ctx.EXPECT().GetProcess().Return(nil).AnyTimes()
-	ctx.EXPECT().Stats(gomock.Any(), gomock.Any()).Return(&plan.Stats{}).AnyTimes()
+	ctx.EXPECT().Stats(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 	ctx.EXPECT().GetQueryingSubscription().Return(nil).AnyTimes()
+	ctx.EXPECT().DatabaseExists(gomock.Any(), gomock.Any()).Return(true).AnyTimes()
+	ctx.EXPECT().ResolveById(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
+	ctx.EXPECT().GetStatsCache().Return(nil).AnyTimes()
+	ctx.EXPECT().GetSnapshot().Return(nil).AnyTimes()
+	ctx.EXPECT().SetViews(gomock.Any()).AnyTimes()
+	ctx.EXPECT().SetSnapshot(gomock.Any()).AnyTimes()
+	ctx.EXPECT().GetLowerCaseTableNames().Return(int64(1)).AnyTimes()
+	ctx.EXPECT().GetSubscriptionMeta(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 
 	ctx.EXPECT().GetRootSql().Return(sql1).AnyTimes()
 	stmt1, err := parsers.ParseOne(context.Background(), dialect.MYSQL, sql1, 1)
@@ -162,13 +176,13 @@ func TestBuildLockTables(t *testing.T) {
 	sql3 := "lock tables t1 read, t1 write"
 
 	store["db.t1"] = arg{
-		&plan.ObjectRef{PubAccountId: -1},
+		&plan.ObjectRef{},
 		&plan.TableDef{
 			TableType: catalog.SystemOrdinaryRel,
 			Cols: []*ColDef{
 				{
 					Name: "a",
-					Typ: &plan.Type{
+					Typ: plan.Type{
 						Id:    int32(types.T_varchar),
 						Width: types.MaxVarcharLen,
 						Table: "t1",
@@ -179,8 +193,8 @@ func TestBuildLockTables(t *testing.T) {
 
 	ctx := NewMockCompilerContext2(ctrl)
 	ctx.EXPECT().DefaultDatabase().Return("db").AnyTimes()
-	ctx.EXPECT().Resolve(gomock.Any(), gomock.Any()).DoAndReturn(
-		func(schemaName string, tableName string) (*ObjectRef, *TableDef) {
+	ctx.EXPECT().Resolve(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(schemaName string, tableName string, snapshot *Snapshot) (*ObjectRef, *TableDef) {
 			if schemaName == "" {
 				schemaName = "db"
 			}
@@ -188,10 +202,10 @@ func TestBuildLockTables(t *testing.T) {
 			return x.obj, x.table
 		}).AnyTimes()
 	ctx.EXPECT().ResolveVariable(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
-	ctx.EXPECT().GetAccountId().Return(catalog.System_Account).AnyTimes()
+	ctx.EXPECT().GetAccountId().Return(catalog.System_Account, nil).AnyTimes()
 	ctx.EXPECT().GetContext().Return(context.Background()).AnyTimes()
 	ctx.EXPECT().GetProcess().Return(nil).AnyTimes()
-	ctx.EXPECT().Stats(gomock.Any(), gomock.Any()).Return(&plan.Stats{}).AnyTimes()
+	ctx.EXPECT().Stats(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 
 	ctx.EXPECT().GetRootSql().Return(sql1).AnyTimes()
 	stmt1, err := parsers.ParseOne(context.Background(), dialect.MYSQL, sql1, 1)
@@ -206,13 +220,13 @@ func TestBuildLockTables(t *testing.T) {
 	assert.Error(t, err)
 
 	store["db.t2"] = arg{
-		&plan.ObjectRef{PubAccountId: -1},
+		&plan.ObjectRef{},
 		&plan.TableDef{
 			TableType: catalog.SystemOrdinaryRel,
 			Cols: []*ColDef{
 				{
 					Name: "a",
-					Typ: &plan.Type{
+					Typ: plan.Type{
 						Id:    int32(types.T_varchar),
 						Width: types.MaxVarcharLen,
 						Table: "t2",
@@ -233,7 +247,11 @@ func TestBuildLockTables(t *testing.T) {
 
 func TestBuildCreateTable(t *testing.T) {
 	mock := NewMockOptimizer(false)
-
+	rt := moruntime.DefaultRuntime()
+	moruntime.SetupServiceBasedRuntime("", rt)
+	rt.SetGlobalVariables(moruntime.InternalSQLExecutor, executor.NewMemExecutor(func(sql string) (executor.Result, error) {
+		return executor.Result{}, nil
+	}))
 	sqls := []string{
 		`CREATE TABLE t3(
 					col1 INT NOT NULL,
@@ -308,6 +326,22 @@ func TestBuildCreateTable(t *testing.T) {
 					UNIQUE KEY (col1, col3)
 				);`,
 
+		`CREATE TABLE t1 (
+			col1 INT NOT NULL,
+			col2 DATE NOT NULL,
+			col3 INT NOT NULL,
+			col4 INT NOT NULL,
+			UNIQUE KEY (col1 DESC)
+		);`,
+
+		`CREATE TABLE t2 (
+			col1 INT NOT NULL,
+			col2 DATE NOT NULL,
+			col3 INT NOT NULL,
+			col4 INT NOT NULL,
+			UNIQUE KEY (col1 ASC)
+		);`,
+
 		"CREATE TABLE t2 (" +
 			"	`PRIMARY` INT NOT NULL, " +
 			"	col2 DATE NOT NULL, " +
@@ -367,6 +401,14 @@ func TestBuildCreateTableError(t *testing.T) {
 			col3 INT NOT NULL,
 			col4 INT NOT NULL
 		);`,
+
+		`CREATE TABLE t3 (
+			col1 INT NOT NULL,
+			col2 DATE NOT NULL,
+			col3 INT NOT NULL,
+			col4 INT NOT NULL,
+			UNIQUE KEY uk1 ((col1 + col3))
+		);`,
 	}
 	runTestShouldError(mock, t, sqlerrs)
 }
@@ -378,8 +420,105 @@ func TestBuildAlterTable(t *testing.T) {
 		"ALTER TABLE emp ADD UNIQUE idx1 (empno, ename);",
 		"ALTER TABLE emp ADD UNIQUE INDEX idx1 (empno, ename);",
 		"ALTER TABLE emp ADD INDEX idx1 (ename, sal);",
+		"ALTER TABLE emp ADD INDEX idx2 (ename, sal DESC);",
+		"ALTER TABLE emp ADD UNIQUE INDEX idx1 (empno ASC);",
 		//"alter table emp drop foreign key fk1",
 		//"alter table nation add FOREIGN KEY fk_t1(n_nationkey) REFERENCES nation2(n_nationkey)",
 	}
 	runTestShouldPass(mock, t, sqls, false, false)
+}
+
+func TestBuildAlterTableError(t *testing.T) {
+	mock := NewMockOptimizer(false)
+	// should pass
+	sqls := []string{
+		"ALTER TABLE emp ADD UNIQUE idx1 ((empno+1) DESC, ename);",
+		"ALTER TABLE emp ADD INDEX idx2 (ename, (sal*30) DESC);",
+		"ALTER TABLE emp ADD UNIQUE INDEX idx1 ((empno+20), (sal*30));",
+	}
+	runTestShouldError(mock, t, sqls)
+}
+
+func TestCreateSingleTable(t *testing.T) {
+	sql := "create cluster table a (a int);"
+	mock := NewMockOptimizer(false)
+	logicPlan, err := buildSingleStmt(mock, t, sql)
+	if err != nil {
+		t.Fatalf("%+v", err)
+	}
+	outPutPlan(logicPlan, true, t)
+}
+
+func TestCreateTableAsSelect(t *testing.T) {
+	mock := NewMockOptimizer(false)
+	sqls := []string{"CREATE TABLE t1 (a int, b char(5)); CREATE TABLE t2 (c float) as select b, a from t1"}
+	runTestShouldPass(mock, t, sqls, false, false)
+}
+
+func TestParseDuration(t *testing.T) {
+
+	cases := []struct {
+		period      uint64
+		unit        string
+		expected    time.Duration
+		expectedErr error
+	}{
+		// nil input
+		{expectedErr: moerr.NewInvalidArg(context.Background(), "time unit", "")},
+		// 0 second
+		{0, "second", 0, nil},
+		// 1 second
+		{1, "second", time.Second, nil},
+		// 2 minute
+		{2, "minute", 2 * time.Minute, nil},
+		// 3 hour
+		{3, "hour", 3 * time.Hour, nil},
+		// 4 day
+		{4, "day", 4 * 24 * time.Hour, nil},
+		// 5 week
+		{5, "week", 5 * 7 * 24 * time.Hour, nil},
+		// 6 month
+		{6, "month", 6 * 30 * 24 * time.Hour, nil},
+		// invalid time unit: year
+		{7, "year", 0, moerr.NewInvalidArg(context.Background(), "time unit", "year")},
+	}
+
+	for _, c := range cases {
+		duration, err := parseDuration(context.Background(), c.period, c.unit)
+		assert.Equal(t, c.expected, duration)
+		assert.Equal(t, err, c.expectedErr)
+	}
+}
+
+func Test_buildTableDefs(t *testing.T) {
+	stmt := &tree.CreateTable{
+		Temporary:          false,
+		IsClusterTable:     false,
+		IfNotExists:        false,
+		Table:              tree.TableName{},
+		Defs:               nil,
+		Options:            nil,
+		PartitionOption:    nil,
+		ClusterByOption:    nil,
+		Param:              nil,
+		AsSource:           &tree.Select{Select: &tree.SelectClause{From: &tree.From{}}},
+		IsDynamicTable:     false,
+		DTOptions:          nil,
+		IsAsSelect:         true,
+		IsAsLike:           false,
+		LikeTableName:      tree.TableName{},
+		SubscriptionOption: nil,
+	}
+
+	ctx := &MockCompilerContext{}
+
+	createTable := &plan.CreateTable{
+		Database: "db",
+		TableDef: &plan.TableDef{
+			Name: "table",
+		},
+	}
+
+	err := buildTableDefs(stmt, ctx, createTable, nil)
+	assert.Error(t, err)
 }

@@ -20,6 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode"
+
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 )
 
 func (p *Path) init(subs []subPath) {
@@ -45,6 +47,31 @@ func (p *Path) step() (sub subPath, newP Path) {
 	sub = p.paths[0]
 	newP.init(p.paths[1:])
 	return
+}
+
+// A path is simple if it is a linear path with no star, double star, or range.
+func (p *Path) IsSimple() bool {
+	if p == nil {
+		return true
+	}
+	if p.flag != 0 {
+		return false
+	}
+
+	for _, sub := range p.paths {
+		if (sub.tp == subPathKey && sub.key != "*") ||
+			sub.tp == subPathIdx {
+			continue
+		} else {
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Path) popOneSubPath() (Path, subPath) {
+	lastPathIdx := len(p.paths) - 1
+	return Path{paths: p.paths[:lastPathIdx]}, p.paths[lastPathIdx]
 }
 
 func (p *Path) String() string {
@@ -312,7 +339,7 @@ func (pg *pathGenerator) generateKey(legs []subPath) ([]subPath, bool) {
 			})
 		}
 		key = "\"" + key + "\""
-		if !json.Valid(string2Slice(key)) {
+		if !json.Valid(util.UnsafeStringToBytes(key)) {
 			return nil, false
 		}
 		key, err := strconv.Unquote(key)

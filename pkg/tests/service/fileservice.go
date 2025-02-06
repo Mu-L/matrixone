@@ -15,6 +15,7 @@
 package service
 
 import (
+	"context"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -31,71 +32,66 @@ type fileServices struct {
 	sync.RWMutex
 
 	t            *testing.T
-	dnServiceNum int
+	tnServiceNum int
 	cnServiceNum int
 
-	dnLocalFSs []fileservice.FileService
+	tnLocalFSs []fileservice.FileService
 	cnLocalFSs []fileservice.FileService
 	s3FS       fileservice.FileService
 	etlFS      fileservice.FileService
 }
 
-// newFileServices constructs an instance of fileServices.
-func (c *testCluster) buildFileServices() *fileServices {
-	dnServiceNum := c.opt.initial.dnServiceNum
-	cnServiceNum := c.opt.initial.cnServiceNum
-
-	factory := func(dir string, name string) fileservice.FileService {
-		fs, err := fileservice.NewMemoryFS(name)
+func (c *testCluster) createFS(
+	ctx context.Context,
+	dir string,
+	name string) fileservice.FileService {
+	if c.opt.keepData {
+		fs, err := fileservice.NewLocalFS(ctx, name, filepath.Join(dir, name), fileservice.CacheConfig{}, nil)
 		require.NoError(c.t, err)
 		return fs
 	}
-	if c.opt.keepData {
-		factory = func(dir string, name string) fileservice.FileService {
-			fs, err := fileservice.NewLocalFS(name, filepath.Join(dir, name), 0, nil)
-			require.NoError(c.t, err)
-			return fs
-		}
-	}
 
-	dnLocals := make([]fileservice.FileService, 0, dnServiceNum)
-	for i := 0; i < dnServiceNum; i++ {
-		dnLocals = append(dnLocals, factory(c.dn.cfgs[i].DataDir, defines.LocalFileServiceName))
-	}
+	fs, err := fileservice.NewMemoryFS(name, fileservice.DisabledCacheConfig, nil)
+	require.NoError(c.t, err)
+	return fs
 
-	cnLocals := make([]fileservice.FileService, 0, cnServiceNum)
-	for i := 0; i < cnServiceNum; i++ {
-		cnLocals = append(cnLocals, factory(filepath.Join(c.opt.rootDataDir, c.cn.cfgs[i].UUID), defines.LocalFileServiceName))
+}
+
+// newFileServices constructs an instance of fileServices.
+func (c *testCluster) buildFileServices(ctx context.Context) *fileServices {
+	tnServiceNum := c.opt.initial.tnServiceNum
+
+	tnLocals := make([]fileservice.FileService, 0, tnServiceNum)
+	for i := 0; i < tnServiceNum; i++ {
+		tnLocals = append(tnLocals, c.createFS(ctx, c.tn.cfgs[i].DataDir, defines.LocalFileServiceName))
 	}
 
 	return &fileServices{
 		t:            c.t,
-		dnServiceNum: dnServiceNum,
-		cnServiceNum: cnServiceNum,
-		dnLocalFSs:   dnLocals,
-		cnLocalFSs:   cnLocals,
-		s3FS:         factory(c.opt.rootDataDir, defines.SharedFileServiceName),
-		etlFS:        factory(c.opt.rootDataDir, defines.ETLFileServiceName),
+		tnServiceNum: tnServiceNum,
+		tnLocalFSs:   tnLocals,
+		s3FS:         c.createFS(ctx, c.opt.rootDataDir, defines.SharedFileServiceName),
+		etlFS:        c.createFS(ctx, c.opt.rootDataDir, defines.ETLFileServiceName),
 	}
 }
 
 // assertFileServiceLocked asserts constructed file services.
 func (f *fileServices) assertFileServiceLocked() {
-	assert.Equal(f.t, f.dnServiceNum, len(f.dnLocalFSs))
+	assert.Equal(f.t, f.tnServiceNum, len(f.tnLocalFSs))
 	assert.Equal(f.t, f.cnServiceNum, len(f.cnLocalFSs))
 }
 
-// getDNLocalFileService gets local FileService for DN service.
-func (f *fileServices) getDNLocalFileService(index int) fileservice.FileService {
+// getTNLocalFileService gets local FileService for TN service.
+func (f *fileServices) getTNLocalFileService(index int) fileservice.FileService {
 	f.RLock()
 	defer f.RUnlock()
 
 	f.assertFileServiceLocked()
 
-	if index >= len(f.dnLocalFSs) {
+	if index >= len(f.tnLocalFSs) {
 		return nil
 	}
-	return f.dnLocalFSs[index]
+	return f.tnLocalFSs[index]
 }
 
 func (f *fileServices) getCNLocalFileService(index int) fileservice.FileService {
@@ -110,7 +106,7 @@ func (f *fileServices) getCNLocalFileService(index int) fileservice.FileService 
 	return f.cnLocalFSs[index]
 }
 
-// getS3FileService gets S3 FileService for all DN services.
+// getS3FileService gets S3 FileService for all TN services.
 func (f *fileServices) getS3FileService() fileservice.FileService {
 	f.RLock()
 	defer f.RUnlock()
@@ -118,7 +114,7 @@ func (f *fileServices) getS3FileService() fileservice.FileService {
 	return f.s3FS
 }
 
-// getETLFileService gets ETL FileService for all DN services.
+// getETLFileService gets ETL FileService for all TN services.
 func (f *fileServices) getETLFileService() fileservice.FileService {
 	f.RLock()
 	defer f.RUnlock()

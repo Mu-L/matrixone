@@ -15,6 +15,9 @@
 package clusterservice
 
 import (
+	"context"
+
+	logpb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 )
 
@@ -24,6 +27,13 @@ type Op int
 var (
 	// EQ ==
 	EQ = Op(1)
+
+	// EQ_Globbing means the labels are equal, also support globbing(*)
+	// to match key/value from request.
+	EQ_Globbing = Op(2)
+
+	// Contain means the requested labels are contained in the CN labels.
+	Contain = Op(3)
 )
 
 // Selector is used to choose a service from MOCluster
@@ -31,10 +41,18 @@ type Selector struct {
 	byServiceID bool
 	serviceID   string
 
-	byLabel     bool
-	labelName   string
-	labelOp     Op
-	labelValues []string
+	byLabel bool
+	labels  map[string]string
+	labelOp Op
+
+	// all is ture means that we only want all the CN services to do
+	// the filter. Otherwise, only the ones whose work state is working
+	// would do the filter. This is only used for CN. Its default value
+	// is false.
+	all bool
+
+	// regexCache is the cache for compiled regexp item.
+	regexpCache *regexpCache
 }
 
 // MOCluster is used to get the meta and status information of the MO cluster.
@@ -49,16 +67,45 @@ type MOCluster interface {
 	// Since the query result may be a Slice, to avoid memory allocation overhead,
 	// we use apply to notify the caller of a Service that satisfies the condition.
 	GetCNService(selector Selector, apply func(metadata.CNService) bool)
-	// GetDNService get services by selector, and the applyFunc used to save the
-	// dn service that matches the selector's conditions.
+	// GetTNService get services by selector, and the applyFunc used to save the
+	// tn service that matches the selector's conditions.
 	//
 	// Since the query result may be a Slice, to avoid memory allocation overhead,
 	// we use apply to notify the caller of a Service that satisfies the condition.
-	GetDNService(selector Selector, apply func(metadata.DNService) bool)
+	GetTNService(selector Selector, apply func(metadata.TNService) bool)
+	// GetAllTNServices get all tn services
+	GetAllTNServices() []metadata.TNService
+	// GetCNServiceWithoutWorkingState get services by selector, and the applyFunc used to save the
+	// cn service that matches the selector's conditions.
+	//
+	// Since the query result may be a Slice, to avoid memory allocation overhead,
+	// we use apply to notify the caller of a Service that satisfies the condition.
+	GetCNServiceWithoutWorkingState(selector Selector, apply func(metadata.CNService) bool)
 	// ForceRefresh when other modules use the cluster information and find out that
 	// the current cache information is out of date, you can force the cache to be
 	// refreshed.
-	ForceRefresh()
+	ForceRefresh(sync bool)
 	// Close close the cluster
 	Close()
+	// DebugUpdateCNLabel updates the labels on specified CN. It is only used in mo_ctl
+	// internally for debug purpose.
+	DebugUpdateCNLabel(uuid string, kvs map[string][]string) error
+	DebugUpdateCNWorkState(uuid string, state int) error
+
+	// RemoveCN removes the specified CN from the cluster
+	RemoveCN(id string)
+	// AddCN adds the specified CN to the cluster
+	AddCN(metadata.CNService)
+	// UpdateCN updates the specified CN in the cluster
+	UpdateCN(metadata.CNService)
+}
+
+type ClusterClient interface {
+	GetClusterDetails(ctx context.Context) (logpb.ClusterDetails, error)
+}
+
+type labelSupportedClient interface {
+	ClusterClient
+	UpdateCNLabel(ctx context.Context, label logpb.CNStoreLabel) error
+	UpdateCNWorkState(ctx context.Context, state logpb.CNWorkState) error
 }

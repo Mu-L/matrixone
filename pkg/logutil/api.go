@@ -125,14 +125,15 @@ func GetLoggerWithOptions(
 	syncer zapcore.WriteSyncer,
 	options ...zap.Option) *zap.Logger {
 	var cores []zapcore.Core
-	options = append(options, zap.AddStacktrace(zapcore.FatalLevel), zap.AddCaller())
-	if syncer == nil {
-		syncer = getConsoleSyncer()
+	if EnableLog() {
+		if syncer == nil {
+			syncer = getConsoleSyncer()
+		}
+		if encoder == nil {
+			encoder = getLoggerEncoder("console")
+		}
+		cores = append(cores, zapcore.NewCore(encoder, syncer, level))
 	}
-	if encoder == nil {
-		encoder = getLoggerEncoder("console")
-	}
-	cores = append(cores, zapcore.NewCore(encoder, syncer, level))
 
 	if EnableStoreDB() {
 		encoder, syncer := getTraceLogSinks()
@@ -157,5 +158,5 @@ func GetPanicLogger(options ...zap.Option) *zap.Logger {
 // returned zap logger should only be used in tests.
 func GetPanicLoggerWithLevel(level zapcore.Level, options ...zap.Option) *zap.Logger {
 	return GetLoggerWithOptions(level, nil, nil,
-		zap.OnFatal(zapcore.WriteThenPanic))
+		zap.WithFatalHook(zapcore.WriteThenPanic))
 }

@@ -15,19 +15,21 @@
 package txnimpl
 
 import (
+	"context"
 	"sync"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio"
-
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"go.uber.org/zap"
 )
 
 type txnDB struct {
@@ -70,12 +72,12 @@ func (db *txnDB) SetDropEntry(e txnif.TxnEntry) error {
 	return nil
 }
 
-func (db *txnDB) LogTxnEntry(tableId uint64, entry txnif.TxnEntry, readed []*common.ID) (err error) {
+func (db *txnDB) LogTxnEntry(tableId uint64, entry txnif.TxnEntry, readedObjects, readedTombstone []*common.ID) (err error) {
 	table, err := db.getOrSetTable(tableId)
 	if err != nil {
 		return
 	}
-	return table.LogTxnEntry(entry, readed)
+	return table.LogTxnEntry(entry, readedObjects, readedTombstone)
 }
 
 func (db *txnDB) Close() error {
@@ -103,7 +105,7 @@ func (db *txnDB) BatchDedup(id uint64, pk containers.Vector) (err error) {
 	return table.DoBatchDedup(pk)
 }
 
-func (db *txnDB) Append(id uint64, bat *containers.Batch) error {
+func (db *txnDB) Append(ctx context.Context, id uint64, bat *containers.Batch) error {
 	table, err := db.getOrSetTable(id)
 	if err != nil {
 		return err
@@ -111,13 +113,13 @@ func (db *txnDB) Append(id uint64, bat *containers.Batch) error {
 	if table.IsDeleted() {
 		return moerr.NewNotFoundNoCtx()
 	}
-	return table.Append(bat)
+	return table.Append(ctx, bat)
 }
 
-func (db *txnDB) AddBlksWithMetaLoc(
+func (db *txnDB) AddDataFiles(
+	ctx context.Context,
 	tid uint64,
-	zm []dataio.Index,
-	metaLocs []string) error {
+	stats containers.Vector) error {
 	table, err := db.getOrSetTable(tid)
 	if err != nil {
 		return err
@@ -125,21 +127,24 @@ func (db *txnDB) AddBlksWithMetaLoc(
 	if table.IsDeleted() {
 		return moerr.NewNotFoundNoCtx()
 	}
-	return table.AddBlksWithMetaLoc(zm, metaLocs)
+	return table.AddDataFiles(ctx, stats)
 }
 
-func (db *txnDB) DeleteOne(table *txnTable, id *common.ID, row uint32, dt handle.DeleteType) (err error) {
-	changed, nid, nrow, err := table.TransferDeleteIntent(id, row)
-	if err != nil {
-		return err
-	}
-	if !changed {
-		return table.RangeDelete(id, row, row, dt)
-	}
-	return table.RangeDelete(nid, nrow, nrow, dt)
-}
+// func (db *txnDB) DeleteOne(table *txnTable, id *common.ID, row uint32, dt handle.DeleteType) (err error) {
+// 	changed, nid, nrow, err := table.TransferDeleteIntent(id, row)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	if !changed {
+// 		return table.RangeDelete(id, row, row, dt)
+// 	}
+// 	return table.RangeDelete(nid, nrow, nrow, dt)
+// }
 
-func (db *txnDB) RangeDelete(id *common.ID, start, end uint32, dt handle.DeleteType) (err error) {
+func (db *txnDB) RangeDelete(
+	id *common.ID, start, end uint32,
+	pkVec containers.Vector, dt handle.DeleteType,
+) (err error) {
 	table, err := db.getOrSetTable(id.TableID)
 	if err != nil {
 		return err
@@ -147,19 +152,38 @@ func (db *txnDB) RangeDelete(id *common.ID, start, end uint32, dt handle.DeleteT
 	if table.IsDeleted() {
 		return moerr.NewNotFoundNoCtx()
 	}
-	return table.RangeDelete(id, start, end, dt)
-	// if start == end {
-	// 	return db.DeleteOne(table, id, start, dt)
-	// }
-	// for i := start; i <= end; i++ {
-	// 	if err = db.DeleteOne(table, id, i, dt); err != nil {
-	// 		return
-	// 	}
-	// }
-	// return
+	return table.RangeDelete(id, start, end, pkVec, dt)
 }
 
-func (db *txnDB) GetByFilter(tid uint64, filter *handle.Filter) (id *common.ID, offset uint32, err error) {
+func (db *txnDB) DeleteByPhyAddrKeys(
+	id *common.ID, rowIDVec containers.Vector,
+	pkVec containers.Vector, dt handle.DeleteType,
+) (err error) {
+	table, err := db.getOrSetTable(id.TableID)
+	if err != nil {
+		return err
+	}
+	if table.IsDeleted() {
+		return moerr.NewNotFoundNoCtx()
+	}
+	return table.DeleteByPhyAddrKeys(rowIDVec, pkVec, dt)
+}
+
+func (db *txnDB) AddPersistedTombstoneFile(
+	id *common.ID,
+	stats objectio.ObjectStats,
+) (ok bool, err error) {
+	table, err := db.getOrSetTable(id.TableID)
+	if err != nil {
+		return
+	}
+	if table.IsDeleted() {
+		return false, moerr.NewNotFoundNoCtx()
+	}
+	return table.AddPersistedTombstoneFile(id, stats)
+}
+
+func (db *txnDB) GetByFilter(ctx context.Context, tid uint64, filter *handle.Filter) (id *common.ID, offset uint32, err error) {
 	table, err := db.getOrSetTable(tid)
 	if err != nil {
 		return
@@ -168,10 +192,10 @@ func (db *txnDB) GetByFilter(tid uint64, filter *handle.Filter) (id *common.ID, 
 		err = moerr.NewNotFoundNoCtx()
 		return
 	}
-	return table.GetByFilter(filter)
+	return table.GetByFilter(ctx, filter)
 }
 
-func (db *txnDB) GetValue(id *common.ID, row uint32, colIdx uint16) (v any, err error) {
+func (db *txnDB) GetValue(id *common.ID, row uint32, colIdx uint16, skipCheckDelete bool) (v any, isNull bool, err error) {
 	table, err := db.getOrSetTable(id.TableID)
 	if err != nil {
 		return
@@ -180,7 +204,7 @@ func (db *txnDB) GetValue(id *common.ID, row uint32, colIdx uint16) (v any, err 
 		err = moerr.NewNotFoundNoCtx()
 		return
 	}
-	return table.GetValue(id, row, colIdx)
+	return table.GetValue(context.Background(), id, row, colIdx, skipCheckDelete)
 }
 
 func (db *txnDB) CreateRelation(def any) (relation handle.Relation, err error) {
@@ -292,30 +316,38 @@ func (db *txnDB) GetRelationByID(id uint64) (relation handle.Relation, err error
 	return
 }
 
-func (db *txnDB) GetSegment(id *common.ID) (seg handle.Segment, err error) {
+func (db *txnDB) GetObject(id *common.ID, isTombstone bool) (obj handle.Object, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.GetSegment(id.SegmentID)
+	return table.GetObject(id.ObjectID(), isTombstone)
 }
 
-func (db *txnDB) CreateSegment(tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (db *txnDB) CreateObject(tid uint64, isTombstone bool) (obj handle.Object, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(tid); err != nil {
 		return
 	}
-	return table.CreateSegment(is1PC)
+	return table.CreateObject(isTombstone)
 }
-
-func (db *txnDB) CreateNonAppendableSegment(tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (db *txnDB) CreateNonAppendableObject(tid uint64, opt *objectio.CreateObjOpt, isTombstone bool) (obj handle.Object, err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(tid); err != nil {
 		return
 	}
-	return table.CreateNonAppendableSegment(is1PC, nil)
+	opt.WithIsTombstone(isTombstone)
+	return table.CreateNonAppendableObject(opt)
 }
 
+func (db *txnDB) UpdateObjectStats(id *common.ID, stats *objectio.ObjectStats, isTombstone bool) error {
+	table, err := db.getOrSetTable(id.TableID)
+	if err != nil {
+		return err
+	}
+	table.UpdateObjectStats(id, stats, isTombstone)
+	return nil
+}
 func (db *txnDB) getOrSetTable(id uint64) (table *txnTable, err error) {
 	db.mu.RLock()
 	table = db.tables[id]
@@ -336,70 +368,28 @@ func (db *txnDB) getOrSetTable(id uint64) (table *txnTable, err error) {
 	if db.store.warChecker == nil {
 		db.store.warChecker = newWarChecker(db.store.txn, db.store.catalog)
 	}
-	table = newTxnTable(db.store, entry)
+	table, err = newTxnTable(db.store, entry)
+	if err != nil {
+		return
+	}
 	table.idx = len(db.tables)
 	db.tables[id] = table
 	return
 }
 
-func (db *txnDB) CreateNonAppendableBlock(id *common.ID, opts *common.CreateBlockOpt) (blk handle.Block, err error) {
+func (db *txnDB) SoftDeleteObject(id *common.ID, isTombstone bool) (err error) {
 	var table *txnTable
 	if table, err = db.getOrSetTable(id.TableID); err != nil {
 		return
 	}
-	return table.CreateNonAppendableBlock(id.SegmentID, opts)
-}
-
-func (db *txnDB) GetBlock(id *common.ID) (blk handle.Block, err error) {
-	var table *txnTable
-	if table, err = db.getOrSetTable(id.TableID); err != nil {
-		return
-	}
-	return table.GetBlock(id)
-}
-
-func (db *txnDB) CreateBlock(tid uint64, sid types.Uuid, is1PC bool) (blk handle.Block, err error) {
-	var table *txnTable
-	if table, err = db.getOrSetTable(tid); err != nil {
-		return
-	}
-	return table.CreateBlock(sid, is1PC)
-}
-
-func (db *txnDB) SoftDeleteBlock(id *common.ID) (err error) {
-	var table *txnTable
-	if table, err = db.getOrSetTable(id.TableID); err != nil {
-		return
-	}
-	return table.SoftDeleteBlock(id)
-}
-func (db *txnDB) UpdateMetaLoc(id *common.ID, metaLoc string) (err error) {
-	var table *txnTable
-	if table, err = db.getOrSetTable(id.TableID); err != nil {
-		return
-	}
-	return table.UpdateMetaLoc(id, metaLoc)
-}
-func (db *txnDB) UpdateDeltaLoc(id *common.ID, deltaLoc string) (err error) {
-	var table *txnTable
-	if table, err = db.getOrSetTable(id.TableID); err != nil {
-		return
-	}
-	return table.UpdateDeltaLoc(id, deltaLoc)
-}
-func (db *txnDB) SoftDeleteSegment(id *common.ID) (err error) {
-	var table *txnTable
-	if table, err = db.getOrSetTable(id.TableID); err != nil {
-		return
-	}
-	return table.SoftDeleteSegment(id.SegmentID)
+	return table.SoftDeleteObject(id.ObjectID(), isTombstone)
 }
 func (db *txnDB) NeedRollback() bool {
 	return db.createEntry != nil && db.dropEntry != nil
 }
 func (db *txnDB) ApplyRollback() (err error) {
 	if db.createEntry != nil {
-		if err = db.createEntry.ApplyRollback(db.store.cmdMgr.MakeLogIndex(db.ddlCSN)); err != nil {
+		if err = db.createEntry.ApplyRollback(); err != nil {
 			return
 		}
 	}
@@ -409,7 +399,7 @@ func (db *txnDB) ApplyRollback() (err error) {
 		}
 	}
 	if db.dropEntry != nil {
-		if err = db.dropEntry.ApplyRollback(db.store.cmdMgr.MakeLogIndex(db.ddlCSN)); err != nil {
+		if err = db.dropEntry.ApplyRollback(); err != nil {
 			return
 		}
 	}
@@ -422,28 +412,11 @@ func (db *txnDB) WaitPrepared() (err error) {
 	}
 	return
 }
-func (db *txnDB) Apply1PCCommit() (err error) {
-	if db.createEntry != nil && db.createEntry.Is1PC() {
-		if err = db.createEntry.ApplyCommit(db.store.cmdMgr.MakeLogIndex(db.ddlCSN)); err != nil {
-			return
-		}
-	}
-	for _, table := range db.tables {
-		if err = table.Apply1PCCommit(); err != nil {
-			break
-		}
-	}
-	if db.dropEntry != nil && db.dropEntry.Is1PC() {
-		if err = db.dropEntry.ApplyCommit(db.store.cmdMgr.MakeLogIndex(db.ddlCSN)); err != nil {
-			return
-		}
-	}
-	return
-}
+
 func (db *txnDB) ApplyCommit() (err error) {
 	now := time.Now()
-	if db.createEntry != nil && !db.createEntry.Is1PC() {
-		if err = db.createEntry.ApplyCommit(db.store.cmdMgr.MakeLogIndex(db.ddlCSN)); err != nil {
+	if db.createEntry != nil {
+		if err = db.createEntry.ApplyCommit(db.store.txn.GetID()); err != nil {
 			return
 		}
 	}
@@ -452,16 +425,18 @@ func (db *txnDB) ApplyCommit() (err error) {
 			break
 		}
 	}
-	if db.dropEntry != nil && !db.dropEntry.Is1PC() {
-		if err = db.dropEntry.ApplyCommit(db.store.cmdMgr.MakeLogIndex(db.ddlCSN)); err != nil {
+	if db.dropEntry != nil {
+		if err = db.dropEntry.ApplyCommit(db.store.txn.GetID()); err != nil {
 			return
 		}
 	}
-	logutil.Debugf("Txn-%X ApplyCommit Takes %s", db.store.txn.GetID(), time.Since(now))
+	common.DoIfDebugEnabled(func() {
+		logutil.Debugf("Txn-%X ApplyCommit Takes %s", db.store.txn.GetID(), time.Since(now))
+	})
 	return
 }
 
-func (db *txnDB) PrePrepare() (err error) {
+func (db *txnDB) Freeze(ctx context.Context) (err error) {
 	for _, table := range db.tables {
 		if table.NeedRollback() {
 			if err = table.PrepareRollback(); err != nil {
@@ -470,19 +445,78 @@ func (db *txnDB) PrePrepare() (err error) {
 			delete(db.tables, table.GetID())
 		}
 	}
+	nowTS := db.store.rt.Now()
 	for _, table := range db.tables {
-		if err = table.PrePreareTransfer(); err != nil {
+		if err = table.PrePreareTransfer(
+			ctx, txnif.FreezePhase, nowTS,
+		); err != nil {
 			return
 		}
 	}
+
+	dedupType := db.store.txn.GetDedupType()
+	if dedupType.SkipTargetOldCommitted() {
+		now := time.Now()
+		for _, table := range db.tables {
+			if err = table.PrePrepareDedup(
+				ctx, false, txnif.FreezePhase, nowTS,
+			); err != nil {
+				return
+			}
+			if err = table.PrePrepareDedup(
+				ctx, true, txnif.FreezePhase, nowTS,
+			); err != nil {
+				return
+			}
+		}
+		v2.TxnTNAppendDeduplicateDurationHistogram.Observe(time.Since(now).Seconds())
+	}
+	return
+}
+
+func (db *txnDB) approxSize() int {
+	size := 0
+	for _, tbl := range db.tables {
+		size += tbl.approxSize()
+	}
+	return size
+}
+
+func (db *txnDB) PrePrepare(ctx context.Context) (err error) {
 	for _, table := range db.tables {
-		if err = table.PrePrepareDedup(); err != nil {
+		if err = table.PrePreareTransfer(
+			ctx,
+			txnif.PrePreparePhase,
+			table.store.rt.Now(),
+		); err != nil {
 			return
 		}
 	}
+
+	now := time.Now()
+	nowTS := db.store.rt.Now()
+	for _, table := range db.tables {
+		if err = table.PrePrepareDedup(ctx, true, txnif.PrePreparePhase, nowTS); err != nil {
+			return
+		}
+		if err = table.PrePrepareDedup(ctx, false, txnif.PrePreparePhase, nowTS); err != nil {
+			return
+		}
+	}
+	duration := time.Since(now)
+	v2.TxnTNPrePrepareDeduplicateDurationHistogram.Observe(duration.Seconds())
+
+	if duration > time.Millisecond*500 {
+		logutil.Info(
+			"SLOW-LOG-PrePrepareDedup",
+			zap.String("txn", db.store.txn.String()),
+			zap.Duration("duration", duration),
+		)
+	}
+
 	for _, table := range db.tables {
 		if err = table.PrePrepare(); err != nil {
-			panic(err)
+			return
 		}
 	}
 	return
@@ -506,7 +540,9 @@ func (db *txnDB) PrepareCommit() (err error) {
 		}
 	}
 
-	logutil.Debugf("Txn-%X PrepareCommit Takes %s", db.store.txn.GetID(), time.Since(now))
+	common.DoIfDebugEnabled(func() {
+		logutil.Debugf("Txn-%X PrepareCommit Takes %s", db.store.txn.GetID(), time.Since(now))
+	})
 
 	return
 }
@@ -576,4 +612,18 @@ func (db *txnDB) PrepareRollback() error {
 	}
 
 	return err
+}
+
+func (db *txnDB) CleanUp() {
+	for _, tbl := range db.tables {
+		tbl.CleanUp()
+	}
+}
+
+func (db *txnDB) FillInWorkspaceDeletes(id *common.ID, deletes **nulls.Nulls, deleteStartOffset uint64) error {
+	table, err := db.getOrSetTable(id.TableID)
+	if err != nil {
+		return err
+	}
+	return table.FillInWorkspaceDeletes(id.BlockID, deletes, deleteStartOffset)
 }

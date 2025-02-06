@@ -15,106 +15,152 @@
 package txnimpl
 
 import (
-	"bytes"
+	"context"
 	"testing"
 
-	"github.com/RoaringBitmap/roaring"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
-
-func TestPointerCmd(t *testing.T) {
-	defer testutils.AfterTest(t)()
-	testutils.EnsureNoLeak(t)
-	groups := uint32(10)
-	maxLsn := uint64(10)
-	for group := uint32(1); group <= groups; group++ {
-		for lsn := uint64(1); lsn <= maxLsn; lsn++ {
-			cmd := new(txnbase.PointerCmd)
-			cmd.Group = group
-			cmd.Lsn = lsn
-			mashalled, err := cmd.Marshal()
-			assert.Nil(t, err)
-			r := bytes.NewBuffer(mashalled)
-			cmd2, _, err := txnbase.BuildCommandFrom(r)
-			assert.Nil(t, err)
-			assert.Equal(t, cmd.Group, cmd2.(*txnbase.PointerCmd).Group)
-			assert.Equal(t, cmd.Lsn, cmd2.(*txnbase.PointerCmd).Lsn)
-		}
-	}
-}
 
 func TestComposedCmd(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	testutils.EnsureNoLeak(t)
-	composed := txnbase.NewComposedCmd()
+	composed := txnbase.NewComposedCmd(0)
 	defer composed.Close()
-	groups := uint32(10)
-	maxLsn := uint64(10)
-	for group := uint32(1); group <= groups; group++ {
-		for lsn := uint64(1); lsn <= maxLsn; lsn++ {
-			cmd := new(txnbase.PointerCmd)
-			cmd.Group = group
-			cmd.Lsn = lsn
-			composed.AddCmd(cmd)
-		}
-	}
-	batCnt := 5
 
-	schema := catalog.MockSchema(4, 0)
-	for i := 0; i < batCnt; i++ {
-		bat := catalog.MockBatch(schema, (i+1)*5)
-		defer bat.Close()
-		batCmd := txnbase.NewBatchCmd(bat)
-		del := roaring.NewBitmap()
-		del.Add(uint32(i))
-		delCmd := txnbase.NewDeleteBitmapCmd(del)
-		comp := txnbase.NewComposedCmd()
-		comp.AddCmd(batCmd)
-		comp.AddCmd(delCmd)
-		composed.AddCmd(comp)
+	schema := catalog.MockSchema(1, 0)
+	c := catalog.MockCatalog()
+	defer c.Close()
+
+	db, _ := c.CreateDBEntry("db", "", "", nil)
+	dbCmd, err := db.MakeCommand(1)
+	assert.Nil(t, err)
+	composed.AddCmd(dbCmd)
+
+	table, _ := db.CreateTableEntry(schema, nil, nil)
+	tblCmd, err := table.MakeCommand(1)
+	assert.Nil(t, err)
+	composed.AddCmd(tblCmd)
+
+	stats := objectio.NewObjectStatsWithObjectID(objectio.NewObjectid(), true, false, false)
+	obj, _ := table.CreateObject(nil, &objectio.CreateObjOpt{Stats: stats}, nil)
+	objCmd, err := obj.MakeCommand(1)
+	assert.Nil(t, err)
+	composed.AddCmd(objCmd)
+
+	// TODO
+
+	// objMvcc := updates.NewObjectMVCCHandle(obj)
+
+	// controller := updates.NewMVCCHandle(objMvcc, 0)
+	// ts := types.NextGlobalTsForTest()
+
+	// appenderMvcc := updates.NewAppendMVCCHandle(obj)
+
+	// node := updates.MockAppendNode(ts, 0, 2515, appenderMvcc)
+	// cmd := updates.NewAppendCmd(1, node)
+
+	// composed.AddCmd(cmd)
+
+	// del := updates.NewDeleteNode(nil, handle.DT_Normal,
+	// 	updates.IOET_WALTxnCommand_DeleteNode_V2)
+	// del.AttachTo(controller.GetDeleteChain())
+	// cmd2, err := del.MakeCommand(1)
+	// assert.Nil(t, err)
+	// composed.AddCmd(cmd2)
+
+	// buf, err := composed.MarshalBinary()
+	// assert.Nil(t, err)
+	// _, err = txnbase.BuildCommandFrom(buf)
+	// assert.Nil(t, err)
+}
+
+func TestComposedCmdMaxSize(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	testutils.EnsureNoLeak(t)
+	composed := txnbase.NewComposedCmd(1280 + txnbase.CmdBufReserved)
+	defer composed.Close()
+
+	schema := catalog.MockSchema(1, 0)
+	c := catalog.MockCatalog()
+	defer c.Close()
+
+	db, _ := c.CreateDBEntry("db", "", "", nil)
+	dbCmd, err := db.MakeCommand(1)
+	assert.Nil(t, err)
+	composed.AddCmd(dbCmd)
+
+	table, _ := db.CreateTableEntry(schema, nil, nil)
+	for i := 2; i <= 10; i++ {
+		cmd, err := table.MakeCommand(uint32(i))
+		assert.Nil(t, err)
+		composed.AddCmd(cmd)
 	}
-	var w bytes.Buffer
-	_, err := composed.WriteTo(&w)
+
+	buf, err := composed.MarshalBinary()
+	assert.Nil(t, err)
+	assert.Equal(t, true, composed.MoreCmds())
+	cmd, err := txnbase.BuildCommandFrom(buf)
+	assert.Nil(t, err)
+	c1, ok := cmd.(*txnbase.ComposedCmd)
+	assert.True(t, ok)
+	assert.NotNil(t, c1)
+	assert.Equal(t, composed.LastPos, len(c1.Cmds))
+
+	buf, err = composed.MarshalBinary()
+	assert.Nil(t, err)
+	assert.Equal(t, true, composed.MoreCmds())
+	cmd, err = txnbase.BuildCommandFrom(buf)
+	assert.Nil(t, err)
+	c2, ok := cmd.(*txnbase.ComposedCmd)
+	assert.True(t, ok)
+	assert.NotNil(t, c2)
+	assert.Equal(t, composed.LastPos, len(c1.Cmds)+len(c2.Cmds))
+
+	// Remove the left commands, because it has different result in different platforms.
+}
+
+func TestAppendCmd_Compatibility(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	ctx := context.Background()
+	testutils.EnsureNoLeak(t)
+	dir := testutils.InitTestEnv(ModuleName, t)
+	c, mgr, driver := initTestContext(ctx, t, dir)
+	defer driver.Close()
+	defer c.Close()
+	defer mgr.Stop()
+
+	schema := catalog.MockSchemaAll(3, 2)
+
+	txn, _ := mgr.StartTxn(nil)
+	db, err := txn.CreateDatabase("db", "", "")
+	assert.Nil(t, err)
+	rel, _ := db.CreateRelation(schema)
+	bat := catalog.MockBatch(schema, int(mpool.KB)*100)
+	defer bat.Close()
+	bats := bat.Split(100)
+	for _, data := range bats {
+		err := rel.Append(context.Background(), data)
+		assert.Nil(t, err)
+	}
+	tDB, _ := txn.GetStore().(*txnStore).getOrSetDB(db.GetID())
+	tbl, _ := tDB.getOrSetTable(rel.ID())
+
+	cmd, err := tbl.dataTable.tableSpace.node.MakeCommand(1)
 	assert.Nil(t, err)
 
-	buf := w.Bytes()
-
-	r := bytes.NewBuffer(buf)
-	composed2, _, err := txnbase.BuildCommandFrom(r)
+	appendCmd := cmd.(*AppendCmd)
+	data, err := appendCmd.MarshalBinaryV2()
 	assert.Nil(t, err)
-	defer composed2.Close()
-	cmd1 := composed.Cmds
-	cmd2 := composed2.(*txnbase.ComposedCmd).Cmds
 
-	assert.Equal(t, len(cmd1), len(cmd2))
-	for i, c1 := range cmd1 {
-		c2 := cmd2[i]
-		assert.Equal(t, c1.GetType(), c2.GetType())
-		switch c1.GetType() {
-		case txnbase.CmdPointer:
-			assert.Equal(t, c1.(*txnbase.PointerCmd).Group, c2.(*txnbase.PointerCmd).Group)
-			assert.Equal(t, c1.(*txnbase.PointerCmd).Group, c2.(*txnbase.PointerCmd).Group)
-		case txnbase.CmdComposed:
-			comp1 := c1.(*txnbase.ComposedCmd)
-			comp2 := c2.(*txnbase.ComposedCmd)
-			for j, cc1 := range comp1.Cmds {
-				cc2 := comp2.Cmds[j]
-				assert.Equal(t, cc1.GetType(), cc2.GetType())
-				switch cc1.GetType() {
-				case txnbase.CmdPointer:
-					assert.Equal(t, cc1.(*txnbase.PointerCmd).Group, cc2.(*txnbase.PointerCmd).Group)
-					assert.Equal(t, cc1.(*txnbase.PointerCmd).Group, cc2.(*txnbase.PointerCmd).Group)
-				case txnbase.CmdDeleteBitmap:
-					assert.True(t, cc1.(*txnbase.DeleteBitmapCmd).Bitmap.Equals(cc1.(*txnbase.DeleteBitmapCmd).Bitmap))
-				case txnbase.CmdBatch:
-					b1 := cc1.(*txnbase.BatchCmd)
-					b2 := cc2.(*txnbase.BatchCmd)
-					assert.True(t, b1.Bat.Equals(b2.Bat))
-				}
-			}
-		}
-	}
+	cmd2 := NewEmptyAppendCmd()
+	err = cmd2.UnmarshalBinaryV2(data[4:])
+	assert.Nil(t, err)
+
+	require.Equal(t, appendCmd.Data.Length(), cmd2.Data.Length())
 }

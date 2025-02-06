@@ -15,8 +15,12 @@
 package txnimpl
 
 import (
+	"time"
+
 	"github.com/matrixorigin/matrixone/pkg/logutil"
-	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
@@ -30,9 +34,9 @@ type commandManager struct {
 	driver wal.Driver
 }
 
-func newCommandManager(driver wal.Driver) *commandManager {
+func newCommandManager(driver wal.Driver, maxMessageSize uint64) *commandManager {
 	return &commandManager{
-		cmd:    txnbase.NewTxnCmd(),
+		cmd:    txnbase.NewTxnCmd(maxMessageSize),
 		driver: driver,
 	}
 }
@@ -50,33 +54,50 @@ func (mgr *commandManager) AddCmd(cmd txnif.TxnCmd) {
 	mgr.csn++
 }
 
-func (mgr *commandManager) MakeLogIndex(csn uint32) *wal.Index {
-	return &wal.Index{LSN: mgr.lsn, CSN: csn, Size: mgr.csn}
-}
-
-func (mgr *commandManager) ApplyTxnRecord(tid string, txn txnif.AsyncTxn) (logEntry entry.Entry, err error) {
+func (mgr *commandManager) ApplyTxnRecord(txn txnif.AsyncTxn) (logEntry entry.Entry, err error) {
 	if mgr.driver == nil {
 		return
 	}
-	mgr.cmd.SetCmdSize(mgr.csn)
+	t1 := time.Now()
 	mgr.cmd.SetTxn(txn)
 	var buf []byte
-	if buf, err = mgr.cmd.Marshal(); err != nil {
+	if buf, err = mgr.cmd.MarshalBinary(); err != nil {
 		return
 	}
-	// logutil.Info("", common.OperationField("suxi-replay-cmd"),
-	// common.OperandField(mgr.cmd.Desc()))
+	if len(buf) > 10*mpool.MB {
+		logutil.Info(
+			"BIG-TXN",
+			zap.Int("wal-size", len(buf)),
+			zap.Uint64("lsn", mgr.lsn),
+			zap.String("txn", txn.String()),
+		)
+	}
 	logEntry = entry.GetBase()
-	logEntry.SetType(ETTxnRecord)
+	logEntry.SetType(IOET_WALEntry_TxnRecord)
 	if err = logEntry.SetPayload(buf); err != nil {
 		return
 	}
 	info := &entry.Info{
 		Group: wal.GroupPrepare,
-		TxnId: tid,
 	}
 	logEntry.SetInfo(info)
+	t2 := time.Now()
 	mgr.lsn, err = mgr.driver.AppendEntry(wal.GroupPrepare, logEntry)
+	t3 := time.Now()
+	if t3.Sub(t1) > time.Millisecond*500 {
+		logutil.Warn(
+			"SLOW-LOG",
+			zap.String("txn", txn.String()),
+			zap.Duration("make-log-entry-duration", t3.Sub(t1)),
+		)
+	}
+	if t3.Sub(t2) > time.Millisecond*20 {
+		logutil.Warn(
+			"SLOW-LOG",
+			zap.Duration("append-log-entry-duration", t3.Sub(t1)),
+			zap.String("txn", txn.String()),
+		)
+	}
 	logutil.Debugf("ApplyTxnRecord LSN=%d, Size=%d", mgr.lsn, len(buf))
 	return
 }

@@ -17,80 +17,150 @@ package tables
 import (
 	"context"
 
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index/indexwrapper"
 
 	"github.com/matrixorigin/matrixone/pkg/objectio"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer/base"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
 )
 
-func constructRowId(id *common.ID, rows uint32) (col containers.Vector, err error) {
-	prefix := id.BlockID[:]
-	return model.PreparePhyAddrData(
-		types.T_Rowid.ToType(),
-		prefix,
-		0,
-		rows,
-	)
+//func LoadPersistedColumnData(
+//	ctx context.Context,
+//	rt *dbutils.Runtime,
+//	id *common.ID,
+//	def *catalog.ColDef,
+//	location objectio.Location,
+//	mp *mpool.MPool,
+//) (vec containers.Vector, err error) {
+//	if def.IsPhyAddr() {
+//		return model.PreparePhyAddrData(&id.BlockID, 0, location.Rows(), rt.VectorPool.Transient)
+//	}
+//	//Extend lifetime of vectors is without the function.
+//	//need to copy. closeFunc will be nil.
+//	vectors, _, err := blockio.LoadColumns2(
+//		ctx, []uint16{uint16(def.SeqNum)},
+//		[]types.Type{def.Type},
+//		rt.Fs.Service,
+//		location,
+//		fileservice.Policy(0),
+//		true,
+//		rt.VectorPool.Transient)
+//	if err != nil {
+//		return
+//	}
+//	return vectors[0], nil
+//}
+
+func PreparePhyAddrData(
+	id *objectio.Blockid, startRow, length uint32, pool *containers.VectorPool,
+) (col containers.Vector, err error) {
+	col = pool.GetVector(&objectio.RowidType)
+	vec := col.GetDownstreamVector()
+	m := col.GetAllocator()
+	if err = objectio.ConstructRowidColumnTo(
+		vec, id, startRow, length, m,
+	); err != nil {
+		col.Close()
+		col = nil
+	}
+	return
 }
 
-func LoadPersistedColumnData(
-	mgr base.INodeManager,
-	fs *objectio.ObjectFS,
+func LoadPersistedColumnDatas(
+	ctx context.Context,
+	schema *catalog.Schema,
+	rt *dbutils.Runtime,
 	id *common.ID,
-	def *catalog.ColDef,
-	location string,
-) (vec containers.Vector, err error) {
-	_, _, meta, rows, err := blockio.DecodeLocation(location)
+	colIdxs []int,
+	location objectio.Location,
+	mp *mpool.MPool,
+	tsForAppendable *types.TS,
+) ([]containers.Vector, *nulls.Nulls, error) {
+	cols := make([]uint16, 0)
+	typs := make([]types.Type, 0)
+	vectors := make([]containers.Vector, len(colIdxs))
+	phyAddIdx := -1
+	var deletes *nulls.Nulls
+	for i, colIdx := range colIdxs {
+		if colIdx == objectio.SEQNUM_COMMITTS {
+			cols = append(cols, objectio.SEQNUM_COMMITTS)
+			typs = append(typs, objectio.TSType)
+			continue
+		}
+		def := schema.ColDefs[colIdx]
+		if def.IsPhyAddr() {
+			vec, err := PreparePhyAddrData(&id.BlockID, 0, location.Rows(), rt.VectorPool.Transient)
+			if err != nil {
+				return nil, deletes, err
+			}
+			phyAddIdx = i
+			vectors[phyAddIdx] = vec
+			continue
+		}
+		cols = append(cols, def.SeqNum)
+		typs = append(typs, def.Type)
+	}
+	if len(cols) == 0 {
+		return vectors, deletes, nil
+	}
+	if tsForAppendable != nil {
+		deletes = nulls.NewWithSize(1024)
+		cols = append(cols, objectio.SEQNUM_COMMITTS)
+		defer func() {
+			cols = cols[:len(cols)-1]
+		}()
+	}
+	var vecs []containers.Vector
+	var err error
+	//Extend lifetime of vectors is without the function.
+	//need to copy. closeFunc will be nil.
+	vecs, _, err = ioutil.LoadColumns2(
+		ctx, cols,
+		typs,
+		rt.Fs.Service,
+		location,
+		fileservice.Policy(0),
+		true,
+		rt.VectorPool.Transient)
 	if err != nil {
-		return nil, err
+		return nil, deletes, err
 	}
-	if def.IsPhyAddr() {
-		return constructRowId(id, rows)
+	if tsForAppendable != nil {
+		commits := vector.MustFixedColNoTypeCheck[types.TS](vecs[len(vecs)-1].GetDownstreamVector())
+		for i := 0; i < len(commits); i++ {
+			if commits[i].GT(tsForAppendable) {
+				deletes.Add(uint64(i))
+			}
+		}
+		vecs[len(vecs)-1].Close()
+		vecs = vecs[:len(vecs)-1]
 	}
-	reader, err := blockio.NewObjectReader(fs.Service, location)
-	if err != nil {
-		return
+	for i, vec := range vecs {
+		idx := i
+		if idx >= phyAddIdx && phyAddIdx > -1 {
+			idx++
+		}
+		vectors[idx] = vec
 	}
-	bat, err := reader.LoadColumns(context.Background(), []uint16{uint16(def.Idx)}, []uint32{meta.Id()}, nil)
-	if err != nil {
-		return
-	}
-	return containers.NewVectorWithSharedMemory(bat[0].Vecs[0], def.NullAbility), nil
+	return vectors, deletes, nil
 }
 
-func ReadPersistedBlockRow(location string) int {
-	meta, err := blockio.DecodeMetaLocToMeta(location)
-	if err != nil {
-		panic(err)
-	}
-	return int(meta.GetRows())
-}
-
-func LoadPersistedDeletes(
-	mgr base.INodeManager,
-	fs *objectio.ObjectFS,
-	location string) (bat *containers.Batch, err error) {
-	_, _, meta, _, err := blockio.DecodeLocation(location)
-	if err != nil {
-		return nil, err
-	}
-	reader, err := blockio.NewObjectReader(fs.Service, location)
-	if err != nil {
-		return
-	}
-	movbat, err := reader.LoadColumns(context.Background(), []uint16{0, 1, 2}, []uint32{meta.Id()}, nil)
-	if err != nil {
-		return
-	}
-	bat = containers.NewBatch()
-	colNames := []string{catalog.PhyAddrColumnName, catalog.AttrCommitTs, catalog.AttrAborted}
-	for i := 0; i < 3; i++ {
-		bat.AddVector(colNames[i], containers.NewVectorWithSharedMemory(movbat[0].Vecs[i], false))
-	}
+func MakeImmuIndex(
+	ctx context.Context,
+	meta *catalog.ObjectEntry,
+	bf objectio.BloomFilter,
+	rt *dbutils.Runtime,
+) (idx indexwrapper.ImmutIndex, err error) {
+	idx = indexwrapper.NewImmutIndex(
+		meta.SortKeyZoneMap(), bf, meta.ObjectLocation(),
+	)
 	return
 }

@@ -17,8 +17,6 @@ package plan
 import (
 	"context"
 
-	"strings"
-
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
@@ -47,22 +45,22 @@ func (b *UpdateBinder) BindColRef(astExpr *tree.UnresolvedName, depth int32, isR
 }
 
 func (b *UpdateBinder) bindColRef(astExpr *tree.UnresolvedName, _ int32, _ bool) (expr *plan.Expr, err error) {
-	col := strings.ToLower(astExpr.Parts[0])
+	col := astExpr.ColName()
 	idx := -1
 	var typ *Type
 	for i, c := range b.cols {
 		if c.Name == col {
 			idx = i
-			typ = c.Typ
+			typ = &c.Typ
 			break
 		}
 	}
 	if idx == -1 {
-		err = moerr.NewInvalidInput(b.GetContext(), "column '%s' does not exist", col)
+		err = moerr.NewInvalidInputf(b.GetContext(), "column '%s' does not exist", astExpr.ColNameOrigin())
 		return
 	}
 	expr = &plan.Expr{
-		Typ: typ,
+		Typ: *typ,
 	}
 	// a = a +1 ,  a = values(a) + 1.  'a' actually have different idx. you need replace to exact idx before eval expr.
 	// binder only check the column name exists.
@@ -70,19 +68,24 @@ func (b *UpdateBinder) bindColRef(astExpr *tree.UnresolvedName, _ int32, _ bool)
 		Col: &plan.ColRef{
 			RelPos: 0,
 			ColPos: int32(idx),
+			Name:   col,
 		},
 	}
 	return
 }
 
 func (b *UpdateBinder) BindAggFunc(funcName string, astExpr *tree.FuncExpr, depth int32, isRoot bool) (*plan.Expr, error) {
-	return nil, moerr.NewInvalidInput(b.GetContext(), "cannot bind agregate functions '%s'", funcName)
+	return nil, moerr.NewInvalidInputf(b.GetContext(), "cannot bind agregate functions '%s'", funcName)
 }
 
 func (b *UpdateBinder) BindWinFunc(funcName string, astExpr *tree.FuncExpr, depth int32, isRoot bool) (*plan.Expr, error) {
-	return nil, moerr.NewInvalidInput(b.GetContext(), "cannot bind window functions '%s'", funcName)
+	return nil, moerr.NewInvalidInputf(b.GetContext(), "cannot bind window functions '%s'", funcName)
 }
 
 func (b *UpdateBinder) BindSubquery(astExpr *tree.Subquery, isRoot bool) (*plan.Expr, error) {
 	return nil, moerr.NewNYI(b.GetContext(), "subquery in JOIN condition")
+}
+
+func (b *UpdateBinder) BindTimeWindowFunc(funcName string, astExpr *tree.FuncExpr, depth int32, isRoot bool) (*plan.Expr, error) {
+	return nil, moerr.NewInvalidInputf(b.GetContext(), "cannot bind time window functions '%s'", funcName)
 }

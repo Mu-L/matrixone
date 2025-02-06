@@ -124,11 +124,11 @@ min(t1)    max(t2)
 -838:59:59    838:59:59
 drop table time_02;
 create table time_02 (t1 int,t2 time primary key,t3 varchar(25))partition by hash(t2)partitions 4;
-SQL syntax error: type TIME not allowed in partition clause
+Field 't2' is of a not allowed type for this type of partitioning
 create table time_03 (t1 int,t2 time primary key,t3 varchar(25));
 insert into time_03 values (30,"101412","yellow");
 insert into time_03 values (40,"101412","apple");
-Duplicate entry '10:14:12.000000' for key 't2'
+Duplicate entry ('\d{2}\:\d{2}:\d{2}'|'\d{2}\:\d{2}:\d{2}\.\d{6}') for key 't2'
 select * from time_03;
 t1    t2    t3
 30    10:14:12    yellow
@@ -136,7 +136,7 @@ drop table time_03;
 create table time_03 (t1 int,t2 time,t3 varchar(25),t4 time default '110034',primary key(t1,t2));
 insert into time_03(t1,t2,t3) values (30,"24:59:09.932823","yellow");
 insert into time_03(t1,t2,t3) values (30,"24:59:09.932823","oooppppp");
-Duplicate entry '3a151e471914f1701380' for key '__mo_cpkey_col'
+Duplicate entry ('\(\d{2}\,\d{2}\:\d{2}:\d{2}\)'|'\w{20}') for key '(.*)'
 insert into time_03(t1,t2,t3) values (31,"24:59:09.932823","postttttt");
 insert into time_03(t1,t2,t3) values (32,NULL,"vinda");
 constraint violation: Column 't2' cannot be null
@@ -162,7 +162,7 @@ select * from time_03;
 t1    t2    t3    t4
 insert into time_03 values (40,"37","gloooooooge","35:50");
 truncate table time_03;
-load data infile "$resources/external_table_file/time_ex_table.csv" into table time_03;
+load data infile "$resources/external_table_file/time_ex_table.csv" into table time_03 fields terminated by ',';
 create external table time_ex_01(t1 int,t2 time,t3 varchar(25),t4 time)  infile{"filepath"='$resources/external_table_file/time_ex_table.csv'} fields terminated by ',' enclosed by '\"';
 select * from time_ex_01;
 t1    t2    t3    t4
@@ -290,3 +290,63 @@ cast(02 10:11:12 as time(26))
 select cast('255 10:11:12' as time);
 cast(255 10:11:12 as time(26))
 6130:11:12
+create database if not exists test;
+use test;
+drop table if exists mysql_ts_test;
+create table if not exists mysql_ts_test (id int, col_date date, col_time time, col timestamp);
+select * from mysql_ts_test;
+id    col_date    col_time    col
+insert into mysql_ts_test values (1, '2024-03-13', '11:30:00', '2024-03-13 11:30:00');
+insert into mysql_ts_test values (2, DATE '2024-03-14', TIME '2024', TIMESTAMP '2024-03-14 11:30:00');
+insert into mysql_ts_test values (3, {d '2024-03-15'}, {t '11:30:30'}, {ts '2024-03-15 11:30:00'});
+select * from mysql_ts_test;
+id    col_date    col_time    col
+1    2024-03-13    11:30:00    2024-03-13 11:30:00
+2    2024-03-14    00:20:24    2024-03-14 11:30:00
+3    2024-03-15    11:30:30    2024-03-15 11:30:00
+insert into mysql_ts_test values (4, {d '2024-03-16'}, {t '23:59:59'}, {ts now()});
+insert into mysql_ts_test values (4, {d '2024-03-16'}, {t '23:59:59'}, {ts current_timestamp});
+select * from mysql_ts_test;
+id    col_date    col_time    col
+1    2024-03-13    11:30:00    2024-03-13 11:30:00
+2    2024-03-14    00:20:24    2024-03-14 11:30:00
+3    2024-03-15    11:30:30    2024-03-15 11:30:00
+4    2024-03-16    23:59:59    2024-03-15 15:25:37
+4    2024-03-16    23:59:59    2024-03-15 15:25:37
+drop table mysql_ts_test;
+drop table if exists stockpriceus2_5min_copy1;
+create table stockpriceus2_5min_copy1 (
+id int auto_increment primary key,
+time_1 datetime,
+price decimal(10, 2));
+insert into stockpriceus2_5min_copy1 (time_1, price) values
+('2023-06-25 14:00:00', 150.50),
+('2023-06-25 14:05:00', 151.00),
+('2022-06-25 14:10:00', 149.75),
+('2021-06-25 14:15:00', 148.25),
+('2020-06-25 14:20:00', 147.00);
+select * from stockpriceus2_5min_copy1;
+id    time_1    price
+1    2023-06-25 14:00:00    150.50
+2    2023-06-25 14:05:00    151.00
+3    2022-06-25 14:10:00    149.75
+4    2021-06-25 14:15:00    148.25
+5    2020-06-25 14:20:00    147.00
+select year(`time_1`) as yr_time_1_ok
+from stockpriceus2_5min_copy1
+group by year(`time_1`);
+yr_time_1_ok
+2023
+2022
+2021
+2020
+select year(`time_1`) as yr_time_1_ok
+from stockpriceus2_5min_copy1
+group by 1;
+yr_time_1_ok
+2023
+2022
+2021
+2020
+drop table stockpriceus2_5min_copy1;
+drop database test;

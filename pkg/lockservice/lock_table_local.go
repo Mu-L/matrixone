@@ -19,36 +19,63 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/common/log"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/lock"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
-	"github.com/matrixorigin/matrixone/pkg/util/trace"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"go.uber.org/zap"
+)
+
+const (
+	eventsWorkers = 4
 )
 
 // a localLockTable instance manages the locks on a table
 type localLockTable struct {
-	bind     pb.LockTable
-	detector *detector
-	clock    clock.Clock
-	mu       struct {
+	bind      pb.LockTable
+	fsp       *fixedSlicePool
+	clock     clock.Clock
+	events    *waiterEvents
+	txnHolder activeTxnHolder
+	logger    *log.MOLogger
+
+	mu struct {
 		sync.RWMutex
-		closed bool
-		store  LockStorage
+		closed           bool
+		store            LockStorage
+		tableCommittedAt timestamp.Timestamp
+	}
+
+	options struct {
+		beforeCloseFirstWaiter func(c *lockContext)
+		beforeWait             func(c *lockContext) func()
+		afterWait              func(c *lockContext) func()
 	}
 }
 
 func newLocalLockTable(
 	bind pb.LockTable,
-	detector *detector,
-	clock clock.Clock) lockTable {
+	fsp *fixedSlicePool,
+	events *waiterEvents,
+	clock clock.Clock,
+	txnHolder activeTxnHolder,
+	logger *log.MOLogger,
+) lockTable {
 	l := &localLockTable{
-		bind:     bind,
-		detector: detector,
-		clock:    clock,
+		bind:      bind,
+		fsp:       fsp,
+		clock:     clock,
+		events:    events,
+		txnHolder: txnHolder,
+		logger:    logger,
 	}
 	l.mu.store = newBtreeBasedStorage()
+	l.mu.tableCommittedAt, _ = clock.Now()
 	return l
 }
 
@@ -56,88 +83,262 @@ func (l *localLockTable) lock(
 	ctx context.Context,
 	txn *activeTxn,
 	rows [][]byte,
-	opts LockOptions) (pb.Result, error) {
-	// FIXME(fagongzi): too many mem alloc in trace
-	ctx, span := trace.Debug(ctx, "lockservice.lock.local")
-	defer span.End()
+	opts LockOptions,
+	cb func(pb.Result, error)) {
+	v2.TxnLocalLockTotalCounter.Inc()
 
-	table := l.bind.Table
-	offset := 0
-	var w *waiter
+	logLocalLock(l.logger, txn, l.bind.Table, rows, opts)
+	c := l.newLockContext(ctx, txn, rows, opts, cb, l.bind)
+	if opts.async {
+		c.lockFunc = l.doLock
+	}
+	l.doLock(c, false)
+}
+
+func (l *localLockTable) doLock(
+	c *lockContext,
+	blocked bool) {
+	var old *waiter
+	var oldOffset int
 	var err error
-	var idx int
-	var lockedTS timestamp.Timestamp
-	result := pb.Result{LockedOn: l.bind}
-	logLocalLock(l.bind.ServiceID, txn, table, rows, opts)
+	table := l.bind.Table
 	for {
-		idx, w, lockedTS, err = l.doAcquireLock(
-			txn,
-			w,
-			offset,
-			rows,
-			opts)
-		if err != nil {
-			logLocalLockFailed(l.bind.ServiceID, txn, table, rows, opts, err)
-			return result, err
-		}
-		// no waiter, all locks are added
-		if w == nil {
-			txn.setBlocked(txn.txnID, nil)
-			logLocalLockAdded(l.bind.ServiceID, txn, l.bind.Table, rows, opts)
-			if result.Timestamp.IsEmpty() {
-				result.Timestamp = lockedTS
+		// blocked used for async callback, waiter is created, and added to wait list.
+		// So only need wait notify.
+		if !blocked {
+			err = l.doAcquireLock(c)
+			if err != nil {
+				logLocalLockFailed(l.logger, c.txn, table, c.rows, c.opts, err)
+				if c.w != nil {
+					c.w.disableNotify()
+					c.w.close("doLock, doAcquireLock err", l.logger)
+				}
+				c.done(err)
+				return
 			}
-			return result, nil
+			// no waiter, all locks are added
+			if c.w == nil {
+				v2.TxnAcquireLockWaitDurationHistogram.Observe(time.Since(c.createAt).Seconds())
+				if old != nil {
+					old.disableNotify()
+					old.close("doLock, no waiter, all locks are added in doLock", l.logger)
+				}
+				c.txn.clearBlocked(old, l.logger)
+				logLocalLockAdded(l.logger, c.txn, l.bind.Table, c.rows, c.opts)
+				if c.result.Timestamp.IsEmpty() {
+					c.result.Timestamp = c.lockedTS
+				}
+				c.done(nil)
+				return
+			}
+
+			if oldOffset != c.offset {
+				if old != nil {
+					old.disableNotify()
+					old.close("doLock, lock next row", l.logger)
+				}
+				c.txn.clearBlocked(old, l.logger)
+			}
+
+			// we handle remote lock on current rpc io read goroutine, so we can not wait here, otherwise
+			// the rpc will be blocked.
+			if c.opts.async {
+				return
+			}
 		}
 
-		v := w.wait(ctx, l.bind.ServiceID)
-		logLocalLockWaitOnResult(l.bind.ServiceID, txn, table, rows[idx], opts, w, err)
-		if v.err != nil {
-			w.close(l.bind.ServiceID, v)
-			return result, v.err
+		// txn is locked by service.lock or service_remote.lock. We must unlock here. And lock again after
+		// wait result. Because during wait, deadlock detection may be triggered, and need call txn.fetchWhoWaitingMe,
+		// or other concurrent txn method.
+		oldOffset = c.offset
+		oldTxnID := c.txn.txnID
+		old = c.w
+		c.txn.Unlock()
+
+		if l.options.beforeWait != nil {
+			l.options.beforeWait(c)()
 		}
-		w.resetWait(l.bind.ServiceID)
-		offset = idx
-		result.Timestamp = v.ts
-		result.HasConflict = true
-		if !result.HasPrevCommit {
-			result.HasPrevCommit = !v.ts.IsEmpty()
+
+		v := c.w.wait(c.ctx, l.logger)
+
+		if l.options.afterWait != nil {
+			l.options.afterWait(c)()
 		}
+
+		c.txn.Lock()
+
+		logLocalLockWaitOnResult(l.logger, c.txn, table, c.rows[c.idx], c.opts, c.w, v)
+
+		// txn closed between Unlock and get Lock again
+		e := v.err
+		if e == nil && (!bytes.Equal(oldTxnID, c.txn.txnID) ||
+			!bytes.Equal(c.w.txn.TxnID, oldTxnID)) {
+			e = ErrTxnNotFound
+		}
+		if e != nil ||
+			c.txn.deadlockFound {
+			c.closed = true
+			if e != ErrTxnNotFound {
+				c.txn.closeBlockWaiters(l.logger)
+			}
+
+			ck := *c.w.conflictKey.Load()
+			if len(ck) > 0 &&
+				c.opts.Granularity == pb.Granularity_Row {
+
+				if l.options.beforeCloseFirstWaiter != nil {
+					l.options.beforeCloseFirstWaiter(c)
+				}
+
+				l.mu.Lock()
+				// we must reload conflict lock, because the lock may be deleted
+				// by other txn and readd into store. So c.w.conflictWith is
+				// invalid.
+				conflictWith, ok := l.mu.store.Get(ck)
+				if ok && conflictWith.closeWaiter(c.w, l.logger) {
+					l.mu.store.Delete(ck)
+				}
+				l.mu.Unlock()
+			}
+
+			c.w.close("doLock, txn closed between Unlock and get Lock again", l.logger)
+			c.done(e)
+			return
+		}
+
+		if c.opts.RetryWait > 0 {
+			time.Sleep(time.Duration(c.opts.RetryWait))
+		}
+
+		c.w.resetWait(l.logger)
+		c.offset = c.idx
+		c.result.Timestamp = v.ts
+		c.result.HasConflict = true
+		c.result.TableDefChanged = v.defChanged
+		if !c.result.HasPrevCommit {
+			c.result.HasPrevCommit = !v.ts.IsEmpty()
+		}
+		if c.opts.TableDefChanged {
+			c.opts.TableDefChanged = v.defChanged
+		}
+		blocked = false
 	}
 }
 
 func (l *localLockTable) unlock(
 	txn *activeTxn,
 	ls *cowSlice,
-	commitTS timestamp.Timestamp) {
+	commitTS timestamp.Timestamp,
+	mutations ...pb.ExtraMutation) {
+	start := time.Now()
+	defer func() {
+		v2.TxnUnlockBtreeTotalDurationHistogram.Observe(time.Since(start).Seconds())
+	}()
+
+	getMutation := func(key []byte) int {
+		for i := range mutations {
+			if bytes.Equal(mutations[i].Key, key) {
+				return i
+			}
+		}
+		return -1
+	}
+
 	logUnlockTableOnLocal(
-		l.bind.ServiceID,
+		l.logger,
 		txn,
-		l.bind)
+		l.bind,
+	)
 
 	locks := ls.slice()
 	defer locks.unref()
 
 	l.mu.Lock()
+	v2.TxnUnlockBtreeGetLockDurationHistogram.Observe(time.Since(start).Seconds())
+
 	defer l.mu.Unlock()
 	if l.mu.closed {
 		return
 	}
 
+	b, ok := txn.getHoldLocksLocked(l.bind.Group).tableBinds[l.bind.Table]
+	if !ok {
+		panic("BUG: missing bind")
+	}
+
+	var startKey []byte
 	locks.iter(func(key []byte) bool {
 		if lock, ok := l.mu.store.Get(key); ok {
-			if lock.isLockRow() || lock.isLockRangeEnd() {
-				lock.waiter.clearAllNotify(l.bind.ServiceID, "unlock")
-				next := lock.waiter.close(l.bind.ServiceID, notifyValue{ts: commitTS})
-				logUnlockTableKeyOnLocal(l.bind.ServiceID, txn, l.bind, key, lock, next)
+			idx := getMutation(key)
+			if idx != -1 && mutations[idx].Skip {
+				return true
 			}
-			l.mu.store.Delete(key)
+
+			if lock.isLockRangeStart() {
+				startKey = key
+				return true
+			}
+
+			if !lock.holders.contains(txn.txnID) {
+				// 1. txn1 hold key1 on bind version 0
+				// 2. txn1 commit success
+				// 3. dn restart
+				// 4. txn2 hold key1 on bind version 1
+				// 5. txn1 unlock.
+				if b.Changed(l.bind) {
+					return true
+				}
+
+				l.logger.Fatal("BUG: unlock a lock that is not held by the current txn",
+					zap.Bool("row", lock.isLockRow()),
+					zap.Int("keys-count", locks.len()),
+					zap.String("hold-bind", b.DebugString()),
+					zap.String("bind", l.bind.DebugString()),
+					waitTxnArrayField("holders", lock.holders.txns),
+					txnField(txn))
+			}
+			if len(startKey) > 0 && !lock.isLockRangeEnd() {
+				panic("BUG: missing range end key")
+			}
+
+			if idx != -1 {
+				replaceTo := mutations[idx].ReplaceTo
+				lock.holders.replace(txn.txnID,
+					pb.WaitTxn{TxnID: replaceTo, CreatedOn: txn.remoteService})
+				// cannot dead lock here, the replaceTo txn was created on the same cn.
+				replaceToTxn := l.txnHolder.getActiveTxn(mutations[idx].ReplaceTo, true, txn.remoteService)
+				replaceToTxn.Lock()
+				_ = replaceToTxn.lockAdded(l.bind.Group, l.bind, [][]byte{key}, l.logger)
+				replaceToTxn.Unlock()
+				return true
+			}
+
+			lockCanRemoved := lock.closeTxn(
+				txn,
+				notifyValue{ts: commitTS})
+			logLockUnlocked(l.logger, txn, key, lock)
+
+			if lockCanRemoved {
+				v2.TxnHoldLockDurationHistogram.Observe(time.Since(lock.createAt).Seconds())
+				l.mu.store.Delete(key)
+				if len(startKey) > 0 {
+					l.mu.store.Delete(startKey)
+					startKey = nil
+				}
+				lock.release()
+			}
 		}
 		return true
 	})
+	if l.mu.tableCommittedAt.Less(commitTS) {
+		l.mu.tableCommittedAt = commitTS
+	}
 }
 
-func (l *localLockTable) getLock(txnID, key []byte, fn func(Lock)) {
+func (l *localLockTable) getLock(
+	key []byte,
+	txn pb.WaitTxn,
+	fn func(Lock)) {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	if l.mu.closed {
@@ -160,173 +361,497 @@ func (l *localLockTable) close() {
 
 	l.mu.store.Iter(func(key []byte, lock Lock) bool {
 		if lock.isLockRow() || lock.isLockRangeEnd() {
-			w := lock.waiter
-			w.clearAllNotify(l.bind.ServiceID, "close local")
 			// if there are waiters in the current lock, just notify
 			// the head, and the subsequent waiters will be notified
 			// by the previous waiter.
-			if w = w.close(l.bind.ServiceID, notifyValue{err: ErrLockTableNotFound}); w != nil {
-				w.notify(l.bind.ServiceID, notifyValue{err: ErrLockTableNotFound})
-			}
+			lock.close(notifyValue{err: ErrLockTableNotFound})
 		}
 		return true
 	})
 	l.mu.store.Clear()
-	logLockTableClosed(l.bind.ServiceID, l.bind, false)
+	logLockTableClosed(l.logger, l.bind, false)
 }
 
-func (l *localLockTable) doAcquireLock(
-	txn *activeTxn,
-	w *waiter,
-	offset int,
-	rows [][]byte,
-	opts LockOptions) (int, *waiter, timestamp.Timestamp, error) {
+func (l *localLockTable) doAcquireLock(c *lockContext) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if l.mu.closed {
-		return 0, nil,
-			timestamp.Timestamp{},
-			moerr.NewInvalidStateNoCtx("local lock table closed")
+		return moerr.NewInvalidStateNoCtx("local lock table closed")
 	}
 
-	switch opts.Granularity {
+	switch c.opts.Granularity {
 	case pb.Granularity_Row:
-		idx, w, lockedTS := l.acquireRowLockLocked(txn, w, offset, rows, opts.Mode)
-		return idx, w, lockedTS, nil
+		return l.acquireRowLockLocked(c)
 	case pb.Granularity_Range:
-		if len(rows) == 0 ||
-			len(rows)%2 != 0 {
+		if len(c.rows) == 0 ||
+			len(c.rows)%2 != 0 {
 			panic("invalid range lock")
 		}
-		idx, w, lockedTS := l.acquireRangeLockLocked(txn, w, offset, rows, opts.Mode)
-		return idx, w, lockedTS, nil
+		return l.acquireRangeLockLocked(c)
 	default:
-		panic(fmt.Sprintf("not support lock granularity %d", opts))
+		panic(fmt.Sprintf("not support lock granularity %d", c.opts.Granularity))
 	}
 }
 
-func (l *localLockTable) acquireRowLockLocked(
-	txn *activeTxn,
-	w *waiter,
-	offset int,
-	rows [][]byte,
-	mode pb.LockMode) (int, *waiter, timestamp.Timestamp) {
-	n := len(rows)
-	for idx := offset; idx < n; idx++ {
-		row := rows[idx]
-		logLocalLockRow(l.bind.ServiceID, txn, l.bind.Table, row, mode)
+func (l *localLockTable) acquireRowLockLocked(c *lockContext) error {
+	n := len(c.rows)
+	for idx := c.offset; idx < n; idx++ {
+		row := c.rows[idx]
+
 		key, lock, ok := l.mu.store.Seek(row)
 		if ok &&
 			(bytes.Equal(key, row) ||
 				lock.isLockRangeEnd()) {
-			// current txn's lock
-			if bytes.Equal(txn.txnID, lock.txnID) {
-				if w != nil {
-					panic("BUG: can not has a waiter on self txn")
+			hold, newHolder := lock.tryHold(l.logger, c)
+			if hold {
+				if c.w != nil {
+					c.w = nil
+				}
+				// only new holder can added lock into txn.
+				// newHolder is false means prev op of txn has already added lock into txn
+				if newHolder {
+					err := c.txn.lockAdded(l.bind.Group, l.bind, [][]byte{key}, l.logger)
+					if err != nil {
+						return err
+					}
+					c.result.NewLockAdd = true
 				}
 				continue
 			}
-			w = getWaiter(l.bind.ServiceID, w, txn.txnID)
-			l.handleLockConflict(txn, w, key, lock)
-			return idx, w, timestamp.Timestamp{}
+
+			// need wait for prev txn closed"
+			if c.w == nil {
+				c.w = acquireWaiter(c.waitTxn, "acquireRowLockLocked", l.logger)
+			}
+
+			c.offset = idx
+			return l.handleLockConflictLocked(c, key, lock)
 		}
-		l.addRowLockLocked(txn, row, getWaiter(l.bind.ServiceID, w, txn.txnID), mode)
+		err := l.addRowLockLocked(c, row)
+		if err != nil {
+			return err
+		}
+
 		// lock added, need create new waiter next time
-		w = nil
+		c.w = nil
 	}
-	now, _ := l.clock.Now()
-	return 0, nil, now
+
+	c.offset = 0
+	c.lockedTS = l.mu.tableCommittedAt
+	return nil
 }
 
-func (l *localLockTable) acquireRangeLockLocked(
-	txn *activeTxn,
-	w *waiter,
-	offset int,
-	rows [][]byte,
-	mode pb.LockMode) (int, *waiter, timestamp.Timestamp) {
-	n := len(rows)
-	for i := offset; i < n; {
-		start := rows[i]
-		end := rows[i+1]
+func (l *localLockTable) acquireRangeLockLocked(c *lockContext) error {
+	n := len(c.rows)
+	for i := c.offset; i < n; i += 2 {
+		start := c.rows[i]
+		end := c.rows[i+1]
 		if bytes.Compare(start, end) >= 0 {
 			panic(fmt.Sprintf("lock error: start[%v] is greater than end[%v]",
 				start, end))
 		}
-		logLocalLockRange(l.bind.ServiceID, txn, l.bind.Table, start, end, mode)
-		key, lock, ok := l.mu.store.Seek(start)
-		if ok &&
-			bytes.Compare(key, end) <= 0 {
-			// current txn's lock
-			if bytes.Equal(txn.txnID, lock.txnID) {
-				// TODO: range merge, and check start to end conflict
-				panic("BUG: current not support")
+
+		logLocalLockRange(l.logger, c.txn, l.bind.Table, start, end, c.opts.Mode)
+		conflict, conflictWith, err := l.addRangeLockLocked(c, start, end)
+		if err != nil {
+			return err
+		}
+		if len(conflict) > 0 {
+			if c.w == nil {
+				c.w = acquireWaiter(c.waitTxn, "acquireRangeLockLocked", l.logger)
 			}
 
-			w = getWaiter(l.bind.ServiceID, w, txn.txnID)
-			l.handleLockConflict(txn, w, key, lock)
-			return i, w, timestamp.Timestamp{}
+			c.offset = i
+			return l.handleLockConflictLocked(c, conflict, conflictWith)
 		}
 
-		l.addRangeLockLocked(txn, start, end, getWaiter(l.bind.ServiceID, w, txn.txnID), mode)
 		// lock added, need create new waiter next time
-		w = nil
-		i += 2
+		c.w = nil
 	}
-	now, _ := l.clock.Now()
-	return 0, nil, now
+	c.offset = 0
+	c.lockedTS = l.mu.tableCommittedAt
+	return nil
 }
 
 func (l *localLockTable) addRowLockLocked(
-	txn *activeTxn,
-	row []byte,
-	waiter *waiter,
-	mode pb.LockMode) {
-	lock := newRowLock(txn.txnID, mode)
-	lock.waiter = waiter
+	c *lockContext,
+	row []byte) error {
+	lock := newRowLock(l.logger, c)
+
+	// new lock added, use last committed ts to update keys last commit ts.
+	lock.waiters.resetCommittedAt(l.mu.tableCommittedAt)
 
 	// we must first add the lock to txn to ensure that the
 	// lock can be read when the deadlock is detected.
-	txn.lockAdded(l.bind.ServiceID, l.bind.Table, [][]byte{row}, false)
+	err := c.txn.lockAdded(l.bind.Group, l.bind, [][]byte{row}, l.logger)
+	if err != nil {
+		return err
+	}
+	c.result.NewLockAdd = true
 	l.mu.store.Add(row, lock)
+	return nil
+}
+
+func (l *localLockTable) handleLockConflictLocked(
+	c *lockContext,
+	key []byte,
+	conflictWith Lock,
+) error {
+	if c.opts.Policy == pb.WaitPolicy_FastFail {
+		return ErrLockConflict
+	}
+
+	c.w.conflictKey.Store(&key)
+	c.w.lt.Store(l)
+	c.w.waitFor = c.w.waitFor[:0]
+	for _, txn := range conflictWith.holders.txns {
+		c.w.waitFor = append(c.w.waitFor, txn.TxnID)
+	}
+	c.result.ConflictKey = key
+	if len(c.w.waitFor) > 0 {
+		c.result.ConflictTxn = c.w.waitFor[0]
+	}
+	c.result.Waiters = uint32(conflictWith.waiters.size())
+	conflictWith.waiters.iter(func(w *waiter) bool {
+		c.result.PrevWaiter = w.txn.TxnID
+		return true
+	})
+
+	conflictWith.addWaiter(l.logger, c.w)
+	l.events.add(c)
+
+	// find conflict, and wait prev txn completed, and a new
+	// waiter added, we need to active deadlock check.
+	c.txn.setBlocked(c.w, l.logger)
+	logLocalLockWaitOn(l.logger, c.txn, l.bind.Table, c.w, key, conflictWith)
+
+	if c.opts.Granularity != pb.Granularity_Range {
+		return nil
+	}
+
+	if len(c.rangeLastWaitKey) > 0 {
+		v, ok := l.mu.store.Get(c.rangeLastWaitKey)
+		if !ok {
+			panic("BUG: missing range last wait key")
+		}
+		if ok && v.closeWaiter(c.w, l.logger) {
+			l.mu.store.Delete(c.rangeLastWaitKey)
+		}
+	}
+	c.rangeLastWaitKey = key
+	return nil
 }
 
 func (l *localLockTable) addRangeLockLocked(
-	txn *activeTxn,
-	start, end []byte,
-	waiter *waiter,
-	mode pb.LockMode) {
-	startLock, endLock := newRangeLock(txn.txnID, mode)
-	startLock.waiter = waiter
-	endLock.waiter = waiter
+	c *lockContext,
+	start, end []byte) ([]byte, Lock, error) {
+
+	if c.opts.LockOptions.Mode == pb.LockMode_Shared {
+		l1, ok1 := l.mu.store.Get(start)
+		l2, ok2 := l.mu.store.Get(end)
+		if ok1 && ok2 &&
+			l1.isShared() && l2.isShared() &&
+			l1.isLockRangeStart() && l2.isLockRangeEnd() {
+			hold, newHolder := l1.tryHold(l.logger, c)
+			if !hold {
+				panic("BUG: must get shared lock")
+			}
+			hold, _ = l2.tryHold(l.logger, c)
+			if !hold {
+				panic("BUG: must get shared lock")
+			}
+			if c.w != nil {
+				c.w = nil
+			}
+			if newHolder {
+				err := c.txn.lockAdded(l.bind.Group, l.bind, [][]byte{start, end}, l.logger)
+				if err != nil {
+					return nil, Lock{}, err
+				}
+				c.result.NewLockAdd = true
+			}
+			return nil, Lock{}, nil
+		}
+	}
+
+	wq := newWaiterQueue()
+	wq.init(l.logger)
+	mc := newMergeContext(wq)
+	defer mc.close()
+
+	var err error
+	var conflictWith Lock
+	var conflictKey []byte
+	var prevStartKey []byte
+	rangeStartEncountered := false
+	// TODO: remove mem allocate.
+	upperBounded := nextKey(end, nil)
+
+	for {
+		l.mu.store.Range(
+			start,
+			nil,
+			func(key []byte, keyLock Lock) bool {
+				// current txn is not holder, maybe conflict
+				if !keyLock.holders.contains(c.txn.txnID) {
+					if hasConflictWithLock(key, keyLock, end) {
+						conflictWith = keyLock
+						conflictKey = key
+					}
+					return false
+				}
+
+				if keyLock.holders.size() > 1 {
+					err = ErrMergeRangeLockNotSupport
+					return false
+				}
+
+				// merge current txn locks
+				if keyLock.isLockRangeStart() {
+					prevStartKey = key
+					rangeStartEncountered = true
+					return bytes.Compare(key, end) < 0
+				}
+				if rangeStartEncountered &&
+					!keyLock.isLockRangeEnd() {
+					panic("BUG, missing range end key")
+				}
+
+				start, end = l.mergeRangeLocked(
+					start, end,
+					prevStartKey,
+					key, keyLock,
+					mc,
+				)
+				prevStartKey = nil
+				rangeStartEncountered = false
+				return bytes.Compare(key, end) < 0
+			})
+		if err != nil {
+			mc.rollback()
+			return nil, Lock{}, err
+		}
+
+		if len(conflictKey) > 0 {
+			hold, newHolder := conflictWith.tryHold(l.logger, c)
+			if hold {
+				if c.w != nil {
+					c.w = nil
+				}
+
+				// only new holder can added lock into txn.
+				// newHolder is false means prev op of txn has already added lock into txn
+				if newHolder {
+					err := c.txn.lockAdded(l.bind.Group, l.bind, [][]byte{conflictKey}, l.logger)
+					if err != nil {
+						return nil, Lock{}, err
+					}
+					c.result.NewLockAdd = true
+				}
+				conflictWith = Lock{}
+				conflictKey = nil
+				rangeStartEncountered = false
+				continue
+			}
+
+			mc.rollback()
+			return conflictKey, conflictWith, nil
+		}
+
+		if rangeStartEncountered {
+			key, keyLock, ok := l.mu.store.Seek(upperBounded)
+			if !ok {
+				panic("BUG, missing range end key")
+			}
+			start, end = l.mergeRangeLocked(
+				start, end,
+				prevStartKey,
+				key, keyLock,
+				mc,
+			)
+		}
+		break
+	}
+
+	mc.commit(l.bind, c.txn, l.mu.store, l.logger)
+	startLock, endLock := newRangeLock(l.logger, c)
+
+	wq.resetCommittedAt(l.mu.tableCommittedAt)
+	startLock.waiters = wq
+	endLock.waiters = wq
 
 	// similar to row lock
-	txn.lockAdded(l.bind.ServiceID, l.bind.Table, [][]byte{start, end}, false)
+	err = c.txn.lockAdded(l.bind.Group, l.bind, [][]byte{start, end}, l.logger)
+	if err != nil {
+		return nil, Lock{}, err
+	}
+	c.result.NewLockAdd = true
+
 	l.mu.store.Add(start, startLock)
 	l.mu.store.Add(end, endLock)
+
+	if n := len(mc.mergedLocks); n > 0 {
+		h := c.txn.getHoldLocksLocked(l.bind.Group)
+		v, ok := h.tableKeys[l.bind.Table]
+		if ok {
+			l.logger.Info("range lock merged",
+				zap.Uint64("table", l.bind.OriginTable),
+				zap.String("txn", c.txn.txnKey),
+				zap.Int("merged", n),
+				zap.Int("current", v.mustGet().len()),
+			)
+		}
+	}
+
+	return nil, Lock{}, nil
 }
 
-func (l *localLockTable) handleLockConflict(
+func (l *localLockTable) mergeRangeLocked(
+	start, end []byte,
+	prevStartKey []byte,
+	seekKey []byte,
+	seekLock Lock,
+	mc *mergeContext,
+) ([]byte, []byte) {
+	// range lock encountered a row lock
+	if seekLock.isLockRow() {
+		// 5 + [1, 4] => [1, 4] + [5]
+		if bytes.Compare(seekKey, end) > 0 {
+			return start, end
+		}
+
+		// [1~4] + [1, 4] => [1, 4]
+		mc.mergeLocks([][]byte{seekKey})
+		mc.mergeWaiter(seekLock.waiters)
+		return start, end
+	}
+
+	if len(prevStartKey) == 0 {
+		prevStartKey = l.mustGetRangeStart(seekKey)
+	}
+
+	oldStart, oldEnd := prevStartKey, seekKey
+
+	// no overlap
+	if bytes.Compare(oldStart, end) > 0 ||
+		bytes.Compare(start, oldEnd) > 0 {
+		return start, end
+	}
+
+	min, max := oldStart, oldEnd
+	if bytes.Compare(min, start) > 0 {
+		min = start
+	}
+	if bytes.Compare(max, end) < 0 {
+		max = end
+	}
+
+	mc.mergeLocks([][]byte{oldStart, oldEnd})
+	mc.mergeWaiter(seekLock.waiters)
+	return min, max
+}
+
+func (l *localLockTable) mustGetRangeStart(endKey []byte) []byte {
+	v, _, ok := l.mu.store.Prev(endKey)
+	if !ok {
+		panic("missing start key")
+	}
+	return v
+}
+
+func nextKey(src, dst []byte) []byte {
+	dst = append(dst, src...)
+	dst = append(dst, 0)
+	return dst
+}
+
+var (
+	mergePool = sync.Pool{
+		New: func() any {
+			return &mergeContext{
+				mergedLocks: make(map[string]struct{}, 8),
+			}
+		},
+	}
+)
+
+type mergeContext struct {
+	to            waiterQueue
+	mergedWaiters []waiterQueue
+	mergedLocks   map[string]struct{}
+}
+
+func newMergeContext(to waiterQueue) *mergeContext {
+	c := mergePool.Get().(*mergeContext)
+	c.to = to
+	c.to.beginChange()
+	return c
+}
+
+func (c *mergeContext) close() {
+	for k := range c.mergedLocks {
+		delete(c.mergedLocks, k)
+	}
+	c.to = nil
+	c.mergedWaiters = c.mergedWaiters[:0]
+	mergePool.Put(c)
+}
+
+func (c *mergeContext) mergeWaiter(from waiterQueue) {
+	from.moveTo(c.to)
+	c.mergedWaiters = append(c.mergedWaiters, from)
+}
+
+func (c *mergeContext) mergeLocks(locks [][]byte) {
+	for _, v := range locks {
+		c.mergedLocks[util.UnsafeBytesToString(v)] = struct{}{}
+	}
+}
+
+func (c *mergeContext) commit(
+	bind pb.LockTable,
 	txn *activeTxn,
-	w *waiter,
-	key []byte,
-	conflictWith Lock) {
-	// find conflict, and wait prev txn completed, and a new
-	// waiter added, we need to active deadlock check.
-	txn.setBlocked(w.txnID, w)
-	conflictWith.waiter.add(l.bind.ServiceID, w)
-	if err := l.detector.check(
-		txn.toWaitTxn(
-			l.bind.ServiceID,
-			false)); err != nil {
-		panic("BUG: active dead lock check can not fail")
+	s LockStorage,
+	logger *log.MOLogger,
+) {
+	for k := range c.mergedLocks {
+		s.Delete(util.UnsafeStringToBytes(k))
 	}
-	logLocalLockWaitOn(l.bind.ServiceID, txn, l.bind.Table, w, key, conflictWith)
+
+	txn.lockRemoved(
+		bind.Group,
+		bind.Table,
+		c.mergedLocks,
+	)
+
+	for _, q := range c.mergedWaiters {
+		// release ref in merged waiters. The ref is moved to c.to.
+		q.iter(func(w *waiter) bool {
+			w.close("mergeContext commit", logger)
+			return true
+		})
+		q.reset()
+	}
+	c.to.commitChange()
 }
 
-func getWaiter(serviceID string, w *waiter, txnID []byte) *waiter {
-	if w != nil {
-		return w
+func (c *mergeContext) rollback() {
+	c.to.rollbackChange()
+}
+
+func hasConflictWithLock(
+	key []byte,
+	lock Lock,
+	end []byte) bool {
+	if lock.isLockRow() {
+		// row lock, start <= key <= end
+		return bytes.Compare(key, end) <= 0
 	}
-	return acquireWaiter(serviceID, txnID)
+	if lock.isLockRangeStart() {
+		// range start lock, [1, 4] + [2, any]
+		return bytes.Compare(key, end) <= 0
+	}
+	// range end lock, always conflict
+	return true
 }

@@ -61,7 +61,7 @@ func TestTransaction(t *testing.T) {
 	txn.writes = append(txn.writes, make([]Entry, 0, 1))
 	ro := txn.ReadOnly()
 	require.Equal(t, false, ro)
-	err := txn.WriteBatch(INSERT, 0, 0, "test", "test", new(batch.Batch))
+	err := txn.WriteBatch(INSERT, 0, 0, "test", "test", batch.NewOffHeapEmpty())
 	require.NoError(t, err)
 	txn.IncStatementId()
 	txn.RegisterFile("test")
@@ -81,13 +81,13 @@ func TestTransaction(t *testing.T) {
 	}
 	// fmt.Printf("%v", blks)
 
-	_, _ = txn.getRow(ctx, 0, 0, nil, nil, makeFunctionExprForTest(">", []*plan.Expr{
-		makeColExprForTest(0, types.T_int64),
+	_, _ = txn.getRow(ctx, 0, 0, nil, nil, MakeFunctionExprForTest(">", []*plan.Expr{
+		MakeColExprForTest(0, types.T_int64),
 		plan2.MakePlan2Int64ConstExprWithType(20),
 	}), nil)
 
-	_, _ = txn.getRows(ctx, 0, 0, nil, nil, makeFunctionExprForTest(">", []*plan.Expr{
-		makeColExprForTest(0, types.T_int64),
+	_, _ = txn.getRows(ctx, 0, 0, nil, nil, MakeFunctionExprForTest(">", []*plan.Expr{
+		MakeColExprForTest(0, types.T_int64),
 		plan2.MakePlan2Int64ConstExprWithType(20),
 	}), nil)
 

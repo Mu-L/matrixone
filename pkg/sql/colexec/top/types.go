@@ -15,46 +15,139 @@
 package top
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/compare"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-const (
-	Build = iota
-	Eval
-)
+var _ vm.Operator = new(Top)
 
 type container struct {
 	n     int // result vector number
-	state int
+	state vm.CtrState
 	sels  []int64
 	poses []int32 // sorted list of attributes
 	cmps  []compare.Compare
 
-	bat *batch.Batch
+	limit         uint64
+	limitExecutor colexec.ExpressionExecutor
+
+	executorsForOrderColumn []colexec.ExpressionExecutor
+	desc                    bool
+	topValueZM              objectio.ZoneMap
+	bat                     *batch.Batch
+	buildBat                *batch.Batch //temp batch, do not need free or reset
 }
 
-type Argument struct {
-	Limit int64
-	ctr   *container
-	Fs    []*plan.OrderBySpec
+type Top struct {
+	Limit       *plan.Expr
+	TopValueTag int32
+	ctr         container
+	Fs          []*plan.OrderBySpec
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
-	if ctr != nil {
-		mp := proc.Mp()
-		ctr.cleanBatch(mp)
+func (top *Top) GetOperatorBase() *vm.OperatorBase {
+	return &top.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool(
+		func() *Top {
+			return &Top{}
+		},
+		func(a *Top) {
+			*a = Top{}
+		},
+		reuse.DefaultOptions[Top]().
+			WithEnableChecker(),
+	)
+}
+
+func (top Top) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Top {
+	return reuse.Alloc[Top](nil)
+}
+
+func (top *Top) WithLimit(limit *plan.Expr) *Top {
+	top.Limit = limit
+	return top
+}
+
+func (top *Top) WithFs(fs []*plan.OrderBySpec) *Top {
+	top.Fs = fs
+	return top
+}
+
+func (top *Top) Release() {
+	if top != nil {
+		reuse.Free(top, nil)
 	}
 }
 
-func (ctr *container) cleanBatch(mp *mpool.MPool) {
+func (top *Top) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	top.ctr.reset(proc)
+}
+
+func (top *Top) Free(proc *process.Process, pipelineFailed bool, err error) {
+	top.ctr.free(proc)
+}
+
+func (top *Top) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
+}
+
+func (ctr *container) reset(proc *process.Process) {
+	ctr.n = 0
+	ctr.state = 0
+	ctr.sels = nil
+	ctr.poses = nil
+	ctr.cmps = nil
+
+	ctr.limit = 0
+	if ctr.limitExecutor != nil {
+		ctr.limitExecutor.ResetForNextQuery()
+	}
+
+	for _, executor := range ctr.executorsForOrderColumn {
+		if executor != nil {
+			executor.ResetForNextQuery()
+		}
+	}
+	ctr.desc = false
+	ctr.topValueZM = nil
 	if ctr.bat != nil {
-		ctr.bat.Clean(mp)
+		ctr.bat.Clean(proc.Mp())
 		ctr.bat = nil
+	}
+
+	if ctr.buildBat != nil {
+		//should not clean ctr.buildBat, because ctr.buildBat's value from PreOperator or ctr.executorsForOrderColumn.Eval
+		// PreOperator or ctr.executorsForOrderColumn will clean them
+		ctr.buildBat = nil
+	}
+}
+
+func (ctr *container) free(proc *process.Process) {
+	if ctr.bat != nil {
+		ctr.bat.Clean(proc.Mp())
+	}
+	for _, executor := range ctr.executorsForOrderColumn {
+		if executor != nil {
+			executor.Free()
+		}
+	}
+	if ctr.limitExecutor != nil {
+		ctr.limitExecutor.Free()
 	}
 }
 

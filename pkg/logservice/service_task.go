@@ -15,16 +15,24 @@
 package logservice
 
 import (
-	"context"
-	"math/rand"
-	"time"
-
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	logservicepb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
+	"github.com/matrixorigin/matrixone/pkg/util"
+	db_holder "github.com/matrixorigin/matrixone/pkg/util/export/etl/db"
 	"go.uber.org/zap"
 )
+
+func (s *Service) initSqlWriterFactory() {
+	getClient := func() util.HAKeeperClient {
+		return s.haClient
+	}
+	db_holder.SetSQLWriterDBAddressFunc(util.AddressFunc(s.cfg.UUID, getClient))
+}
+
+func (s *Service) createSQLLogger(command *logservicepb.CreateTaskService) {
+	db_holder.SetSQLWriterDBUser(db_holder.MOLoggerUser, command.User.Password)
+}
 
 func (s *Service) initTaskHolder() {
 	s.task.Lock()
@@ -33,35 +41,24 @@ func (s *Service) initTaskHolder() {
 		return
 	}
 
-	addressFunc := func(ctx context.Context) (string, error) {
-		ctx, cancel := context.WithTimeout(ctx,
-			time.Second*5)
-		defer cancel()
-		if s.haClient == nil {
-			return "", nil
-		}
-		details, err := s.haClient.GetClusterDetails(ctx)
-		if err != nil {
-			return "", err
-		}
-		if len(details.CNStores) == 0 {
-			return "", moerr.NewInvalidState(ctx, "no cn in the cluster")
-		}
-
-		n := rand.Intn(len(details.CNStores))
-		return details.CNStores[n].SQLAddress, nil
+	getClient := func() util.HAKeeperClient {
+		return s.haClient
 	}
 
 	if s.task.storageFactory != nil {
 		s.task.holder = taskservice.NewTaskServiceHolderWithTaskStorageFactorySelector(
-			runtime.ProcessLevelRuntime(),
-			addressFunc,
+			runtime.ServiceRuntime(s.cfg.UUID),
+			util.AddressFunc(s.cfg.UUID, getClient),
 			func(_, _, _ string) taskservice.TaskStorageFactory {
 				return s.task.storageFactory
-			})
+			},
+		)
 		return
 	}
-	s.task.holder = taskservice.NewTaskServiceHolder(runtime.ProcessLevelRuntime(), addressFunc)
+	s.task.holder = taskservice.NewTaskServiceHolder(
+		runtime.ServiceRuntime(s.cfg.UUID),
+		util.AddressFunc(s.cfg.UUID, getClient),
+	)
 }
 
 func (s *Service) createTaskService(command *logservicepb.CreateTaskService) {

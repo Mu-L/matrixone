@@ -15,6 +15,7 @@
 package catalog
 
 import (
+	"context"
 	"sync"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -72,7 +73,7 @@ func (store *mockTxnStore) PrepareCommit() error {
 
 func (store *mockTxnStore) ApplyCommit() error {
 	for e := range store.entries {
-		err := e.ApplyCommit(nil)
+		err := e.ApplyCommit(store.txn.GetID())
 		if err != nil {
 			return err
 		}
@@ -90,7 +91,7 @@ type mockDBHandle struct {
 	entry   *DBEntry
 }
 
-type mockSegIt struct {
+type mockObjIt struct {
 	sync.RWMutex
 }
 
@@ -124,11 +125,10 @@ func newMockTableHandle(catalog *Catalog, txn txnif.AsyncTxn, entry *TableEntry)
 	}
 }
 
-func (it *mockSegIt) GetError() error            { return nil }
-func (it *mockSegIt) Valid() bool                { return false }
-func (it *mockSegIt) Next()                      {}
-func (it *mockSegIt) Close() error               { return nil }
-func (it *mockSegIt) GetSegment() handle.Segment { return nil }
+func (it *mockObjIt) GetError() error          { return nil }
+func (it *mockObjIt) Next() bool               { return false }
+func (it *mockObjIt) Close() error             { return nil }
+func (it *mockObjIt) GetObject() handle.Object { return nil }
 
 func (h *mockDBHandle) CreateRelation(def any) (rel handle.Relation, err error) {
 	schema := def.(*Schema)
@@ -202,12 +202,12 @@ func (h *mockDBHandle) GetCreateSql() string {
 	return h.entry.GetCreateSql()
 }
 
-func (h *mockTableHandle) MakeSegmentIt() (it handle.SegmentIt) {
-	return new(mockSegIt)
+func (h *mockTableHandle) MakeObjectIt(bool) (it handle.ObjectIt) {
+	return new(mockObjIt)
 }
 
-func (h *mockTableHandle) MakeSegmentItOnSnap() (it handle.SegmentIt) {
-	return new(mockSegIt)
+func (h *mockTableHandle) MakeObjectItOnSnap(bool) (it handle.ObjectIt) {
+	return new(mockObjIt)
 }
 
 func (h *mockTableHandle) String() string {
@@ -229,7 +229,7 @@ func (txn *mockTxn) CreateDatabase(name, createSql, datTyp string) (handle.Datab
 	return h, nil
 }
 
-func (txn *mockTxn) CreateDatabaseWithID(name, createSql, datTyp string, id uint64) (handle.Database, error) {
+func (txn *mockTxn) CreateDatabaseWithID(ctx context.Context, name, createSql, datTyp string, id uint64) (handle.Database, error) {
 	entry, err := txn.catalog.CreateDBEntryWithID(name, createSql, datTyp, id, txn)
 	if err != nil {
 		return nil, err
@@ -260,7 +260,7 @@ func (txn *mockTxn) GetDatabaseByID(id uint64) (handle.Database, error) {
 }
 
 func (txn *mockTxn) DropDatabase(name string) (handle.Database, error) {
-	_, entry, err := txn.catalog.DropDBEntry(name, txn)
+	_, entry, err := txn.catalog.DropDBEntryByName(name, txn)
 	if err != nil {
 		return nil, err
 	}
@@ -280,8 +280,8 @@ func (txn *mockTxn) DropDatabaseByID(id uint64) (handle.Database, error) {
 func MockBatch(schema *Schema, rows int) *containers.Batch {
 	if schema.HasSortKey() {
 		sortKey := schema.GetSingleSortKey()
-		return containers.MockBatchWithAttrs(schema.Types(), schema.Attrs(), schema.Nullables(), rows, sortKey.Idx, nil)
+		return containers.MockBatchWithAttrs(schema.Types(), schema.Attrs(), rows, sortKey.Idx, nil)
 	} else {
-		return containers.MockBatchWithAttrs(schema.Types(), schema.Attrs(), schema.Nullables(), rows, schema.PhyAddrKey.Idx, nil)
+		return containers.MockBatchWithAttrs(schema.Types(), schema.Attrs(), rows, schema.GetPrimaryKey().Idx /*get fake pk*/, nil)
 	}
 }

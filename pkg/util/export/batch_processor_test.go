@@ -23,23 +23,26 @@ import (
 	"testing"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/config"
-	"github.com/matrixorigin/matrixone/pkg/util/stack"
-	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace"
-
-	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/util/batchpipe"
-	"github.com/matrixorigin/matrixone/pkg/util/errutil"
-
+	"github.com/golang/mock/gomock"
 	"github.com/google/gops/agent"
 	"github.com/prashantv/gostub"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zapcore"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/config"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/util/batchpipe"
+	"github.com/matrixorigin/matrixone/pkg/util/errutil"
+	"github.com/matrixorigin/matrixone/pkg/util/export/table"
+	"github.com/matrixorigin/matrixone/pkg/util/stack"
+	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace"
 )
 
 func init() {
-	time.Local = time.FixedZone("CST", 0) // set time-zone +0000
+	// Tips: Op 'time.Local = time.FixedZone(...)' would cause DATA RACE against to time.Now()
+
 	logutil.SetupMOLogger(&logutil.LogConfig{
 		Level:      zapcore.DebugLevel.String(),
 		Format:     "console",
@@ -89,9 +92,9 @@ func (s *dummyBuffer) Add(item batchpipe.HasName) {
 	if s.signal != nil {
 		val := int(*item.(*Num))
 		length := len(s.arr)
-		logutil.Infof("accept: %v, len: %d", *item.(*Num), length)
+		logutil.Debugf("accept: %v, len: %d", *item.(*Num), length)
 		if (val <= 3 && val != length) && (val-3) != length {
-			panic(moerr.NewInternalError(ctx, "len not rignt, elem: %d, len: %d", val, length))
+			panic(moerr.NewInternalErrorf(ctx, "len not rignt, elem: %d, len: %d", val, length))
 		}
 		s.signal()
 	}
@@ -99,7 +102,7 @@ func (s *dummyBuffer) Add(item batchpipe.HasName) {
 func (s *dummyBuffer) Reset() {
 	s.mux.Lock()
 	defer s.mux.Unlock()
-	logutil.Infof("buffer reset, stack: %+v", stack.Callers(0))
+	logutil.Debugf("buffer reset, stack: %+v", stack.Callers(0))
 	s.arr = s.arr[0:0]
 }
 func (s *dummyBuffer) IsEmpty() bool {
@@ -113,10 +116,11 @@ func (s *dummyBuffer) ShouldFlush() bool {
 	length := len(s.arr)
 	should := length >= 3
 	if should {
-		logutil.Infof("buffer shouldFlush: %v", should)
+		logutil.Debugf("buffer shouldFlush: %v", should)
 	}
 	return should
 }
+func (s *dummyBuffer) Size() int64 { return 0 }
 
 var waitGetBatchFinish = func() {}
 
@@ -127,7 +131,7 @@ func (s *dummyBuffer) GetBatch(ctx context.Context, buf *bytes.Buffer) any {
 		return ""
 	}
 
-	logutil.Infof("GetBatch, len: %d", len(s.arr))
+	logutil.Debugf("GetBatch, len: %d", len(s.arr))
 	buf.Reset()
 	for _, item := range s.arr {
 		s, ok := item.(*Num)
@@ -138,11 +142,11 @@ func (s *dummyBuffer) GetBatch(ctx context.Context, buf *bytes.Buffer) any {
 		buf.WriteString(fmt.Sprintf("%d", *s))
 		buf.WriteString("),")
 	}
-	logutil.Infof("GetBatch: %s", buf.String())
+	logutil.Debugf("GetBatch: %s", buf.String())
 	if waitGetBatchFinish != nil {
-		logutil.Infof("wait BatchFinish")
+		logutil.Debugf("wait BatchFinish")
 		waitGetBatchFinish()
-		logutil.Infof("wait BatchFinish, Done")
+		logutil.Debugf("wait BatchFinish, Done")
 	}
 	return string(buf.Next(buf.Len() - 1))
 }
@@ -162,6 +166,8 @@ func (n *dummyPipeImpl) NewItemBatchHandler(ctx context.Context) func(any) {
 	}
 }
 
+func (n *dummyPipeImpl) NewAggregator(context.Context, string) table.Aggregator { return nil }
+
 var MOCollectorMux sync.Mutex
 
 func TestNewMOCollector(t *testing.T) {
@@ -179,7 +185,8 @@ func TestNewMOCollector(t *testing.T) {
 	stub1 := gostub.Stub(&signalFunc, func() { signalC <- struct{}{} })
 	defer stub1.Reset()
 
-	collector := NewMOCollector(ctx)
+	cfg := getDummyOBCollectorConfig()
+	collector := NewMOCollector(ctx, "", WithOBCollectorConfig(cfg))
 	collector.Register(newDummy(0), &dummyPipeImpl{ch: ch, duration: time.Hour})
 	collector.Start()
 
@@ -212,12 +219,7 @@ func TestNewMOCollector_Stop(t *testing.T) {
 	ctx := context.Background()
 	ch := make(chan string, 3)
 
-	errorCnt := 0
-	errutil.SetErrorReporter(func(ctx context.Context, err error, i int) {
-		errorCnt++
-	})
-
-	collector := NewMOCollector(ctx)
+	collector := NewMOCollector(ctx, "")
 	collector.Register(newDummy(0), &dummyPipeImpl{ch: ch, duration: time.Hour})
 	collector.Start()
 	collector.Stop(true)
@@ -226,9 +228,10 @@ func TestNewMOCollector_Stop(t *testing.T) {
 	for i := 0; i < N; i++ {
 		collector.Collect(ctx, newDummy(int64(i)))
 	}
-	length := len(collector.awakeCollect)
-	t.Logf("channal len: %d, errorCnt: %d, totalElem: %d", length, errorCnt, N)
-	require.Equal(t, N, errorCnt+length)
+	length := collector.awakeQueue.Len()
+	dropCnt := collector.stopDrop.Load()
+	t.Logf("channal len: %d, dropCnt: %d, totalElem: %d", length, dropCnt, N)
+	require.Equal(t, N, int(dropCnt)+int(length))
 }
 
 func TestNewMOCollector_BufferCnt(t *testing.T) {
@@ -255,11 +258,10 @@ func TestNewMOCollector_BufferCnt(t *testing.T) {
 	})
 	defer bhStub.Reset()
 
-	cfg := &config.OBCollectorConfig{}
-	cfg.SetDefaultValues()
+	cfg := getDummyOBCollectorConfig()
 	cfg.ShowStatsInterval.Duration = 5 * time.Second
 	cfg.BufferCnt = 2
-	collector := NewMOCollector(ctx, WithOBCollectorConfig(cfg))
+	collector := NewMOCollector(ctx, "", WithOBCollectorConfig(cfg))
 	collector.Register(newDummy(0), &dummyPipeImpl{ch: ch, duration: time.Hour})
 	collector.Start()
 
@@ -280,10 +282,17 @@ func TestNewMOCollector_BufferCnt(t *testing.T) {
 
 	// make 2/2 buffer hang.
 	<-batchFlowC
+	t.Log("done 2rd buffer fill, then send the last elem")
+
 	// send 7th elem, it will hang, wait for buffer slot
-	go collector.Collect(ctx, newDummy(7))
+	go func() {
+		t.Log("dummy hung goroutine started.")
+		collector.Collect(ctx, newDummy(7))
+		t.Log("dummy hung goroutine finished.")
+	}()
 	// reset
 	bhStub.Reset()
+	t.Log("done all dummy action, then do check result")
 
 	select {
 	case <-signalC:
@@ -325,9 +334,8 @@ func Test_newBufferHolder_AddAfterStop(t *testing.T) {
 	ch := make(chan string)
 	triggerSignalFunc := func(holder *bufferHolder) {}
 
-	cfg := &config.OBCollectorConfig{}
-	cfg.SetDefaultValues()
-	collector := NewMOCollector(context.TODO(), WithOBCollectorConfig(cfg))
+	cfg := getDummyOBCollectorConfig()
+	collector := NewMOCollector(context.TODO(), "", WithOBCollectorConfig(cfg))
 
 	tests := []struct {
 		name string
@@ -349,12 +357,335 @@ func Test_newBufferHolder_AddAfterStop(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			buf := newBufferHolder(tt.args.ctx, tt.args.name, tt.args.impl, tt.args.signal, tt.args.c)
 			buf.Start()
-			buf.Add(newDummy(1))
+			buf.Add(newDummy(1), true)
 			buf.Stop()
-			buf.Add(newDummy(2))
-			buf.Add(newDummy(3))
+			buf.Add(newDummy(2), true)
+			buf.Add(newDummy(3), true)
 			b, _ := buf.buffer.(*dummyBuffer)
 			require.Equal(t, []batchpipe.HasName{newDummy(1)}, b.arr)
+		})
+	}
+}
+
+func getDummyOBCollectorConfig() *config.OBCollectorConfig {
+	cfg := &config.OBCollectorConfig{}
+	cfg.SetDefaultValues()
+	cfg.ExporterCntPercent = maxPercentValue
+	cfg.GeneratorCntPercent = maxPercentValue
+	cfg.CollectorCntPercent = maxPercentValue
+	return cfg
+}
+
+func TestMOCollector_DiscardableCollect(t *testing.T) {
+
+	ctx := context.TODO()
+	cfg := getDummyOBCollectorConfig()
+	collector := NewMOCollector(context.TODO(), "", WithOBCollectorConfig(cfg))
+	elem := newDummy(1)
+	for i := 0; i < defaultRingBufferSize; i++ {
+		collector.Collect(ctx, elem)
+	}
+	require.Equal(t, defaultRingBufferSize, int(collector.awakeQueue.Len()))
+
+	// check DisableStore will discard
+	now := time.Now()
+	collector.DiscardableCollect(ctx, elem)
+	require.Equal(t, defaultRingBufferSize, int(collector.awakeQueue.Len()))
+	require.True(t, time.Since(now) > discardCollectTimeout)
+	t.Logf("DiscardableCollect accept")
+}
+
+func TestMOCollector_calculateDefaultWorker(t *testing.T) {
+	type fields struct {
+		collectorCntP int
+		generatorCntP int
+		exporterCntP  int
+	}
+	type args struct {
+		numCpu int
+	}
+	type want struct {
+		collectorCnt int
+		generatorCnt int
+		exporterCnt  int
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		args   args
+		wants  want
+	}{
+		{
+			name:   "normal_8c",
+			fields: fields{collectorCntP: 10, generatorCntP: 20, exporterCntP: 80},
+			args:   args{numCpu: 8},
+			wants:  want{collectorCnt: 1, generatorCnt: 1, exporterCnt: 1},
+		},
+		{
+			name:   "normal_30c",
+			fields: fields{collectorCntP: 10, generatorCntP: 20, exporterCntP: 80},
+			args:   args{numCpu: 30},
+			wants:  want{collectorCnt: 1, generatorCnt: 1, exporterCnt: 2},
+		},
+		{
+			name:   "normal_8c_big",
+			fields: fields{collectorCntP: 10, generatorCntP: 800, exporterCntP: 800},
+			args:   args{numCpu: 8},
+			wants:  want{collectorCnt: 1, generatorCnt: 8, exporterCnt: 8},
+		},
+		{
+			name:   "normal_1c_100p_400p",
+			fields: fields{collectorCntP: 10, generatorCntP: 100, exporterCntP: 400},
+			args:   args{numCpu: 1},
+			wants:  want{collectorCnt: 1, generatorCnt: 1, exporterCnt: 1},
+		},
+		{
+			name:   "normal_7c_80p_400p_1000p",
+			fields: fields{collectorCntP: 80, generatorCntP: 400, exporterCntP: 1000},
+			args:   args{numCpu: 7},
+			wants:  want{collectorCnt: 1, generatorCnt: 4, exporterCnt: 7},
+		},
+		{
+			name:   "normal_16c_80p_400p_1000p",
+			fields: fields{collectorCntP: 80, generatorCntP: 400, exporterCntP: 800},
+			args:   args{numCpu: 16},
+			wants:  want{collectorCnt: 2, generatorCnt: 8, exporterCnt: 16},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &MOCollector{
+				collectorCntP: tt.fields.collectorCntP,
+				generatorCntP: tt.fields.generatorCntP,
+				exporterCntP:  tt.fields.exporterCntP,
+			}
+			c.calculateDefaultWorker(tt.args.numCpu)
+			require.Equal(t, tt.wants.collectorCnt, c.collectorCnt)
+			require.Equal(t, tt.wants.generatorCnt, c.generatorCnt)
+			require.Equal(t, tt.wants.exporterCnt, c.exporterCnt)
+		})
+	}
+}
+
+func Test_bufferHolder_getGenerateReq(t *testing.T) {
+	c := &MOCollector{}
+	c.bufferCond = sync.NewCond(&c.bufferMux)
+	c.logger = runtime.GetLogger("dummy_id")
+
+	ctx := context.TODO()
+	ctrl := gomock.NewController(t)
+	impl := NewMockPipeImpl(ctrl)
+	aggr := NewMockAggregator(ctrl)
+	impl.EXPECT().NewAggregator(gomock.Any(), gomock.Any()).Return(aggr).AnyTimes()
+	//impl.EXPECT().NewItemBuffer(gomock.Any()).Return().AnyTimes()
+
+	reminder := NewMockReminder(ctrl)
+	reminder.EXPECT().RemindNextAfter().Return(5 * time.Second).AnyTimes()
+	aggr.EXPECT().AddItem(gomock.Any()).DoAndReturn(func() (table.Item, any) {
+		panic("Aggregator::AddItem panic")
+	}).AnyTimes()
+	aggr.EXPECT().GetWindow().Return(5 * time.Second).AnyTimes()
+	aggr.EXPECT().PopResultsBeforeWindow(gomock.Any()).Return([]table.Item{nil}).AnyTimes()
+
+	// not empty case.
+	bufferMock := NewMockBuffer(ctrl)
+	bufferMock.EXPECT().IsEmpty().Return(false).AnyTimes()
+	bufferMock.EXPECT().Reset().Return().AnyTimes()
+	bufferMock.EXPECT().Add(gomock.Any()).DoAndReturn(func(any) {
+		panic("Buffer::Add panic")
+	}).AnyTimes()
+	// empty buffer case.
+	emtpyBufferMock := NewMockBuffer(ctrl)
+	emtpyBufferMock.EXPECT().IsEmpty().Return(true).AnyTimes()
+
+	dummyBufferPool := &sync.Pool{
+		New: func() any { return bufferMock },
+	}
+	type fields struct {
+		c          *MOCollector
+		ctx        context.Context
+		name       string
+		buffer     motrace.Buffer
+		bufferPool *sync.Pool
+		reminder   batchpipe.Reminder
+		signal     bufferSignalFunc
+		impl       motrace.PipeImpl
+		trigger    *time.Timer
+		aggr       table.Aggregator
+		stopped    bool
+	}
+	tests := []struct {
+		name          string
+		fields        fields
+		wantReqNil    bool
+		wantBufferCnt int32
+	}{
+		{
+			name: "nil",
+			fields: fields{
+				c:          c,
+				ctx:        ctx,
+				name:       "dummy",
+				buffer:     emtpyBufferMock,
+				bufferPool: dummyBufferPool,
+				//bufferCnt:  atomic.Int32{},
+				//discardCnt: atomic.Int32{},
+				reminder: reminder,
+				signal:   nil,
+				impl:     impl,
+				trigger:  time.NewTimer(time.Hour),
+				aggr:     aggr,
+				stopped:  false,
+			},
+			wantReqNil:    true,
+			wantBufferCnt: 0,
+		},
+		// panic case check in  Test_bufferHolder_Add_panic
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &bufferHolder{
+				c:          tt.fields.c,
+				ctx:        tt.fields.ctx,
+				name:       tt.fields.name,
+				buffer:     tt.fields.buffer,
+				bufferPool: tt.fields.bufferPool,
+				reminder:   tt.fields.reminder,
+				signal:     tt.fields.signal,
+				impl:       tt.fields.impl,
+				trigger:    tt.fields.trigger,
+				aggr:       tt.fields.aggr,
+				stopped:    tt.fields.stopped,
+			}
+			got := b.getGenerateReq()
+			if tt.wantReqNil {
+				require.Nil(t, got)
+			} else {
+				require.NotNil(t, got)
+			}
+			require.Equal(t, tt.wantBufferCnt, b.bufferCnt.Load())
+		})
+	}
+}
+
+func Test_bufferHolder_Add_panic(t *testing.T) {
+	c := &MOCollector{}
+	c.bufferCond = sync.NewCond(&c.bufferMux)
+	c.logger = runtime.GetLogger("dummy_id")
+
+	ctx := context.TODO()
+	ctrl := gomock.NewController(t)
+	impl := NewMockPipeImpl(ctrl)
+	aggr := NewMockAggregator(ctrl)
+	impl.EXPECT().NewAggregator(gomock.Any(), gomock.Any()).Return(aggr).AnyTimes()
+	//impl.EXPECT().NewItemBuffer(gomock.Any()).Return().AnyTimes()
+
+	reminder := NewMockReminder(ctrl)
+	reminder.EXPECT().RemindNextAfter().Return(5 * time.Second).AnyTimes()
+	aggr.EXPECT().AddItem(gomock.Any()).DoAndReturn(func() (table.Item, any) {
+		panic("Aggregator::AddItem panic")
+	}).AnyTimes()
+	aggr.EXPECT().GetWindow().Return(5 * time.Second).AnyTimes()
+	aggr.EXPECT().PopResultsBeforeWindow(gomock.Any()).Return([]table.Item{nil}).AnyTimes()
+
+	// panic case.
+	bufferMock := NewMockBuffer(ctrl)
+	bufferMock.EXPECT().IsEmpty().Return(false).AnyTimes()
+	bufferMock.EXPECT().Reset().Return().AnyTimes()
+	bufferMock.EXPECT().Add(gomock.Any()).DoAndReturn(func(any) {
+		panic("Buffer::Add panic")
+	}).AnyTimes()
+	// empty buffer case.
+	emtpyBufferMock := NewMockBuffer(ctrl)
+	emtpyBufferMock.EXPECT().IsEmpty().Return(true).AnyTimes()
+	emtpyBufferMock.EXPECT().Add(gomock.Any()).AnyTimes()
+	emtpyBufferMock.EXPECT().ShouldFlush().Return(false).AnyTimes()
+
+	dummyBufferPool := &sync.Pool{
+		New: func() any { return bufferMock },
+	}
+	type fields struct {
+		c          *MOCollector
+		ctx        context.Context
+		name       string
+		buffer     motrace.Buffer
+		bufferPool *sync.Pool
+		reminder   batchpipe.Reminder
+		signal     bufferSignalFunc
+		impl       motrace.PipeImpl
+		trigger    *time.Timer
+		aggr       table.Aggregator
+		stopped    bool
+	}
+	tests := []struct {
+		name          string
+		fields        fields
+		wantReqNil    bool
+		wantBufferCnt int32
+	}{
+		{
+			name: "nil",
+			fields: fields{
+				c:          c,
+				ctx:        ctx,
+				name:       "dummy",
+				buffer:     emtpyBufferMock,
+				bufferPool: dummyBufferPool,
+				//bufferCnt:  atomic.Int32{},
+				//discardCnt: atomic.Int32{},
+				reminder: reminder,
+				signal:   nil,
+				impl:     impl,
+				trigger:  time.NewTimer(time.Hour),
+				aggr:     aggr,
+				stopped:  false,
+			},
+			wantReqNil:    false,
+			wantBufferCnt: 0,
+		},
+		{
+			name: "panic",
+			fields: fields{
+				c:          c,
+				ctx:        ctx,
+				name:       "dummy",
+				buffer:     bufferMock,
+				bufferPool: dummyBufferPool,
+				//bufferCnt:  atomic.Int32{},
+				//discardCnt: atomic.Int32{},
+				reminder: reminder,
+				signal:   nil,
+				impl:     impl,
+				trigger:  time.NewTimer(time.Hour),
+				aggr:     aggr,
+				stopped:  false,
+			},
+			wantReqNil:    true,
+			wantBufferCnt: -1,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := &bufferHolder{
+				c:          tt.fields.c,
+				ctx:        tt.fields.ctx,
+				name:       tt.fields.name,
+				buffer:     tt.fields.buffer,
+				bufferPool: tt.fields.bufferPool,
+				reminder:   tt.fields.reminder,
+				signal:     tt.fields.signal,
+				impl:       tt.fields.impl,
+				trigger:    tt.fields.trigger,
+				aggr:       tt.fields.aggr,
+				stopped:    tt.fields.stopped,
+			}
+			b.Add(newDummy(1), false)
+			if tt.wantReqNil {
+				require.Nil(t, b.buffer)
+			} else {
+				require.NotNil(t, b.buffer)
+			}
+			require.Equal(t, tt.wantBufferCnt, b.bufferCnt.Load())
 		})
 	}
 }

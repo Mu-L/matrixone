@@ -25,6 +25,7 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
 const chanCapConst = 10000
@@ -42,7 +43,7 @@ type Reminder interface {
 	RemindReset()
 }
 
-// ItemBuffer Stash items and construct a batch can be stored. for instance, an sql inserting all items into a table
+// ItemBuffer Stash items and construct a batch can be stored. for instance, a sql inserting all items into a table
 type ItemBuffer[T any, B any] interface {
 	Reminder
 	Add(item T)
@@ -242,7 +243,7 @@ func (bc *BaseBatchPipe[T, B]) Stop(graceful bool) (<-chan struct{}, bool) {
 		return nil, false
 	}
 
-	logutil.Infof("BaseBatchPipe accept graceful(%v) Stop", graceful)
+	logutil.Debugf("BaseBatchPipe accept graceful(%v) Stop", graceful)
 	stopCh := make(chan struct{})
 	if graceful {
 		go func() {
@@ -287,7 +288,7 @@ func (bc *BaseBatchPipe[T, B]) startMergeWorker(inputCtx context.Context) {
 func (bc *BaseBatchPipe[T, B]) batchWorker(ctx context.Context) {
 	defer bc.batchStopWg.Done()
 	quitMsg := quitUnknown
-	defer logutil.Infof("batchWorker quit: %s", &quitMsg)
+	defer logutil.Debugf("batchWorker quit: %s", &quitMsg)
 	f := bc.impl.NewItemBatchHandler(ctx)
 	for {
 		select {
@@ -299,6 +300,7 @@ func (bc *BaseBatchPipe[T, B]) batchWorker(ctx context.Context) {
 				quitMsg = quitChannelClose
 				return
 			}
+			v2.TraceCollectorMetricQueueLength.Set(float64(len(bc.batchCh)))
 			f(batch)
 		}
 	}
@@ -321,11 +323,12 @@ func (bc *BaseBatchPipe[T, B]) mergeWorker(ctx context.Context) {
 	registry := newReminderRegistry()
 	quitMsg := quitUnknown
 	defer registry.CleanAll()
-	defer logutil.Infof("mergeWorker quit: %v", &quitMsg)
+	defer logutil.Debugf("mergeWorker quit: %v", &quitMsg)
 
 	doFlush := func(name string, itembuf ItemBuffer[T, B]) {
 		batch := itembuf.GetBatch(ctx, batchbuf)
 		bc.batchCh <- batch
+		v2.TraceCollectorMetricQueueLength.Set(float64(len(bc.batchCh)))
 		itembuf.Reset()
 		itembuf.RemindReset()
 		registry.Reset(name, itembuf.RemindNextAfter())

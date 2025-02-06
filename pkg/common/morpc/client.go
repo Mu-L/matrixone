@@ -16,7 +16,6 @@ package morpc
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +23,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"go.uber.org/zap"
 )
 
@@ -69,14 +69,19 @@ func WithClientMaxBackendMaxIdleDuration(value time.Duration) ClientOption {
 	}
 }
 
-func WithClientTag(tag string) ClientOption {
+// WithClientEnableAutoCreateBackend enable client to automatically create a backend
+// in the background, when the links in the connection pool are used, if the pool has
+// not reached the maximum number of links, it will automatically create them in the
+// background to improve the latency of link creation.
+func WithClientEnableAutoCreateBackend() ClientOption {
 	return func(c *client) {
-		c.tag = tag
+		c.options.enableAutoCreate = true
 	}
 }
 
 type client struct {
-	tag         string
+	name        string
+	metrics     *metrics
 	logger      *zap.Logger
 	stopper     *stopper.Stopper
 	factory     BackendFactory
@@ -95,12 +100,19 @@ type client struct {
 		maxIdleDuration    time.Duration
 		initBackends       []string
 		initBackendCounts  []int
+		enableAutoCreate   bool
 	}
 }
 
 // NewClient create rpc client with options
-func NewClient(factory BackendFactory, options ...ClientOption) (RPCClient, error) {
+func NewClient(
+	name string,
+	factory BackendFactory,
+	options ...ClientOption) (RPCClient, error) {
+	v2.RPCClientCreateCounter.WithLabelValues(name).Inc()
 	c := &client{
+		name:        name,
+		metrics:     newMetrics(name),
 		factory:     factory,
 		gcInactiveC: make(chan string),
 	}
@@ -111,7 +123,7 @@ func NewClient(factory BackendFactory, options ...ClientOption) (RPCClient, erro
 		opt(c)
 	}
 	c.adjust()
-	c.stopper = stopper.NewStopper(c.tag, stopper.WithLogger(c.logger))
+	c.stopper = stopper.NewStopper(c.name, stopper.WithLogger(c.logger))
 
 	if err := c.maybeInitBackends(); err != nil {
 		c.Close()
@@ -133,8 +145,7 @@ func NewClient(factory BackendFactory, options ...ClientOption) (RPCClient, erro
 }
 
 func (c *client) adjust() {
-	c.tag = fmt.Sprintf("rpc-client[%s]", c.tag)
-	c.logger = logutil.Adjust(c.logger).Named(c.tag)
+	c.logger = logutil.Adjust(c.logger).Named(c.name)
 	if c.createC == nil {
 		c.createC = make(chan string, 16)
 	}
@@ -147,6 +158,9 @@ func (c *client) adjust() {
 				c.options.maxBackendsPerHost = cnt
 			}
 		}
+	}
+	if c.options.maxIdleDuration == 0 {
+		c.options.maxIdleDuration = defaultMaxIdleDuration
 	}
 }
 
@@ -167,40 +181,63 @@ func (c *client) maybeInitBackends() error {
 }
 
 func (c *client) Send(ctx context.Context, backend string, request Message) (*Future, error) {
-	b, err := c.getBackend(backend, false)
-	if err != nil {
-		return nil, err
+	if backend == "" {
+		return nil, moerr.NewBackendCannotConnectNoCtx()
 	}
 
-	f, err := b.Send(ctx, request)
-	if err != nil {
-		return nil, err
+	if ctx == nil {
+		panic("client Send nil context")
 	}
-	return f, nil
+	for {
+		b, err := c.getBackend(backend, false)
+		if err != nil {
+			return nil, err
+		}
+
+		f, err := b.Send(ctx, request)
+		if err != nil && err == backendClosed {
+			continue
+		}
+		return f, err
+	}
 }
 
 func (c *client) NewStream(backend string, lock bool) (Stream, error) {
-	b, err := c.getBackend(backend, lock)
-	if err != nil {
-		return nil, err
-	}
+	for {
+		b, err := c.getBackend(backend, lock)
+		if err != nil {
+			return nil, err
+		}
 
-	return b.NewStream(lock)
+		st, err := b.NewStream(lock)
+		if err != nil && err == backendClosed {
+			continue
+		}
+		return st, err
+	}
 }
 
 func (c *client) Ping(ctx context.Context, backend string) error {
-	b, err := c.getBackend(backend, false)
-	if err != nil {
-		return err
+	if ctx == nil {
+		panic("client Ping nil context")
 	}
+	for {
+		b, err := c.getBackend(backend, false)
+		if err != nil {
+			return err
+		}
 
-	f, err := b.SendInternal(ctx, &flagOnlyMessage{flag: flagPing})
-	if err != nil {
+		f, err := b.SendInternal(ctx, &flagOnlyMessage{flag: flagPing})
+		if err != nil {
+			if err == backendClosed {
+				continue
+			}
+			return err
+		}
+		_, err = f.Get()
+		f.Close()
 		return err
 	}
-	defer f.Close()
-	_, err = f.Get()
-	return err
 }
 
 func (c *client) Close() error {
@@ -220,6 +257,17 @@ func (c *client) Close() error {
 
 	c.stopper.Stop()
 	close(c.createC)
+	return nil
+}
+
+func (c *client) CloseBackend() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, backends := range c.mu.backends {
+		for _, b := range backends {
+			b.Close()
+		}
+	}
 	return nil
 }
 
@@ -243,6 +291,9 @@ func (c *client) getBackendLocked(backend string, lock bool) (Backend, error) {
 	if c.mu.closed {
 		return nil, moerr.NewClientClosedNoCtx()
 	}
+	defer func() {
+		c.updatePoolSizeMetricsLocked()
+	}()
 
 	lockedCnt := 0
 	inactiveCnt := 0
@@ -305,6 +356,10 @@ func (c *client) maybeCreateLocked(backend string) bool {
 }
 
 func (c *client) tryCreate(backend string) bool {
+	if !c.options.enableAutoCreate {
+		return false
+	}
+
 	select {
 	case c.createC <- backend:
 		return true
@@ -314,8 +369,8 @@ func (c *client) tryCreate(backend string) bool {
 }
 
 func (c *client) gcIdleTask(ctx context.Context) {
-	c.logger.Info("gc idle backends task started")
-	defer c.logger.Error("gc idle backends task stopped")
+	c.logger.Debug("gc idle backends task started")
+	defer c.logger.Debug("gc idle backends task stopped")
 
 	ticker := time.NewTicker(c.options.maxIdleDuration)
 	defer ticker.Stop()
@@ -340,8 +395,8 @@ func (c *client) triggerGCInactive(remote string) {
 }
 
 func (c *client) gcInactiveTask(ctx context.Context) {
-	c.logger.Info("gc inactive backends task started")
-	defer c.logger.Error("gc inactive backends task stopped")
+	c.logger.Debug("gc inactive backends task started")
+	defer c.logger.Debug("gc inactive backends task stopped")
 
 	for {
 		select {
@@ -370,6 +425,8 @@ func (c *client) doRemoveInactive(remote string) {
 		newBackends = append(newBackends, backend)
 	}
 	c.mu.backends[remote] = newBackends
+
+	c.updatePoolSizeMetricsLocked()
 }
 
 func (c *client) closeIdleBackends() {
@@ -381,13 +438,13 @@ func (c *client) closeIdleBackends() {
 			if !b.Locked() &&
 				time.Since(b.LastActiveTime()) > c.options.maxIdleDuration {
 				idleBackends = append(idleBackends, b)
-				// panic(2)
 				continue
 			}
 			newBackends = append(newBackends, b)
 		}
 		c.mu.backends[k] = newBackends
 	}
+	c.updatePoolSizeMetricsLocked()
 	c.mu.Unlock()
 
 	for _, b := range idleBackends {
@@ -453,7 +510,7 @@ func (c *client) createBackendLocked(backend string) (Backend, error) {
 }
 
 func (c *client) doCreate(backend string) (Backend, error) {
-	b, err := c.factory.Create(backend)
+	b, err := c.factory.Create(backend, WithBackendMetrics(c.metrics))
 	if err != nil {
 		c.logger.Error("create backend failed",
 			zap.String("backend", backend),
@@ -465,6 +522,14 @@ func (c *client) doCreate(backend string) (Backend, error) {
 
 func (c *client) canCreateLocked(backend string) bool {
 	return len(c.mu.backends[backend]) < c.options.maxBackendsPerHost
+}
+
+func (c *client) updatePoolSizeMetricsLocked() {
+	n := 0
+	for _, backends := range c.mu.backends {
+		n += len(backends)
+	}
+	c.metrics.poolSizeGauge.Set(float64(n))
 }
 
 type op struct {

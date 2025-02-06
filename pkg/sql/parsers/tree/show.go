@@ -22,15 +22,23 @@ type showImpl struct {
 	Show
 }
 
+func (s *showImpl) Free() {
+}
+
 // SHOW CREATE TABLE statement
 type ShowCreateTable struct {
 	showImpl
-	Name *UnresolvedObjectName
+	Name     *UnresolvedObjectName
+	AtTsExpr *AtTimeStamp
 }
 
 func (node *ShowCreateTable) Format(ctx *FmtCtx) {
 	ctx.WriteString("show create table ")
 	node.Name.ToTableName().Format(ctx)
+	if node.AtTsExpr != nil {
+		ctx.WriteString(" ")
+		node.AtTsExpr.Format(ctx)
+	}
 }
 
 func (node *ShowCreateTable) GetStatementType() string { return "Show Create Table" }
@@ -43,12 +51,17 @@ func NewShowCreate(n *UnresolvedObjectName) *ShowCreateTable {
 // SHOW CREATE VIEW statement
 type ShowCreateView struct {
 	showImpl
-	Name *UnresolvedObjectName
+	Name     *UnresolvedObjectName
+	AtTsExpr *AtTimeStamp
 }
 
 func (node *ShowCreateView) Format(ctx *FmtCtx) {
 	ctx.WriteString("show create view ")
 	node.Name.ToTableName().Format(ctx)
+	if node.AtTsExpr != nil {
+		ctx.WriteString(" ")
+		node.AtTsExpr.Format(ctx)
+	}
 }
 func (node *ShowCreateView) GetStatementType() string { return "Show Create View" }
 func (node *ShowCreateView) GetQueryType() string     { return QueryTypeOth }
@@ -62,6 +75,7 @@ type ShowCreateDatabase struct {
 	showImpl
 	IfNotExists bool
 	Name        string
+	AtTsExpr    *AtTimeStamp
 }
 
 func (node *ShowCreateDatabase) Format(ctx *FmtCtx) {
@@ -71,6 +85,10 @@ func (node *ShowCreateDatabase) Format(ctx *FmtCtx) {
 	}
 	ctx.WriteByte(' ')
 	ctx.WriteString(string(node.Name))
+	if node.AtTsExpr != nil {
+		ctx.WriteString(" ")
+		node.AtTsExpr.Format(ctx)
+	}
 }
 func (node *ShowCreateDatabase) GetStatementType() string { return "Show Create View" }
 func (node *ShowCreateDatabase) GetQueryType() string     { return QueryTypeOth }
@@ -135,8 +153,9 @@ func NewShowColumns(e bool, f bool, t *UnresolvedObjectName, d string, l *Compar
 // the SHOW DATABASES statement.
 type ShowDatabases struct {
 	showImpl
-	Like  *ComparisonExpr
-	Where *Where
+	Like     *ComparisonExpr
+	Where    *Where
+	AtTsExpr *AtTimeStamp
 }
 
 func (node *ShowDatabases) Format(ctx *FmtCtx) {
@@ -148,6 +167,10 @@ func (node *ShowDatabases) Format(ctx *FmtCtx) {
 	if node.Where != nil {
 		ctx.WriteByte(' ')
 		node.Where.Format(ctx)
+	}
+	if node.AtTsExpr != nil {
+		ctx.WriteByte(' ')
+		node.AtTsExpr.Format(ctx)
 	}
 }
 func (node *ShowDatabases) GetStatementType() string { return "Show Databases" }
@@ -167,7 +190,6 @@ const (
 	ShowCharset
 	ShowCreateUser
 	ShowTriggers
-	ShowProcedureStatus
 	ShowConfig
 	ShowEvents
 	ShowPlugins
@@ -186,8 +208,6 @@ func (s ShowType) String() string {
 		return "create user"
 	case ShowTriggers:
 		return "triggers"
-	case ShowProcedureStatus:
-		return "procedure status"
 	case ShowConfig:
 		return "config"
 	case ShowEvents:
@@ -331,12 +351,13 @@ func (node *ShowSequences) GetQueryType() string     { return QueryTypeOth }
 // SHOW TABLES statement.
 type ShowTables struct {
 	showImpl
-	Ext    bool
-	Open   bool
-	Full   bool
-	DBName string
-	Like   *ComparisonExpr
-	Where  *Where
+	Ext      bool
+	Open     bool
+	Full     bool
+	DBName   string
+	Like     *ComparisonExpr
+	Where    *Where
+	AtTsExpr *AtTimeStamp
 }
 
 func (node *ShowTables) Format(ctx *FmtCtx) {
@@ -359,6 +380,10 @@ func (node *ShowTables) Format(ctx *FmtCtx) {
 	if node.Where != nil {
 		ctx.WriteByte(' ')
 		node.Where.Format(ctx)
+	}
+	if node.AtTsExpr != nil {
+		ctx.WriteByte(' ')
+		node.AtTsExpr.Format(ctx)
 	}
 }
 func (node *ShowTables) GetStatementType() string { return "Show Tables" }
@@ -515,13 +540,21 @@ func NewShowStatus(g bool, l *ComparisonExpr, w *Where) *ShowStatus {
 // show index statement
 type ShowIndex struct {
 	showImpl
-	TableName TableName
+	TableName *UnresolvedObjectName
+	DbName    string
 	Where     *Where
 }
 
 func (node *ShowIndex) Format(ctx *FmtCtx) {
-	ctx.WriteString("show index from ")
-	node.TableName.Format(ctx)
+	ctx.WriteString("show index")
+	if node.TableName != nil {
+		ctx.WriteString(" from ")
+		node.TableName.Format(ctx)
+	}
+	if node.DbName != "" {
+		ctx.WriteString(" from ")
+		ctx.WriteString(node.DbName)
+	}
 	if node.Where != nil {
 		ctx.WriteByte(' ')
 		node.Where.Format(ctx)
@@ -530,23 +563,28 @@ func (node *ShowIndex) Format(ctx *FmtCtx) {
 func (node *ShowIndex) GetStatementType() string { return "Show Index" }
 func (node *ShowIndex) GetQueryType() string     { return QueryTypeOth }
 
-func NewShowIndex(t TableName, w *Where) *ShowIndex {
+func NewShowIndex(t *UnresolvedObjectName, w *Where) *ShowIndex {
 	return &ShowIndex{
 		TableName: t,
 		Where:     w,
 	}
 }
 
-// show Function statement
+// show Function or Procedure statement
 
-type ShowFunctionStatus struct {
+type ShowFunctionOrProcedureStatus struct {
 	showImpl
-	Like  *ComparisonExpr
-	Where *Where
+	Like       *ComparisonExpr
+	Where      *Where
+	IsFunction bool
 }
 
-func (node *ShowFunctionStatus) Format(ctx *FmtCtx) {
-	ctx.WriteString("show function status")
+func (node *ShowFunctionOrProcedureStatus) Format(ctx *FmtCtx) {
+	if node.IsFunction {
+		ctx.WriteString("show function status")
+	} else {
+		ctx.WriteString("show procedure status")
+	}
 	if node.Like != nil {
 		ctx.WriteString(" like ")
 		node.Like.Format(ctx)
@@ -557,13 +595,16 @@ func (node *ShowFunctionStatus) Format(ctx *FmtCtx) {
 	}
 }
 
-func (node *ShowFunctionStatus) GetStatementType() string { return "Show Function Status" }
-func (node *ShowFunctionStatus) GetQueryType() string     { return QueryTypeOth }
+func (node *ShowFunctionOrProcedureStatus) GetStatementType() string {
+	return "Show Function Or Procedure Status"
+}
+func (node *ShowFunctionOrProcedureStatus) GetQueryType() string { return QueryTypeOth }
 
-func NewShowFunctionStatus(l *ComparisonExpr, w *Where) *ShowFunctionStatus {
-	return &ShowFunctionStatus{
-		Like:  l,
-		Where: w,
+func NewShowFunctionOrProcedureStatus(l *ComparisonExpr, w *Where, i bool) *ShowFunctionOrProcedureStatus {
+	return &ShowFunctionOrProcedureStatus{
+		Like:       l,
+		Where:      w,
+		IsFunction: i,
 	}
 }
 
@@ -693,6 +734,17 @@ func (node *ShowAccounts) Format(ctx *FmtCtx) {
 func (node *ShowAccounts) GetStatementType() string { return "Show Accounts" }
 func (node *ShowAccounts) GetQueryType() string     { return QueryTypeOth }
 
+type ShowAccountUpgrade struct {
+	statementImpl
+}
+
+func (node *ShowAccountUpgrade) Format(ctx *FmtCtx) {
+	ctx.WriteString("show upgrade")
+}
+
+func (node *ShowAccountUpgrade) GetStatementType() string { return "show upgrade" }
+func (node *ShowAccountUpgrade) GetQueryType() string     { return QueryTypeOth }
+
 type ShowPublications struct {
 	showImpl
 	Like *ComparisonExpr
@@ -711,11 +763,15 @@ func (node *ShowPublications) GetQueryType() string     { return QueryTypeOth }
 
 type ShowSubscriptions struct {
 	showImpl
+	All  bool
 	Like *ComparisonExpr
 }
 
 func (node *ShowSubscriptions) Format(ctx *FmtCtx) {
 	ctx.WriteString("show subscriptions")
+	if node.All {
+		ctx.WriteString(" all")
+	}
 	if node.Like != nil {
 		ctx.WriteByte(' ')
 		node.Like.Format(ctx)
@@ -761,4 +817,98 @@ func NewShowTableSize(table *UnresolvedObjectName, dbname string) *ShowTableSize
 		Table:  table,
 		DbName: dbname,
 	}
+}
+
+// show Roles statement
+
+type ShowRolesStmt struct {
+	showImpl
+	Like *ComparisonExpr
+}
+
+func (node *ShowRolesStmt) Format(ctx *FmtCtx) {
+	ctx.WriteString("show roles")
+	if node.Like != nil {
+		ctx.WriteString(" ")
+		node.Like.Format(ctx)
+	}
+}
+
+func (node *ShowRolesStmt) GetStatementType() string { return "Show Roles" }
+func (node *ShowRolesStmt) GetQueryType() string     { return QueryTypeOth }
+
+// ShowBackendServers indicates SHOW BACKEND SERVERS statement.
+type ShowBackendServers struct {
+	showImpl
+}
+
+func (node *ShowBackendServers) Format(ctx *FmtCtx) {
+	ctx.WriteString("show backend servers")
+}
+
+func (node *ShowBackendServers) GetStatementType() string { return "Show Backend Servers" }
+func (node *ShowBackendServers) GetQueryType() string     { return QueryTypeOth }
+
+type ShowConnectors struct {
+	showImpl
+}
+
+func (node *ShowConnectors) Format(ctx *FmtCtx) {
+	ctx.WriteString("show connectors")
+}
+func (node *ShowConnectors) GetStatementType() string { return "Show Connectors" }
+func (node *ShowConnectors) GetQueryType() string     { return QueryTypeOth }
+
+func NewShowConnectors(f bool) *ShowConnectors {
+	return &ShowConnectors{}
+}
+
+type ShowLogserviceReplicas struct {
+	showImpl
+}
+
+func (node *ShowLogserviceReplicas) Format(ctx *FmtCtx) {
+	ctx.WriteString("show logservice replicas")
+}
+func (node *ShowLogserviceReplicas) GetStatementType() string { return "Show Logservice Replicas" }
+func (node *ShowLogserviceReplicas) GetQueryType() string     { return QueryTypeOth }
+
+type ShowLogserviceStores struct {
+	showImpl
+}
+
+func (node *ShowLogserviceStores) Format(ctx *FmtCtx) {
+	ctx.WriteString("show logservice stores")
+}
+func (node *ShowLogserviceStores) GetStatementType() string { return "Show Logservice Stores" }
+func (node *ShowLogserviceStores) GetQueryType() string     { return QueryTypeOth }
+
+type ShowLogserviceSettings struct {
+	showImpl
+}
+
+func (node *ShowLogserviceSettings) Format(ctx *FmtCtx) {
+	ctx.WriteString("show logservice settings")
+}
+func (node *ShowLogserviceSettings) GetStatementType() string { return "Show Logservice Settings" }
+func (node *ShowLogserviceSettings) GetQueryType() string     { return QueryTypeOth }
+
+type EmptyStmt struct {
+	statementImpl
+}
+
+func (e *EmptyStmt) String() string {
+	return ""
+}
+
+func (e *EmptyStmt) Format(ctx *FmtCtx) {
+	ctx.WriteString("")
+}
+
+func (e EmptyStmt) GetStatementType() string {
+	return "InternalCmd"
+}
+
+func (e EmptyStmt) GetQueryType() string {
+	return QueryTypeOth
 }

@@ -17,6 +17,7 @@ package db
 import (
 	"sync"
 
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
 )
@@ -25,14 +26,14 @@ func ScopeConflictCheck(oldScope, newScope *common.ID) (err error) {
 	if oldScope.TableID != newScope.TableID {
 		return
 	}
-	if oldScope.SegmentID != newScope.SegmentID &&
-		!common.IsEmptySegid(&oldScope.SegmentID) &&
-		!common.IsEmptySegid(&newScope.SegmentID) {
+	if !oldScope.SegmentID().Eq(*newScope.SegmentID()) &&
+		!objectio.IsEmptySegid(oldScope.SegmentID()) &&
+		!objectio.IsEmptySegid(newScope.SegmentID()) {
 		return
 	}
 	if oldScope.BlockID != newScope.BlockID &&
-		!common.IsEmptyBlkid(&oldScope.BlockID) &&
-		!common.IsEmptyBlkid(&newScope.BlockID) {
+		!objectio.IsEmptyBlkid(&oldScope.BlockID) &&
+		!objectio.IsEmptyBlkid(&newScope.BlockID) {
 		return
 	}
 	return tasks.ErrScheduleScopeConflict
@@ -41,12 +42,12 @@ func ScopeConflictCheck(oldScope, newScope *common.ID) (err error) {
 type asyncJobDispatcher struct {
 	sync.RWMutex
 	*tasks.BaseDispatcher
-	actives map[common.ID]bool
+	actives map[common.ID]struct{}
 }
 
 func newAsyncJobDispatcher() *asyncJobDispatcher {
 	return &asyncJobDispatcher{
-		actives:        make(map[common.ID]bool),
+		actives:        make(map[common.ID]struct{}),
 		BaseDispatcher: tasks.NewBaseDispatcher(),
 	}
 }
@@ -71,16 +72,11 @@ func (dispatcher *asyncJobDispatcher) TryDispatch(task tasks.Task) (err error) {
 	}
 	dispatcher.Lock()
 	if err = dispatcher.checkConflictLocked(scopes); err != nil {
-		// str := ""
-		// for scope := range dispatcher.actives {
-		// 	str = fmt.Sprintf("%s%s,", str, scope.String())
-		// }
-		// logutil.Warnf("ActiveScopes: %s, Incomming: %s", str, common.IDArraryString(scopes))
 		dispatcher.Unlock()
 		return
 	}
 	for _, scope := range scopes {
-		dispatcher.actives[scope] = true
+		dispatcher.actives[scope] = struct{}{}
 	}
 	task.AddObserver(dispatcher)
 	dispatcher.Unlock()

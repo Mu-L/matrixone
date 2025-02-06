@@ -15,6 +15,8 @@
 package catalog
 
 import (
+	"context"
+	"crypto/rand"
 	"fmt"
 	"sync"
 	"testing"
@@ -22,11 +24,14 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -35,11 +40,11 @@ const (
 
 func TestCreateDB1(t *testing.T) {
 	defer testutils.AfterTest(t)()
-	catalog := MockCatalog(nil)
+	catalog := MockCatalog()
 	defer catalog.Close()
 
 	txnMgr := txnbase.NewTxnManager(MockTxnStoreFactory(catalog), MockTxnFactory(catalog), types.NewMockHLCClock(1))
-	txnMgr.Start()
+	txnMgr.Start(context.Background())
 	defer txnMgr.Stop()
 
 	txn1, _ := txnMgr.StartTxn(nil)
@@ -52,7 +57,7 @@ func TestCreateDB1(t *testing.T) {
 	assert.Equal(t, 2, len(catalog.entries))
 	cnt := 0
 	catalog.link.Loop(func(n *common.GenericDLNode[*DBEntry]) bool {
-		t.Log(n.GetPayload().GetID())
+		t.Log(n.GetPayload().ID)
 		cnt++
 		return true
 	}, true)
@@ -69,7 +74,7 @@ func TestCreateDB1(t *testing.T) {
 	_, err = txn1.GetDatabase(name)
 	assert.Nil(t, err)
 
-	err = txn1.Commit()
+	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
 
 	assert.Nil(t, err)
@@ -123,11 +128,11 @@ func TestCreateDB1(t *testing.T) {
 //	[TXN1]: CREATE DB1 [OK] | GET DB [OK]
 func TestTableEntry1(t *testing.T) {
 	defer testutils.AfterTest(t)()
-	catalog := MockCatalog(nil)
+	catalog := MockCatalog()
 	defer catalog.Close()
 
 	txnMgr := txnbase.NewTxnManager(MockTxnStoreFactory(catalog), MockTxnFactory(catalog), types.NewMockHLCClock(1))
-	txnMgr.Start()
+	txnMgr.Start(context.Background())
 	defer txnMgr.Stop()
 
 	txn1, _ := txnMgr.StartTxn(nil)
@@ -158,7 +163,7 @@ func TestTableEntry1(t *testing.T) {
 	_, err = txn2.DropDatabase(name)
 	assert.True(t, moerr.IsMoErrCode(err, moerr.OkExpectedEOB))
 
-	err = txn1.Commit()
+	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
 
 	_, err = txn2.DropDatabase(name)
@@ -184,7 +189,7 @@ func TestTableEntry1(t *testing.T) {
 	_, err = db.DropRelationByName(schema.Name)
 	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict))
 
-	err = txn3.Commit()
+	err = txn3.Commit(context.Background())
 	assert.Nil(t, err)
 
 	t.Log(tb1.String())
@@ -198,11 +203,11 @@ func TestTableEntry1(t *testing.T) {
 
 func TestTableEntry2(t *testing.T) {
 	defer testutils.AfterTest(t)()
-	catalog := MockCatalog(nil)
+	catalog := MockCatalog()
 	defer catalog.Close()
 
 	txnMgr := txnbase.NewTxnManager(MockTxnStoreFactory(catalog), MockTxnFactory(catalog), types.NewMockHLCClock(1))
-	txnMgr.Start()
+	txnMgr.Start(context.Background())
 	defer txnMgr.Stop()
 
 	txn1, _ := txnMgr.StartTxn(nil)
@@ -220,7 +225,7 @@ func TestTableEntry2(t *testing.T) {
 		_, err = db.CreateRelation(s)
 		assert.Nil(t, err)
 	}
-	err = txn1.Commit()
+	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
 
 	txn2, _ := txnMgr.StartTxn(nil)
@@ -262,11 +267,11 @@ func TestTableEntry2(t *testing.T) {
 
 func TestDB1(t *testing.T) {
 	defer testutils.AfterTest(t)()
-	catalog := MockCatalog(nil)
+	catalog := MockCatalog()
 	defer catalog.Close()
 
 	txnMgr := txnbase.NewTxnManager(MockTxnStoreFactory(catalog), MockTxnFactory(catalog), types.NewMockHLCClock(1))
-	txnMgr.Start()
+	txnMgr.Start(context.Background())
 	defer txnMgr.Stop()
 	name := "db1"
 	var wg sync.WaitGroup
@@ -285,7 +290,7 @@ func TestDB1(t *testing.T) {
 				return
 			}
 		}
-		err = txn.Commit()
+		err = txn.Commit(context.Background())
 		assert.Nil(t, err)
 	}
 
@@ -298,11 +303,11 @@ func TestDB1(t *testing.T) {
 
 func TestTable1(t *testing.T) {
 	defer testutils.AfterTest(t)()
-	catalog := MockCatalog(nil)
+	catalog := MockCatalog()
 	defer catalog.Close()
 
 	txnMgr := txnbase.NewTxnManager(MockTxnStoreFactory(catalog), MockTxnFactory(catalog), types.NewMockHLCClock(1))
-	txnMgr.Start()
+	txnMgr.Start(context.Background())
 	defer txnMgr.Stop()
 	name := "db1"
 	tbName := "tb1"
@@ -324,7 +329,7 @@ func TestTable1(t *testing.T) {
 				return
 			}
 		}
-		err = txn.Commit()
+		err = txn.Commit(context.Background())
 		assert.Nil(t, err)
 		// t.Log(rel.String())
 	}
@@ -332,7 +337,7 @@ func TestTable1(t *testing.T) {
 		txn, _ := txnMgr.StartTxn(nil)
 		_, err := txn.CreateDatabase(name, "", "")
 		assert.Nil(t, err)
-		err = txn.Commit()
+		err = txn.Commit(context.Background())
 		assert.Nil(t, err)
 	}
 	for i := 0; i < 1000; i++ {
@@ -343,18 +348,18 @@ func TestTable1(t *testing.T) {
 }
 
 // UT Steps
-// 1. Start Txn1, create a database "db", table "tb" and segment "seg1", then commit Txn1
-// 1. Start Txn2, create a segment "seg2". Txn2 scan "tb" and "seg1, seg2" found
-// 2. Start Txn3, scan "tb" and only "seg1" found
+// 1. Start Txn1, create a database "db", table "tb" and Object "obj1", then commit Txn1
+// 1. Start Txn2, create a Object "obj2". Txn2 scan "tb" and "obj1, obj2" found
+// 2. Start Txn3, scan "tb" and only "obj1" found
 // 3. Commit Txn2
-// 4. Txn3 scan "tb" and also only "seg1" found
-// 5. Start Txn4, scan "tb" and both "seg1" and "seg2" found
-func TestSegment1(t *testing.T) {
+// 4. Txn3 scan "tb" and also only "obj1" found
+// 5. Start Txn4, scan "tb" and both "obj1" and "obj2" found
+func TestObject1(t *testing.T) {
 	defer testutils.AfterTest(t)()
-	catalog := MockCatalog(nil)
+	catalog := MockCatalog()
 	defer catalog.Close()
 	txnMgr := txnbase.NewTxnManager(MockTxnStoreFactory(catalog), MockTxnFactory(catalog), types.NewMockHLCClock(1))
-	txnMgr.Start()
+	txnMgr.Start(context.Background())
 	defer txnMgr.Stop()
 	name := "db"
 	tbName := "tb"
@@ -365,10 +370,72 @@ func TestSegment1(t *testing.T) {
 	schema.Name = tbName
 	tb, err := db.CreateTableEntry(schema, txn1, nil)
 	assert.Nil(t, err)
-	seg1, err := tb.CreateSegment(txn1, ES_Appendable, nil, nil)
+	stats := objectio.NewObjectStatsWithObjectID(objectio.NewObjectid(), true, false, false)
+	obj1, err := tb.CreateObject(txn1, &objectio.CreateObjOpt{Stats: stats, IsTombstone: false}, nil)
 	assert.Nil(t, err)
-	err = txn1.Commit()
+	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
-	t.Log(seg1.String())
+	t.Log(obj1.String())
 	t.Log(tb.String())
+}
+
+func TestAlterSchema(t *testing.T) {
+	schema := MockSchema(10, 5)
+	req := api.NewAddColumnReq(0, 0, "xyz", types.NewProtoType(types.T_int32), 2)
+	require.NoError(t, schema.ApplyAlterTable(req))
+	require.Equal(t, 12, len(schema.NameMap))
+	require.Equal(t, 12, len(schema.SeqnumMap))
+
+	require.Equal(t, 2, schema.GetColIdx("xyz"))
+	require.Equal(t, uint16(10), schema.GetSeqnum("xyz"))
+	require.Equal(t, 2, schema.SeqnumMap[10])
+	require.Equal(t, 6, schema.GetColIdx("mock_5"))
+	require.Equal(t, uint16(5), schema.GetSeqnum("mock_5"))
+	require.Equal(t, 11, schema.GetColIdx(PhyAddrColumnName))
+	require.Equal(t, uint16(65535), schema.GetSeqnum(PhyAddrColumnName))
+	require.Equal(t, true, schema.HasPK())
+	require.Equal(t, true, schema.HasSortKey())
+	require.Equal(t, "mock_5", schema.GetSingleSortKey().Name)
+	require.Equal(t, uint16(5), schema.GetSingleSortKey().SeqNum)
+	require.Equal(t, 6, schema.GetSingleSortKeyIdx())
+
+	req = api.NewRemoveColumnReq(0, 0, 4, 3)
+	schema.ApplyAlterTable(req)
+	require.Equal(t, 11, len(schema.NameMap))
+	require.Equal(t, 11, len(schema.SeqnumMap))
+
+	require.Equal(t, 2, schema.GetColIdx("xyz"))
+	require.Equal(t, uint16(10), schema.GetSeqnum("xyz"))
+	require.Equal(t, 2, schema.SeqnumMap[10])
+	require.Equal(t, 5, schema.GetColIdx("mock_5"))
+	require.Equal(t, uint16(5), schema.GetSeqnum("mock_5"))
+	require.Equal(t, 10, schema.GetColIdx(PhyAddrColumnName))
+	require.Equal(t, uint16(65535), schema.GetSeqnum(PhyAddrColumnName))
+	require.Equal(t, true, schema.HasPK())
+	require.Equal(t, true, schema.HasSortKey())
+	require.Equal(t, "mock_5", schema.GetSingleSortKey().Name)
+	require.Equal(t, uint16(5), schema.GetSingleSortKey().SeqNum)
+	require.Equal(t, 5, schema.GetSingleSortKeyIdx())
+
+}
+
+func randomTxnID(t *testing.T) []byte {
+	bytes := make([]byte, 8)
+	_, err := rand.Read(bytes)
+	require.NoError(t, err)
+	return bytes
+}
+
+func TestTxnManager_GetOrCreateTxnWithMeta(t *testing.T) {
+	mockCatalog := MockCatalog()
+	txnMgr := txnbase.NewTxnManager(MockTxnStoreFactory(mockCatalog), MockTxnFactory(mockCatalog), types.NewMockHLCClock(1))
+	txn1 := randomTxnID(t)
+	ts := *types.BuildTSForTest(10, 0)
+	meta, err := txnMgr.GetOrCreateTxnWithMeta(nil, txn1, ts)
+	require.NoError(t, err)
+	require.Equal(t, string(txn1), meta.GetID())
+
+	meta2, err := txnMgr.GetOrCreateTxnWithMeta(nil, txn1, ts)
+	require.NoError(t, err)
+	require.Equal(t, string(txn1), meta2.GetID())
 }

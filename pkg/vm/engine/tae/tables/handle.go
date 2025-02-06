@@ -21,75 +21,64 @@ import (
 )
 
 type tableHandle struct {
-	table    *dataTable
-	block    *ablock
-	appender data.BlockAppender
+	table       *dataTable
+	object      *aobject
+	appender    data.ObjectAppender
+	isTombstone bool
 }
 
-func newHandle(table *dataTable, block *ablock) *tableHandle {
+func newHandle(table *dataTable, object *aobject, isTombstone bool) *tableHandle {
 	h := &tableHandle{
-		table: table,
-		block: block,
+		table:       table,
+		object:      object,
+		isTombstone: isTombstone,
 	}
-	if block != nil {
-		h.appender, _ = block.MakeAppender()
+	if object != nil {
+		h.appender, _ = object.MakeAppender()
 	}
 	return h
 }
 
-func (h *tableHandle) SetAppender(id *common.ID) (appender data.BlockAppender) {
+func (h *tableHandle) SetAppender(id *common.ID) (appender data.ObjectAppender) {
 	tableMeta := h.table.meta
-	segMeta, _ := tableMeta.GetSegmentByID(id.SegmentID)
-	blkMeta, _ := segMeta.GetBlockEntryByID(id.BlockID)
-	h.block = blkMeta.GetBlockData().(*ablock)
-	h.appender, _ = h.block.MakeAppender()
-	h.block.Ref()
+	objMeta, _ := tableMeta.GetObjectByID(id.ObjectID(), h.isTombstone)
+	h.object = objMeta.GetObjectData().(*aobject)
+	h.appender, _ = h.object.MakeAppender()
+	h.object.Ref()
 	return h.appender
 }
 
-func (h *tableHandle) ThrowAppenderAndErr() (appender data.BlockAppender, err error) {
-	id := h.appender.GetID()
-	segEntry, _ := h.table.meta.GetSegmentByID(id.SegmentID)
-	if segEntry == nil ||
-		segEntry.GetAppendableBlockCnt() >= int(segEntry.GetTable().GetSchema().SegmentMaxBlocks) {
-		err = data.ErrAppendableSegmentNotFound
-	} else {
-		err = data.ErrAppendableBlockNotFound
-		appender = h.appender
-	}
-	h.block = nil
+func (h *tableHandle) ThrowAppenderAndErr() (appender data.ObjectAppender, err error) {
+	err = data.ErrAppendableObjectNotFound
+	h.object = nil
 	h.appender = nil
 	return
 }
 
-func (h *tableHandle) GetAppender() (appender data.BlockAppender, err error) {
-	var segEntry *catalog.SegmentEntry
+func (h *tableHandle) GetAppender() (appender data.ObjectAppender, err error) {
+	var objEntry *catalog.ObjectEntry
 	if h.appender == nil {
-		segEntry = h.table.meta.LastAppendableSegmemt()
-		if segEntry == nil {
-			err = data.ErrAppendableSegmentNotFound
+		objEntry = h.table.meta.TryFindLastAppendableObject(h.isTombstone)
+		if objEntry == nil {
+			err = data.ErrAppendableObjectNotFound
 			return
 		}
-		blkEntry := segEntry.LastAppendableBlock()
-		if blkEntry == nil {
-			err = data.ErrAppendableSegmentNotFound
-			return
-		}
-		h.block = blkEntry.GetBlockData().(*ablock)
-		h.appender, err = h.block.MakeAppender()
+		h.object = objEntry.GetObjectData().(*aobject)
+		h.appender, err = h.object.MakeAppender()
 		if err != nil {
 			panic(err)
 		}
 	}
-	dropped := h.block.meta.HasDropCommitted()
-	if !h.appender.IsAppendable() || !h.block.IsAppendable() || dropped {
+
+	dropped := h.object.meta.Load().HasDropCommitted()
+	if !h.appender.IsAppendable() || !h.object.IsAppendable() || dropped {
 		return h.ThrowAppenderAndErr()
 	}
-	h.block.Ref()
+	h.object.Ref()
 	// Similar to optimistic locking
-	dropped = h.block.meta.HasDropCommitted()
-	if !h.appender.IsAppendable() || !h.block.IsAppendable() || dropped {
-		h.block.Unref()
+	dropped = h.object.meta.Load().HasDropCommitted()
+	if !h.appender.IsAppendable() || !h.object.IsAppendable() || dropped {
+		h.object.Unref()
 		return h.ThrowAppenderAndErr()
 	}
 	appender = h.appender

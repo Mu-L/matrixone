@@ -15,191 +15,244 @@
 package catalog
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
+	"unsafe"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 )
 
 type MetadataMVCCNode struct {
-	*EntryMVCCNode
-	*txnbase.TxnMVCCNode
-	MetaLoc  string
-	DeltaLoc string
+	MetaLoc  objectio.Location
+	DeltaLoc objectio.Location
+
+	// For deltaloc from CN, it needs to ensure that deleteChain is empty.
+	NeedCheckDeleteChainWhenCommit bool
 }
 
-func NewEmptyMetadataMVCCNode() txnif.MVCCNode {
-	return &MetadataMVCCNode{
-		EntryMVCCNode: &EntryMVCCNode{},
-		TxnMVCCNode:   &txnbase.TxnMVCCNode{},
-	}
+func NewEmptyMetadataMVCCNode() *MetadataMVCCNode {
+	return &MetadataMVCCNode{}
 }
 
-func CompareMetaBaseNode(e, o txnif.MVCCNode) int {
-	return e.(*MetadataMVCCNode).Compare(o.(*MetadataMVCCNode).TxnMVCCNode)
-}
-
-func (e *MetadataMVCCNode) CloneAll() txnif.MVCCNode {
+func (e *MetadataMVCCNode) CloneAll() *MetadataMVCCNode {
 	node := &MetadataMVCCNode{
-		EntryMVCCNode: e.EntryMVCCNode.Clone(),
-		TxnMVCCNode:   e.TxnMVCCNode.CloneAll(),
-		MetaLoc:       e.MetaLoc,
-		DeltaLoc:      e.DeltaLoc,
+		MetaLoc:  e.MetaLoc,
+		DeltaLoc: e.DeltaLoc,
 	}
 	return node
 }
 
-func (e *MetadataMVCCNode) CloneData() txnif.MVCCNode {
+func (e *MetadataMVCCNode) CloneData() *MetadataMVCCNode {
 	return &MetadataMVCCNode{
-		EntryMVCCNode: e.EntryMVCCNode.CloneData(),
-		TxnMVCCNode:   &txnbase.TxnMVCCNode{},
-		MetaLoc:       e.MetaLoc,
-		DeltaLoc:      e.DeltaLoc,
+		MetaLoc:  e.MetaLoc,
+		DeltaLoc: e.DeltaLoc,
 	}
 }
 
 func (e *MetadataMVCCNode) String() string {
 
-	return fmt.Sprintf("%s%s[MetaLoc=\"%s\",DeltaLoc=\"%s\"]",
-		e.TxnMVCCNode.String(),
-		e.EntryMVCCNode.String(),
-		e.MetaLoc,
-		e.DeltaLoc)
-}
-func (e *MetadataMVCCNode) UpdateMetaLoc(metaLoc string) {
-	e.MetaLoc = metaLoc
-}
-func (e *MetadataMVCCNode) UpdateDeltaLoc(deltaLoc string) {
-	e.DeltaLoc = deltaLoc
+	return fmt.Sprintf("[MetaLoc=\"%s\",DeltaLoc=\"%s\"]",
+		e.MetaLoc.String(),
+		e.DeltaLoc.String())
 }
 
 // for create drop in one txn
-func (e *MetadataMVCCNode) Update(vun txnif.MVCCNode) {
-	un := vun.(*MetadataMVCCNode)
-	e.CreatedAt = un.CreatedAt
-	e.DeletedAt = un.DeletedAt
-	e.MetaLoc = un.MetaLoc
-	e.DeltaLoc = un.DeltaLoc
-}
-
-func (e *MetadataMVCCNode) ApplyCommit(index *wal.Index) (err error) {
-	var commitTS types.TS
-	commitTS, err = e.TxnMVCCNode.ApplyCommit(index)
-	if err != nil {
-		return
+func (e *MetadataMVCCNode) Update(un *MetadataMVCCNode) {
+	if !un.MetaLoc.IsEmpty() {
+		e.MetaLoc = un.MetaLoc
 	}
-	err = e.EntryMVCCNode.ApplyCommit(commitTS)
-	return err
-}
-func (e *MetadataMVCCNode) PrepareRollback() (err error) {
-	return e.TxnMVCCNode.PrepareRollback()
-}
-func (e *MetadataMVCCNode) ApplyRollback(index *wal.Index) (err error) {
-	var commitTS types.TS
-	commitTS, err = e.TxnMVCCNode.ApplyRollback(index)
-	if err != nil {
-		return
+	if !un.DeltaLoc.IsEmpty() {
+		e.DeltaLoc = un.DeltaLoc
 	}
-	err = e.EntryMVCCNode.ApplyCommit(commitTS)
-	return
 }
-
-func (e *MetadataMVCCNode) PrepareCommit() (err error) {
-	_, err = e.TxnMVCCNode.PrepareCommit()
-	if err != nil {
-		return
-	}
-	err = e.EntryMVCCNode.PrepareCommit()
-	return
-}
-
 func (e *MetadataMVCCNode) WriteTo(w io.Writer) (n int64, err error) {
 	var sn int64
-	sn, err = e.EntryMVCCNode.WriteTo(w)
-	if err != nil {
+	if sn, err = objectio.WriteBytes(e.MetaLoc, w); err != nil {
 		return
 	}
 	n += sn
-	sn, err = e.TxnMVCCNode.WriteTo(w)
-	if err != nil {
+	if sn, err = objectio.WriteBytes(e.DeltaLoc, w); err != nil {
 		return
 	}
 	n += sn
-
-	length := uint32(len([]byte(e.MetaLoc)))
-	if err = binary.Write(w, binary.BigEndian, length); err != nil {
-		return
-	}
-	n += 4
-	var n2 int
-	n2, err = w.Write([]byte(e.MetaLoc))
-	if err != nil {
-		return
-	}
-	if n2 != int(length) {
-		panic(moerr.NewInternalErrorNoCtx("logic err %d!=%d, %v", n2, length, err))
-	}
-	n += int64(n2)
-	length = uint32(len([]byte(e.DeltaLoc)))
-	if err = binary.Write(w, binary.BigEndian, length); err != nil {
-		return
-	}
-	n += 4
-	n2, err = w.Write([]byte(e.DeltaLoc))
-	if err != nil {
-		return
-	}
-	if n2 != int(length) {
-		panic(moerr.NewInternalErrorNoCtx("logic err %d!=%d, %v", n2, length, err))
-	}
-	n += int64(n2)
 	return
 }
 
-func (e *MetadataMVCCNode) ReadFrom(r io.Reader) (n int64, err error) {
+func (e *MetadataMVCCNode) ReadFromWithVersion(r io.Reader, ver uint16) (n int64, err error) {
 	var sn int64
-	sn, err = e.EntryMVCCNode.ReadFrom(r)
-	if err != nil {
+	if e.MetaLoc, sn, err = objectio.ReadBytes(r); err != nil {
 		return
 	}
 	n += sn
-	sn, err = e.TxnMVCCNode.ReadFrom(r)
-	if err != nil {
+	if e.DeltaLoc, sn, err = objectio.ReadBytes(r); err != nil {
 		return
 	}
 	n += sn
+	return
+}
 
-	length := uint32(0)
-	if err = binary.Read(r, binary.BigEndian, &length); err != nil {
+type ObjectMVCCNode struct {
+	objectio.ObjectStats
+}
+
+func NewEmptyObjectMVCCNode() *ObjectMVCCNode {
+	return &ObjectMVCCNode{
+		ObjectStats: *objectio.NewObjectStats(),
+	}
+}
+
+func NewObjectInfoWithMetaLocation(metaLoc objectio.Location, id *objectio.ObjectId) *ObjectMVCCNode {
+	node := NewEmptyObjectMVCCNode()
+	if metaLoc.IsEmpty() {
+		objectio.SetObjectStatsObjectName(&node.ObjectStats, objectio.BuildObjectNameWithObjectID(id))
+		return node
+	}
+	objectio.SetObjectStatsObjectName(&node.ObjectStats, metaLoc.Name())
+	objectio.SetObjectStatsExtent(&node.ObjectStats, metaLoc.Extent())
+	return node
+}
+
+func NewObjectInfoWithObjectID(id *objectio.ObjectId) *ObjectMVCCNode {
+	node := NewEmptyObjectMVCCNode()
+	objectio.SetObjectStatsObjectName(&node.ObjectStats, objectio.BuildObjectNameWithObjectID(id))
+	return node
+}
+
+func NewObjectInfoWithObjectStats(stats *objectio.ObjectStats) *ObjectMVCCNode {
+	return &ObjectMVCCNode{
+		ObjectStats: *stats.Clone(),
+	}
+}
+
+func (e *ObjectMVCCNode) CloneAll() *ObjectMVCCNode {
+	obj := &ObjectMVCCNode{
+		ObjectStats: *e.ObjectStats.Clone(),
+	}
+	return obj
+}
+func (e *ObjectMVCCNode) CloneData() *ObjectMVCCNode {
+	return &ObjectMVCCNode{
+		ObjectStats: *e.ObjectStats.Clone(),
+	}
+}
+func (e *ObjectMVCCNode) String() string {
+	if e == nil {
+		return "[OBJ(nil)]"
+	}
+	return e.ObjectStats.String()
+}
+func (e *ObjectMVCCNode) Update(vun *ObjectMVCCNode) {
+	e.ObjectStats = *vun.ObjectStats.Clone()
+}
+func (e *ObjectMVCCNode) WriteTo(w io.Writer) (n int64, err error) {
+	var sn int
+	if sn, err = w.Write(e.ObjectStats[:]); err != nil {
 		return
 	}
-	n += 4
-	buf := make([]byte, length)
-	var n2 int
-	n2, err = r.Read(buf)
+	n += int64(sn)
+	return
+}
+func (e *ObjectMVCCNode) ReadFromWithVersion(r io.Reader, ver uint16) (n int64, err error) {
+	var sn int
+	if sn, err = r.Read(e.ObjectStats[:]); err != nil {
+		return
+	}
+	n += int64(sn)
+	return
+}
+
+func (e *ObjectMVCCNode) IsEmpty() bool {
+	return e.Size() == 0
+}
+
+func (e *ObjectMVCCNode) AppendTuple(sid *types.Objectid, batch *containers.Batch) {
+	batch.GetVectorByName(ObjectAttr_ObjectStats).Append(e.ObjectStats[:], false)
+}
+
+func ReadObjectInfoTuple(objs *vector.Vector, row int) (e *ObjectMVCCNode) {
+	objBuf := objs.GetBytesAt(row)
+	e = new(ObjectMVCCNode)
+	e.ObjectStats.UnMarshal(objBuf)
+	return
+}
+
+type ObjectNode struct {
+	IsLocal  bool   // this object is hold by a localobject
+	SortHint uint64 // sort object by create time, make iteration on object determined
+
+	// for tombstone
+	IsTombstone bool
+
+	forcePNode  bool // not persisted, a flag to force ckp-replayed aobject to be created as a pnode
+	nextVersion *ObjectEntry
+	prevVersion *ObjectEntry
+}
+
+const (
+	BlockNodeSize int64 = int64(unsafe.Sizeof(BlockNode{}))
+)
+
+func (node *ObjectNode) ReadFrom(r io.Reader) (n int64, err error) {
+	_, err = r.Read(types.EncodeBool(&node.IsLocal))
 	if err != nil {
 		return
 	}
-	if n2 != int(length) {
-		panic(moerr.NewInternalErrorNoCtx("logic err %d!=%d, %v", n2, length, err))
-	}
-	e.MetaLoc = string(buf)
-	if err = binary.Read(r, binary.BigEndian, &length); err != nil {
-		return
-	}
-	buf = make([]byte, length)
-	n2, err = r.Read(buf)
+	n += 1
+	_, err = r.Read(types.EncodeUint64(&node.SortHint))
 	if err != nil {
 		return
 	}
-	if n2 != int(length) {
-		panic(moerr.NewInternalErrorNoCtx("logic err %d!=%d, %v", n2, length, err))
+	n += 8
+	_, err = r.Read(types.EncodeBool(&node.IsTombstone))
+	if err != nil {
+		return
 	}
-	e.DeltaLoc = string(buf)
+	n += 1
+	return
+}
+
+func (node *ObjectNode) WriteTo(w io.Writer) (n int64, err error) {
+	_, err = w.Write(types.EncodeBool(&node.IsLocal))
+	if err != nil {
+		return
+	}
+	n += 1
+	_, err = w.Write(types.EncodeUint64(&node.SortHint))
+	if err != nil {
+		return
+	}
+	n += 8
+	_, err = w.Write(types.EncodeBool(&node.IsTombstone))
+	if err != nil {
+		return
+	}
+	n += 1
+	return
+}
+
+type BlockNode struct {
+	state EntryState
+}
+
+func EncodeBlockNode(node *BlockNode) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(node)), BlockNodeSize)
+}
+
+func (node *BlockNode) ReadFrom(r io.Reader) (n int64, err error) {
+	if _, err = r.Read(EncodeBlockNode(node)); err != nil {
+		return
+	}
+	n += BlockNodeSize
+	return
+}
+
+func (node *BlockNode) WriteTo(w io.Writer) (n int64, err error) {
+	if _, err = w.Write(EncodeBlockNode(node)); err != nil {
+		return
+	}
+	n += BlockNodeSize
 	return
 }

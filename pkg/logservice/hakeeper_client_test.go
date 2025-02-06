@@ -29,39 +29,52 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 )
 
 func TestHAKeeperClientConfigIsValidated(t *testing.T) {
 	cfg := HAKeeperClientConfig{}
-	cc1, err := NewCNHAKeeperClient(context.TODO(), cfg)
+	cc1, err := NewCNHAKeeperClient(context.TODO(), "", cfg)
 	assert.Nil(t, cc1)
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrBadConfig))
-	cc2, err := NewDNHAKeeperClient(context.TODO(), cfg)
+	assert.Error(t, err)
+	cc2, err := NewTNHAKeeperClient(context.TODO(), "", cfg)
 	assert.Nil(t, cc2)
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrBadConfig))
-	cc3, err := NewLogHAKeeperClient(context.TODO(), cfg)
+	assert.Error(t, err)
+	cc3, err := NewLogHAKeeperClient(context.TODO(), "", cfg)
 	assert.Nil(t, cc3)
-	assert.True(t, moerr.IsMoErrCode(err, moerr.ErrBadConfig))
+	assert.Error(t, err)
 }
 
 func TestHAKeeperClientsCanBeCreated(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
 		cfg := HAKeeperClientConfig{
-			ServiceAddresses: []string{testServiceAddress},
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		c1, err := NewCNHAKeeperClient(ctx, cfg)
+		c1, err := NewCNHAKeeperClient(ctx, "", cfg)
 		require.NoError(t, err)
 		assert.NoError(t, c1.Close())
-		c2, err := NewDNHAKeeperClient(ctx, cfg)
+		c2, err := NewTNHAKeeperClient(ctx, "", cfg)
 		assert.NoError(t, err)
 		assert.NoError(t, c2.Close())
-		c3, err := NewLogHAKeeperClient(ctx, cfg)
+		c3, err := NewLogHAKeeperClient(ctx, "", cfg)
 		assert.NoError(t, err)
 		assert.NoError(t, c3.Close())
+	}
+	runServiceTest(t, true, true, fn)
+}
+
+func TestHAKeeperClientsCanBeCreatedWithRetry(t *testing.T) {
+	fn := func(t *testing.T, s *Service) {
+		cfg := HAKeeperClientConfig{
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+		}
+		c := NewLogHAKeeperClientWithRetry(context.Background(), "", cfg)
+		assert.NoError(t, c.Close())
 	}
 	runServiceTest(t, true, true, fn)
 }
@@ -69,15 +82,15 @@ func TestHAKeeperClientsCanBeCreated(t *testing.T) {
 func TestHAKeeperClientCanNotConnectToNonHAKeeperNode(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
 		cfg := HAKeeperClientConfig{
-			ServiceAddresses: []string{testServiceAddress},
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_, err := NewCNHAKeeperClient(ctx, cfg)
+		_, err := NewCNHAKeeperClient(ctx, "", cfg)
 		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNoHAKeeper))
-		_, err = NewDNHAKeeperClient(ctx, cfg)
+		_, err = NewTNHAKeeperClient(ctx, "", cfg)
 		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNoHAKeeper))
-		_, err = NewLogHAKeeperClient(ctx, cfg)
+		_, err = NewLogHAKeeperClient(ctx, "", cfg)
 		require.True(t, moerr.IsMoErrCode(err, moerr.ErrNoHAKeeper))
 	}
 	runServiceTest(t, false, true, fn)
@@ -85,9 +98,10 @@ func TestHAKeeperClientCanNotConnectToNonHAKeeperNode(t *testing.T) {
 
 func TestHAKeeperClientConnectByReverseProxy(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
+		testServiceAddress := s.cfg.LogServiceServiceAddr()
 		done := false
 		for i := 0; i < 1000; i++ {
-			si, ok, err := GetShardInfo(testServiceAddress, hakeeper.DefaultHAKeeperShardID)
+			si, ok, err := GetShardInfo("", testServiceAddress, hakeeper.DefaultHAKeeperShardID)
 			if err != nil || !ok {
 				time.Sleep(10 * time.Millisecond)
 				continue
@@ -111,7 +125,7 @@ func TestHAKeeperClientConnectByReverseProxy(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
-		c, err := NewLogHAKeeperClient(ctx, cfg)
+		c, err := NewLogHAKeeperClient(ctx, "", cfg)
 		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, c.Close())
@@ -124,7 +138,7 @@ func TestHAKeeperClientConnectByReverseProxy(t *testing.T) {
 
 		sc := pb.ScheduleCommand{
 			UUID:        s.ID(),
-			ServiceType: pb.DNService,
+			ServiceType: pb.TNService,
 			ShutdownStore: &pb.ShutdownStore{
 				StoreID: "hello world",
 			},
@@ -141,11 +155,11 @@ func TestHAKeeperClientConnectByReverseProxy(t *testing.T) {
 func TestHAKeeperClientSendCNHeartbeat(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
 		cfg := HAKeeperClientConfig{
-			ServiceAddresses: []string{testServiceAddress},
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		c1, err := NewCNHAKeeperClient(ctx, cfg)
+		c1, err := NewCNHAKeeperClient(ctx, "", cfg)
 		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, c1.Close())
@@ -159,11 +173,12 @@ func TestHAKeeperClientSendCNHeartbeat(t *testing.T) {
 		hb := pb.CNStoreHeartbeat{
 			UUID:           s.ID(),
 			ServiceAddress: "addr1",
+			CommitID:       "c123",
 		}
 		_, err = c1.SendCNHeartbeat(ctx, hb)
 		require.NoError(t, err)
 
-		c2, err := NewDNHAKeeperClient(ctx, cfg)
+		c2, err := NewTNHAKeeperClient(ctx, "", cfg)
 		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, c2.Close())
@@ -174,12 +189,12 @@ func TestHAKeeperClientSendCNHeartbeat(t *testing.T) {
 		assert.NoError(t, cc.mu.client.close())
 		cc.mu.client = nil
 
-		hb2 := pb.DNStoreHeartbeat{
+		hb2 := pb.TNStoreHeartbeat{
 			UUID:                 s.ID(),
 			ServiceAddress:       "addr2",
 			LogtailServerAddress: "addr3",
 		}
-		cb, err := c2.SendDNHeartbeat(ctx, hb2)
+		cb, err := c2.SendTNHeartbeat(ctx, hb2)
 		require.NoError(t, err)
 		assert.Equal(t, 0, len(cb.Commands))
 
@@ -193,46 +208,49 @@ func TestHAKeeperClientSendCNHeartbeat(t *testing.T) {
 		cn := pb.CNStore{
 			UUID:           s.ID(),
 			ServiceAddress: "addr1",
+			WorkState:      metadata.WorkState_Working,
+			UpTime:         cd.CNStores[0].UpTime,
+			CommitID:       hb.CommitID,
 		}
-		dn := pb.DNStore{
+		tn := pb.TNStore{
 			UUID:                 s.ID(),
 			ServiceAddress:       "addr2",
 			LogtailServerAddress: "addr3",
 		}
 		assert.Equal(t, []pb.CNStore{cn}, cd.CNStores)
-		assert.Equal(t, []pb.DNStore{dn}, cd.DNStores)
+		assert.Equal(t, []pb.TNStore{tn}, cd.TNStores)
 	}
 	runServiceTest(t, true, true, fn)
 }
 
-func TestHAKeeperClientSendDNHeartbeat(t *testing.T) {
+func TestHAKeeperClientSendTNHeartbeat(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
 		cfg := HAKeeperClientConfig{
-			ServiceAddresses: []string{testServiceAddress},
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		c, err := NewDNHAKeeperClient(ctx, cfg)
+		c, err := NewTNHAKeeperClient(ctx, "", cfg)
 		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, c.Close())
 		}()
-		hb := pb.DNStoreHeartbeat{
+		hb := pb.TNStoreHeartbeat{
 			UUID: s.ID(),
 		}
-		cb, err := c.SendDNHeartbeat(ctx, hb)
+		cb, err := c.SendTNHeartbeat(ctx, hb)
 		require.NoError(t, err)
 		assert.Equal(t, 0, len(cb.Commands))
 
 		sc := pb.ScheduleCommand{
 			UUID:        s.ID(),
-			ServiceType: pb.DNService,
+			ServiceType: pb.TNService,
 			ShutdownStore: &pb.ShutdownStore{
 				StoreID: "hello world",
 			},
 		}
 		require.NoError(t, s.store.addScheduleCommands(ctx, 0, []pb.ScheduleCommand{sc}))
-		cb, err = c.SendDNHeartbeat(ctx, hb)
+		cb, err = c.SendTNHeartbeat(ctx, hb)
 		require.NoError(t, err)
 		require.Equal(t, 1, len(cb.Commands))
 		require.Equal(t, sc, cb.Commands[0])
@@ -243,11 +261,11 @@ func TestHAKeeperClientSendDNHeartbeat(t *testing.T) {
 func TestHAKeeperClientSendLogHeartbeat(t *testing.T) {
 	fn := func(t *testing.T, s *Service) {
 		cfg := HAKeeperClientConfig{
-			ServiceAddresses: []string{testServiceAddress},
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		c, err := NewLogHAKeeperClient(ctx, cfg)
+		c, err := NewLogHAKeeperClient(ctx, "", cfg)
 		require.NoError(t, err)
 		defer func() {
 			assert.NoError(t, c.Close())
@@ -265,7 +283,7 @@ func TestHAKeeperClientSendLogHeartbeat(t *testing.T) {
 
 		sc := pb.ScheduleCommand{
 			UUID:        s.ID(),
-			ServiceType: pb.DNService,
+			ServiceType: pb.TNService,
 			ShutdownStore: &pb.ShutdownStore{
 				StoreID: "hello world",
 			},
@@ -281,33 +299,37 @@ func TestHAKeeperClientSendLogHeartbeat(t *testing.T) {
 
 func testNotHAKeeperErrorIsHandled(t *testing.T, fn func(*testing.T, *managedHAKeeperClient)) {
 	defer leaktest.AfterTest(t)()
-	cfg1 := Config{
-		UUID:                uuid.New().String(),
-		FS:                  vfs.NewStrictMem(),
-		DeploymentID:        1,
-		RTTMillisecond:      5,
-		DataDir:             "data-1",
-		ServiceAddress:      "127.0.0.1:9002",
-		RaftAddress:         "127.0.0.1:9000",
-		GossipAddress:       "127.0.0.1:9001",
-		GossipSeedAddresses: []string{"127.0.0.1:9011"},
-		DisableWorkers:      true,
-	}
-	cfg2 := Config{
-		UUID:                uuid.New().String(),
-		FS:                  vfs.NewStrictMem(),
-		DeploymentID:        1,
-		RTTMillisecond:      5,
-		DataDir:             "data-2",
-		ServiceAddress:      "127.0.0.1:9012",
-		RaftAddress:         "127.0.0.1:9010",
-		GossipAddress:       "127.0.0.1:9011",
-		GossipSeedAddresses: []string{"127.0.0.1:9001"},
-		DisableWorkers:      true,
-	}
-	cfg1.Fill()
+	cfg1 := DefaultConfig()
+	cfg1.UUID = uuid.New().String()
+	cfg1.FS = vfs.NewStrictMem()
+	cfg1.DeploymentID = 1
+	cfg1.RTTMillisecond = 5
+	cfg1.DataDir = "data-1"
+	cfg1.LogServicePort = 9002
+	cfg1.RaftPort = 9000
+	cfg1.GossipPort = 9001
+	cfg1.GossipSeedAddresses = []string{"127.0.0.1:9011"}
+	cfg1.DisableWorkers = true
+	cfg2 := DefaultConfig()
+	cfg2.UUID = uuid.New().String()
+	cfg2.FS = vfs.NewStrictMem()
+	cfg2.DeploymentID = 1
+	cfg2.RTTMillisecond = 5
+	cfg2.DataDir = "data-2"
+	cfg2.LogServicePort = 9012
+	cfg2.RaftPort = 9010
+	cfg2.GossipPort = 9011
+	cfg2.GossipSeedAddresses = []string{"127.0.0.1:9001"}
+	cfg2.DisableWorkers = true
+
+	rt := runtime.ServiceRuntime("")
+	runtime.SetupServiceBasedRuntime("", rt)
+	runtime.SetupServiceBasedRuntime(cfg1.UUID, rt)
+	runtime.SetupServiceBasedRuntime(cfg2.UUID, rt)
+
 	service1, err := NewService(cfg1,
 		newFS(),
+		nil,
 		WithBackendFilter(func(msg morpc.Message, backendAddr string) bool {
 			return true
 		}),
@@ -316,9 +338,9 @@ func testNotHAKeeperErrorIsHandled(t *testing.T, fn func(*testing.T, *managedHAK
 	defer func() {
 		assert.NoError(t, service1.Close())
 	}()
-	cfg2.Fill()
 	service2, err := NewService(cfg2,
 		newFS(),
+		nil,
 		WithBackendFilter(func(msg morpc.Message, backendAddr string) bool {
 			return true
 		}),
@@ -341,7 +363,7 @@ func testNotHAKeeperErrorIsHandled(t *testing.T, fn func(*testing.T, *managedHAK
 		return &RPCResponse{pool: respPool}
 	}
 	cfg := HAKeeperClientConfig{
-		ServiceAddresses: []string{cfg1.ServiceAddress, cfg2.ServiceAddress},
+		ServiceAddresses: []string{cfg1.LogServiceServiceAddr(), cfg2.LogServiceServiceAddr()},
 	}
 	c := &hakeeperClient{
 		cfg:      cfg,
@@ -350,9 +372,17 @@ func testNotHAKeeperErrorIsHandled(t *testing.T, fn func(*testing.T, *managedHAK
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
-	cc, err := getRPCClient(ctx, cfg1.ServiceAddress, c.respPool, defaultMaxMessageSize, false)
+	cc, err := getRPCClient(
+		ctx,
+		"",
+		cfg1.LogServiceServiceAddr(),
+		c.respPool,
+		defaultMaxMessageSize,
+		false,
+		0,
+	)
 	require.NoError(t, err)
-	c.addr = cfg1.ServiceAddress
+	c.addr = cfg1.LogServiceServiceAddr()
 	c.client = cc
 	client := &managedHAKeeperClient{cfg: cfg}
 	client.mu.client = c
@@ -386,12 +416,12 @@ func TestSendCNHeartbeatWhenNotConnectedToHAKeeper(t *testing.T) {
 	testNotHAKeeperErrorIsHandled(t, fn)
 }
 
-func TestSendDNHeartbeatWhenNotConnectedToHAKeeper(t *testing.T) {
+func TestSendTNHeartbeatWhenNotConnectedToHAKeeper(t *testing.T) {
 	fn := func(t *testing.T, c *managedHAKeeperClient) {
 		oldc := c.mu.client
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		defer cancel()
-		_, err := c.SendDNHeartbeat(ctx, pb.DNStoreHeartbeat{})
+		_, err := c.SendTNHeartbeat(ctx, pb.TNStoreHeartbeat{})
 		require.NoError(t, err)
 		require.True(t, oldc != c.mu.client)
 	}
@@ -408,4 +438,404 @@ func TestSendLogHeartbeatWhenNotConnectedToHAKeeper(t *testing.T) {
 		require.True(t, oldc != c.mu.client)
 	}
 	testNotHAKeeperErrorIsHandled(t, fn)
+}
+
+func TestHAKeeperClientUpdateCNLabel(t *testing.T) {
+	fn := func(t *testing.T, s *Service) {
+		cfg := HAKeeperClientConfig{
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		c1, err := NewProxyHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		c2, err := NewCNHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, c1.Close())
+			assert.NoError(t, c2.Close())
+		}()
+
+		label := pb.CNStoreLabel{
+			UUID: s.ID(),
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+				"role":    {Labels: []string{"1", "2"}},
+			},
+		}
+		err = c1.UpdateCNLabel(ctx, label)
+		require.Error(t, err)
+
+		hb := pb.CNStoreHeartbeat{
+			UUID:           s.ID(),
+			ServiceAddress: "addr1",
+		}
+		_, err = c2.SendCNHeartbeat(ctx, hb)
+		require.NoError(t, err)
+
+		label = pb.CNStoreLabel{
+			UUID: s.ID(),
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+				"role":    {Labels: []string{"1", "2"}},
+			},
+		}
+		err = c1.UpdateCNLabel(ctx, label)
+		require.NoError(t, err)
+
+		state, err := c1.GetClusterState(ctx)
+		info, ok1 := state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		labels1, ok2 := info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		labels2, ok3 := info.Labels["role"]
+		assert.True(t, ok3)
+		assert.Equal(t, labels2.Labels, []string{"1", "2"})
+		require.NoError(t, err)
+
+		label = pb.CNStoreLabel{
+			UUID: s.ID(),
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+			},
+		}
+		err = c1.UpdateCNLabel(ctx, label)
+		require.NoError(t, err)
+
+		state, err = c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		info, ok1 = state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		labels1, ok2 = info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		_, ok3 = info.Labels["role"]
+		assert.False(t, ok3)
+	}
+	runServiceTest(t, true, true, fn)
+}
+
+func TestHAKeeperClientUpdateCNWorkState(t *testing.T) {
+	fn := func(t *testing.T, s *Service) {
+		cfg := HAKeeperClientConfig{
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		c1, err := NewProxyHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		c2, err := NewCNHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, c1.Close())
+			assert.NoError(t, c2.Close())
+		}()
+
+		workState := pb.CNWorkState{
+			UUID:  s.ID(),
+			State: metadata.WorkState_Unknown,
+		}
+		err = c1.UpdateCNWorkState(ctx, workState)
+		require.Error(t, err)
+
+		hb := pb.CNStoreHeartbeat{
+			UUID:           s.ID(),
+			ServiceAddress: "addr1",
+		}
+		_, err = c2.SendCNHeartbeat(ctx, hb)
+		require.NoError(t, err)
+
+		workState = pb.CNWorkState{
+			UUID:  s.ID(),
+			State: metadata.WorkState_Working,
+		}
+		err = c1.UpdateCNWorkState(ctx, workState)
+		require.NoError(t, err)
+
+		state, err := c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		info, ok1 := state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		require.Equal(t, metadata.WorkState_Working, info.WorkState)
+
+		workState = pb.CNWorkState{
+			UUID:  s.ID(),
+			State: metadata.WorkState_Draining,
+		}
+		err = c1.UpdateCNWorkState(ctx, workState)
+		require.NoError(t, err)
+
+		state, err = c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		info, ok1 = state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		require.Equal(t, metadata.WorkState_Draining, info.WorkState)
+
+		workState = pb.CNWorkState{
+			UUID:  s.ID(),
+			State: metadata.WorkState_Working,
+		}
+		err = c1.UpdateCNWorkState(ctx, workState)
+		require.NoError(t, err)
+
+		state, err = c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		info, ok1 = state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		require.Equal(t, metadata.WorkState_Working, info.WorkState)
+	}
+	runServiceTest(t, true, true, fn)
+}
+
+func TestHAKeeperClientPatchCNStore(t *testing.T) {
+	fn := func(t *testing.T, s *Service) {
+		cfg := HAKeeperClientConfig{
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		c1, err := NewProxyHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		c2, err := NewCNHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, c1.Close())
+			assert.NoError(t, c2.Close())
+		}()
+
+		stateLabel := pb.CNStateLabel{
+			UUID:  s.ID(),
+			State: metadata.WorkState_Unknown,
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+				"role":    {Labels: []string{"1", "2"}},
+			},
+		}
+		err = c1.PatchCNStore(ctx, stateLabel)
+		require.Error(t, err)
+
+		hb := pb.CNStoreHeartbeat{
+			UUID:           s.ID(),
+			ServiceAddress: "addr1",
+		}
+		_, err = c2.SendCNHeartbeat(ctx, hb)
+		require.NoError(t, err)
+
+		stateLabel = pb.CNStateLabel{
+			UUID:  s.ID(),
+			State: metadata.WorkState_Working,
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+				"role":    {Labels: []string{"1", "2"}},
+			},
+		}
+		err = c1.PatchCNStore(ctx, stateLabel)
+		require.NoError(t, err)
+
+		state, err := c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		info, ok1 := state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		require.Equal(t, metadata.WorkState_Working, info.WorkState)
+		labels1, ok2 := info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		labels2, ok3 := info.Labels["role"]
+		assert.True(t, ok3)
+		assert.Equal(t, labels2.Labels, []string{"1", "2"})
+
+		stateLabel = pb.CNStateLabel{
+			UUID:  s.ID(),
+			State: metadata.WorkState_Draining,
+		}
+		err = c1.PatchCNStore(ctx, stateLabel)
+		require.NoError(t, err)
+
+		state, err = c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		info, ok1 = state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		require.Equal(t, metadata.WorkState_Draining, info.WorkState)
+		labels1, ok2 = info.Labels["account"]
+		assert.True(t, ok2)
+		labels2, ok3 = info.Labels["role"]
+		assert.True(t, ok3)
+		assert.Equal(t, labels2.Labels, []string{"1", "2"})
+
+		stateLabel = pb.CNStateLabel{
+			UUID: s.ID(),
+			Labels: map[string]metadata.LabelList{
+				"account": {Labels: []string{"a", "b"}},
+			},
+		}
+		err = c1.PatchCNStore(ctx, stateLabel)
+		require.NoError(t, err)
+
+		state, err = c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		info, ok1 = state.CNState.Stores[s.ID()]
+		assert.True(t, ok1)
+		require.Equal(t, metadata.WorkState_Working, info.WorkState)
+		labels1, ok2 = info.Labels["account"]
+		assert.True(t, ok2)
+		assert.Equal(t, labels1.Labels, []string{"a", "b"})
+		labels2, ok3 = info.Labels["role"]
+		assert.False(t, ok3)
+	}
+	runServiceTest(t, true, true, fn)
+}
+
+func TestHAKeeperClientDeleteCNStore(t *testing.T) {
+	fn := func(t *testing.T, s *Service) {
+		cfg := HAKeeperClientConfig{
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		c1, err := NewProxyHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		c2, err := NewCNHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, c1.Close())
+			assert.NoError(t, c2.Close())
+		}()
+
+		hb := pb.CNStoreHeartbeat{
+			UUID:           s.ID(),
+			ServiceAddress: "addr1",
+		}
+		_, err = c2.SendCNHeartbeat(ctx, hb)
+		require.NoError(t, err)
+		state, err := c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		_, ok := state.CNState.Stores[s.ID()]
+		assert.True(t, ok)
+
+		cnStore := pb.DeleteCNStore{
+			StoreID: s.ID(),
+		}
+		err = c1.DeleteCNStore(ctx, cnStore)
+		require.NoError(t, err)
+
+		state, err = c1.GetClusterState(ctx)
+		require.NoError(t, err)
+		_, ok = state.CNState.Stores[s.ID()]
+		assert.False(t, ok)
+	}
+	runServiceTest(t, true, true, fn)
+}
+
+func TestHAKeeperClientSendProxyHeartbeat(t *testing.T) {
+	fn := func(t *testing.T, s *Service) {
+		cfg := HAKeeperClientConfig{
+			ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		c1, err := NewProxyHAKeeperClient(ctx, "", cfg)
+		require.NoError(t, err)
+		defer func() {
+			assert.NoError(t, c1.Close())
+		}()
+
+		hb := pb.ProxyHeartbeat{
+			UUID:          s.ID(),
+			ListenAddress: "addr1",
+		}
+		cb, err := c1.SendProxyHeartbeat(ctx, hb)
+		require.NoError(t, err)
+		assert.Equal(t, 0, len(cb.Commands))
+
+		cd, err := c1.GetClusterDetails(ctx)
+		require.NoError(t, err)
+		p := pb.ProxyStore{
+			UUID:          s.ID(),
+			ListenAddress: "addr1",
+		}
+		assert.Equal(t, []pb.ProxyStore{p}, cd.ProxyStores)
+	}
+	runServiceTest(t, true, true, fn)
+}
+
+func TestHAKeeperClientCheckLogServiceHealth(t *testing.T) {
+	t.Run("no tn stores", func(t *testing.T) {
+		fn := func(t *testing.T, s *Service) {
+			cfg := HAKeeperClientConfig{
+				ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			c, err := NewClusterHAKeeperClient(ctx, "", cfg)
+			require.NoError(t, err)
+			defer func() {
+				assert.NoError(t, c.Close())
+			}()
+			err = c.CheckLogServiceHealth(ctx)
+			require.NoError(t, err)
+		}
+		runServiceTest(t, true, true, fn)
+	})
+
+	t.Run("ok", func(t *testing.T) {
+		fn := func(t *testing.T, s *Service) {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			req := pb.Request{
+				Method: pb.TN_HEARTBEAT,
+				TNHeartbeat: &pb.TNStoreHeartbeat{
+					UUID: "uuid1",
+					Shards: []pb.TNShardInfo{
+						{
+							ShardID:   1,
+							ReplicaID: 100,
+						},
+					},
+				},
+			}
+			resp := s.handleTNHeartbeat(ctx, req)
+			assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+
+			req = pb.Request{
+				Method: pb.LOG_HEARTBEAT,
+				LogHeartbeat: &pb.LogStoreHeartbeat{
+					UUID: s.ID(),
+					Replicas: []pb.LogReplicaInfo{
+						{
+							LogShardInfo: pb.LogShardInfo{
+								ShardID: 1,
+								Replicas: map[uint64]string{
+									100: "uuid1",
+								},
+							},
+						},
+					},
+				},
+			}
+			s.handleLogHeartbeat(ctx, req)
+			assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+
+			cfg := HAKeeperClientConfig{
+				ServiceAddresses: []string{s.cfg.LogServiceServiceAddr()},
+			}
+			c, err := NewClusterHAKeeperClient(ctx, "", cfg)
+			require.NoError(t, err)
+			defer func() {
+				assert.NoError(t, c.Close())
+			}()
+			err = c.CheckLogServiceHealth(ctx)
+			require.NoError(t, err)
+		}
+		runServiceTest(t, true, true, fn)
+	})
+}
+
+func Test_NewLogHAKeeperClientWithRetry(t *testing.T) {
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second, moerr.NewInternalErrorNoCtx("ut tester"))
+	defer cancel()
+	cfg := HAKeeperClientConfig{
+		DiscoveryAddress: "wrongaddress",
+	}
+	NewLogHAKeeperClientWithRetry(ctx, "", cfg)
 }

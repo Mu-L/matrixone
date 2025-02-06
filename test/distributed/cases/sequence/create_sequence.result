@@ -58,7 +58,6 @@ table seq_temp already exists
 create sequence Seq_temp start 10;
 table seq_temp already exists
 create sequence sequence;
-SQL parser error: You have an error in your SQL syntax; check the manual that corresponds to your MatrixOne server version for the right syntax to use. syntax error at line 1 column 24 near " sequence;";
 create sequence table as bigint;
 SQL parser error: You have an error in your SQL syntax; check the manual that corresponds to your MatrixOne server version for the right syntax to use. syntax error at line 1 column 21 near " table as bigint;";
 create sequence seq_01 as tinyint unsigned MINVALUE 26  NO CYCLE;
@@ -289,19 +288,19 @@ col1
 376
 426
 create sequence seq_an_01 as smallint start -1000;
-invalid input: Start value for sequence must between minvalue and maxvalue
+invalid input: STARTVALUE (-1000) for sequence must between MINVALUE (1) and MAXVALUE (32767)
 create sequence if not exists seq_an_01 as bigint increment by 10000 minvalue 500  start with 100;
-invalid input: Start value for sequence must between minvalue and maxvalue
+invalid input: STARTVALUE (100) for sequence must between MINVALUE (500) and MAXVALUE (9223372036854775807)
 create sequence seq_an_01 as smallint maxvalue 9999999 start with -10;
-invalid input: Max value of sequence must be bigger than min value of it
+invalid input: MAXVALUE (-27009) of sequence must be bigger than MINVALUE (1) of it
 create sequence seq_an_01 start with 0;
-invalid input: Start value for sequence must between minvalue and maxvalue
+invalid input: STARTVALUE (0) for sequence must between MINVALUE (1) and MAXVALUE (9223372036854775807)
 create sequence seq_an_02 as tinyint unsigned;
 not supported: Unsupported type for sequence
 create sequence seq_an_02 as tinyint;
 not supported: Unsupported type for sequence
 create sequence seq_an_03  increment -50 start with 126 no cycle;
-invalid input: Start value for sequence must between minvalue and maxvalue
+invalid input: STARTVALUE (126) for sequence must between MINVALUE (-9223372036854775808) and MAXVALUE (-1)
 show sequences;
 Names    Data Type
 seq_01    INT
@@ -313,6 +312,7 @@ _acc    BIGINT
 ab.cd    BIGINT
 abcddddddfsfafaffsefsfsefljofiseosfjosisssssssssssssssssssssssssssssssssssssssssssssssssssssssssssss24444444444444444444444444222222222@fffffffffffffffffffffffffffffffffffffffffffffffffffff    BIGINT
 seq_temp    BIGINT
+sequence    BIGINT
 seq_03    BIGINT
 seq_04    BIGINT
 seq_05    BIGINT
@@ -336,30 +336,32 @@ drop sequence seq_15;
 no such sequence create_sequence.seq_15
 drop sequence seq_non;
 no such sequence create_sequence.seq_non
+create sequence seq_15;
 create sequence seq_16 increment 10 start with 20 no cycle;
 truncate table seq_table_01;
 prepare stmt1 from 'insert into seq_table_01 values(?)';
-set @a_var = nextval('seq15');
+set @a_var = nextval('seq_15');
 execute stmt1 using @a_var;
 select * from seq_table_01;
 col1
-null
+1
 execute stmt1 using @a_var;
 select * from seq_table_01;
 col1
-null
-null
+1
+1
 execute stmt1 using @a_var;
 select * from seq_table_01;
 col1
-null
-null
-null
+1
+1
+1
 drop sequence seq_16;
+drop sequence seq_15;
 create sequence seq_17 increment 10 start with 20 no cycle;
 select lastval();
 lastval()
-176
+1
 select nextval('seq_17');
 nextval(seq_17)
 20
@@ -384,3 +386,40 @@ nextval(seq_17)    currval(seq_17)
 select lastval();
 lastval()
 28
+begin;
+create sequence seq_18 minvalue 1000;
+select nextval('seq_18');
+SQL parser error: table "seq_18" does not exist
+select nextval('seq_18');
+ExpectedEOB
+create sequence seq_18;
+ExpectedEOB
+select nextval('seq_18');
+SQL parser error: table "seq_18" does not exist
+commit;
+select nextval('seq_18'),currval('seq_18');
+SQL parser error: table "seq_18" does not exist
+drop sequence seq_18;
+no such sequence create_sequence.seq_18
+begin;
+create sequence seq_19 minvalue 1000;
+select nextval('seq_19');
+SQL parser error: table "seq_19" does not exist
+select nextval('seq_19');
+ExpectedEOB
+create sequence seq_19;
+ExpectedEOB
+rollback;
+select nextval('seq_19');
+SQL parser error: table "seq_19" does not exist
+drop sequence seq_19;
+no such sequence create_sequence.seq_19
+start transaction ;
+create sequence seq_20 increment by -10;
+select nextval('seq_20');
+SQL parser error: table "seq_20" does not exist
+rollback;
+select nextval('seq_20');
+SQL parser error: table "seq_20" does not exist
+drop sequence seq_20;
+no such sequence create_sequence.seq_20

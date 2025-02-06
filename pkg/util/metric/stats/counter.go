@@ -28,6 +28,11 @@ func (c *Counter) Add(delta int64) (new int64) {
 	return c.global.Add(delta)
 }
 
+// Set swaps the global counter value
+func (c *Counter) Swap(n int64) int64 {
+	return c.global.Swap(n)
+}
+
 // Load return the global counter value
 func (c *Counter) Load() int64 {
 	return c.global.Load()
@@ -36,4 +41,15 @@ func (c *Counter) Load() int64 {
 // SwapW swaps current window counter with new
 func (c *Counter) SwapW(new int64) int64 {
 	return c.window.Swap(new)
+}
+
+// LoadW returns current window value
+func (c *Counter) LoadW() int64 {
+	return c.window.Load()
+}
+
+// Reset reset the global and window counter to 0
+func (c *Counter) Reset() {
+	c.global.Store(0)
+	c.window.Store(0)
 }

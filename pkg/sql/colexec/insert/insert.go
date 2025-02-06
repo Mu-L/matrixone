@@ -19,106 +19,223 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/catalog"
-	pb "github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(_ any, buf *bytes.Buffer) {
-	buf.WriteString("insert")
+const opName = "insert"
+
+func (insert *Insert) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(": insert")
 }
 
-func Prepare(_ *process.Process, arg any) error {
-	ap := arg.(*Argument)
-	if ap.IsRemote {
-		ap.s3Writer = colexec.NewS3Writer(ap.InsertCtx.TableDef)
+func (insert *Insert) OpType() vm.OpType {
+	return vm.Insert
+}
+
+func (insert *Insert) Prepare(proc *process.Process) error {
+	if insert.OpAnalyzer == nil {
+		insert.OpAnalyzer = process.NewAnalyzer(insert.GetIdx(), insert.IsFirst, insert.IsLast, "insert")
+	} else {
+		insert.OpAnalyzer.Reset()
+	}
+
+	insert.ctr.state = vm.Build
+	if insert.ToWriteS3 {
+		// If the target is not partition table, you only need to operate the main table
+		s3Writer, err := colexec.NewS3Writer(insert.InsertCtx.TableDef, 0)
+		if err != nil {
+			return err
+		}
+		insert.ctr.s3Writer = s3Writer
+
+		if insert.ctr.buf == nil {
+			insert.initBufForS3()
+		}
+	} else {
+		ref := insert.InsertCtx.Ref
+		eng := insert.InsertCtx.Engine
+		rel, err := colexec.GetRelAndPartitionRelsByObjRef(proc.Ctx, proc, eng, ref)
+		if err != nil {
+			return err
+		}
+		insert.ctr.source = rel
+		if insert.ctr.buf == nil {
+			insert.ctr.buf = batch.NewWithSize(len(insert.InsertCtx.Attrs))
+			insert.ctr.buf.SetAttributes(insert.InsertCtx.Attrs)
+		}
+	}
+	insert.ctr.affectedRows = 0
+	return nil
+}
+
+// first parameter: true represents whether the current pipeline has ended
+// first parameter: false
+func (insert *Insert) Call(proc *process.Process) (vm.CallResult, error) {
+	analyzer := insert.OpAnalyzer
+
+	t := time.Now()
+	defer func() {
+		analyzer.AddInsertTime(t)
+	}()
+
+	if insert.ToWriteS3 {
+		return insert.insert_s3(proc, analyzer)
+	}
+	return insert.insert_table(proc, analyzer)
+}
+
+func (insert *Insert) insert_s3(proc *process.Process, analyzer process.Analyzer) (vm.CallResult, error) {
+	start := time.Now()
+	defer func() {
+		v2.TxnStatementInsertS3DurationHistogram.Observe(time.Since(start).Seconds())
+	}()
+
+	if insert.ctr.state == vm.Build {
+		for {
+			input, err := vm.ChildrenCall(insert.GetChildren(0), proc, analyzer)
+			if err != nil {
+				return input, err
+			}
+
+			if input.Batch == nil {
+				insert.ctr.state = vm.Eval
+				break
+			}
+			if input.Batch.IsEmpty() {
+				continue
+			}
+
+			if insert.InsertCtx.AddAffectedRows {
+				affectedRows := uint64(input.Batch.RowCount())
+				atomic.AddUint64(&insert.ctr.affectedRows, affectedRows)
+			}
+
+			// write to s3.
+			input.Batch.Attrs = append(input.Batch.Attrs[:0], insert.InsertCtx.Attrs...)
+			err = writeBatch(proc, insert.ctr.s3Writer, input.Batch, analyzer)
+			if err != nil {
+				insert.ctr.state = vm.End
+				return vm.CancelResult, err
+			}
+		}
+	}
+
+	result := vm.NewCallResult()
+	result.Batch = insert.ctr.buf
+	if insert.ctr.state == vm.Eval {
+		writer := insert.ctr.s3Writer
+		// handle the last Batch that batchSize less than DefaultBlockMaxRows
+		// for more info, refer to the comments about reSizeBatch
+		err := flushTailBatch(proc, writer, &result, analyzer)
+		if err != nil {
+			insert.ctr.state = vm.End
+			return result, err
+		}
+		insert.ctr.state = vm.End
+		return result, nil
+	}
+
+	if insert.ctr.state == vm.End {
+		return vm.CancelResult, nil
+	}
+
+	panic("bug")
+}
+
+func (insert *Insert) insert_table(proc *process.Process, analyzer process.Analyzer) (vm.CallResult, error) {
+	if !insert.delegated {
+		input, err := vm.ChildrenCall(insert.GetChildren(0), proc, analyzer)
+		if err != nil {
+			return input, err
+		}
+
+		if input.Batch == nil || input.Batch.IsEmpty() {
+			return input, nil
+		}
+
+		insert.input = input
+	}
+
+	input := insert.input
+	affectedRows := uint64(input.Batch.RowCount())
+	insert.ctr.buf.CleanOnlyData()
+	for i := range insert.ctr.buf.Attrs {
+		if insert.ctr.buf.Vecs[i] == nil {
+			insert.ctr.buf.Vecs[i] = vector.NewVec(*input.Batch.Vecs[i].GetType())
+		}
+		if err := insert.ctr.buf.Vecs[i].UnionBatch(input.Batch.Vecs[i], 0, input.Batch.Vecs[i].Length(), nil, proc.GetMPool()); err != nil {
+			return input, err
+		}
+	}
+	insert.ctr.buf.SetRowCount(input.Batch.RowCount())
+
+	crs := analyzer.GetOpCounterSet()
+	newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
+
+	// insert into table, insertBat will be deeply copied into txn's workspace.
+	err := insert.ctr.source.Write(newCtx, insert.ctr.buf)
+	if err != nil {
+		return input, err
+	}
+	analyzer.AddWrittenRows(int64(insert.ctr.buf.RowCount()))
+	analyzer.AddS3RequestCount(crs)
+	analyzer.AddFileServiceCacheInfo(crs)
+	analyzer.AddDiskIO(crs)
+
+	if insert.InsertCtx.AddAffectedRows {
+		atomic.AddUint64(&insert.ctr.affectedRows, affectedRows)
+	}
+	// `insertBat` does not include partition expression columns
+	return input, nil
+}
+
+func writeBatch(proc *process.Process, writer *colexec.S3Writer, bat *batch.Batch, analyzer process.Analyzer) error {
+	if writer.StashBatch(proc, bat) {
+		crs := analyzer.GetOpCounterSet()
+		newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
+
+		blockInfos, stats, err := writer.SortAndSync(newCtx, proc)
+		if err != nil {
+			return err
+		}
+		analyzer.AddS3RequestCount(crs)
+		analyzer.AddFileServiceCacheInfo(crs)
+		analyzer.AddDiskIO(crs)
+
+		err = writer.FillBlockInfoBat(blockInfos, stats, proc.GetMPool())
+		if err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func Call(idx int, proc *process.Process, arg any, _ bool, _ bool) (bool, error) {
-	defer analyze(proc, idx)()
+func flushTailBatch(proc *process.Process, writer *colexec.S3Writer, result *vm.CallResult, analyzer process.Analyzer) error {
+	crs := analyzer.GetOpCounterSet()
+	newCtx := perfcounter.AttachS3RequestKey(proc.Ctx, crs)
 
-	insertArg := arg.(*Argument)
-	s3Writer := insertArg.s3Writer
-	bat := proc.InputBatch()
-	if bat == nil {
-		if insertArg.IsRemote {
-			// handle the last Batch that batchSize less than DefaultBlockMaxRows
-			// for more info, refer to the comments about reSizeBatch
-			if err := s3Writer.WriteS3CacheBatch(proc); err != nil {
-				return false, err
-			}
-		}
-		return true, nil
-	}
-	if bat.Length() == 0 {
-		return false, nil
-	}
-
-	defer func() {
-		bat.Clean(proc.Mp())
-	}()
-
-	insertCtx := insertArg.InsertCtx
-
-	if insertArg.IsRemote {
-		// write to s3
-		err := s3Writer.WriteS3Batch(bat, proc, 0)
-		if err != nil {
-			return false, err
-		}
-	} else {
-		// write origin table
-		err := insertCtx.Source.Write(proc.Ctx, bat)
-		if err != nil {
-			return false, err
-		}
-	}
-
-	// write unique key table
-	nameToPos, pkPos := getUniqueKeyInfo(insertCtx.TableDef)
-	err := colexec.WriteUniqueTable(s3Writer, proc, bat, insertCtx.TableDef, nameToPos, pkPos, insertCtx.UniqueSource)
+	blockInfos, stats, err := writer.FlushTailBatch(newCtx, proc)
 	if err != nil {
-		return false, err
+		return err
 	}
+	analyzer.AddS3RequestCount(crs)
+	analyzer.AddFileServiceCacheInfo(crs)
+	analyzer.AddDiskIO(crs)
 
-	affectedRows := uint64(bat.Vecs[0].Length())
-	if insertArg.IsRemote {
-		s3Writer.WriteEnd(proc)
-	}
-	atomic.AddUint64(&insertArg.Affected, affectedRows)
-	return false, nil
-}
-
-func analyze(proc *process.Process, idx int) func() {
-	t := time.Now()
-	anal := proc.GetAnalyze(idx)
-	anal.Start()
-	return func() {
-		anal.Stop()
-		anal.AddInsertTime(t)
-	}
-}
-
-func getUniqueKeyInfo(tableDef *pb.TableDef) (map[string]int, int) {
-	nameToPos := make(map[string]int)
-	pkPos := -1
-	pos := 0
-	for j, col := range tableDef.Cols {
-		// Check whether the composite primary key column is included
-		if (tableDef.Pkey == nil || tableDef.Pkey.CompPkeyCol == nil) && col.Name != catalog.Row_ID && col.Primary {
-			pkPos = j
-		}
-		if col.Name != catalog.Row_ID {
-			nameToPos[col.Name] = pos
-			pos++
+	// if stats is not zero, then the blockInfos must not be nil
+	if !stats.IsZero() {
+		err = writer.FillBlockInfoBat(blockInfos, stats, proc.GetMPool())
+		if err != nil {
+			return err
 		}
 	}
-	// Check whether the composite primary key column is included
-	if tableDef.Pkey != nil && tableDef.Pkey.CompPkeyCol != nil {
-		pkPos = pos
-	}
-	return nameToPos, pkPos
+
+	return writer.Output(proc, result)
 }

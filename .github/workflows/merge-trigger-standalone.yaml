@@ -1,0 +1,18 @@
+name:  MO Checkin Regression(Standalone BVT)
+
+on:
+  pull_request_target:
+    branches: [ main,'[0-9]+.[0-9]+*' ]
+    types:
+      - closed
+    paths:
+      - '**.go'
+      - '**.c'
+      - '**.h'
+      - 'test/distributed/**'
+
+jobs:
+  mo-checkin-regression:
+    name: MO Checkin Regression(Standalone BVT)
+    uses: matrixorigin/CI/.github/workflows/merge-trigger-standalone.yaml@main
+    secrets: inherit

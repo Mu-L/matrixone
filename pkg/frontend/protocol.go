@@ -17,14 +17,10 @@ package frontend
 import (
 	"context"
 	"fmt"
-	"math"
-	"sync"
-	"sync/atomic"
+
+	"go.uber.org/zap"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-
-	"github.com/fagongzi/goetty/v2"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 )
 
 // Response Categories
@@ -41,11 +37,13 @@ const (
 	LocalInfileRequest
 )
 
+const (
+	ConnectionInfoKey = "connection_info"
+)
+
 type Request struct {
 	//the command type from the client
 	cmd CommandType
-	// sequence num
-	seq uint8
 	//the data from the client
 	data interface{}
 }
@@ -81,37 +79,32 @@ type Response struct {
 	*/
 	affectedRows, lastInsertId uint64
 	warnings                   uint16
+	isIssue3482                bool
+	loadLocalFile              string
 }
 
-func NewResponse(category int, status uint16, cmd int, d interface{}) *Response {
+func NewResponse(category int, affectedRows, lastInsertId uint64, warnings, status uint16, cmd int, d interface{}) *Response {
 	return &Response{
-		category: category,
-		status:   status,
-		cmd:      cmd,
-		data:     d,
-	}
-}
-
-func NewGeneralErrorResponse(cmd CommandType, err error) *Response {
-	return NewResponse(ErrorResponse, 0, int(cmd), err)
-}
-
-func NewGeneralOkResponse(cmd CommandType) *Response {
-	return NewResponse(OkResponse, 0, int(cmd), nil)
-}
-
-func NewOkResponse(affectedRows, lastInsertId uint64, warnings, status uint16, cmd int, d interface{}) *Response {
-	resp := &Response{
-		category:     OkResponse,
-		status:       status,
-		cmd:          cmd,
-		data:         d,
+		category:     category,
 		affectedRows: affectedRows,
 		lastInsertId: lastInsertId,
 		warnings:     warnings,
+		status:       status,
+		cmd:          cmd,
+		data:         d,
 	}
+}
 
-	return resp
+func NewGeneralErrorResponse(cmd CommandType, status uint16, err error) *Response {
+	return NewResponse(ErrorResponse, 0, 0, 0, status, int(cmd), err)
+}
+
+func NewGeneralOkResponse(cmd CommandType, status uint16) *Response {
+	return NewResponse(OkResponse, 0, 0, 0, status, int(cmd), nil)
+}
+
+func NewOkResponse(affectedRows, lastInsertId uint64, warnings, status uint16, cmd int, d interface{}) *Response {
+	return NewResponse(OkResponse, affectedRows, lastInsertId, warnings, status, cmd, d)
 }
 
 func (resp *Response) GetData() interface{} {
@@ -138,213 +131,101 @@ func (resp *Response) SetCategory(category int) {
 	resp.category = category
 }
 
-type Protocol interface {
-	IsEstablished() bool
-
-	SetEstablished()
-
-	// GetRequest gets Request from Packet
-	GetRequest(payload []byte) *Request
-
-	// SendResponse sends a response to the client for the application request
-	SendResponse(context.Context, *Response) error
-
-	// ConnectionID the identity of the client
-	ConnectionID() uint32
-
-	// Peer gets the address [Host:Port,Host:Port] of the client and the server
-	Peer() string
-
-	GetDatabaseName() string
-
-	SetDatabaseName(string)
-
-	GetUserName() string
-
-	SetUserName(string)
-
-	GetSequenceId() uint8
-
-	SetSequenceID(value uint8)
-
-	GetDebugString() string
-
-	GetTcpConnection() goetty.IOSession
-
-	GetCapability() uint32
-
-	IsTlsEstablished() bool
-
-	SetTlsEstablished()
-
-	HandleHandshake(ctx context.Context, payload []byte) (bool, error)
-
-	SendPrepareResponse(ctx context.Context, stmt *PrepareStmt) error
-
-	Quit()
-
-	incDebugCount(int)
-
-	resetDebugCount() []uint64
+func (mp *MysqlProtocolImpl) UpdateCtx(ctx context.Context) {
+	mp.ctx = ctx
 }
 
-type ProtocolImpl struct {
-	m sync.Mutex
-
-	io IOPackage
-
-	tcpConn goetty.IOSession
-
-	quit atomic.Bool
-
-	//random bytes
-	salt []byte
-
-	//the id of the connection
-	connectionID uint32
-
-	// whether the handshake succeeded
-	established atomic.Bool
-
-	// whether the tls handshake succeeded
-	tlsEstablished atomic.Bool
-
-	//The sequence-id is incremented with each packet and may wrap around.
-	//It starts at 0 and is reset to 0 when a new command begins in the Command Phase.
-	sequenceId atomic.Uint32
-
-	//for debug
-	debugCount [16]uint64
+func (mp *MysqlProtocolImpl) setQuit(b bool) bool {
+	return mp.quit.Swap(b)
 }
 
-func (pi *ProtocolImpl) incDebugCount(i int) {
-	if i >= 0 && i < len(pi.debugCount) {
-		atomic.AddUint64(&pi.debugCount[i], 1)
-	}
+func (mp *MysqlProtocolImpl) GetSequenceId() uint8 {
+	return uint8(mp.sequenceId.Load())
 }
 
-func (pi *ProtocolImpl) resetDebugCount() []uint64 {
-	ret := make([]uint64, len(pi.debugCount))
-	for i := 0; i < len(pi.debugCount); i++ {
-		ret[i] = atomic.LoadUint64(&pi.debugCount[i])
-	}
-	return ret
-}
-
-func (pi *ProtocolImpl) setQuit(b bool) bool {
-	return pi.quit.Swap(b)
-}
-
-func (pi *ProtocolImpl) GetSequenceId() uint8 {
-	return uint8(pi.sequenceId.Load())
-}
-
-func (pi *ProtocolImpl) SetSequenceID(value uint8) {
-	pi.sequenceId.Store(uint32(value))
-}
-
-func (pi *ProtocolImpl) getDebugStringUnsafe() string {
-	if pi.tcpConn != nil {
-		return fmt.Sprintf("connectionId %d|%s", pi.connectionID, pi.tcpConn.RemoteAddress())
+func (mp *MysqlProtocolImpl) getDebugStringUnsafe() string {
+	if mp.tcpConn != nil {
+		return fmt.Sprintf("connectionId %d|%s", mp.connectionID, mp.tcpConn.RemoteAddress())
 	}
 	return ""
 }
 
-func (pi *ProtocolImpl) GetDebugString() string {
-	pi.m.Lock()
-	defer pi.m.Unlock()
-	return pi.getDebugStringUnsafe()
+func (mp *MysqlProtocolImpl) GetDebugString() string {
+	mp.m.Lock()
+	defer mp.m.Unlock()
+	return mp.getDebugStringUnsafe()
 }
 
-func (pi *ProtocolImpl) GetSalt() []byte {
-	pi.m.Lock()
-	defer pi.m.Unlock()
-	return pi.salt
+func (mp *MysqlProtocolImpl) GetSalt() []byte {
+	mp.m.Lock()
+	defer mp.m.Unlock()
+	return mp.salt
 }
 
-func (pi *ProtocolImpl) IsEstablished() bool {
-	return pi.established.Load()
+// SetSalt updates the salt value. This happens with proxy mode enabled.
+func (mp *MysqlProtocolImpl) SetSalt(s []byte) {
+	mp.m.Lock()
+	defer mp.m.Unlock()
+	mp.salt = s
 }
 
-func (pi *ProtocolImpl) SetEstablished() {
-	logDebugf(pi.GetDebugString(), "SWITCH ESTABLISHED to true")
-	pi.established.Store(true)
+func (mp *MysqlProtocolImpl) IsEstablished() bool {
+	return mp.established.Load()
 }
 
-func (pi *ProtocolImpl) IsTlsEstablished() bool {
-	return pi.tlsEstablished.Load()
+func (mp *MysqlProtocolImpl) SetEstablished() {
+	getLogger(mp.sid).Debug("SWITCH ESTABLISHED to true", zap.String(ConnectionInfoKey, mp.GetDebugString()))
+	mp.established.Store(true)
 }
 
-func (pi *ProtocolImpl) SetTlsEstablished() {
-	logutil.Debugf("SWITCH TLS_ESTABLISHED to true")
-	pi.tlsEstablished.Store(true)
+func (mp *MysqlProtocolImpl) IsTlsEstablished() bool {
+	return mp.tlsEstablished.Load()
 }
 
-func (pi *ProtocolImpl) ConnectionID() uint32 {
-	return pi.connectionID
+func (mp *MysqlProtocolImpl) SetTlsEstablished() {
+	getLogger(mp.sid).Debug("SWITCH TLS_ESTABLISHED to true", zap.String(ConnectionInfoKey, mp.GetDebugString()))
+	mp.tlsEstablished.Store(true)
+}
+
+func (mp *MysqlProtocolImpl) ConnectionID() uint32 {
+	return mp.connectionID
 }
 
 // Quit kill tcpConn still connected.
 // before calling NewMysqlClientProtocol, tcpConn.Connected() must be true
 // please check goetty/application.go::doStart() and goetty/application.go::NewIOSession(...) for details
-func (pi *ProtocolImpl) Quit() {
-	pi.m.Lock()
-	defer pi.m.Unlock()
+func (mp *MysqlProtocolImpl) safeQuit() {
 	//if it was quit, do nothing
-	if pi.setQuit(true) {
+	if mp.setQuit(true) {
 		return
 	}
-	if pi.tcpConn != nil {
-		if err := pi.tcpConn.Disconnect(); err != nil {
-			return
-		}
+	if mp.tcpConn != nil {
+		_ = mp.tcpConn.closeConn()
 	}
 	//release salt
-	if pi.salt != nil {
-		pi.salt = nil
+	if mp.salt != nil {
+		mp.salt = nil
 	}
 }
 
-func (pi *ProtocolImpl) GetLock() sync.Locker {
-	return &pi.m
+func (mp *MysqlProtocolImpl) GetTcpConnection() *Conn {
+	return mp.tcpConn
 }
 
-func (pi *ProtocolImpl) GetTcpConnection() goetty.IOSession {
-	pi.m.Lock()
-	defer pi.m.Unlock()
-	return pi.tcpConn
-}
-
-func (pi *ProtocolImpl) Peer() string {
-	tcp := pi.GetTcpConnection()
+func (mp *MysqlProtocolImpl) Peer() string {
+	tcp := mp.GetTcpConnection()
 	if tcp == nil {
 		return ""
 	}
 	return tcp.RemoteAddress()
 }
 
-func (mp *MysqlProtocolImpl) GetRequest(payload []byte) *Request {
-	req := &Request{
-		cmd:  CommandType(payload[0]),
-		data: payload[1:],
-	}
-
-	return req
-}
-
-func (mp *MysqlProtocolImpl) getAbortTransactionErrorInfo() string {
-	ses := mp.GetSession()
-	//update error message in Case1,Case3,Case4.
-	if ses != nil && ses.OptionBitsIsSet(OPTION_ATTACH_ABORT_TRANSACTION_ERROR) {
-		ses.ClearOptionBits(OPTION_ATTACH_ABORT_TRANSACTION_ERROR)
-		return abortTransactionErrorInfo()
-	}
-	return ""
-}
-
 func (mp *MysqlProtocolImpl) SendResponse(ctx context.Context, resp *Response) error {
-	mp.GetLock().Lock()
-	defer mp.GetLock().Unlock()
+	//move here to prohibit potential recursive lock
+	var attachAbort string
+
+	mp.m.Lock()
+	defer mp.m.Unlock()
 
 	switch resp.category {
 	case OkResponse:
@@ -360,7 +241,6 @@ func (mp *MysqlProtocolImpl) SendResponse(ctx context.Context, resp *Response) e
 		if err == nil {
 			return mp.sendOKPacket(0, 0, uint16(resp.status), 0, "")
 		}
-		attachAbort := mp.getAbortTransactionErrorInfo()
 		switch myerr := err.(type) {
 		case *moerr.Error:
 			var code uint16
@@ -393,144 +273,8 @@ func (mp *MysqlProtocolImpl) SendResponse(ctx context.Context, resp *Response) e
 		return mp.sendResultSet(ctx, mer.Mrs(), resp.cmd, mer.Warnings(), uint16(resp.status))
 	case LocalInfileRequest:
 		s, _ := resp.data.(string)
-		return mp.sendLocalInfileRequest(s)
+		return mp.WriteLocalInfileRequest(s)
 	default:
-		return moerr.NewInternalError(ctx, "unsupported response:%d ", resp.category)
+		return moerr.NewInternalErrorf(ctx, "unsupported response:%d ", resp.category)
 	}
-}
-
-var _ MysqlProtocol = &FakeProtocol{}
-
-const (
-	fakeConnectionID uint32 = math.MaxUint32
-)
-
-// FakeProtocol works for the background transaction that does not use the network protocol.
-type FakeProtocol struct {
-	username string
-	database string
-	ioses    goetty.IOSession
-}
-
-func (fp *FakeProtocol) GetCapability() uint32 {
-	return DefaultCapability
-}
-
-func (fp *FakeProtocol) IsTlsEstablished() bool {
-	return true
-}
-
-func (fp *FakeProtocol) SetTlsEstablished() {
-
-}
-
-func (fp *FakeProtocol) HandleHandshake(ctx context.Context, payload []byte) (bool, error) {
-	return false, nil
-}
-
-func (fp *FakeProtocol) GetTcpConnection() goetty.IOSession {
-	return fp.ioses
-}
-
-func (fp *FakeProtocol) GetDebugString() string {
-	return "fake protocol"
-}
-
-func (fp *FakeProtocol) GetSequenceId() uint8 {
-	return 0
-}
-
-func (fp *FakeProtocol) SetSequenceID(value uint8) {
-}
-
-func (fp *FakeProtocol) SendPrepareResponse(ctx context.Context, stmt *PrepareStmt) error {
-	return nil
-}
-
-func (fp *FakeProtocol) ParseExecuteData(ctx context.Context, stmt *PrepareStmt, data []byte, pos int) (names []string, vars []any, err error) {
-	return nil, nil, nil
-}
-
-func (fp *FakeProtocol) SendResultSetTextBatchRow(mrs *MysqlResultSet, cnt uint64) error {
-	return nil
-}
-
-func (fp *FakeProtocol) SendResultSetTextBatchRowSpeedup(mrs *MysqlResultSet, cnt uint64) error {
-	return nil
-}
-
-func (fp *FakeProtocol) SendColumnDefinitionPacket(ctx context.Context, column Column, cmd int) error {
-	return nil
-}
-
-func (fp *FakeProtocol) SendColumnCountPacket(count uint64) error {
-	return nil
-}
-
-func (fp *FakeProtocol) SendEOFPacketIf(warnings uint16, status uint16) error {
-	return nil
-}
-
-func (fp *FakeProtocol) sendOKPacket(affectedRows uint64, lastInsertId uint64, status uint16, warnings uint16, message string) error {
-	return nil
-}
-
-func (fp *FakeProtocol) sendEOFOrOkPacket(warnings uint16, status uint16) error {
-	return nil
-}
-
-func (fp *FakeProtocol) ResetStatistics() {}
-
-func (fp *FakeProtocol) GetStats() string {
-	return ""
-}
-
-func (fp *FakeProtocol) IsEstablished() bool {
-	return true
-}
-
-func (fp *FakeProtocol) SetEstablished() {}
-
-func (fp *FakeProtocol) GetRequest(payload []byte) *Request {
-	return nil
-}
-
-func (fp *FakeProtocol) SendResponse(ctx context.Context, resp *Response) error {
-	return nil
-}
-
-func (fp *FakeProtocol) ConnectionID() uint32 {
-	return fakeConnectionID
-}
-
-func (fp *FakeProtocol) Peer() string {
-	return ""
-}
-
-func (fp *FakeProtocol) GetDatabaseName() string {
-	return fp.database
-}
-
-func (fp *FakeProtocol) SetDatabaseName(s string) {
-	fp.database = s
-}
-
-func (fp *FakeProtocol) GetUserName() string {
-	return fp.username
-}
-
-func (fp *FakeProtocol) SetUserName(s string) {
-	fp.username = s
-}
-
-func (fp *FakeProtocol) Quit() {}
-
-func (fp *FakeProtocol) sendLocalInfileRequest(filename string) error {
-	return nil
-}
-
-func (fp *FakeProtocol) incDebugCount(int) {}
-
-func (fp *FakeProtocol) resetDebugCount() []uint64 {
-	return nil
 }

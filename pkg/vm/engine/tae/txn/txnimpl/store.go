@@ -15,76 +15,204 @@
 package txnimpl
 
 import (
+	"context"
+	"fmt"
+	"runtime/trace"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio"
-
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/moprobe"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer/base"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/updates"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
+
+	"go.uber.org/zap"
 )
 
+var (
+	_tracerPool = sync.Pool{
+		New: func() any {
+			return &txnTracer{}
+		},
+	}
+)
+
+const (
+	MaxWalSize = 70 * mpool.MB
+)
+
+func getTracer() *txnTracer {
+	return _tracerPool.Get().(*txnTracer)
+}
+
+func putTracer(tracer *txnTracer) {
+	tracer.task = nil
+	tracer.state = 0
+	_tracerPool.Put(tracer)
+}
+
+type txnTracer struct {
+	state uint8
+	task  *trace.Task
+	stamp time.Time
+}
+
+func (tracer *txnTracer) Trigger(state uint8) {
+	switch state {
+	case 0: // start preparing wait
+		_, tracer.task = trace.NewTask(context.Background(), "1-PreparingWait")
+		tracer.stamp = time.Now()
+		tracer.state = 0
+
+	case 1: // end preparing wait and start preparing
+		if tracer.task != nil && tracer.state == 0 {
+			tracer.task.End()
+			v2.TxnPreparingWaitDurationHistogram.Observe(time.Since(tracer.stamp).Seconds())
+		}
+		_, tracer.task = trace.NewTask(context.Background(), "2-Preparing")
+		tracer.stamp = time.Now()
+		tracer.state = 1
+
+	case 2: // end preparing and start prepare wal wait
+		if tracer.task != nil && tracer.state == 1 {
+			tracer.task.End()
+			v2.TxnPreparingDurationHistogram.Observe(time.Since(tracer.stamp).Seconds())
+		}
+		_, tracer.task = trace.NewTask(context.Background(), "3-PrepareWalWait")
+		tracer.stamp = time.Now()
+		tracer.state = 2
+
+	case 3: // end prepare wal wait and start prepare wal
+		if tracer.task != nil && tracer.state == 2 {
+			tracer.task.End()
+			v2.TxnPrepareWalWaitDurationHistogram.Observe(time.Since(tracer.stamp).Seconds())
+		}
+		_, tracer.task = trace.NewTask(context.Background(), "4-PrepareWal")
+		tracer.stamp = time.Now()
+		tracer.state = 3
+
+	case 4: // end prepare wal and start prepared wait
+		if tracer.task != nil && tracer.state == 3 {
+			tracer.task.End()
+			v2.TxnPrepareWalDurationHistogram.Observe(time.Since(tracer.stamp).Seconds())
+		}
+		_, tracer.task = trace.NewTask(context.Background(), "5-PreparedWait")
+		tracer.stamp = time.Now()
+		tracer.state = 4
+
+	case 5: // end prepared wait and start prepared
+		if tracer.task != nil && tracer.state == 4 {
+			tracer.task.End()
+			v2.TxnPreparedWaitDurationHistogram.Observe(time.Since(tracer.stamp).Seconds())
+		}
+		_, tracer.task = trace.NewTask(context.Background(), "6-Prepared")
+		tracer.stamp = time.Now()
+		tracer.state = 5
+	}
+}
+
+func (tracer *txnTracer) Stop() {
+	if tracer.task != nil && tracer.state == 5 {
+		tracer.task.End()
+		v2.TxnPreparedDurationHistogram.Observe(time.Since(tracer.stamp).Seconds())
+	}
+	tracer.task = nil
+	tracer.state = 0
+}
+
 type txnStore struct {
+	ctx context.Context
 	txnbase.NoopTxnStore
-	mu            sync.RWMutex
-	transferTable *model.HashPageTable
-	dbs           map[uint64]*txnDB
-	driver        wal.Driver
-	nodesMgr      base.INodeManager
-	txn           txnif.AsyncTxn
-	catalog       *catalog.Catalog
-	cmdMgr        *commandManager
-	logs          []entry.Entry
-	warChecker    *warChecker
-	dataFactory   *tables.DataFactory
-	writeOps      atomic.Uint32
+	mu          sync.RWMutex
+	rt          *dbutils.Runtime
+	dbs         map[uint64]*txnDB
+	driver      wal.Driver
+	txn         txnif.AsyncTxn
+	catalog     *catalog.Catalog
+	cmdMgr      *commandManager
+	logs        []entry.Entry
+	warChecker  *warChecker
+	dataFactory *tables.DataFactory
+	writeOps    atomic.Uint32
+	tracer      *txnTracer
 
 	wg sync.WaitGroup
 }
 
 var TxnStoreFactory = func(
+	ctx context.Context,
 	catalog *catalog.Catalog,
 	driver wal.Driver,
-	transferTable *model.HashPageTable,
-	txnBufMgr base.INodeManager,
-	dataFactory *tables.DataFactory) txnbase.TxnStoreFactory {
+	rt *dbutils.Runtime,
+	dataFactory *tables.DataFactory,
+	maxMessageSize uint64) txnbase.TxnStoreFactory {
 	return func() txnif.TxnStore {
-		return newStore(catalog, driver, transferTable, txnBufMgr, dataFactory)
+		return newStore(ctx, catalog, driver, rt, dataFactory, maxMessageSize)
 	}
 }
 
 func newStore(
+	ctx context.Context,
 	catalog *catalog.Catalog,
 	driver wal.Driver,
-	transferTable *model.HashPageTable,
-	txnBufMgr base.INodeManager,
-	dataFactory *tables.DataFactory) *txnStore {
+	rt *dbutils.Runtime,
+	dataFactory *tables.DataFactory,
+	maxMessageSize uint64) *txnStore {
 	return &txnStore{
-		transferTable: transferTable,
-		dbs:           make(map[uint64]*txnDB),
-		catalog:       catalog,
-		cmdMgr:        newCommandManager(driver),
-		driver:        driver,
-		logs:          make([]entry.Entry, 0),
-		dataFactory:   dataFactory,
-		nodesMgr:      txnBufMgr,
-		wg:            sync.WaitGroup{},
+		ctx:         ctx,
+		rt:          rt,
+		dbs:         make(map[uint64]*txnDB),
+		catalog:     catalog,
+		cmdMgr:      newCommandManager(driver, maxMessageSize),
+		driver:      driver,
+		logs:        make([]entry.Entry, 0),
+		dataFactory: dataFactory,
+		wg:          sync.WaitGroup{},
 	}
 }
+
+func (store *txnStore) StartTrace() {
+	if store.IsReadonly() || store.GetTransactionType() == txnif.TxnType_Heartbeat {
+		return
+	}
+	store.tracer = getTracer()
+	store.tracer.Trigger(txnif.TraceStart)
+}
+
+func (store *txnStore) EndTrace() {
+	if store.tracer == nil {
+		return
+	}
+	tracer := store.tracer
+	store.tracer = nil
+	tracer.Stop()
+	putTracer(tracer)
+}
+
+func (store *txnStore) TriggerTrace(state uint8) {
+	if store.tracer == nil {
+		return
+	}
+	store.tracer.Trigger(state)
+}
+
+func (store *txnStore) GetContext() context.Context    { return store.ctx }
+func (store *txnStore) SetContext(ctx context.Context) { store.ctx = ctx }
 
 func (store *txnStore) IsReadonly() bool {
 	return store.writeOps.Load() == 0
@@ -94,12 +222,12 @@ func (store *txnStore) IncreateWriteCnt() int {
 	return int(store.writeOps.Add(1))
 }
 
-func (store *txnStore) LogTxnEntry(dbId uint64, tableId uint64, entry txnif.TxnEntry, readed []*common.ID) (err error) {
+func (store *txnStore) LogTxnEntry(dbId uint64, tableId uint64, entry txnif.TxnEntry, readedObject, readedTombstone []*common.ID) (err error) {
 	db, err := store.getOrSetDB(dbId)
 	if err != nil {
 		return
 	}
-	return db.LogTxnEntry(tableId, entry, readed)
+	return db.LogTxnEntry(tableId, entry, readedObject, readedTombstone)
 }
 
 func (store *txnStore) LogTxnState(sync bool) (logEntry entry.Entry, err error) {
@@ -109,17 +237,16 @@ func (store *txnStore) LogTxnState(sync bool) (logEntry entry.Entry, err error) 
 		store.txn.GetCommitTS(),
 	)
 	var buf []byte
-	if buf, err = cmd.Marshal(); err != nil {
+	if buf, err = cmd.MarshalBinary(); err != nil {
 		return
 	}
 	logEntry = entry.GetBase()
-	logEntry.SetType(ETTxnState)
+	logEntry.SetType(IOET_WALEntry_TxnRecord)
 	if err = logEntry.SetPayload(buf); err != nil {
 		return
 	}
 	info := &entry.Info{
 		Group: wal.GroupC,
-		TxnId: store.txn.GetID(),
 	}
 	logEntry.SetInfo(info)
 	var lsn uint64
@@ -164,7 +291,7 @@ func (store *txnStore) BatchDedup(dbId, id uint64, pk containers.Vector) (err er
 	return db.BatchDedup(id, pk)
 }
 
-func (store *txnStore) Append(dbId, id uint64, data *containers.Batch) error {
+func (store *txnStore) Append(ctx context.Context, dbId, id uint64, data *containers.Batch) error {
 	store.IncreateWriteCnt()
 	db, err := store.getOrSetDB(dbId)
 	if err != nil {
@@ -173,53 +300,58 @@ func (store *txnStore) Append(dbId, id uint64, data *containers.Batch) error {
 	// if db.IsDeleted() {
 	// 	return txnbase.ErrNotFound
 	// }
-	return db.Append(id, data)
+	return db.Append(ctx, id, data)
 }
 
-func (store *txnStore) AddBlksWithMetaLoc(
+func (store *txnStore) AddDataFiles(
+	ctx context.Context,
 	dbId, tid uint64,
-	zm []dataio.Index,
-	metaLoc []string,
+	stats containers.Vector,
 ) error {
 	store.IncreateWriteCnt()
 	db, err := store.getOrSetDB(dbId)
 	if err != nil {
 		return err
 	}
-	return db.AddBlksWithMetaLoc(tid, zm, metaLoc)
+	return db.AddDataFiles(ctx, tid, stats)
 }
 
-func (store *txnStore) RangeDelete(dbId uint64, id *common.ID, start, end uint32, dt handle.DeleteType) (err error) {
-	db, err := store.getOrSetDB(dbId)
+func (store *txnStore) RangeDelete(
+	id *common.ID, start, end uint32,
+	pkVec containers.Vector, dt handle.DeleteType,
+) (err error) {
+	store.IncreateWriteCnt()
+	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
 		return err
 	}
-	return db.RangeDelete(id, start, end, dt)
+	return db.RangeDelete(id, start, end, pkVec, dt)
 }
 
-func (store *txnStore) UpdateMetaLoc(dbId uint64, id *common.ID, metaLoc string) (err error) {
-	db, err := store.getOrSetDB(dbId)
+func (store *txnStore) DeleteByPhyAddrKeys(
+	id *common.ID,
+	rowIDVec, pkVec containers.Vector, dt handle.DeleteType,
+) (err error) {
+	store.IncreateWriteCnt()
+	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
 		return err
 	}
-	// if table.IsDeleted() {
-	// 	return txnbase.ErrNotFound
-	// }
-	return db.UpdateMetaLoc(id, metaLoc)
+	return db.DeleteByPhyAddrKeys(id, rowIDVec, pkVec, dt)
 }
 
-func (store *txnStore) UpdateDeltaLoc(dbId uint64, id *common.ID, deltaLoc string) (err error) {
-	db, err := store.getOrSetDB(dbId)
+func (store *txnStore) AddPersistedTombstoneFile(
+	id *common.ID, stats objectio.ObjectStats,
+) (ok bool, err error) {
+	store.IncreateWriteCnt()
+	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
-		return err
+		return
 	}
-	// if table.IsDeleted() {
-	// 	return txnbase.ErrNotFound
-	// }
-	return db.UpdateDeltaLoc(id, deltaLoc)
+	return db.AddPersistedTombstoneFile(id, stats)
 }
 
-func (store *txnStore) GetByFilter(dbId, tid uint64, filter *handle.Filter) (id *common.ID, offset uint32, err error) {
+func (store *txnStore) GetByFilter(ctx context.Context, dbId, tid uint64, filter *handle.Filter) (id *common.ID, offset uint32, err error) {
 	db, err := store.getOrSetDB(dbId)
 	if err != nil {
 		return
@@ -228,11 +360,11 @@ func (store *txnStore) GetByFilter(dbId, tid uint64, filter *handle.Filter) (id 
 	// 	err = txnbase.ErrNotFound
 	// 	return
 	// }
-	return db.GetByFilter(tid, filter)
+	return db.GetByFilter(ctx, tid, filter)
 }
 
-func (store *txnStore) GetValue(dbId uint64, id *common.ID, row uint32, colIdx uint16) (v any, err error) {
-	db, err := store.getOrSetDB(dbId)
+func (store *txnStore) GetValue(id *common.ID, row uint32, colIdx uint16, skipCheckDelete bool) (v any, isNull bool, err error) {
+	db, err := store.getOrSetDB(id.DbID)
 	if err != nil {
 		return
 	}
@@ -240,7 +372,7 @@ func (store *txnStore) GetValue(dbId uint64, id *common.ID, row uint32, colIdx u
 	// 	err = txnbase.ErrNotFound
 	// 	return
 	// }
-	return db.GetValue(id, row, colIdx)
+	return db.GetValue(id, row, colIdx, skipCheckDelete)
 }
 
 func (store *txnStore) DatabaseNames() (names []string) {
@@ -301,22 +433,11 @@ func (store *txnStore) GetDatabaseByID(id uint64) (h handle.Database, err error)
 }
 
 func (store *txnStore) CreateDatabase(name, createSql, datTyp string) (h handle.Database, err error) {
-	meta, err := store.catalog.CreateDBEntry(name, createSql, datTyp, store.txn)
-	if err != nil {
-		return nil, err
-	}
-	var db *txnDB
-	if db, err = store.getOrSetDB(meta.GetID()); err != nil {
-		return
-	}
-	if err = db.SetCreateEntry(meta); err != nil {
-		return
-	}
-	h = buildDB(db)
-	return
+	id := store.catalog.NextDB()
+	return store.CreateDatabaseWithID(context.Background(), name, createSql, datTyp, id)
 }
 
-func (store *txnStore) CreateDatabaseWithID(name, createSql, datTyp string, id uint64) (h handle.Database, err error) {
+func (store *txnStore) CreateDatabaseWithID(ctx context.Context, name, createSql, datTyp string, id uint64) (h handle.Database, err error) {
 	meta, err := store.catalog.CreateDBEntryWithID(name, createSql, datTyp, id, store.txn)
 	if err != nil {
 		return nil, err
@@ -328,12 +449,17 @@ func (store *txnStore) CreateDatabaseWithID(name, createSql, datTyp string, id u
 	if err = db.SetCreateEntry(meta); err != nil {
 		return
 	}
+
+	// TODO(aptend): write ddl row
+	// if err = store.Append(ctx, pkgcatalog.MO_CATALOG_ID, pkgcatalog.MO_DATABASE_ID, nil); err != nil {
+	// 	return
+	// }
 	h = buildDB(db)
 	return
 }
 
 func (store *txnStore) DropDatabase(name string) (h handle.Database, err error) {
-	hasNewEntry, meta, err := store.catalog.DropDBEntry(name, store.txn)
+	hasNewEntry, meta, err := store.catalog.DropDBEntryByName(name, store.txn)
 	if err != nil {
 		return
 	}
@@ -353,10 +479,9 @@ func (store *txnStore) DropDatabase(name string) (h handle.Database, err error) 
 func (store *txnStore) ObserveTxn(
 	visitDatabase func(db any),
 	visitTable func(tbl any),
-	rotateTable func(dbName, tblName string, dbid, tid uint64),
-	visitMetadata func(block any),
-	visitAppend func(bat any),
-	visitDelete func(deletes []uint32, prefix []byte)) {
+	rotateTable func(aid uint32, dbName, tblName string, dbid, tid uint64, pkSeqnum uint16),
+	visitObject func(obj any),
+	visitAppend func(bat any, isTombstone bool)) {
 	for _, db := range store.dbs {
 		if db.createEntry != nil || db.dropEntry != nil {
 			visitDatabase(db.entry)
@@ -364,20 +489,22 @@ func (store *txnStore) ObserveTxn(
 		dbName := db.entry.GetName()
 		dbid := db.entry.ID
 		for _, tbl := range db.tables {
-			tblName := tbl.entry.GetSchema().Name
-			tid := tbl.entry.ID
-			rotateTable(dbName, tblName, dbid, tid)
+			schema := tbl.GetLocalSchema(false)
+			pkseq := uint16(60001)
+			if schema.HasPKOrFakePK() { // view table has no pk or fake pk
+				pkseq = schema.GetPrimaryKey().SeqNum
+			}
+			rotateTable(schema.AcInfo.TenantID,
+				dbName, schema.Name,
+				dbid, tbl.entry.ID,
+				pkseq)
 			if tbl.createEntry != nil || tbl.dropEntry != nil {
 				visitTable(tbl.entry)
 			}
 			for _, iTxnEntry := range tbl.txnEntries.entries {
 				switch txnEntry := iTxnEntry.(type) {
-				case *catalog.BlockEntry:
-					visitMetadata(txnEntry)
-				case *updates.DeleteNode:
-					deletes := txnEntry.DeletedRows()
-					prefix := txnEntry.GetPrefix()
-					visitDelete(deletes, prefix)
+				case *catalog.ObjectEntry:
+					visitObject(txnEntry)
 				case *catalog.TableEntry:
 					if tbl.createEntry != nil || tbl.dropEntry != nil {
 						continue
@@ -385,13 +512,27 @@ func (store *txnStore) ObserveTxn(
 					visitTable(txnEntry)
 				}
 			}
-			if tbl.localSegment != nil {
-				for _, node := range tbl.localSegment.nodes {
-					anode, ok := node.(*anode)
-					if ok {
-						visitAppend(anode.storage.mnode.data)
-					}
+			if tbl.dataTable.tableSpace != nil && tbl.dataTable.tableSpace.node != nil {
+				anode := tbl.dataTable.tableSpace.node
+				schema := anode.table.GetLocalSchema(false)
+				bat := &containers.BatchWithVersion{
+					Version:    schema.Version,
+					NextSeqnum: uint16(schema.Extra.NextColSeqnum),
+					Seqnums:    schema.AllSeqnums(),
+					Batch:      anode.data,
 				}
+				visitAppend(bat, false)
+			}
+			if tbl.tombstoneTable != nil && tbl.tombstoneTable.tableSpace != nil && tbl.tombstoneTable.tableSpace.node != nil {
+				anode := tbl.tombstoneTable.tableSpace.node
+				schema := anode.table.GetLocalSchema(true)
+				bat := &containers.BatchWithVersion{
+					Version:    schema.Version,
+					NextSeqnum: uint16(schema.Extra.NextColSeqnum),
+					Seqnums:    schema.AllSeqnums(),
+					Batch:      anode.data,
+				}
+				visitAppend(bat, true)
 			}
 		}
 	}
@@ -476,28 +617,28 @@ func (store *txnStore) GetRelationByID(dbId uint64, id uint64) (relation handle.
 	return db.GetRelationByID(id)
 }
 
-func (store *txnStore) GetSegment(dbId uint64, id *common.ID) (seg handle.Segment, err error) {
+func (store *txnStore) GetObject(id *common.ID, isTombstone bool) (obj handle.Object, err error) {
 	var db *txnDB
-	if db, err = store.getOrSetDB(dbId); err != nil {
+	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
 	}
-	return db.GetSegment(id)
+	return db.GetObject(id, isTombstone)
 }
 
-func (store *txnStore) CreateSegment(dbId, tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (store *txnStore) CreateObject(dbId, tid uint64, isTombstone bool) (obj handle.Object, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(dbId); err != nil {
 		return
 	}
-	return db.CreateSegment(tid, is1PC)
+	return db.CreateObject(tid, isTombstone)
 }
 
-func (store *txnStore) CreateNonAppendableSegment(dbId, tid uint64, is1PC bool) (seg handle.Segment, err error) {
+func (store *txnStore) CreateNonAppendableObject(dbId, tid uint64, isTombstone bool, opt *objectio.CreateObjOpt) (obj handle.Object, err error) {
 	var db *txnDB
 	if db, err = store.getOrSetDB(dbId); err != nil {
 		return
 	}
-	return db.CreateNonAppendableSegment(tid, is1PC)
+	return db.CreateNonAppendableObject(tid, opt, isTombstone)
 }
 
 func (store *txnStore) getOrSetDB(id uint64) (db *txnDB, err error) {
@@ -522,71 +663,52 @@ func (store *txnStore) getOrSetDB(id uint64) (db *txnDB, err error) {
 	store.dbs[id] = db
 	return
 }
-
-func (store *txnStore) CreateNonAppendableBlock(dbId uint64, id *common.ID, opts *common.CreateBlockOpt) (blk handle.Block, err error) {
-	var db *txnDB
-	if db, err = store.getOrSetDB(dbId); err != nil {
-		return
+func (store *txnStore) UpdateObjectStats(id *common.ID, stats *objectio.ObjectStats, isTombstone bool) error {
+	db, err := store.getOrSetDB(id.DbID)
+	if err != nil {
+		return err
 	}
-	return db.CreateNonAppendableBlock(id, opts)
+	db.UpdateObjectStats(id, stats, isTombstone)
+	return nil
 }
 
-func (store *txnStore) GetBlock(dbId uint64, id *common.ID) (blk handle.Block, err error) {
+func (store *txnStore) SoftDeleteObject(isTombstone bool, id *common.ID) (err error) {
 	var db *txnDB
-	if db, err = store.getOrSetDB(dbId); err != nil {
+	if db, err = store.getOrSetDB(id.DbID); err != nil {
 		return
 	}
-	return db.GetBlock(id)
-}
-
-func (store *txnStore) CreateBlock(dbId, tid uint64, sid types.Uuid, is1PC bool) (blk handle.Block, err error) {
-	var db *txnDB
-	if db, err = store.getOrSetDB(dbId); err != nil {
-		return
-	}
-	return db.CreateBlock(tid, sid, is1PC)
-}
-
-func (store *txnStore) SoftDeleteBlock(dbId uint64, id *common.ID) (err error) {
-	var db *txnDB
-	if db, err = store.getOrSetDB(dbId); err != nil {
-		return
-	}
-	return db.SoftDeleteBlock(id)
-}
-
-func (store *txnStore) SoftDeleteSegment(dbId uint64, id *common.ID) (err error) {
-	var db *txnDB
-	if db, err = store.getOrSetDB(dbId); err != nil {
-		return
-	}
-	return db.SoftDeleteSegment(id)
+	perfcounter.Update(store.ctx, func(counter *perfcounter.CounterSet) {
+		counter.TAE.Object.SoftDelete.Add(1)
+	})
+	return db.SoftDeleteObject(id, isTombstone)
 }
 
 func (store *txnStore) ApplyRollback() (err error) {
-	if store.cmdMgr.GetCSN() == 0 {
-		return
-	}
-	for _, db := range store.dbs {
-		if err = db.ApplyRollback(); err != nil {
-			break
+	if store.cmdMgr.GetCSN() != 0 {
+		for _, db := range store.dbs {
+			if err = db.ApplyRollback(); err != nil {
+				break
+			}
 		}
 	}
+	store.CleanUp()
 	return
 }
 
-func (store *txnStore) WaitPrepared() (err error) {
+func (store *txnStore) WaitPrepared(ctx context.Context) (err error) {
 	for _, db := range store.dbs {
 		if err = db.WaitPrepared(); err != nil {
 			return
 		}
 	}
-	for _, e := range store.logs {
-		if err = e.WaitDone(); err != nil {
-			break
+	moprobe.WithRegion(ctx, moprobe.TxnStoreWaitWALFlush, func() {
+		for _, e := range store.logs {
+			if err = e.WaitDone(); err != nil {
+				break
+			}
+			e.Free()
 		}
-		e.Free()
-	}
+	})
 	store.wg.Wait()
 	return
 }
@@ -597,10 +719,11 @@ func (store *txnStore) ApplyCommit() (err error) {
 			break
 		}
 	}
+	store.CleanUp()
 	return
 }
 
-func (store *txnStore) PrePrepare() (err error) {
+func (store *txnStore) Freeze(ctx context.Context) (err error) {
 	for _, db := range store.dbs {
 		if db.NeedRollback() {
 			if err = db.PrepareRollback(); err != nil {
@@ -608,18 +731,44 @@ func (store *txnStore) PrePrepare() (err error) {
 			}
 			delete(store.dbs, db.entry.GetID())
 		}
-		if err = db.PrePrepare(); err != nil {
+		if err = db.Freeze(ctx); err != nil {
 			return
 		}
 	}
 	return
 }
 
+func (store *txnStore) PrePrepare(ctx context.Context) (err error) {
+	for _, db := range store.dbs {
+		if err = db.PrePrepare(ctx); err != nil {
+			return
+		}
+	}
+	approxSize := store.approxSize()
+	if approxSize > MaxWalSize {
+		return moerr.NewInternalError(
+			ctx,
+			fmt.Sprintf("txn %x WAL entry approxSize %d is too large, max is %d", store.txn.GetID(), approxSize, MaxWalSize),
+		)
+	}
+	if approxSize > 50*mpool.MB {
+		logutil.Warnf("[Large-WAL-Entry]txn %x, WAL entry approxSize %d", store.txn.GetID(), approxSize)
+	}
+	return
+}
+func (store *txnStore) approxSize() int {
+	size := 0
+	for _, db := range store.dbs {
+		size += db.approxSize()
+	}
+	return size
+}
 func (store *txnStore) PrepareCommit() (err error) {
 	if store.warChecker != nil {
 		if err = store.warChecker.checkAll(
-			store.txn.GetPrepareTS()); err != nil {
-			return err
+			store.txn.GetPrepareTS(),
+		); err != nil {
+			return
 		}
 	}
 	for _, db := range store.dbs {
@@ -632,12 +781,16 @@ func (store *txnStore) PrepareCommit() (err error) {
 }
 
 func (store *txnStore) PreApplyCommit() (err error) {
-	now := time.Now()
 	for _, db := range store.dbs {
 		if err = db.PreApplyCommit(); err != nil {
 			return
 		}
 	}
+	// logutil.Debugf("Txn-%X PrepareCommit Takes %s", store.txn.GetID(), time.Since(now))
+	return
+}
+
+func (store *txnStore) PrepareWAL() (err error) {
 	if err = store.CollectCmd(); err != nil {
 		return
 	}
@@ -646,19 +799,27 @@ func (store *txnStore) PreApplyCommit() (err error) {
 		return
 	}
 
-	logEntry, err := store.cmdMgr.ApplyTxnRecord(store.txn.GetID(), store.txn)
-	if err != nil {
-		return
-	}
-	if logEntry != nil {
-		store.logs = append(store.logs, logEntry)
-	}
-	for _, db := range store.dbs {
-		if err = db.Apply1PCCommit(); err != nil {
-			return
+	// Apply the record from the command list.
+	// Split the commands by max message size.
+	for store.cmdMgr.cmd.MoreCmds() {
+		logEntry, err := store.cmdMgr.ApplyTxnRecord(store.txn)
+		if err != nil {
+			return err
+		}
+		if logEntry != nil {
+			store.logs = append(store.logs, logEntry)
 		}
 	}
-	logutil.Debugf("Txn-%X PrepareCommit Takes %s", store.txn.GetID(), time.Since(now))
+
+	t1 := time.Now()
+	t2 := time.Now()
+	if t2.Sub(t1) > time.Millisecond*500 {
+		logutil.Warn(
+			"SLOW-LOG",
+			zap.String("txn", store.txn.String()),
+			zap.Duration("apply-1pc-commit-duration", t2.Sub(t1)),
+		)
+	}
 	return
 }
 
@@ -691,3 +852,16 @@ func (store *txnStore) PrepareRollback() error {
 }
 
 func (store *txnStore) GetLSN() uint64 { return store.cmdMgr.lsn }
+
+func (store *txnStore) CleanUp() {
+	for _, db := range store.dbs {
+		db.CleanUp()
+	}
+}
+func (store *txnStore) FillInWorkspaceDeletes(id *common.ID, deletes **nulls.Nulls, deleteStartOffset uint64) error {
+	db, err := store.getOrSetDB(id.DbID)
+	if err != nil {
+		return err
+	}
+	return db.FillInWorkspaceDeletes(id, deletes, deleteStartOffset)
+}

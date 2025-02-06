@@ -17,8 +17,9 @@ package memoryengine
 import (
 	"context"
 	"fmt"
-	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
@@ -43,19 +44,25 @@ func (d *Database) Create(ctx context.Context, relName string, defs []engine.Tab
 		return err
 	}
 
+	// convert interface based engine.TableDef to PB version engine.TableDefPB
+	pbDefs := make([]engine.TableDefPB, 0, len(defs))
+	for i := 0; i < len(defs); i++ {
+		pbDefs = append(pbDefs, defs[i].ToPBVersion())
+	}
+
 	_, err = DoTxnRequest[CreateRelationResp](
 		ctx,
 		d.txnOperator,
 		false,
 		d.engine.allShards,
 		OpCreateRelation,
-		CreateRelationReq{
+		&CreateRelationReq{
 			ID:           id,
 			DatabaseID:   d.id,
 			DatabaseName: d.name,
 			Type:         RelationTable,
 			Name:         strings.ToLower(relName),
-			Defs:         defs,
+			Defs:         pbDefs,
 		},
 	)
 	if err != nil {
@@ -70,7 +77,7 @@ func (d *Database) Truncate(ctx context.Context, relName string) (uint64, error)
 	if err != nil {
 		return 0, err
 	}
-	rel, err := d.Relation(ctx, relName)
+	rel, err := d.Relation(ctx, relName, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -82,7 +89,7 @@ func (d *Database) Truncate(ctx context.Context, relName string) (uint64, error)
 		false,
 		d.engine.allShards,
 		OpTruncateRelation,
-		TruncateRelationReq{
+		&TruncateRelationReq{
 			NewTableID:   newId,
 			OldTableID:   ID(oldId),
 			DatabaseID:   d.id,
@@ -105,7 +112,7 @@ func (d *Database) Delete(ctx context.Context, relName string) error {
 		false,
 		d.engine.allShards,
 		OpDeleteRelation,
-		DeleteRelationReq{
+		&DeleteRelationReq{
 			DatabaseID:   d.id,
 			DatabaseName: d.name,
 			Name:         strings.ToLower(relName),
@@ -118,8 +125,7 @@ func (d *Database) Delete(ctx context.Context, relName string) error {
 	return nil
 }
 
-func (d *Database) Relation(ctx context.Context, relName string) (engine.Relation, error) {
-
+func (d *Database) Relation(ctx context.Context, relName string, _ any) (engine.Relation, error) {
 	if relName == "" {
 		return nil, moerr.NewInvalidInput(ctx, "no table name")
 	}
@@ -130,7 +136,7 @@ func (d *Database) Relation(ctx context.Context, relName string) (engine.Relatio
 		true,
 		d.engine.anyShard,
 		OpOpenRelation,
-		OpenRelationReq{
+		&OpenRelationReq{
 			DatabaseID:   d.id,
 			DatabaseName: d.name,
 			Name:         relName,
@@ -155,9 +161,20 @@ func (d *Database) Relation(ctx context.Context, relName string) (engine.Relatio
 		return table, nil
 
 	default:
-		panic(moerr.NewInternalError(ctx, "unknown type: %+v", resp.Type))
+		panic(moerr.NewInternalErrorf(ctx, "unknown type: %+v", resp.Type))
 	}
 
+}
+func (d *Database) RelationExists(ctx context.Context, relName string, _ any) (bool, error) {
+	rel, err := d.Relation(ctx, relName, nil)
+	if err != nil {
+		if moerr.IsMoErrCode(err, moerr.ErrNoSuchTable) {
+			return false, nil
+		} else {
+			return false, err
+		}
+	}
+	return rel != nil, nil
 }
 
 func (d *Database) Relations(ctx context.Context) ([]string, error) {
@@ -168,7 +185,7 @@ func (d *Database) Relations(ctx context.Context) ([]string, error) {
 		true,
 		d.engine.anyShard,
 		OpGetRelations,
-		GetRelationsReq{
+		&GetRelationsReq{
 			DatabaseID: d.id,
 		},
 	)

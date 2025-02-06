@@ -16,12 +16,13 @@ package main
 
 import (
 	"context"
-	"log"
 	"os"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc"
 	"github.com/matrixorigin/matrixone/pkg/common/morpc/examples/message"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 )
 
 var (
@@ -39,17 +40,17 @@ func main() {
 	}
 
 	bf := morpc.NewGoettyBasedBackendFactory(newCodec())
-	cli, err := morpc.NewClient(bf, morpc.WithClientMaxBackendPerHost(1))
+	cli, err := morpc.NewClient("example-rpc", bf, morpc.WithClientMaxBackendPerHost(1))
 	if err != nil {
 		panic(err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second, moerr.CausePingPongMain)
 	defer cancel()
 
 	f, err := cli.Send(ctx, addr, &message.ExampleMessage{MsgID: 1, Content: "hello"})
 	if err != nil {
-		panic(err)
+		panic(moerr.AttachCause(ctx, err))
 	}
 	defer f.Close()
 
@@ -58,7 +59,7 @@ func main() {
 		panic(err)
 	}
 
-	log.Printf("%s", resp.DebugString())
+	logutil.Infof("%s", resp.DebugString())
 }
 
 func startServer() error {
@@ -66,14 +67,14 @@ func startServer() error {
 	if err != nil {
 		return err
 	}
-	s.RegisterRequestHandler(func(ctx context.Context, request morpc.Message, sequence uint64, cs morpc.ClientSession) error {
+	s.RegisterRequestHandler(func(ctx context.Context, request morpc.RPCMessage, sequence uint64, cs morpc.ClientSession) error {
 		// write request back to client
-		return cs.Write(ctx, request)
+		return cs.Write(ctx, request.Message)
 	})
 
 	return s.Start()
 }
 
 func newCodec() morpc.Codec {
-	return morpc.NewMessageCodec(func() morpc.Message { return &message.ExampleMessage{} })
+	return morpc.NewMessageCodec("", func() morpc.Message { return &message.ExampleMessage{} })
 }

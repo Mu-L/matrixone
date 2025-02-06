@@ -18,13 +18,21 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/compress"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/statsinfo"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 )
@@ -33,10 +41,12 @@ type Nodes []Node
 
 type Node struct {
 	Mcpu int
-	Id   string   `json:"id"`
-	Addr string   `json:"address"`
-	Data [][]byte `json:"payload"`
-	Rel  Relation // local relation
+	Id   string `json:"id"`
+	Addr string `json:"address"`
+	//TODO::change RelData to Tombstoner, since only Tombstones ned to be serialized.
+	Data  RelData
+	CNCNT int32 // number of all cns
+	CNIDX int32 // cn index , starts from 0
 }
 
 // Attribute is a column
@@ -47,7 +57,7 @@ type Attribute struct {
 	IsRowId bool
 	// Column ID
 	ID uint64
-	// Name name of attribute
+	// Name name of attribute, letter case: origin
 	Name string
 	// Alg compression algorithm
 	Alg compress.T
@@ -65,6 +75,10 @@ type Attribute struct {
 	Comment string
 	// AutoIncrement is auto incr or not
 	AutoIncrement bool
+	// Seqnum, do not change during the whole lifetime of the table
+	Seqnum uint16
+	// EnumValues is for enum type
+	EnumVlaues string
 }
 
 type PropertiesDef struct {
@@ -81,9 +95,10 @@ type ClusterByDef struct {
 }
 
 type Statistics interface {
-	Stats(ctx context.Context, expr *plan.Expr, statsInfoMap any) (*plan.Stats, error)
-	Rows(ctx context.Context) (int64, error)
-	Size(ctx context.Context, columnName string) (int64, error)
+	// NOTE: Stats May indirectly access the file service
+	Stats(ctx context.Context, sync bool) (*pb.StatsInfo, error)
+	Rows(ctx context.Context) (uint64, error)
+	Size(ctx context.Context, columnName string) (uint64, error)
 }
 
 type IndexTableDef struct {
@@ -103,10 +118,12 @@ func (node IndexT) ToString() string {
 	default:
 		return "INVAILD"
 	}
+	//TODO: @arjun fix this later
+	// Should this be same as secondary index algo type?
 }
 
 const (
-	Invalid IndexT = iota
+	Empty IndexT = iota
 	ZoneMap
 	BsiIndex
 )
@@ -117,6 +134,10 @@ type AttributeDef struct {
 
 type CommentDef struct {
 	Comment string
+}
+
+type VersionDef struct {
+	Version uint32
 }
 
 type PartitionDef struct {
@@ -144,11 +165,19 @@ type RefChildTableDef struct {
 	Tables []uint64
 }
 
+type StreamConfigsDef struct {
+	Configs []*plan.Property
+}
+
 type TableDef interface {
 	tableDef()
+
+	// ToPBVersion returns corresponding PB struct.
+	ToPBVersion() TableDefPB
 }
 
 func (*CommentDef) tableDef()    {}
+func (*VersionDef) tableDef()    {}
 func (*PartitionDef) tableDef()  {}
 func (*ViewDef) tableDef()       {}
 func (*AttributeDef) tableDef()  {}
@@ -156,6 +185,113 @@ func (*IndexTableDef) tableDef() {}
 func (*PropertiesDef) tableDef() {}
 func (*ClusterByDef) tableDef()  {}
 func (*ConstraintDef) tableDef() {}
+
+func (def *CommentDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_CommentDef{
+			CommentDef: def,
+		},
+	}
+}
+
+func (def *VersionDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_VersionDef{
+			VersionDef: def,
+		},
+	}
+}
+
+func (def *PartitionDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_PartitionDef{
+			PartitionDef: def,
+		},
+	}
+}
+
+func (def *ViewDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_ViewDef{
+			ViewDef: def,
+		},
+	}
+}
+
+func (def *AttributeDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_AttributeDef{
+			AttributeDef: def,
+		},
+	}
+}
+
+func (def *IndexTableDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_IndexTableDef{
+			IndexTableDef: def,
+		},
+	}
+}
+
+func (def *PropertiesDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_PropertiesDef{
+			PropertiesDef: def,
+		},
+	}
+}
+
+func (def *ClusterByDef) ToPBVersion() TableDefPB {
+	return TableDefPB{
+		Def: &TableDefPB_ClusterByDef{
+			ClusterByDef: def,
+		},
+	}
+}
+
+func (def *ConstraintDef) ToPBVersion() TableDefPB {
+	cts := make([]ConstraintPB, 0, len(def.Cts))
+	for i := 0; i < len(def.Cts); i++ {
+		cts = append(cts, def.Cts[i].ToPBVersion())
+	}
+
+	return TableDefPB{
+		Def: &TableDefPB_ConstraintDefPB{
+			ConstraintDefPB: &ConstraintDefPB{
+				Cts: cts,
+			},
+		},
+	}
+}
+
+func (def *TableDefPB) FromPBVersion() TableDef {
+	if r := def.GetCommentDef(); r != nil {
+		return r
+	}
+	if r := def.GetPartitionDef(); r != nil {
+		return r
+	}
+	if r := def.GetViewDef(); r != nil {
+		return r
+	}
+	if r := def.GetAttributeDef(); r != nil {
+		return r
+	}
+	if r := def.GetIndexTableDef(); r != nil {
+		return r
+	}
+	if r := def.GetPropertiesDef(); r != nil {
+		return r
+	}
+	if r := def.GetClusterByDef(); r != nil {
+		return r
+	}
+	if r := def.GetConstraintDefPB(); r != nil {
+		return r.FromPBVersion()
+	}
+	panic("no corresponding type")
+}
 
 type ConstraintDef struct {
 	Cts []Constraint
@@ -168,11 +304,20 @@ const (
 	RefChildTable
 	ForeignKey
 	PrimaryKey
+	StreamConfig
 )
 
-func (c *ConstraintDef) MarshalBinary() (data []byte, err error) {
+type EngineType int8
+
+const (
+	Disttae EngineType = iota
+	Memory
+	UNKNOWN
+)
+
+func (def *ConstraintDef) MarshalBinary() (data []byte, err error) {
 	buf := bytes.NewBuffer(make([]byte, 0))
-	for _, ct := range c.Cts {
+	for _, ct := range def.Cts {
 		switch def := ct.(type) {
 		case *IndexDef:
 			if err := binary.Write(buf, binary.BigEndian, Index); err != nil {
@@ -235,12 +380,29 @@ func (c *ConstraintDef) MarshalBinary() (data []byte, err error) {
 				return nil, err
 			}
 			buf.Write(bytes)
+		case *StreamConfigsDef:
+			if err := binary.Write(buf, binary.BigEndian, StreamConfig); err != nil {
+				return nil, err
+			}
+			if err := binary.Write(buf, binary.BigEndian, uint64(len(def.Configs))); err != nil {
+				return nil, err
+			}
+			for _, c := range def.Configs {
+				bytes, err := c.Marshal()
+				if err != nil {
+					return nil, err
+				}
+				if err := binary.Write(buf, binary.BigEndian, uint64(len(bytes))); err != nil {
+					return nil, err
+				}
+				buf.Write(bytes)
+			}
 		}
 	}
 	return buf.Bytes(), nil
 }
 
-func (c *ConstraintDef) UnmarshalBinary(data []byte) error {
+func (def *ConstraintDef) UnmarshalBinary(data []byte) error {
 	l := 0
 	var length uint64
 	for l < len(data) {
@@ -263,7 +425,7 @@ func (c *ConstraintDef) UnmarshalBinary(data []byte) error {
 				l += int(dataLength)
 				indexes[i] = indexdef
 			}
-			c.Cts = append(c.Cts, &IndexDef{indexes})
+			def.Cts = append(def.Cts, &IndexDef{indexes})
 		case RefChildTable:
 			length = binary.BigEndian.Uint64(data[l : l+8])
 			l += 8
@@ -273,7 +435,7 @@ func (c *ConstraintDef) UnmarshalBinary(data []byte) error {
 				l += 8
 				tables[i] = tblId
 			}
-			c.Cts = append(c.Cts, &RefChildTableDef{tables})
+			def.Cts = append(def.Cts, &RefChildTableDef{tables})
 
 		case ForeignKey:
 			length = binary.BigEndian.Uint64(data[l : l+8])
@@ -291,7 +453,7 @@ func (c *ConstraintDef) UnmarshalBinary(data []byte) error {
 				l += int(dataLength)
 				fKeys[i] = fKey
 			}
-			c.Cts = append(c.Cts, &ForeignKeyDef{fKeys})
+			def.Cts = append(def.Cts, &ForeignKeyDef{fKeys})
 
 		case PrimaryKey:
 			length = binary.BigEndian.Uint64(data[l : l+8])
@@ -302,15 +464,61 @@ func (c *ConstraintDef) UnmarshalBinary(data []byte) error {
 				return err
 			}
 			l += int(length)
-			c.Cts = append(c.Cts, &PrimaryKeyDef{pkey})
+			def.Cts = append(def.Cts, &PrimaryKeyDef{pkey})
+		case StreamConfig:
+			length = binary.BigEndian.Uint64(data[l : l+8])
+			l += 8
+			configs := make([]*plan.Property, length)
+
+			for i := 0; i < int(length); i++ {
+				dataLength := binary.BigEndian.Uint64(data[l : l+8])
+				l += 8
+				config := &plan.Property{}
+				err := config.Unmarshal(data[l : l+int(dataLength)])
+				if err != nil {
+					return err
+				}
+				l += int(dataLength)
+				configs[i] = config
+			}
+			def.Cts = append(def.Cts, &StreamConfigsDef{configs})
 		}
 	}
 	return nil
 }
 
+func (def *ConstraintDefPB) FromPBVersion() *ConstraintDef {
+	cts := make([]Constraint, 0, len(def.Cts))
+	for i := 0; i < len(def.Cts); i++ {
+		cts = append(cts, def.Cts[i].FromPBVersion())
+	}
+	return &ConstraintDef{
+		Cts: cts,
+	}
+}
+
+func (def *ConstraintPB) FromPBVersion() Constraint {
+	if r := def.GetForeignKeyDef(); r != nil {
+		return r
+	}
+	if r := def.GetPrimaryKeyDef(); r != nil {
+		return r
+	}
+	if r := def.GetRefChildTableDef(); r != nil {
+		return r
+	}
+	if r := def.GetIndexDef(); r != nil {
+		return r
+	}
+	if r := def.GetStreamConfigsDef(); r != nil {
+		return r
+	}
+	panic("no corresponding type")
+}
+
 // get the primary key definition in the constraint, and return null if there is no primary key
-func (c *ConstraintDef) GetPrimaryKeyDef() *PrimaryKeyDef {
-	for _, ct := range c.Cts {
+func (def *ConstraintDef) GetPrimaryKeyDef() *PrimaryKeyDef {
+	for _, ct := range def.Cts {
 		if ctVal, ok := ct.(*PrimaryKeyDef); ok {
 			return ctVal
 		}
@@ -320,6 +528,9 @@ func (c *ConstraintDef) GetPrimaryKeyDef() *PrimaryKeyDef {
 
 type Constraint interface {
 	constraint()
+
+	// ToPBVersion returns corresponding PB struct.
+	ToPBVersion() ConstraintPB
 }
 
 // TODO: UniqueIndexDef, SecondaryIndexDef will not be tabledef and need to be moved in Constraint to be able modified
@@ -327,18 +538,342 @@ func (*ForeignKeyDef) constraint()    {}
 func (*PrimaryKeyDef) constraint()    {}
 func (*RefChildTableDef) constraint() {}
 func (*IndexDef) constraint()         {}
+func (*StreamConfigsDef) constraint() {}
+
+func (def *ForeignKeyDef) ToPBVersion() ConstraintPB {
+	return ConstraintPB{
+		Ct: &ConstraintPB_ForeignKeyDef{
+			ForeignKeyDef: def,
+		},
+	}
+}
+func (def *PrimaryKeyDef) ToPBVersion() ConstraintPB {
+	return ConstraintPB{
+		Ct: &ConstraintPB_PrimaryKeyDef{
+			PrimaryKeyDef: def,
+		},
+	}
+}
+func (def *RefChildTableDef) ToPBVersion() ConstraintPB {
+	return ConstraintPB{
+		Ct: &ConstraintPB_RefChildTableDef{
+			RefChildTableDef: def,
+		},
+	}
+}
+func (def *IndexDef) ToPBVersion() ConstraintPB {
+	return ConstraintPB{
+		Ct: &ConstraintPB_IndexDef{
+			IndexDef: def,
+		},
+	}
+}
+
+func (def *StreamConfigsDef) ToPBVersion() ConstraintPB {
+	return ConstraintPB{
+		Ct: &ConstraintPB_StreamConfigsDef{
+			StreamConfigsDef: def,
+		},
+	}
+}
+
+type TombstoneType uint8
+
+const (
+	InvalidTombstoneData TombstoneType = iota
+	TombstoneData
+)
+
+type DataCollectPolicy uint64
+
+const (
+	Policy_CollectCommittedInmemData = 1 << iota
+	Policy_CollectUncommittedInmemData
+	Policy_CollectCommittedPersistedData
+	Policy_CollectUncommittedPersistedData
+	Policy_CollectCommittedData   = Policy_CollectCommittedInmemData | Policy_CollectCommittedPersistedData
+	Policy_CollectUncommittedData = Policy_CollectUncommittedInmemData | Policy_CollectUncommittedPersistedData
+	Policy_CollectAllData         = Policy_CollectCommittedData | Policy_CollectUncommittedData
+)
+
+type TombstoneCollectPolicy uint64
+
+const (
+	Policy_CollectUncommittedTombstones = 1 << iota
+	Policy_CollectCommittedTombstones
+	Policy_CollectAllTombstones = Policy_CollectUncommittedTombstones | Policy_CollectCommittedTombstones
+)
+
+type TombstoneApplyPolicy uint64
+
+const (
+	Policy_SkipUncommitedInMemory = 1 << iota
+	Policy_SkipCommittedInMemory
+	Policy_SkipUncommitedS3
+	Policy_SkipCommittedS3
+)
+
+const (
+	Policy_CheckAll             = 0
+	Policy_CheckCommittedS3Only = Policy_SkipUncommitedInMemory | Policy_SkipCommittedInMemory | Policy_SkipUncommitedS3
+	Policy_CheckCommittedOnly   = Policy_SkipUncommitedInMemory | Policy_SkipUncommitedS3
+	Policy_CheckUnCommittedOnly = Policy_SkipCommittedInMemory | Policy_SkipCommittedS3
+	Policy_SkipAll              = Policy_SkipUncommitedInMemory | Policy_SkipCommittedInMemory | Policy_SkipUncommitedS3 | Policy_SkipCommittedS3
+)
+
+type Tombstoner interface {
+	Type() TombstoneType
+	HasAnyInMemoryTombstone() bool
+	HasAnyTombstoneFile() bool
+
+	String() string
+	StringWithPrefix(string) string
+
+	// false positive check, HasBlockTombstone will access FileService
+	HasBlockTombstone(ctx context.Context, id *objectio.Blockid, fs fileservice.FileService) (bool, error)
+
+	MarshalBinaryWithBuffer(w *bytes.Buffer) error
+	UnmarshalBinary(buf []byte) error
+
+	PrefetchTombstones(srvId string, fs fileservice.FileService, bid []objectio.Blockid)
+
+	// it applies the block related in-memory tombstones to the rowsOffset
+	// `bid` is the block id
+	// `rowsOffset` is the input rows offset to apply
+	// `deleted` is the rows that are deleted from this apply
+	// `left` is the rows that are left after this apply
+	ApplyInMemTombstones(
+		bid *types.Blockid,
+		rowsOffset []int64,
+		deleted *objectio.Bitmap,
+	) (left []int64)
+
+	// it applies the block related tombstones from the persisted tombstone file
+	// to the rowsOffset
+	ApplyPersistedTombstones(
+		ctx context.Context,
+		fs fileservice.FileService,
+		snapshot *types.TS,
+		bid *types.Blockid,
+		rowsOffset []int64,
+		deletedMask *objectio.Bitmap,
+	) (left []int64, err error)
+
+	// a.merge(b) => a = a U b
+	// a and b must be sorted ascendingly
+	// a.Type() must be equal to b.Type()
+	Merge(other Tombstoner) error
+
+	// in-memory tombstones must be sorted ascendingly
+	// it should be called after all in-memory tombstones are added
+	SortInMemory()
+}
+
+type RelDataType uint8
+
+const (
+	RelDataEmpty RelDataType = iota
+	RelDataShardIDList
+	RelDataBlockList
+	RelDataObjList
+)
+
+type RelData interface {
+	// general interface
+
+	GetType() RelDataType
+	String() string
+	MarshalBinary() ([]byte, error)
+	UnmarshalBinary(buf []byte) error
+	AttachTombstones(tombstones Tombstoner) error
+	GetTombstones() Tombstoner
+	DataSlice(begin, end int) RelData
+
+	BuildEmptyRelData(preAllocSize int) RelData
+	DataCnt() int
+
+	// specified interface
+
+	// for memory engine shard id list
+	GetShardIDList() []uint64
+	GetShardID(i int) uint64
+	SetShardID(i int, id uint64)
+	AppendShardID(id uint64)
+
+	// for block info list
+	Split(i int) []RelData
+	GetBlockInfoSlice() objectio.BlockInfoSlice
+	GetBlockInfo(i int) objectio.BlockInfo
+	SetBlockInfo(i int, blk *objectio.BlockInfo)
+	AppendBlockInfo(blk *objectio.BlockInfo)
+	AppendBlockInfoSlice(objectio.BlockInfoSlice)
+}
+
+// ForRangeShardID [begin, end)
+func ForRangeShardID(
+	begin, end int,
+	relData RelData,
+	onShardID func(shardID uint64) (bool, error)) error {
+	slice := relData.GetShardIDList()
+
+	for idx := begin; idx < end; idx++ {
+		if ok, err := onShardID(slice[idx]); !ok || err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// ForRangeBlockInfo [begin, end)
+func ForRangeBlockInfo(
+	begin, end int,
+	relData RelData,
+	onBlock func(blk *objectio.BlockInfo) (bool, error)) error {
+	if begin >= relData.DataCnt() {
+		return nil
+	}
+	slice := relData.GetBlockInfoSlice()
+	slice = slice.Slice(begin, end)
+	sliceLen := slice.Len()
+
+	for i := 0; i < sliceLen; i++ {
+		if ok, err := onBlock(slice.Get(i)); !ok || err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+type DataState uint8
+
+const (
+	InMem DataState = iota
+	Persisted
+	End
+)
+
+type DataSourceType uint8
+
+const (
+	GeneralLocalDataSource DataSourceType = iota
+	ShardingLocalDataSource
+	ShardingRemoteDataSource
+)
+
+type DataSource interface {
+	Next(
+		ctx context.Context,
+		cols []string,
+		types []types.Type,
+		seqNums []uint16,
+		pkSeqNum int32,
+		memFilter any,
+		mp *mpool.MPool,
+		bat *batch.Batch,
+	) (*objectio.BlockInfo, DataState, error)
+
+	ApplyTombstones(
+		ctx context.Context,
+		bid *objectio.Blockid,
+		rowsOffset []int64,
+		applyPolicy TombstoneApplyPolicy,
+	) ([]int64, error)
+
+	GetTombstones(
+		ctx context.Context, bid *objectio.Blockid,
+	) (deletedRows objectio.Bitmap, err error)
+
+	SetOrderBy(orderby []*plan.OrderBySpec)
+
+	GetOrderBy() []*plan.OrderBySpec
+
+	SetFilterZM(zm objectio.ZoneMap)
+
+	Close()
+	String() string
+}
+
+type Ranges interface {
+	GetBytes(i int) []byte
+
+	Len() int
+
+	Append([]byte)
+
+	Size() int
+
+	SetBytes([]byte)
+
+	GetAllBytes() []byte
+
+	Slice(i, j int) []byte
+}
+
+var _ Ranges = (*objectio.BlockInfoSlice)(nil)
+
+type ChangesHandle_Hint int
+
+const (
+	ChangesHandle_Snapshot ChangesHandle_Hint = iota
+	ChangesHandle_Tail_wip
+	ChangesHandle_Tail_done
+)
+
+type ChangesHandle interface {
+	Next(ctx context.Context, mp *mpool.MPool) (data *batch.Batch, tombstone *batch.Batch, hint ChangesHandle_Hint, err error)
+	Close() error
+}
+
+type RangesShuffleParam struct {
+	// these are for shuffle objects
+	Node               *plan.Node
+	CNCNT              int32 // number of all cns
+	CNIDX              int32 // cn index , starts from 0
+	IsLocalCN          bool
+	ShuffleRangeUint64 []uint64
+	ShuffleRangeInt64  []int64
+	Init               bool
+}
+
+type RangesParam struct {
+	BlockFilters       []*plan.Expr //Slice of expressions used to filter zonemap
+	PreAllocBlocks     int          //estimated count of blocks
+	TxnOffset          int          //Transaction offset used to specify the starting position for reading data.
+	Policy             DataCollectPolicy
+	Rsp                *RangesShuffleParam
+	DontSupportRelData bool
+}
+
+var DefaultRangesParam RangesParam = RangesParam{
+	BlockFilters:       nil,
+	PreAllocBlocks:     2,
+	TxnOffset:          0,
+	Policy:             Policy_CollectAllData,
+	DontSupportRelData: true,
+}
 
 type Relation interface {
 	Statistics
 
-	Ranges(context.Context, *plan.Expr) ([][]byte, error)
+	Ranges(context.Context, RangesParam) (RelData, error)
+
+	CollectTombstones(ctx context.Context, txnOffset int, policy TombstoneCollectPolicy) (Tombstoner, error)
+
+	CollectChanges(ctx context.Context, from, to types.TS, mp *mpool.MPool) (ChangesHandle, error)
 
 	TableDefs(context.Context) ([]TableDef, error)
+
+	// Get complete tableDef information, including columns, constraints, partitions, version, comments, etc
+	GetTableDef(context.Context) *plan.TableDef
+	CopyTableDef(context.Context) *plan.TableDef
 
 	GetPrimaryKeys(context.Context) ([]*Attribute, error)
 
 	GetHideKeys(context.Context) ([]*Attribute, error)
 
+	// Note: Write Will access Fileservice
 	Write(context.Context, *batch.Batch) error
 
 	Update(context.Context, *batch.Batch) error
@@ -352,25 +887,86 @@ type Relation interface {
 	// only ConstraintDef can be modified
 	UpdateConstraint(context.Context, *ConstraintDef) error
 
+	AlterTable(context.Context, *ConstraintDef, []*api.AlterTableReq) error
+
+	// Support renaming tables within explicit transactions (CN worspace)
+	TableRenameInTxn(ctx context.Context, constraint [][]byte) error
+
 	GetTableID(context.Context) uint64
 
-	// second argument is the number of reader, third argument is the filter extend, foruth parameter is the payload required by the engine
-	NewReader(context.Context, int, *plan.Expr, [][]byte) ([]Reader, error)
+	// GetTableName returns the name of the table.
+	GetTableName() string
+
+	GetDBID(context.Context) uint64
+
+	// Note: Write Will access Fileservice
+	BuildReaders(
+		ctx context.Context,
+		proc any,
+		expr *plan.Expr,
+		relData RelData,
+		num int,
+		txnOffset int,
+		orderBy bool,
+		policy TombstoneApplyPolicy,
+		filterHint FilterHint,
+	) ([]Reader, error)
+
+	BuildShardingReaders(
+		ctx context.Context,
+		proc any,
+		expr *plan.Expr,
+		relData RelData,
+		num int,
+		txnOffset int,
+		orderBy bool,
+		policy TombstoneApplyPolicy,
+	) ([]Reader, error)
 
 	TableColumns(ctx context.Context) ([]*Attribute, error)
 
 	//max and min values
 	MaxAndMinValues(ctx context.Context) ([][2]any, []uint8, error)
+
+	GetEngineType() EngineType
+
+	GetProcess() any
+
+	// Note: GetColumMetadataScanInfo Will access Fileservice
+	GetColumMetadataScanInfo(ctx context.Context, name string) ([]*plan.MetadataScanInfo, error)
+
+	// PrimaryKeysMayBeModified reports whether any rows with any primary keys in keyVector was modified during `from` to `to`
+	// If not sure, returns true
+	// Initially added for implementing locking rows by primary keys
+	PrimaryKeysMayBeModified(ctx context.Context, from types.TS, to types.TS, batch *batch.Batch, pkIndex int32) (bool, error)
+
+	PrimaryKeysMayBeUpserted(ctx context.Context, from types.TS, to types.TS, batch *batch.Batch, pkIndex int32) (bool, error)
+
+	ApproxObjectsNum(ctx context.Context) int
+	MergeObjects(ctx context.Context, objstats []objectio.ObjectStats, targetObjSize uint32) (*api.MergeCommitEntry, error)
+	GetNonAppendableObjectStats(ctx context.Context) ([]objectio.ObjectStats, error)
+
+	// Reset resets the relation.
+	Reset(op client.TxnOperator) error
+}
+
+type BaseReader interface {
+	Close() error
+	Read(context.Context, []string, *plan.Expr, *mpool.MPool, *batch.Batch) (bool, error)
 }
 
 type Reader interface {
-	Close() error
-	Read(context.Context, []string, *plan.Expr, *mpool.MPool) (*batch.Batch, error)
+	BaseReader
+	SetOrderBy([]*plan.OrderBySpec)
+	GetOrderBy() []*plan.OrderBySpec
+	SetFilterZM(objectio.ZoneMap)
+	//SetScanType()
 }
 
 type Database interface {
 	Relations(context.Context) ([]string, error)
-	Relation(context.Context, string) (Relation, error)
+	Relation(context.Context, string, any) (Relation, error)
+	RelationExists(context.Context, string, any) (bool, error)
 
 	Delete(context.Context, string) error
 	Create(context.Context, string, []TableDef) error // Create Table - (name, table define)
@@ -380,11 +976,19 @@ type Database interface {
 	GetCreateSql(context.Context) string
 }
 
+type LogtailEngine interface {
+	// TryToSubscribeTable tries to subscribe a table.
+	TryToSubscribeTable(context.Context, uint64, uint64) error
+	// UnsubscribeTable unsubscribes a table from logtail client.
+	UnsubscribeTable(context.Context, uint64, uint64) error
+}
+
 type Engine interface {
+	// LogtailEngine has some actions for logtail.
+	LogtailEngine
+
 	// transaction interface
 	New(ctx context.Context, op client.TxnOperator) error
-	Commit(ctx context.Context, op client.TxnOperator) error
-	Rollback(ctx context.Context, op client.TxnOperator) error
 
 	// Delete deletes a database
 	Delete(ctx context.Context, databaseName string, op client.TxnOperator) error
@@ -398,16 +1002,23 @@ type Engine interface {
 	// Database creates a handle for a database
 	Database(ctx context.Context, databaseName string, op client.TxnOperator) (Database, error)
 
-	// Nodes returns all nodes for worker jobs
-	Nodes() (cnNodes Nodes, err error)
+	// Nodes returns all nodes for worker jobs. isInternal, tenant, cnLabel are
+	// used to filter CN servers.
+	Nodes(isInternal bool, tenant string, username string, cnLabel map[string]string) (cnNodes Nodes, err error)
 
 	// Hints returns hints of engine features
 	// return value should not be cached
 	// since implementations may update hints after engine had initialized
 	Hints() Hints
 
-	NewBlockReader(ctx context.Context, num int, ts timestamp.Timestamp,
-		expr *plan.Expr, ranges [][]byte, tblDef *plan.TableDef) ([]Reader, error)
+	BuildBlockReaders(
+		ctx context.Context,
+		proc any,
+		ts timestamp.Timestamp,
+		expr *plan.Expr,
+		def *plan.TableDef,
+		relData RelData,
+		num int) ([]Reader, error)
 
 	// Get database name & table name by table id
 	GetNameById(ctx context.Context, op client.TxnOperator, tableId uint64) (dbName string, tblName string, err error)
@@ -417,6 +1028,25 @@ type Engine interface {
 
 	// AllocateIDByKey allocate a globally unique ID by key.
 	AllocateIDByKey(ctx context.Context, key string) (uint64, error)
+
+	// Stats returns the stats info of the key.
+	// If sync is true, wait for the stats info to be updated, else,
+	// just return nil if the current stats info has not been initialized.
+	Stats(ctx context.Context, key pb.StatsInfoKey, sync bool) *pb.StatsInfo
+
+	// true if the prefetch is received, false if the prefetch is rejected
+	PrefetchTableMeta(ctx context.Context, key pb.StatsInfoKey) bool
+
+	GetMessageCenter() any
+
+	GetService() string
+
+	LatestLogtailAppliedTime() timestamp.Timestamp
+}
+
+type VectorPool interface {
+	PutBatch(bat *batch.Batch)
+	GetVector(typ types.Type) *vector.Vector
 }
 
 type Hints struct {
@@ -430,5 +1060,77 @@ type EntireEngine struct {
 }
 
 func IsMemtable(tblRange []byte) bool {
-	return len(tblRange) == 0
+	return bytes.Equal(tblRange, objectio.EmptyBlockInfoBytes)
+}
+
+type forceBuildRemoteDSConfig struct {
+	sync.Mutex
+	force  bool
+	tblIds []uint64
+}
+
+var forceBuildRemoteDS forceBuildRemoteDSConfig
+
+type forceShuffleReaderConfig struct {
+	sync.Mutex
+	force  bool
+	tblIds []uint64
+	blkCnt int
+}
+
+var forceShuffleReader forceShuffleReaderConfig
+
+func SetForceBuildRemoteDS(force bool, tbls []string) {
+	forceBuildRemoteDS.Lock()
+	defer forceBuildRemoteDS.Unlock()
+
+	forceBuildRemoteDS.tblIds = make([]uint64, len(tbls))
+	for i, tbl := range tbls {
+		id, err := strconv.Atoi(tbl)
+		if err != nil {
+			logutil.Errorf("SetForceBuildRemoteDS: invalid table id %s", tbl)
+			return
+		}
+
+		forceBuildRemoteDS.tblIds[i] = uint64(id)
+	}
+
+	forceBuildRemoteDS.force = force
+}
+
+func GetForceBuildRemoteDS() (bool, []uint64) {
+	forceBuildRemoteDS.Lock()
+	defer forceBuildRemoteDS.Unlock()
+
+	return forceBuildRemoteDS.force, forceBuildRemoteDS.tblIds
+}
+
+func SetForceShuffleReader(force bool, tbls []string, blkCnt int) {
+	forceShuffleReader.Lock()
+	defer forceShuffleReader.Unlock()
+
+	forceShuffleReader.tblIds = make([]uint64, len(tbls))
+	for i, tbl := range tbls {
+		id, err := strconv.Atoi(tbl)
+		if err != nil {
+			logutil.Errorf("SetForceBuildRemoteDS: invalid table id %s", tbl)
+			return
+		}
+
+		forceShuffleReader.tblIds[i] = uint64(id)
+	}
+
+	forceShuffleReader.force = force
+	forceShuffleReader.blkCnt = blkCnt
+}
+
+func GetForceShuffleReader() (bool, []uint64, int) {
+	forceShuffleReader.Lock()
+	defer forceShuffleReader.Unlock()
+
+	return forceShuffleReader.force, forceShuffleReader.tblIds, forceShuffleReader.blkCnt
+}
+
+type FilterHint struct {
+	Must bool
 }

@@ -16,6 +16,7 @@ package morpc
 
 import (
 	"context"
+	"io"
 	"os"
 	"sync"
 	"testing"
@@ -46,8 +47,8 @@ func TestHandleServer(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10000)
 		defer cancel()
 
-		rs.RegisterRequestHandler(func(_ context.Context, request Message, sequence uint64, cs ClientSession) error {
-			return cs.Write(ctx, request)
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, sequence uint64, cs ClientSession) error {
+			return cs.Write(ctx, request.Message)
 		})
 
 		req := newTestMessage(1)
@@ -71,8 +72,8 @@ func TestHandleServerWithPayloadMessage(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 		defer cancel()
 
-		rs.RegisterRequestHandler(func(_ context.Context, request Message, sequence uint64, cs ClientSession) error {
-			return cs.Write(ctx, request)
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, sequence uint64, cs ClientSession) error {
+			return cs.Write(ctx, request.Message)
 		})
 
 		req := &testMessage{id: 1, payload: []byte("payload")}
@@ -95,9 +96,9 @@ func TestHandleServerWriteWithClosedSession(t *testing.T) {
 		defer cancel()
 
 		c := newTestClient(t)
-		rs.RegisterRequestHandler(func(_ context.Context, request Message, _ uint64, cs ClientSession) error {
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, _ uint64, cs ClientSession) error {
 			assert.NoError(t, c.Close())
-			err := cs.Write(ctx, request)
+			err := cs.Write(ctx, request.Message)
 			assert.Error(t, err)
 			return err
 		})
@@ -122,9 +123,9 @@ func TestHandleServerWriteWithClosedClientSession(t *testing.T) {
 		defer cancel()
 
 		c := newTestClient(t)
-		rs.RegisterRequestHandler(func(_ context.Context, request Message, _ uint64, cs ClientSession) error {
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, _ uint64, cs ClientSession) error {
 			assert.NoError(t, cs.Close())
-			return cs.Write(ctx, request)
+			return cs.Write(ctx, request.Message)
 		})
 
 		req := newTestMessage(1)
@@ -132,9 +133,9 @@ func TestHandleServerWriteWithClosedClientSession(t *testing.T) {
 		assert.NoError(t, err)
 
 		defer f.Close()
-		resp, err := f.Get()
-		assert.Error(t, ctx.Err(), err)
-		assert.Nil(t, resp)
+		_, err = f.Get()
+		assert.Error(t, err)
+		assert.Equal(t, io.EOF, err)
 	})
 }
 
@@ -151,11 +152,11 @@ func TestStreamServer(t *testing.T) {
 		wg := sync.WaitGroup{}
 		wg.Add(1)
 		n := 10
-		rs.RegisterRequestHandler(func(_ context.Context, request Message, _ uint64, cs ClientSession) error {
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, _ uint64, cs ClientSession) error {
 			go func() {
 				defer wg.Done()
 				for i := 0; i < n; i++ {
-					assert.NoError(t, cs.Write(ctx, request))
+					assert.NoError(t, cs.Write(ctx, request.Message))
 				}
 			}()
 			return nil
@@ -164,7 +165,7 @@ func TestStreamServer(t *testing.T) {
 		st, err := c.NewStream(testAddr, false)
 		assert.NoError(t, err)
 		defer func() {
-			assert.NoError(t, st.Close())
+			assert.NoError(t, st.Close(false))
 		}()
 
 		req := newTestMessage(st.ID())
@@ -190,7 +191,8 @@ func TestStreamServerWithCache(t *testing.T) {
 			assert.NoError(t, c.Close())
 		}()
 
-		rs.RegisterRequestHandler(func(ctx context.Context, request Message, seq uint64, cs ClientSession) error {
+		rs.RegisterRequestHandler(func(ctx context.Context, msg RPCMessage, seq uint64, cs ClientSession) error {
+			request := msg.Message
 			if seq == 1 {
 				cache, err := cs.CreateCache(ctx, request.GetID())
 				if err != nil {
@@ -220,7 +222,7 @@ func TestStreamServerWithCache(t *testing.T) {
 		st, err := c.NewStream(testAddr, false)
 		assert.NoError(t, err)
 		defer func() {
-			assert.NoError(t, st.Close())
+			assert.NoError(t, st.Close(false))
 		}()
 
 		req1 := newTestMessage(st.ID())
@@ -254,7 +256,8 @@ func TestServerTimeoutCacheWillRemoved(t *testing.T) {
 		}()
 
 		cc := make(chan struct{})
-		rs.RegisterRequestHandler(func(ctx context.Context, request Message, seq uint64, cs ClientSession) error {
+		rs.RegisterRequestHandler(func(ctx context.Context, msg RPCMessage, seq uint64, cs ClientSession) error {
+			request := msg.Message
 			cache, err := cs.CreateCache(ctx, request.GetID())
 			if err != nil {
 				return err
@@ -266,7 +269,7 @@ func TestServerTimeoutCacheWillRemoved(t *testing.T) {
 		st, err := c.NewStream(testAddr, false)
 		assert.NoError(t, err)
 		defer func() {
-			assert.NoError(t, st.Close())
+			assert.NoError(t, st.Close(false))
 		}()
 
 		assert.NoError(t, st.Send(ctx, newTestMessage(1)))
@@ -296,15 +299,15 @@ func TestStreamServerWithSequenceNotMatch(t *testing.T) {
 			assert.NoError(t, c.Close())
 		}()
 
-		rs.RegisterRequestHandler(func(_ context.Context, request Message, _ uint64, cs ClientSession) error {
-			return cs.Write(ctx, request)
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, _ uint64, cs ClientSession) error {
+			return cs.Write(ctx, request.Message)
 		})
 
 		v, err := c.NewStream(testAddr, false)
 		assert.NoError(t, err)
 		st := v.(*stream)
 		defer func() {
-			assert.NoError(t, st.Close())
+			assert.NoError(t, st.Close(false))
 		}()
 
 		st.sequence = 2
@@ -316,6 +319,87 @@ func TestStreamServerWithSequenceNotMatch(t *testing.T) {
 		assert.NotNil(t, rc)
 		resp := <-rc
 		assert.Nil(t, resp)
+	})
+}
+
+func TestStreamReadCannotBlockWrite(t *testing.T) {
+	testRPCServer(t, func(rs *server) {
+		ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+		defer cancel()
+
+		c := newTestClient(t)
+		defer func() {
+			assert.NoError(t, c.Close())
+		}()
+
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, _ uint64, cs ClientSession) error {
+			return cs.Write(ctx, request.Message)
+		})
+
+		st, err := c.NewStream(testAddr, false)
+		assert.NoError(t, err)
+		defer func() {
+			assert.NoError(t, st.Close(false))
+		}()
+
+		ch, err := st.Receive()
+		require.NoError(t, err)
+
+		cc := make(chan struct{})
+		n := 1000
+		go func() {
+			defer close(cc)
+			i := 0
+			for {
+				<-ch
+				i++
+				if i == n {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}()
+		for i := 0; i < n; i++ {
+			require.NoError(t, st.Send(ctx, newTestMessage(st.ID())))
+		}
+		<-cc
+	})
+}
+
+func TestCannotGetClosedBackend(t *testing.T) {
+	testRPCServer(t, func(rs *server) {
+		ctx, cancel := context.WithTimeout(context.TODO(), time.Second*10)
+		defer cancel()
+
+		c := newTestClient(t, WithClientMaxBackendPerHost(2))
+		defer func() {
+			assert.NoError(t, c.Close())
+		}()
+
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, _ uint64, cs ClientSession) error {
+			return cs.Write(ctx, request.Message)
+		})
+
+		st, err := c.NewStream(testAddr, true)
+		require.NoError(t, err)
+		require.NoError(t, st.Close(true))
+
+		require.NoError(t, c.Ping(ctx, testAddr))
+	})
+}
+
+func TestPingError(t *testing.T) {
+	testRPCServer(t, func(rs *server) {
+		c := newTestClient(t, WithClientMaxBackendPerHost(2))
+		defer func() {
+			assert.NoError(t, c.Close())
+		}()
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, _ uint64, cs ClientSession) error {
+			return cs.Write(context.Background(), request.Message)
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+		cancel()
+		require.Error(t, c.Ping(ctx, testAddr))
 	})
 }
 
@@ -331,8 +415,8 @@ func BenchmarkSend(b *testing.B) {
 			assert.NoError(b, c.Close())
 		}()
 
-		rs.RegisterRequestHandler(func(_ context.Context, request Message, sequence uint64, cs ClientSession) error {
-			return cs.Write(ctx, request)
+		rs.RegisterRequestHandler(func(_ context.Context, request RPCMessage, sequence uint64, cs ClientSession) error {
+			return cs.Write(ctx, request.Message)
 		})
 
 		req := newTestMessage(1)
@@ -373,7 +457,10 @@ func testRPCServer(t assert.TestingT, testFunc func(*server), options ...ServerO
 
 func newTestClient(t assert.TestingT, options ...ClientOption) RPCClient {
 	bf := NewGoettyBasedBackendFactory(newTestCodec())
-	c, err := NewClient(bf, options...)
+	c, err := NewClient(
+		"",
+		bf,
+		options...)
 	assert.NoError(t, err)
 	return c
 }

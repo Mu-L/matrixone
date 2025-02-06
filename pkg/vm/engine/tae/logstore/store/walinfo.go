@@ -16,13 +16,12 @@ package store
 
 import (
 	"bytes"
-	"encoding/binary"
 	"io"
-	"math"
 	"sync"
 	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	driverEntry "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
@@ -41,7 +40,7 @@ type StoreInfo struct {
 	walDriverLsnMap     map[uint32]map[uint64]uint64
 	lsnMu               sync.RWMutex
 	driverCheckpointing atomic.Uint64
-	driverCheckpointed  uint64
+	driverCheckpointed  atomic.Uint64
 	walCurrentLsn       map[uint32]uint64 //todo
 	lsnmu               sync.RWMutex
 	syncing             map[uint32]uint64 //todo
@@ -113,6 +112,7 @@ func (w *StoreInfo) SetCheckpointed(gid uint32, lsn uint64) {
 	w.checkpointed[gid] = lsn
 	w.checkpointedMu.Unlock()
 }
+
 func (w *StoreInfo) allocateLsn(gid uint32) uint64 {
 	w.lsnmu.Lock()
 	defer w.lsnmu.Unlock()
@@ -139,7 +139,7 @@ func (w *StoreInfo) logDriverLsn(driverEntry *driverEntry.Entry) {
 		lsnMap = make(map[uint64]uint64)
 		w.walDriverLsnMap[info.Group] = lsnMap
 	}
-	lsnMap[info.GroupLSN] = driverEntry.Lsn
+	lsnMap[info.GroupLSN] = driverEntry.DSN
 	w.lsnMu.Unlock()
 }
 
@@ -160,7 +160,7 @@ func (w *StoreInfo) retryGetDriverLsn(gid uint32, lsn uint64) (driverLsn uint64,
 		currLsn := w.GetCurrSeqNum(gid)
 		if lsn <= currLsn {
 			for i := 0; i < 10; i++ {
-				logutil.Infof("retry %d-%d", gid, lsn)
+				logutil.Debugf("retry %d-%d", gid, lsn)
 				w.commitCond.L.Lock()
 				driverLsn, err = w.getDriverLsn(gid, lsn)
 				if err != ErrGroupNotFount && err != ErrLsnNotFount {
@@ -197,6 +197,27 @@ func (w *StoreInfo) getDriverLsn(gid uint32, lsn uint64) (driverLsn uint64, err 
 		return 0, ErrLsnNotFount
 	}
 	return
+}
+
+func (w *StoreInfo) gcWalDriverLsnMap(drlsn uint64) {
+	w.lsnMu.Lock()
+	defer w.lsnMu.Unlock()
+	for gid, walDriverLsnMap := range w.walDriverLsnMap {
+		minLsn := w.minLsn[gid]
+		lsnsToDelete := make([]uint64, 0)
+		for storeLSN, driverLSN := range walDriverLsnMap {
+			if driverLSN < drlsn {
+				lsnsToDelete = append(lsnsToDelete, storeLSN)
+				if storeLSN > minLsn {
+					minLsn = storeLSN
+				}
+			}
+		}
+		for _, lsn := range lsnsToDelete {
+			delete(walDriverLsnMap, lsn)
+		}
+		w.minLsn[gid] = minLsn + 1
+	}
 }
 
 func (w *StoreInfo) logCheckpointInfo(info *entry.Info) {
@@ -242,7 +263,9 @@ func (w *StoreInfo) onCheckpoint() {
 	}
 	w.ckpcntMu.Unlock()
 }
-
+func (w *StoreInfo) GetTruncated() uint64 {
+	return w.driverCheckpointed.Load()
+}
 func (w *StoreInfo) getDriverCheckpointed() (gid uint32, driverLsn uint64) {
 	groups := make(map[uint32]uint64, 0)
 	w.lsnmu.Lock()
@@ -256,37 +279,27 @@ func (w *StoreInfo) getDriverCheckpointed() (gid uint32, driverLsn uint64) {
 	if len(w.checkpointed) == 0 {
 		return
 	}
-	driverLsn = math.MaxInt64
-	for g, maxLsn := range groups {
-		lsn := w.checkpointed[g]
-		var drLsn uint64
-		var err error
-		if lsn < maxLsn {
-			drLsn, err = w.retryGetDriverLsn(g, lsn+1)
-			if err != nil {
-				if err == ErrLsnTooSmall {
-					logutil.Infof("%d-%d too small", g, lsn)
-					return g, 0
-				}
-				logutil.Infof("%d-%d", g, lsn)
-				panic(err)
+	maxLsn := groups[entry.GTCustomized]
+	lsn := w.checkpointed[entry.GTCustomized]
+	if lsn < maxLsn {
+		drLsn, err := w.retryGetDriverLsn(entry.GTCustomized, lsn+1)
+		if err != nil {
+			if err == ErrLsnTooSmall {
+				return entry.GTCustomized, 0
 			}
-			drLsn--
-		} else {
-			continue
+			panic(err)
 		}
-		if drLsn < driverLsn {
-			gid = g
-			driverLsn = drLsn
-		}
+		drLsn--
+		return entry.GTCustomized, drLsn
+	} else {
+		return entry.GTCustomized, maxLsn
 	}
-	return
 }
 
 func (w *StoreInfo) makeInternalCheckpointEntry() (e entry.Entry) {
 	e = entry.GetBase()
 	lsn := w.GetSynced(GroupCKP)
-	e.SetType(entry.ETPostCommit)
+	e.SetType(entry.IOET_WALEntry_PostCommit)
 	buf, err := w.marshalPostCommitEntry()
 	if err != nil {
 		panic(err)
@@ -322,12 +335,12 @@ func (w *StoreInfo) writePostCommitEntry(writer io.Writer) (n int64, err error) 
 	defer w.ckpMu.RUnlock()
 	//checkpointing
 	length := uint32(len(w.checkpointInfo))
-	if err = binary.Write(writer, binary.BigEndian, length); err != nil {
+	if _, err = writer.Write(types.EncodeUint32(&length)); err != nil {
 		return
 	}
 	n += 4
 	for groupID, ckpInfo := range w.checkpointInfo {
-		if err = binary.Write(writer, binary.BigEndian, groupID); err != nil {
+		if _, err = writer.Write(types.EncodeUint32(&groupID)); err != nil {
 			return
 		}
 		n += 4
@@ -345,13 +358,13 @@ func (w *StoreInfo) readPostCommitEntry(reader io.Reader) (n int64, err error) {
 	defer w.ckpMu.Unlock()
 	//checkpointing
 	length := uint32(0)
-	if err = binary.Read(reader, binary.BigEndian, &length); err != nil {
+	if _, err = reader.Read(types.EncodeUint32(&length)); err != nil {
 		return
 	}
 	n += 4
 	for i := 0; i < int(length); i++ {
 		groupID := uint32(0)
-		if err = binary.Read(reader, binary.BigEndian, &groupID); err != nil {
+		if _, err = reader.Read(types.EncodeUint32(&groupID)); err != nil {
 			return
 		}
 		n += 4

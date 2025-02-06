@@ -21,6 +21,7 @@
 package operator
 
 import (
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 )
 
@@ -67,9 +68,61 @@ type ExecutingReplicas struct {
 	Adding   map[uint64][]uint64
 	Removing map[uint64][]uint64
 	Starting map[uint64][]uint64
+	// Bootstrapping records the shards that are in bootstrapping state
+	// and has not finished.
+	Bootstrapping map[uint64]struct{}
 }
 
 func (c *Controller) GetExecutingReplicas() ExecutingReplicas {
+	executing := ExecutingReplicas{
+		Adding:        make(map[uint64][]uint64),
+		Removing:      make(map[uint64][]uint64),
+		Starting:      make(map[uint64][]uint64),
+		Bootstrapping: make(map[uint64]struct{}),
+	}
+	for shardID, operators := range c.operators {
+		for _, op := range operators {
+			for _, step := range op.steps {
+				switch step := step.(type) {
+				case RemoveLogService:
+					executing.Removing[shardID] = append(executing.Removing[shardID], step.ReplicaID)
+				case AddLogService:
+					executing.Adding[shardID] = append(executing.Adding[shardID], step.ReplicaID)
+				case StartLogService:
+					executing.Starting[shardID] = append(executing.Starting[shardID], step.ReplicaID)
+				case BootstrapShard:
+					executing.Bootstrapping[shardID] = struct{}{}
+				}
+			}
+		}
+	}
+	return executing
+}
+
+func (c *Controller) GetNonVotingExecutingReplicas() ExecutingReplicas {
+	executing := ExecutingReplicas{
+		Adding:   make(map[uint64][]uint64),
+		Removing: make(map[uint64][]uint64),
+		Starting: make(map[uint64][]uint64),
+	}
+	for shardID, operators := range c.operators {
+		for _, op := range operators {
+			for _, step := range op.steps {
+				switch step := step.(type) {
+				case RemoveNonVotingLogService:
+					executing.Removing[shardID] = append(executing.Removing[shardID], step.ReplicaID)
+				case AddNonVotingLogService:
+					executing.Adding[shardID] = append(executing.Adding[shardID], step.ReplicaID)
+				case StartNonVotingLogService:
+					executing.Starting[shardID] = append(executing.Starting[shardID], step.ReplicaID)
+				}
+			}
+		}
+	}
+	return executing
+}
+
+func (c *Controller) GetExecutingNonVotingReplicas() ExecutingReplicas {
 	executing := ExecutingReplicas{
 		Adding:   make(map[uint64][]uint64),
 		Removing: make(map[uint64][]uint64),
@@ -92,10 +145,12 @@ func (c *Controller) GetExecutingReplicas() ExecutingReplicas {
 	return executing
 }
 
-func (c *Controller) RemoveFinishedOperator(logState pb.LogState, dnState pb.DNState, cnState pb.CNState) {
+func (c *Controller) RemoveFinishedOperator(
+	logState pb.LogState, tnState pb.TNState, cnState pb.CNState, proxyState pb.ProxyState,
+) {
 	for _, ops := range c.operators {
 		for _, op := range ops {
-			op.Check(logState, dnState, cnState)
+			op.Check(logState, tnState, cnState, proxyState)
 			switch op.Status() {
 			case SUCCESS, EXPIRED:
 				c.RemoveOperator(op)
@@ -105,10 +160,10 @@ func (c *Controller) RemoveFinishedOperator(logState pb.LogState, dnState pb.DNS
 }
 
 func (c *Controller) Dispatch(ops []*Operator, logState pb.LogState,
-	dnState pb.DNState, cnState pb.CNState) (commands []pb.ScheduleCommand) {
+	tnState pb.TNState, cnState pb.CNState, proxyState pb.ProxyState) (commands []pb.ScheduleCommand) {
 	for _, op := range ops {
 		c.operators[op.shardID] = append(c.operators[op.shardID], op)
-		if step := op.Check(logState, dnState, cnState); step != nil {
+		if step := op.Check(logState, tnState, cnState, proxyState); step != nil {
 			commands = append(commands, generateScheduleCommand(step))
 		}
 	}
@@ -117,28 +172,44 @@ func (c *Controller) Dispatch(ops []*Operator, logState pb.LogState,
 
 func generateScheduleCommand(step OpStep) pb.ScheduleCommand {
 	switch st := step.(type) {
+	case AddLogShard:
+		return addLogShard(st)
+	case BootstrapShard:
+		return bootstrapShard(st)
 	case AddLogService:
 		return addLogService(st)
+	case AddNonVotingLogService:
+		return addNonVotingLogService(st)
 	case RemoveLogService:
 		return removeLogService(st)
+	case RemoveNonVotingLogService:
+		return removeNonVotingLogService(st)
 	case StartLogService:
 		return startLogService(st)
+	case StartNonVotingLogService:
+		return startNonVotingLogService(st)
 	case StopLogService:
 		return stopLogService(st)
+	case StopNonVotingLogService:
+		return stopNonVotingLogService(st)
 	case KillLogZombie:
 		return killLogZombie(st)
-	case AddDnReplica:
-		return addDnReplica(st)
-	case RemoveDnReplica:
-		return removeDnReplica(st)
-	case StopDnStore:
-		return stopDnStore(st)
+	case AddTnReplica:
+		return addTnReplica(st)
+	case RemoveTnReplica:
+		return removeTnReplica(st)
+	case StopTnStore:
+		return stopTnStore(st)
 	case StopLogStore:
 		return stopLogStore(st)
 	case CreateTaskService:
 		return createTaskService(st)
 	case DeleteCNStore:
 		return deleteCNStore(st)
+	case JoinGossipCluster:
+		return joinGossipCluster(st)
+	case DeleteProxyStore:
+		return deleteProxyStore(st)
 	}
 	panic("invalid schedule command")
 }
@@ -154,6 +225,38 @@ func addLogService(st AddLogService) pb.ScheduleCommand {
 				Epoch:     st.Epoch,
 			},
 			ChangeType: pb.AddReplica,
+		},
+		ServiceType: pb.LogService,
+	}
+}
+
+func addNonVotingLogService(st AddNonVotingLogService) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID: st.Target,
+		ConfigChange: &pb.ConfigChange{
+			Replica: pb.Replica{
+				UUID:      st.UUID,
+				ShardID:   st.ShardID,
+				ReplicaID: st.ReplicaID,
+				Epoch:     st.Epoch,
+			},
+			ChangeType: pb.AddNonVotingReplica,
+		},
+		ServiceType: pb.LogService,
+	}
+}
+
+func removeNonVotingLogService(st RemoveNonVotingLogService) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID: st.Target,
+		ConfigChange: &pb.ConfigChange{
+			Replica: pb.Replica{
+				UUID:      st.UUID,
+				ShardID:   st.ShardID,
+				ReplicaID: st.ReplicaID,
+				Epoch:     st.Epoch,
+			},
+			ChangeType: pb.RemoveNonVotingReplica,
 		},
 		ServiceType: pb.LogService,
 	}
@@ -190,6 +293,21 @@ func startLogService(st StartLogService) pb.ScheduleCommand {
 	}
 }
 
+func startNonVotingLogService(st StartNonVotingLogService) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID: st.UUID,
+		ConfigChange: &pb.ConfigChange{
+			Replica: pb.Replica{
+				UUID:      st.UUID,
+				ShardID:   st.ShardID,
+				ReplicaID: st.ReplicaID,
+			},
+			ChangeType: pb.StartNonVotingReplica,
+		},
+		ServiceType: pb.LogService,
+	}
+}
+
 func stopLogService(st StopLogService) pb.ScheduleCommand {
 	return pb.ScheduleCommand{
 		UUID: st.UUID,
@@ -200,6 +318,21 @@ func stopLogService(st StopLogService) pb.ScheduleCommand {
 				Epoch:   st.Epoch,
 			},
 			ChangeType: pb.RemoveReplica,
+		},
+		ServiceType: pb.LogService,
+	}
+}
+
+func stopNonVotingLogService(st StopNonVotingLogService) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID: st.UUID,
+		ConfigChange: &pb.ConfigChange{
+			Replica: pb.Replica{
+				UUID:    st.UUID,
+				ShardID: st.ShardID,
+				Epoch:   st.Epoch,
+			},
+			ChangeType: pb.RemoveNonVotingReplica,
 		},
 		ServiceType: pb.LogService,
 	}
@@ -221,7 +354,7 @@ func killLogZombie(st KillLogZombie) pb.ScheduleCommand {
 	}
 }
 
-func addDnReplica(st AddDnReplica) pb.ScheduleCommand {
+func addTnReplica(st AddTnReplica) pb.ScheduleCommand {
 	return pb.ScheduleCommand{
 		UUID: st.StoreID,
 		ConfigChange: &pb.ConfigChange{
@@ -233,11 +366,11 @@ func addDnReplica(st AddDnReplica) pb.ScheduleCommand {
 			},
 			ChangeType: pb.StartReplica,
 		},
-		ServiceType: pb.DNService,
+		ServiceType: pb.TNService,
 	}
 }
 
-func removeDnReplica(st RemoveDnReplica) pb.ScheduleCommand {
+func removeTnReplica(st RemoveTnReplica) pb.ScheduleCommand {
 	return pb.ScheduleCommand{
 		UUID: st.StoreID,
 		ConfigChange: &pb.ConfigChange{
@@ -249,17 +382,17 @@ func removeDnReplica(st RemoveDnReplica) pb.ScheduleCommand {
 			},
 			ChangeType: pb.StopReplica,
 		},
-		ServiceType: pb.DNService,
+		ServiceType: pb.TNService,
 	}
 }
 
-func stopDnStore(st StopDnStore) pb.ScheduleCommand {
+func stopTnStore(st StopTnStore) pb.ScheduleCommand {
 	return pb.ScheduleCommand{
 		UUID: st.StoreID,
 		ShutdownStore: &pb.ShutdownStore{
 			StoreID: st.StoreID,
 		},
-		ServiceType: pb.DNService,
+		ServiceType: pb.TNService,
 	}
 }
 
@@ -279,7 +412,7 @@ func createTaskService(st CreateTaskService) pb.ScheduleCommand {
 		ServiceType: st.StoreType,
 		CreateTaskService: &pb.CreateTaskService{
 			User:         st.TaskUser,
-			TaskDatabase: "mo_task",
+			TaskDatabase: catalog.MOTaskDB,
 		},
 	}
 }
@@ -290,6 +423,49 @@ func deleteCNStore(st DeleteCNStore) pb.ScheduleCommand {
 		ServiceType: pb.CNService,
 		DeleteCNStore: &pb.DeleteCNStore{
 			StoreID: st.StoreID,
+		},
+	}
+}
+
+func joinGossipCluster(st JoinGossipCluster) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID:        st.StoreID,
+		ServiceType: pb.CNService,
+		JoinGossipCluster: &pb.JoinGossipCluster{
+			Existing: st.Existing,
+		},
+	}
+}
+
+func deleteProxyStore(st DeleteProxyStore) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID:        st.StoreID,
+		ServiceType: pb.ProxyService,
+		DeleteProxyStore: &pb.DeleteProxyStore{
+			StoreID: st.StoreID,
+		},
+	}
+}
+
+func addLogShard(st AddLogShard) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID:        st.UUID,
+		ServiceType: pb.LogService,
+		AddLogShard: &pb.AddLogShard{
+			ShardID: st.ShardID,
+		},
+	}
+}
+
+func bootstrapShard(st BootstrapShard) pb.ScheduleCommand {
+	return pb.ScheduleCommand{
+		UUID:        st.UUID,
+		ServiceType: pb.LogService,
+		BootstrapShard: &pb.BootstrapShard{
+			ShardID:        st.ShardID,
+			ReplicaID:      st.ReplicaID,
+			InitialMembers: st.InitialMembers,
+			Join:           false,
 		},
 	}
 }

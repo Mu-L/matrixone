@@ -18,12 +18,14 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"iter"
 	"os"
 	pathpkg "path"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 )
@@ -35,13 +37,39 @@ type LocalETLFS struct {
 
 	sync.RWMutex
 	dirFiles map[string]*os.File
-
-	createTempDirOnce sync.Once
 }
 
 var _ FileService = new(LocalETLFS)
 
 func NewLocalETLFS(name string, rootPath string) (*LocalETLFS, error) {
+
+	// get absolute path
+	if rootPath != "" {
+		var err error
+		rootPath, err = filepath.Abs(rootPath)
+		if err != nil {
+			return nil, err
+		}
+
+		// ensure dir
+		f, err := os.Open(rootPath)
+		if os.IsNotExist(err) {
+			// not exists, create
+			err := os.MkdirAll(rootPath, 0755)
+			if err != nil {
+				return nil, err
+			}
+
+		} else if err != nil {
+			// stat error
+			return nil, err
+
+		} else {
+			defer f.Close()
+		}
+
+	}
+
 	return &LocalETLFS{
 		name:     name,
 		rootPath: rootPath,
@@ -53,11 +81,7 @@ func (l *LocalETLFS) Name() string {
 	return l.name
 }
 
-func (l *LocalETLFS) ensureTempDir() (err error) {
-	l.createTempDirOnce.Do(func() {
-		err = os.MkdirAll(filepath.Join(l.rootPath, ".tmp"), 0755)
-	})
-	return
+func (l *LocalETLFS) Close(ctx context.Context) {
 }
 
 func (l *LocalETLFS) Write(ctx context.Context, vector IOVector) error {
@@ -102,18 +126,20 @@ func (l *LocalETLFS) write(ctx context.Context, vector IOVector) error {
 		size = int64(last.Offset + last.Size)
 	}
 
+	r := newIOEntriesReader(ctx, vector.Entries)
+
 	// write
-	if err := l.ensureTempDir(); err != nil {
-		return err
-	}
 	f, err := os.CreateTemp(
-		filepath.Join(l.rootPath, ".tmp"),
-		"*.tmp",
+		l.rootPath,
+		".tmp.*",
 	)
 	if err != nil {
 		return err
 	}
-	n, err := io.Copy(f, newIOEntriesReader(ctx, vector.Entries))
+	var buf []byte
+	put := ioBufferPool.Get(&buf)
+	defer put.Put()
+	n, err := io.CopyBuffer(f, r, buf)
 	if err != nil {
 		return err
 	}
@@ -205,23 +231,30 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 				r = io.LimitReader(r, int64(entry.Size))
 			}
 
-			if entry.ToObject != nil {
+			if entry.ToCacheData != nil {
 				r = io.TeeReader(r, entry.WriterForRead)
+				counter := new(atomic.Int64)
 				cr := &countingReader{
 					R: r,
+					C: counter,
 				}
-				obj, size, err := entry.ToObject(cr, nil)
+				cacheData, err := entry.ToCacheData(ctx, cr, nil, DefaultCacheDataAllocator())
 				if err != nil {
 					return err
 				}
-				vector.Entries[i].Object = obj
-				vector.Entries[i].ObjectSize = size
-				if entry.Size > 0 && cr.N != entry.Size {
+				if cacheData == nil {
+					panic("ToCacheData returns nil cache data")
+				}
+				vector.Entries[i].CachedData = cacheData
+				if entry.Size > 0 && counter.Load() != entry.Size {
 					return moerr.NewUnexpectedEOFNoCtx(path.File)
 				}
 
 			} else {
-				n, err := io.Copy(entry.WriterForRead, r)
+				var buf []byte
+				put := ioBufferPool.Get(&buf)
+				defer put.Put()
+				n, err := io.CopyBuffer(entry.WriterForRead, r, buf)
 				if err != nil {
 					return err
 				}
@@ -247,7 +280,7 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 			if entry.Size > 0 {
 				r = io.LimitReader(r, int64(entry.Size))
 			}
-			if entry.ToObject == nil {
+			if entry.ToCacheData == nil {
 				*entry.ReadCloserForRead = &readCloser{
 					r:         r,
 					closeFunc: f.Close,
@@ -258,12 +291,14 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 					r: io.TeeReader(r, buf),
 					closeFunc: func() error {
 						defer f.Close()
-						obj, size, err := entry.ToObject(buf, buf.Bytes())
+						cacheData, err := entry.ToCacheData(ctx, buf, buf.Bytes(), DefaultCacheDataAllocator())
 						if err != nil {
 							return err
 						}
-						vector.Entries[i].Object = obj
-						vector.Entries[i].ObjectSize = size
+						if cacheData != nil {
+							panic("ToCacheData returns nil cache data")
+						}
+						vector.Entries[i].CachedData = cacheData
 						return nil
 					},
 				}
@@ -311,7 +346,7 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 				}
 			}
 
-			if err := entry.setObjectFromData(); err != nil {
+			if err := entry.setCachedData(ctx, DefaultCacheDataAllocator()); err != nil {
 				return err
 			}
 
@@ -324,7 +359,7 @@ func (l *LocalETLFS) Read(ctx context.Context, vector *IOVector) error {
 
 }
 
-func (l *LocalETLFS) Preload(ctx context.Context, filePath string) error {
+func (l *LocalETLFS) ReadCache(ctx context.Context, vector *IOVector) error {
 	return nil
 }
 
@@ -360,59 +395,67 @@ func (l *LocalETLFS) StatFile(ctx context.Context, filePath string) (*DirEntry, 
 	}, nil
 }
 
-func (l *LocalETLFS) List(ctx context.Context, dirPath string) (ret []DirEntry, err error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
+func (l *LocalETLFS) PrefetchFile(ctx context.Context, filePath string) error {
+	return nil
+}
 
-	path, err := ParsePathAtService(dirPath, l.name)
-	if err != nil {
-		return nil, err
-	}
-	nativePath := l.toNativeFilePath(path.File)
-
-	f, err := os.Open(nativePath)
-	if os.IsNotExist(err) {
-		err = nil
-		return
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	entries, err := f.ReadDir(-1)
-	for _, entry := range entries {
-		name := entry.Name()
-		if strings.HasPrefix(name, ".") {
-			continue
+func (l *LocalETLFS) List(ctx context.Context, dirPath string) iter.Seq2[*DirEntry, error] {
+	return func(yield func(*DirEntry, error) bool) {
+		select {
+		case <-ctx.Done():
+			yield(nil, ctx.Err())
+			return
+		default:
 		}
-		info, err := entry.Info()
+
+		path, err := ParsePathAtService(dirPath, l.name)
 		if err != nil {
-			return nil, err
+			yield(nil, err)
+			return
 		}
-		isDir, err := entryIsDir(nativePath, name, info)
+		nativePath := l.toNativeFilePath(path.File)
+
+		f, err := os.Open(nativePath)
+		if os.IsNotExist(err) {
+			return
+		}
 		if err != nil {
-			return nil, err
+			yield(nil, err)
+			return
 		}
-		ret = append(ret, DirEntry{
-			Name:  name,
-			IsDir: isDir,
-			Size:  info.Size(),
-		})
+		defer f.Close()
+
+		entries, err := f.ReadDir(-1)
+		for _, entry := range entries {
+			name := entry.Name()
+			if strings.HasPrefix(name, ".") {
+				continue
+			}
+			info, err := entry.Info()
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			isDir, err := entryIsDir(nativePath, name, info)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+			if !yield(&DirEntry{
+				Name:  name,
+				IsDir: isDir,
+				Size:  info.Size(),
+			}, nil) {
+				break
+			}
+		}
+
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+
 	}
-
-	sort.Slice(ret, func(i, j int) bool {
-		return ret[i].Name < ret[j].Name
-	})
-
-	if err != nil {
-		return ret, err
-	}
-
-	return
 }
 
 func (l *LocalETLFS) Delete(ctx context.Context, filePaths ...string) error {
@@ -438,10 +481,11 @@ func (l *LocalETLFS) deleteSingle(ctx context.Context, filePath string) error {
 	nativePath := l.toNativeFilePath(path.File)
 
 	_, err = os.Stat(nativePath)
-	if os.IsNotExist(err) {
-		return moerr.NewFileNotFoundNoCtx(path.File)
-	}
 	if err != nil {
+		if os.IsNotExist(err) {
+			// ignore not found error
+			return nil
+		}
 		return err
 	}
 
@@ -492,6 +536,10 @@ func (l *LocalETLFS) ensureDir(nativePath string) error {
 
 	// create
 	if err := os.Mkdir(nativePath, 0755); err != nil {
+		if os.IsExist(err) {
+			// existed
+			return nil
+		}
 		return err
 	}
 
@@ -527,6 +575,12 @@ func (l *LocalETLFS) syncDir(nativePath string) error {
 		return err
 	}
 	return nil
+}
+
+func (l *LocalETLFS) Cost() *CostAttr {
+	return &CostAttr{
+		List: CostLow,
+	}
 }
 
 func (l *LocalETLFS) toNativeFilePath(filePath string) string {
@@ -586,7 +640,10 @@ func (l *LocalETLFSMutator) mutate(ctx context.Context, baseOffset int64, entrie
 			if err != nil {
 				return err
 			}
-			n, err := io.Copy(l.osFile, entry.ReaderForWrite)
+			var buf []byte
+			put := ioBufferPool.Get(&buf)
+			defer put.Put()
+			n, err := io.CopyBuffer(l.osFile, entry.ReaderForWrite, buf)
 			if err != nil {
 				return err
 			}

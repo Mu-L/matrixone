@@ -19,9 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestGCZombie(t *testing.T) {
@@ -105,9 +106,9 @@ func TestGCZombieNonCoordinatorTxn(t *testing.T) {
 	sender.AddTxnService(s)
 
 	wTxn := NewTestTxn(1, 1, 1)
-	wTxn.DNShards = append(wTxn.DNShards, NewTestDNShard(2))
+	wTxn.TNShards = append(wTxn.TNShards, NewTestTNShard(2))
 	// make shard 2 is coordinator
-	wTxn.DNShards[0], wTxn.DNShards[1] = wTxn.DNShards[1], wTxn.DNShards[0]
+	wTxn.TNShards[0], wTxn.TNShards[1] = wTxn.TNShards[1], wTxn.TNShards[0]
 
 	checkResponses(t, writeTestData(t, sender, 1, wTxn, 1))
 
@@ -119,4 +120,25 @@ func TestGCZombieNonCoordinatorTxn(t *testing.T) {
 	_, err := w1.wait(ctx)
 	assert.Error(t, err)
 	assert.Equal(t, moerr.ConvertGoError(ctx, ctx.Err()), err)
+}
+
+func Test_parallelSendWithRetry(t *testing.T) {
+	sender := NewTestSender()
+	defer func() {
+		assert.NoError(t, sender.Close())
+	}()
+
+	zombie := time.Millisecond * 3
+	s := NewTestTxnServiceWithLogAndZombie(t, 1, sender, NewTestClock(1), nil, zombie).(*service)
+	assert.NoError(t, s.Start())
+	defer func() {
+		assert.NoError(t, s.Close(false))
+	}()
+
+	sender.AddTxnService(s)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sender.action = "return_err_and_reset"
+	s.parallelSendWithRetry(ctx, nil, nil)
 }

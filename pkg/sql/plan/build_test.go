@@ -22,24 +22,68 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/golang/mock/gomock"
+	"github.com/stretchr/testify/assert"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	moruntime "github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect/mysql"
-	"github.com/matrixorigin/matrixone/pkg/vm/process"
-	"github.com/stretchr/testify/assert"
+	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/testutil"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
 )
+
+func BenchmarkInsert(b *testing.B) {
+	typ := types.T_varchar.ToType()
+	typ.Width = 1024
+	targetType := makePlan2Type(&typ)
+	targetType.Width = 1024
+
+	originStr := "0123456789"
+	testExpr := tree.NewNumVal(originStr, originStr, false, tree.P_char)
+	targetT := &plan.Expr{
+		Typ: targetType,
+		Expr: &plan.Expr_T{
+			T: &plan.TargetType{},
+		},
+	}
+	ctx := context.TODO()
+	for i := 0; i < b.N; i++ {
+		binder := NewDefaultBinder(ctx, nil, nil, targetType, nil)
+		expr, err := binder.BindExpr(testExpr, 0, true)
+		if err != nil {
+			break
+		}
+		_, err = forceCastExpr2(ctx, expr, typ, targetT)
+		if err != nil {
+			break
+		}
+	}
+}
 
 // only use in developing
 func TestSingleSQL(t *testing.T) {
-	//sql := "select * from nation"
-	//sql := "create view v_nation as select n_nationkey,n_name,n_regionkey,n_comment from nation"
-	//sql := "CREATE TABLE t1(id INT PRIMARY KEY,name VARCHAR(25),deptId INT,CONSTRAINT fk_t1 FOREIGN KEY(deptId) REFERENCES nation(n_nationkey))"
-	sql := "create table t2(empno int unsigned,ename varchar(15),job varchar(10)) cluster by(empno,ename)"
-	mock := NewMockOptimizer(false)
-	logicPlan, err := runOneStmt(mock, t, sql)
-	if err != nil {
-		t.Fatalf("%+v", err)
+	// sql := "INSERT INTO NATION VALUES (1, 'NAME1',21, 'COMMENT1'), (2, 'NAME2', 22, 'COMMENT2')"
+	// sql := "insert into dept values (11, 'aa', 'bb')"
+	// sql := "delete from dept where deptno > 10"
+	// sql := "delete from nation where n_nationkey > 10"
+	// sql := "delete nation, nation2 from nation join nation2 on nation.n_name = nation2.n_name"
+	// sql := "update nation set n_name ='a' where n_nationkey > 10"
+	// sql := "update dept set deptno = 11 where deptno = 10"
+	sqls := []string{"prepare stmt1 from update nation set n_name = ? where n_nationkey = ?",
+		"prepare stmt1 from insert into  nation values (?, ?, ?, ?) ON DUPLICATE KEY UPDATE n_name=?"}
+	mock := NewMockOptimizer(true)
+
+	for _, sql := range sqls {
+		logicPlan, err := runOneStmt(mock, t, sql)
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		outPutPlan(logicPlan, true, t)
 	}
-	outPutPlan(logicPlan, true, t)
 }
 
 //Test Query Node Tree
@@ -447,10 +491,11 @@ func TestSingleTableSQLBuilder(t *testing.T) {
 		"select 2222332222222223333333333333333333, 0x616263,-10, bit_and(2), bit_or(2), bit_xor(10.1), 'aaa' like '%a',str_to_date('04/31/2004', '%m/%d/%Y'),unix_timestamp(from_unixtime(2147483647))",
 		"select max(n_nationkey) over  (partition by N_REGIONKEY) from nation",
 		"select * from generate_series(1, 5) g",
-		"select * from nation where n_name like ? or n_nationkey > 10 order by 2 limit '10'",
+		"prepare stmt1 from select * from nation where n_name like ? or n_nationkey > 10 order by 2 limit '10'",
 
 		"values row(1,1), row(2,2), row(3,3) order by column_0 limit 2",
 		"select * from (values row(1,1), row(2,2), row(3,3)) a (c1, c2)",
+		"prepare stmt1 from select * from nation where n_name like ? or n_nationkey > 10 order by 2 limit '10' for update",
 	}
 	runTestShouldPass(mock, t, sqls, false, false)
 
@@ -468,6 +513,7 @@ func TestSingleTableSQLBuilder(t *testing.T) {
 
 		"SELECT DISTINCT N_NAME FROM NATION GROUP BY N_REGIONKEY", //test distinct with group by
 		"SELECT DISTINCT N_NAME FROM NATION ORDER BY N_REGIONKEY", //test distinct with order by
+		"select count(n_name) from nation limit 10 for update",
 		//"select 18446744073709551500",                             //over int64
 		//"select 0xffffffffffffffff",                               //over int64
 	}
@@ -494,6 +540,7 @@ func TestJoinTableSqlBuilder(t *testing.T) {
 		"SELECT N_NAME, R_REGIONKEY FROM NATION2 join REGION using(R_REGIONKEY)",
 		"select nation.n_name from nation join nation2 on nation.n_name !='a' join region on nation.n_regionkey = region.r_regionkey",
 		"select * from nation, nation2, region",
+		"select n_name from nation dedup join region on n_regionkey = r_regionkey",
 	}
 	runTestShouldPass(mock, t, sqls, false, false)
 
@@ -503,6 +550,8 @@ func TestJoinTableSqlBuilder(t *testing.T) {
 		"SELECT N_NAME, R_REGIONKEY FROM NATION join REGION using(R_REGIONKEY)",                                              //column not exist
 		"SELECT N_NAME,N_REGIONKEY FROM NATION a join REGION b on a.N_REGIONKEY = b.R_REGIONKEY WHERE aaaaa.N_REGIONKEY > 0", //table alias not exist
 		"select *", //No table used
+		"SELECT * FROM NATION a join REGION b on a.N_REGIONKEY = b.R_REGIONKEY WHERE a.N_REGIONKEY > 0 for update", //Not support
+		"select * from nation, nation2, region for update",                                                         // Not support
 	}
 	runTestShouldError(mock, t, sqls)
 }
@@ -529,6 +578,7 @@ func TestDerivedTableSqlBuilder(t *testing.T) {
 		"select c_custkey2222 from (select c_custkey from CUSTOMER group by c_custkey ) a",    //column not exist
 		"select col1 from (select c_custkey from CUSTOMER group by c_custkey ) a(col1, col2)", //column length not match
 		"select c_custkey from (select c_custkey from CUSTOMER group by c_custkey) a(col1)",   //column not exist
+		"select c_custkey from (select c_custkey from CUSTOMER ) a for update ",               //not support
 	}
 	runTestShouldError(mock, t, sqls)
 }
@@ -571,7 +621,6 @@ func TestCTESqlBuilder(t *testing.T) {
 	// should pass
 	sqls := []string{
 		"WITH qn AS (SELECT * FROM nation) SELECT * FROM qn;",
-		"WITH qn(a, b) AS (SELECT * FROM nation) SELECT * FROM qn;",
 		"with qn0 as (select 1), qn1 as (select * from qn0), qn2 as (select 1), qn3 as (select 1 from qn1, qn2) select 1 from qn3",
 
 		`WITH qn AS (select "outer" as a)
@@ -583,6 +632,7 @@ func TestCTESqlBuilder(t *testing.T) {
 
 	// should error
 	sqls = []string{
+		"WITH qn(a, b) AS (SELECT * FROM nation) SELECT * FROM qn;",
 		`with qn1 as (with qn3 as (select * from qn2) select * from qn3),
 		qn2 as (select 1)
 		select * from qn1`,
@@ -699,6 +749,7 @@ func TestSubQuery(t *testing.T) {
 		"SELECT * FROM NATION where N_REGIONKEY > (select max(R_REGIONKEY) from REGION222)",                                 // table not exist
 		"SELECT * FROM NATION where N_REGIONKEY > (select max(R_REGIONKEY) from REGION where R_REGIONKEY < N_REGIONKEY222)", // column not exist
 		"SELECT * FROM NATION where N_REGIONKEY > (select max(R_REGIONKEY) from REGION where R_REGIONKEY < N_REGIONKEY)",    // related
+		"SELECT * FROM NATION where N_REGIONKEY > (select max(R_REGIONKEY) from REGION) for update",                         // not support
 	}
 	runTestShouldError(mock, t, sqls)
 }
@@ -738,6 +789,11 @@ func TestTcl(t *testing.T) {
 
 func TestDdl(t *testing.T) {
 	mock := NewMockOptimizer(true)
+	rt := moruntime.DefaultRuntime()
+	moruntime.SetupServiceBasedRuntime("", rt)
+	rt.SetGlobalVariables(moruntime.InternalSQLExecutor, executor.NewMemExecutor(func(sql string) (executor.Result, error) {
+		return executor.Result{}, nil
+	}))
 	// should pass
 	sqls := []string{
 		"create database db_name",               //db not exists and pass
@@ -783,12 +839,13 @@ func TestDdl(t *testing.T) {
 		"drop table tpch.tbl_not_exist", //database not exists
 		"drop table db_not_exist.tbl",   //table not exists
 		"create table t6(empno int unsigned,ename varchar(15) auto_increment) cluster by(empno,ename)",
-		"lock tables t3 read",
+		//"lock tables t3 read",
 		"lock tables t1 read, t1 write",
 		"lock tables nation read, nation write",
 		"alter table nation drop foreign key fk1", //key not exists
 		"alter table nation add FOREIGN KEY fk_t1(col_not_exist) REFERENCES nation2(n_nationkey)",
 		"alter table nation add FOREIGN KEY fk_t1(n_nationkey) REFERENCES nation2(col_not_exist)",
+		"create table agg01 (col1 int, col2 enum('egwjqebwq', 'qwewqewqeqewq', 'weueiwqeowqehwgqjhenw') primary key)",
 	}
 	runTestShouldError(mock, t, sqls)
 }
@@ -827,6 +884,14 @@ func TestShow(t *testing.T) {
 		"show grants for ROLE role1",
 		"show function status",
 		"show function status like '%ff'",
+		"show snapshots",
+		"show snapshots where SNAPSHOT_NAME = 'snapshot_07'",
+		// "show procedure status",
+		// "show procedure status like '%ff'",
+		"show roles",
+		"show roles like '%ff'",
+		"show stages",
+		"show stages like 'my_stage%'",
 		// "show grants",
 	}
 	runTestShouldPass(mock, t, sqls, false, false)
@@ -978,7 +1043,7 @@ func TestBuildUnnest(t *testing.T) {
 }
 
 func TestVisitRule(t *testing.T) {
-	sql := "select * from nation where n_nationkey > ? or n_nationkey=@int_var or abs(-1) > 1"
+	sql := "select * from nation where n_nationkey > 10 or n_nationkey=@int_var or abs(-1) > 1"
 	mock := NewMockOptimizer(false)
 	ctx := context.TODO()
 	plan, err := runOneStmt(mock, t, sql)
@@ -1005,12 +1070,61 @@ func TestVisitRule(t *testing.T) {
 		makePlan2Int64ConstExprWithType(10),
 	}
 	resetParamRule := NewResetParamRefRule(ctx, params)
-	resetVarRule := NewResetVarRefRule(&mock.ctxt, &process.Process{})
-	constantFoldRule := NewConstantFoldRule(&mock.ctxt)
-	vp = NewVisitPlan(plan, []VisitPlanRule{resetParamRule, resetVarRule, constantFoldRule})
+	vp = NewVisitPlan(plan, []VisitPlanRule{resetParamRule})
 	err = vp.Visit(ctx)
 	if err != nil {
 		t.Fatalf("should not error, sql=%s", sql)
+	}
+}
+
+func TestVisitRule2(t *testing.T) {
+	sql := "select * from nation where n_nationkey > 10"
+	mock := NewMockOptimizer(false)
+	ctx := context.TODO()
+	queryPlan, err := runOneStmt(mock, t, sql)
+	if err != nil {
+		t.Fatalf("should not error, sql=%s", sql)
+	}
+	getParamRule := NewGetParamRule()
+	vp := NewVisitPlan(queryPlan, []VisitPlanRule{getParamRule})
+	err = vp.Visit(context.TODO())
+	if err != nil {
+		t.Fatalf("should not error, sql=%s", sql)
+	}
+	getParamRule.SetParamOrder()
+	args := getParamRule.params
+
+	resetParamOrderRule := NewResetParamOrderRule(args)
+	vp = NewVisitPlan(queryPlan, []VisitPlanRule{resetParamOrderRule})
+	err = vp.Visit(ctx)
+	if err != nil {
+		t.Fatalf("should not error, sql=%s", sql)
+	}
+
+	if qry, ok := queryPlan.Plan.(*Plan_Query); ok {
+		if f, ok := qry.Query.Nodes[1].FilterList[0].Expr.(*plan.Expr_F); ok {
+			f.F.Args[1] = &plan.Expr{
+				Typ: plan.Type{
+					Id:          int32(types.T_int64),
+					NotNullable: true,
+				},
+				Expr: &plan.Expr_P{
+					P: &plan.ParamRef{
+						Pos: 1,
+					},
+				},
+			}
+		}
+
+	}
+	params := []*Expr{
+		makePlan2Int64ConstExprWithType(10),
+	}
+	resetParamRule := NewResetParamRefRule(ctx, params)
+	vp = NewVisitPlan(queryPlan, []VisitPlanRule{resetParamRule})
+	err = vp.Visit(ctx)
+	if err == nil {
+		t.Fatalf("param 1 not exist, should error")
 	}
 }
 
@@ -1055,7 +1169,7 @@ func outPutPlan(logicPlan *Plan, toFile bool, t *testing.T) {
 			t.Logf("%+v", err)
 		}
 	} else {
-		t.Logf(string(json))
+		t.Log(string(json))
 	}
 }
 
@@ -1066,7 +1180,7 @@ func runOneStmt(opt Optimizer, t *testing.T, sql string) (*Plan, error) {
 	}
 	// this sql always return one stmt
 	ctx := opt.CurrentContext()
-	return BuildPlan(ctx, stmts[0])
+	return BuildPlan(ctx, stmts[0], false)
 }
 
 func runTestShouldPass(opt Optimizer, t *testing.T, sqls []string, printJSON bool, toFile bool) {
@@ -1092,11 +1206,11 @@ func runTestShouldError(opt Optimizer, t *testing.T, sqls []string) {
 }
 
 func Test_mergeContexts(t *testing.T) {
-	b1 := NewBinding(0, 1, "a", 0, nil, nil, false)
+	b1 := NewBinding(0, 1, "db", "a", 0, nil, nil, nil, false, nil)
 	bc1 := NewBindContext(nil, nil)
 	bc1.bindings = append(bc1.bindings, b1)
 
-	b2 := NewBinding(1, 2, "a", 0, nil, nil, false)
+	b2 := NewBinding(1, 2, "db", "a", 0, nil, nil, nil, false, nil)
 	bc2 := NewBindContext(nil, nil)
 	bc2.bindings = append(bc2.bindings, b2)
 
@@ -1108,7 +1222,7 @@ func Test_mergeContexts(t *testing.T) {
 	assert.EqualError(t, err, "invalid input: table 'a' specified more than once")
 
 	//a merge b
-	b3 := NewBinding(2, 3, "b", 0, nil, nil, false)
+	b3 := NewBinding(2, 3, "db", "b", 0, nil, nil, nil, false, nil)
 	bc3 := NewBindContext(nil, nil)
 	bc3.bindings = append(bc3.bindings, b3)
 
@@ -1120,4 +1234,34 @@ func Test_mergeContexts(t *testing.T) {
 	err = bc.mergeContexts(ctx, bc1, bc2)
 	assert.Error(t, err)
 	assert.EqualError(t, err, "invalid input: table 'a' specified more than once")
+}
+
+func Test_limitUint64(t *testing.T) {
+	sqls := []string{
+		"select * from t1 limit 0, 18446744073709551615",
+		"select * from t1 limit 18446744073709551615, 18446744073709551615",
+		"SELECT IFNULL(CAST(@var AS BIGINT UNSIGNED), 1)",
+	}
+	testutil.NewProc()
+	mock := NewMockOptimizer(false)
+
+	for _, sql := range sqls {
+		logicPlan, err := runOneStmt(mock, t, sql)
+		if err != nil {
+			t.Fatalf("%+v", err)
+		}
+		outPutPlan(logicPlan, true, t)
+	}
+}
+
+// test canDeleteRewriteToTruncate
+func Test_bind_delete(t *testing.T) {
+	ctx := context.TODO()
+	ctrl := gomock.NewController(t)
+	compileCtx := NewMockCompilerContext2(ctrl)
+	compileCtx.EXPECT().ResolveVariable(gomock.Any(), gomock.Any(), gomock.Any()).Return("", nil).AnyTimes()
+	compileCtx.EXPECT().GetAccountId().Return(catalog.System_Account, moerr.NewInternalError(ctx, "no account id in context")).AnyTimes()
+	dmlCtx := &DMLContext{}
+	_, err := canDeleteRewriteToTruncate(compileCtx, dmlCtx)
+	assert.Error(t, err)
 }

@@ -15,17 +15,32 @@
 package explain
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/models"
+	"github.com/matrixorigin/matrixone/pkg/sql/util"
+	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
 )
 
-func ConvertNode(ctx context.Context, node *plan.Node, options *ExplainOptions) (*Node, error) {
+var errUnsupportedNodeType = "Unsupported node type when plan is serialized to json"
+
+// The global variable is used to serialize plan and avoid objects being repeatedly created
+var MarshalPlanOptions = ExplainOptions{
+	Verbose: true,
+	Analyze: true,
+	Format:  EXPLAIN_FORMAT_TEXT,
+}
+
+func ConvertNode(ctx context.Context, node *plan.Node, options *ExplainOptions) (*models.Node, error) {
 	marshalNodeImpl := NewMarshalNodeImpl(node)
-	newNode := &Node{
+	newNode := &models.Node{
 		NodeId:     strconv.FormatInt(int64(node.NodeId), 10),
 		Statistics: marshalNodeImpl.GetStatistics(ctx, options),
 		Stats:      marshalNodeImpl.GetStats(),
@@ -54,10 +69,10 @@ func ConvertNode(ctx context.Context, node *plan.Node, options *ExplainOptions) 
 type MarshalNode interface {
 	GetNodeName(ctx context.Context) (string, error)
 	GetNodeTitle(ctx context.Context, options *ExplainOptions) (string, error)
-	GetNodeLabels(ctx context.Context, options *ExplainOptions) ([]Label, error)
-	GetStatistics(ctx context.Context, options *ExplainOptions) Statistics
-	GetStats() Stats
-	GetTotalStats() TotalStats
+	GetNodeLabels(ctx context.Context, options *ExplainOptions) ([]models.Label, error)
+	GetStatistics(ctx context.Context, options *ExplainOptions) models.Statistics
+	GetStats() models.Stats
+	GetTotalStats() models.TotalStats
 }
 
 type MarshalNodeImpl struct {
@@ -70,190 +85,177 @@ func NewMarshalNodeImpl(node *plan.Node) *MarshalNodeImpl {
 	}
 }
 
-func (m MarshalNodeImpl) GetStats() Stats {
+func (m MarshalNodeImpl) GetStats() models.Stats {
 	if m.node.Stats != nil {
-		return Stats{
+		var hashmapSize float64
+		if m.node.Stats.HashmapStats != nil {
+			hashmapSize = m.node.Stats.HashmapStats.HashmapSize
+		}
+		return models.Stats{
 			BlockNum:    m.node.Stats.BlockNum,
 			Cost:        m.node.Stats.Cost,
 			Outcnt:      m.node.Stats.Outcnt,
-			HashmapSize: m.node.Stats.HashmapSize,
+			HashmapSize: hashmapSize,
 			Rowsize:     m.node.Stats.Rowsize,
 		}
 	} else {
-		return Stats{}
+		return models.Stats{}
 	}
 }
 
 func (m MarshalNodeImpl) GetNodeName(ctx context.Context) (string, error) {
-	var name string
 	// Get the Node Name
-	switch m.node.NodeType {
-	case plan.Node_UNKNOWN:
-		name = "UnKnow Node"
-	case plan.Node_VALUE_SCAN:
-		name = "Values Scan"
-	case plan.Node_TABLE_SCAN:
-		name = "Table Scan"
-	case plan.Node_FUNCTION_SCAN:
-		name = "Function Scan"
-	case plan.Node_EXTERNAL_SCAN:
-		name = "External Scan"
-	case plan.Node_MATERIAL_SCAN:
-		name = "Material Scan"
-	case plan.Node_PROJECT:
-		name = "Project"
-	case plan.Node_EXTERNAL_FUNCTION:
-		name = "External Function"
-	case plan.Node_MATERIAL:
-		name = "Material"
-	case plan.Node_RECURSIVE_CTE:
-		name = "Recursive CTE"
-	case plan.Node_SINK:
-		name = "Sink"
-	case plan.Node_SINK_SCAN:
-		name = "Sink Scan"
-	case plan.Node_AGG:
-		name = "Aggregate"
-	case plan.Node_DISTINCT:
-		name = "Distinct"
-	case plan.Node_FILTER:
-		name = "Filter"
-	case plan.Node_JOIN:
-		name = "Join"
-	case plan.Node_SAMPLE:
-		name = "Sample"
-	case plan.Node_SORT:
-		name = "Sort"
-	case plan.Node_UNION:
-		name = "Union"
-	case plan.Node_UNION_ALL:
-		name = "Union All"
-	case plan.Node_UNIQUE:
-		name = "Unique"
-	case plan.Node_WINDOW:
-		name = "Window"
-	case plan.Node_BROADCAST:
-		name = "Broadcast"
-	case plan.Node_SPLIT:
-		name = "Split"
-	case plan.Node_GATHER:
-		name = "Gather"
-	case plan.Node_ASSERT:
-		name = "Assert"
-	case plan.Node_INSERT:
-		name = "Insert"
-	case plan.Node_UPDATE:
-		name = "Update"
-	case plan.Node_DELETE:
-		name = "Delete"
-	case plan.Node_INTERSECT:
-		name = "Intersect"
-	case plan.Node_INTERSECT_ALL:
-		name = "Intersect All"
-	case plan.Node_MINUS:
-		name = "Minus"
-	case plan.Node_MINUS_ALL:
-		name = "Minus All"
-	default:
-		return name, moerr.NewInternalError(ctx, "Unsupported node type when plan is serialized to json")
+	if value, ok := nodeTypeToNameMap[m.node.NodeType]; ok {
+		return value, nil
+	} else {
+		return "", moerr.NewInternalError(ctx, errUnsupportedNodeType)
 	}
-	return name, nil
 }
 
 func (m MarshalNodeImpl) GetNodeTitle(ctx context.Context, options *ExplainOptions) (string, error) {
-	var result string
+	//var result string
+	buf := bytes.NewBuffer(make([]byte, 0, 400))
 	var err error
 	switch m.node.NodeType {
-	case plan.Node_TABLE_SCAN, plan.Node_EXTERNAL_SCAN, plan.Node_MATERIAL_SCAN, plan.Node_INSERT:
+	case plan.Node_TABLE_SCAN, plan.Node_EXTERNAL_SCAN, plan.Node_MATERIAL_SCAN, plan.Node_SOURCE_SCAN:
 		//"title" : "SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.DATE_DIM",
 		if m.node.ObjRef != nil {
-			result += m.node.ObjRef.GetSchemaName() + "." + m.node.ObjRef.GetObjName()
+			buf.WriteString(m.node.ObjRef.GetSchemaName() + "." + m.node.ObjRef.GetObjName())
 		} else if m.node.TableDef != nil {
-			result += m.node.TableDef.GetName()
+			buf.WriteString(m.node.TableDef.GetName())
 		} else {
-			return result, moerr.NewInvalidInput(ctx, "Table definition not found when plan is serialized to json")
-		}
-	case plan.Node_UPDATE:
-		if m.node.UpdateCtx != nil {
-			first := true
-			for _, ctx := range m.node.UpdateCtx.Ref {
-				if !first {
-					result += ", "
-				}
-				result += ctx.SchemaName + "." + ctx.ObjName
-				if first {
-					first = false
-				}
-			}
-		} else {
-			return result, moerr.NewInvalidInput(ctx, "Table definition not found when plan is serialized to json")
+			return "", moerr.NewInvalidInput(ctx, "Table definition not found when plan is serialized to json")
 		}
 	case plan.Node_DELETE:
 		if m.node.DeleteCtx != nil {
-			first := true
-			for _, ctx := range m.node.DeleteCtx.Ref {
-				if !first {
-					result += ", "
-				}
-				result += ctx.SchemaName + "." + ctx.ObjName
-				if first {
-					first = false
-				}
-			}
+			ctx := m.node.DeleteCtx.Ref
+			buf.WriteString(ctx.SchemaName + "." + ctx.ObjName)
 		} else {
-			return result, moerr.NewInternalError(ctx, "Table definition not found when plan is serialized to json")
+			return "", moerr.NewInternalError(ctx, "Table definition not found when plan is serialized to json")
+		}
+	case plan.Node_INSERT:
+		if m.node.InsertCtx != nil {
+			ctx := m.node.InsertCtx.Ref
+			buf.WriteString(ctx.SchemaName + "." + ctx.ObjName)
+		} else {
+			return "", moerr.NewInternalError(ctx, "Table definition not found when plan is serialized to json")
 		}
 	case plan.Node_PROJECT, plan.Node_VALUE_SCAN, plan.Node_UNION, plan.Node_UNION_ALL,
 		plan.Node_INTERSECT, plan.Node_INTERSECT_ALL, plan.Node_MINUS:
 		//"title" : "STORE.S_STORE_NAME,STORE.S_STORE_ID,WSS.D_WEEK_SEQ"
 		exprs := NewExprListDescribeImpl(m.node.ProjectList)
-		result, err = exprs.GetDescription(ctx, options)
+		err = exprs.GetDescription(ctx, options, buf)
 		if err != nil {
-			return result, err
+			return "", err
 		}
 	case plan.Node_AGG:
 		// "SUM(IFF(DATE_DIM.D_DAY_NAME = 'Sunday', STORE_SALES.SS_SALES_PRICE, null))"
 		exprs := NewExprListDescribeImpl(m.node.AggList)
-		result, err = exprs.GetDescription(ctx, options)
+		err = exprs.GetDescription(ctx, options, buf)
 		if err != nil {
-			return result, err
+			return "", err
 		}
 	case plan.Node_FILTER:
 		//"title" : "(D_0.D_MONTH_SEQ >= 1189) AND (D_0.D_MONTH_SEQ <= 1200)",
 		exprs := NewExprListDescribeImpl(m.node.FilterList)
-		result, err = exprs.GetDescription(ctx, options)
+		err = exprs.GetDescription(ctx, options, buf)
 		if err != nil {
-			return result, err
+			return "", err
 		}
 	case plan.Node_JOIN:
 		//"title" : "(DATE_DIM.D_DATE_SK = STORE_SALES.SS_SOLD_DATE_SK)",
 		exprs := NewExprListDescribeImpl(m.node.OnList)
-		result, err = exprs.GetDescription(ctx, options)
+		err = exprs.GetDescription(ctx, options, buf)
 		if err != nil {
-			return result, err
+			return "", err
 		}
 	case plan.Node_SORT:
 		//"title" : "STORE.S_STORE_NAME ASC NULLS LAST,STORE.S_STORE_ID ASC NULLS LAST,WSS.D_WEEK_SEQ ASC NULLS LAST",
 		orderByDescImpl := NewOrderByDescribeImpl(m.node.OrderBy)
-		result, err = orderByDescImpl.GetDescription(ctx, options)
+		err = orderByDescImpl.GetDescription(ctx, options, buf)
 		if err != nil {
-			return result, err
+			return "", err
 		}
+	case plan.Node_PRE_INSERT:
+		return "preinsert", nil
+	case plan.Node_PRE_INSERT_UK:
+		return "preinsert_uk", nil
+	case plan.Node_PRE_INSERT_SK:
+		return "preinsert_sk", nil
+	case plan.Node_SINK:
+		return "sink", nil
+	case plan.Node_SINK_SCAN:
+		return "sink_scan", nil
+	case plan.Node_RECURSIVE_SCAN:
+		return "recursive_scan", nil
+	case plan.Node_RECURSIVE_CTE:
+		return "cte_scan", nil
+	case plan.Node_ON_DUPLICATE_KEY:
+		return "on_duplicate_key", nil
+	case plan.Node_LOCK_OP:
+		return "lock_op", nil
+	case plan.Node_ASSERT:
+		return "assert", nil
+	case plan.Node_BROADCAST:
+		return "broadcast", nil
+	case plan.Node_SPLIT:
+		return "split", nil
+	case plan.Node_GATHER:
+		return "gather", nil
+	case plan.Node_REPLACE:
+		return "replace", nil
+	case plan.Node_TIME_WINDOW:
+		return "time_window", nil
+	case plan.Node_FILL:
+		return "fill", nil
+	case plan.Node_PARTITION:
+		return "partition", nil
+	case plan.Node_FUNCTION_SCAN:
+		//"title" : "SNOWFLAKE_SAMPLE_DATA.TPCDS_SF10TCL.DATE_DIM",
+		if m.node.TableDef != nil && m.node.TableDef.TblFunc != nil {
+			fmt.Fprintf(buf, "Table Function[%s]", m.node.TableDef.TblFunc.Name)
+		} else {
+			return "", moerr.NewInvalidInput(ctx, "Table definition not found when plan is serialized to json")
+		}
+	case plan.Node_FUZZY_FILTER:
+		return "fuzzy_filter", nil
+	case plan.Node_SAMPLE:
+		return "sample", nil
+	case plan.Node_UNKNOWN:
+		return "unknown", nil
+	case plan.Node_DISTINCT:
+		return "distinct", nil
+	case plan.Node_UNIQUE:
+		return "unique", nil
+	case plan.Node_MINUS_ALL:
+		return "minus_all", nil
+	case plan.Node_EXTERNAL_FUNCTION:
+		return "external_function", nil
+	case plan.Node_WINDOW:
+		return "window", nil
+	case plan.Node_MATERIAL:
+		return "mterial", nil
+	case plan.Node_APPLY:
+		return "apply", nil
+	case plan.Node_MULTI_UPDATE:
+		return "multi_update", nil
+	case plan.Node_POSTDML:
+		return "postdml", nil
 	default:
-		return "", moerr.NewInternalError(ctx, "Unsupported node type when plan is serialized to json")
+		return "", moerr.NewInternalError(ctx, errUnsupportedNodeType)
 	}
-	return strings.TrimSpace(result), nil
+	return strings.TrimSpace(buf.String()), nil
 }
 
-func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOptions) ([]Label, error) {
-	labels := make([]Label, 0)
+func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOptions) ([]models.Label, error) {
+	labels := make([]models.Label, 0)
 
+	// 1. Handling unique label information for different nodes
 	switch m.node.NodeType {
-	case plan.Node_TABLE_SCAN, plan.Node_FUNCTION_SCAN, plan.Node_EXTERNAL_SCAN,
-		plan.Node_MATERIAL_SCAN:
+	case plan.Node_TABLE_SCAN, plan.Node_EXTERNAL_SCAN, plan.Node_MATERIAL_SCAN, plan.Node_SOURCE_SCAN:
 		tableDef := m.node.TableDef
 		objRef := m.node.ObjRef
-		var fullTableName string
+		fullTableName := ""
 		if objRef != nil {
 			fullTableName += objRef.GetSchemaName() + "." + objRef.GetObjName()
 		} else if tableDef != nil {
@@ -262,90 +264,99 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 			return nil, moerr.NewInternalError(ctx, "Table definition not found when plan is serialized to json")
 		}
 
-		labels = append(labels, Label{
-			Name:  "Full table name",
+		labels = append(labels, models.Label{
+			Name:  Label_Table_Name, //"Full table name",
 			Value: fullTableName,
 		})
 
 		// "name" : "Columns (2 / 28)",
 		columns := GetTableColsLableValue(ctx, tableDef.Cols, options)
 
-		labels = append(labels, Label{
-			Name:  "Columns",
+		labels = append(labels, models.Label{
+			Name:  Label_Table_Columns, //"Columns",
 			Value: columns,
 		})
 
-		labels = append(labels, Label{
-			Name:  "Total columns",
+		labels = append(labels, models.Label{
+			Name:  Label_Total_Columns, //"Total columns",
 			Value: len(tableDef.Name2ColIndex),
 		})
 
-		labels = append(labels, Label{
-			Name:  "Scan columns",
+		labels = append(labels, models.Label{
+			Name:  Label_Scan_Columns, //"Scan columns",
 			Value: len(tableDef.Cols),
 		})
 
-	case plan.Node_INSERT:
+		if len(m.node.BlockFilterList) > 0 {
+			value, err := GetExprsLabelValue(ctx, m.node.BlockFilterList, options)
+			if err != nil {
+				return nil, err
+			}
+			labels = append(labels, models.Label{
+				Name:  Label_Block_Filter_Conditions, // "Block Filter conditions",
+				Value: value,
+			})
+		}
+	case plan.Node_FUNCTION_SCAN:
 		tableDef := m.node.TableDef
-		objRef := m.node.ObjRef
-		var fullTableName string
-		if objRef != nil {
-			fullTableName += objRef.GetSchemaName() + "." + objRef.GetObjName()
-		} else if tableDef != nil {
-			fullTableName += tableDef.GetName()
+		fullTableName := ""
+		if tableDef != nil && tableDef.TblFunc != nil {
+			fullTableName += tableDef.TblFunc.GetName()
 		} else {
-			return nil, moerr.NewInternalError(ctx, "Table definition not found when plan is serialized to json")
+			return nil, moerr.NewInternalError(ctx, "Table Function definition not found when plan is serialized to json")
 		}
 
-		labels = append(labels, Label{
-			Name:  "Full table name",
+		labels = append(labels, models.Label{
+			Name:  Label_Table_Name, //"Full table name",
 			Value: fullTableName,
 		})
 
 		// "name" : "Columns (2 / 28)",
 		columns := GetTableColsLableValue(ctx, tableDef.Cols, options)
 
-		labels = append(labels, Label{
-			Name:  "Columns",
+		labels = append(labels, models.Label{
+			Name:  Label_Table_Columns, //"Columns",
 			Value: columns,
 		})
 
-		labels = append(labels, Label{
-			Name:  "Total columns",
+		labels = append(labels, models.Label{
+			Name:  Label_Total_Columns, //"Total columns",
+			Value: len(tableDef.Name2ColIndex),
+		})
+
+		labels = append(labels, models.Label{
+			Name:  Label_Scan_Columns, //"Scan columns",
 			Value: len(tableDef.Cols),
 		})
 
-		labels = append(labels, Label{
-			Name:  "Scan columns",
-			Value: len(tableDef.Cols),
-		})
-	case plan.Node_UPDATE:
-		if m.node.UpdateCtx != nil {
-			updateTableNames := GetUpdateTableLableValue(ctx, m.node.UpdateCtx, options)
-			labels = append(labels, Label{
-				Name:  "Full table name",
-				Value: updateTableNames,
-			})
-
-			updateCols := make([]string, 0)
-			for i, ctx := range m.node.UpdateCtx.Ref {
-				if m.node.UpdateCtx.UpdateCol[i] != nil {
-					upcols := GetUpdateTableColsLableValue(m.node.UpdateCtx.UpdateCol[i].Map, ctx.SchemaName, ctx.ObjName, options)
-					updateCols = append(updateCols, upcols...)
-				}
+		if len(m.node.BlockFilterList) > 0 {
+			value, err := GetExprsLabelValue(ctx, m.node.BlockFilterList, options)
+			if err != nil {
+				return nil, err
 			}
-			labels = append(labels, Label{
-				Name:  "Update columns",
-				Value: updateCols,
+			labels = append(labels, models.Label{
+				Name:  Label_Block_Filter_Conditions, // "Block Filter conditions",
+				Value: value,
 			})
-		} else {
-			return nil, moerr.NewInvalidInput(ctx, "Table definition not found when plan is serialized to json")
 		}
+	case plan.Node_INSERT:
+		objRef := m.node.InsertCtx.Ref
+		fullTableName := ""
+		if objRef != nil {
+			fullTableName += objRef.GetSchemaName() + "." + objRef.GetObjName()
+		} else {
+			return nil, moerr.NewInternalError(ctx, "Table definition not found when plan is serialized to json")
+		}
+
+		labels = append(labels, models.Label{
+			Name:  Label_Table_Name, //"Full table name",
+			Value: fullTableName,
+		})
 	case plan.Node_DELETE:
 		if m.node.DeleteCtx != nil {
-			deleteTableNames := GetDeleteTableLableValue(ctx, m.node.DeleteCtx, options)
-			labels = append(labels, Label{
-				Name:  "Full table name",
+			deleteTableNames := GetDeleteTableLabelValue(m.node.DeleteCtx)
+			labels = append(labels, models.Label{
+				Name:  Label_Table_Name, //"Full table name",
 				Value: deleteTableNames,
 			})
 		} else {
@@ -356,8 +367,8 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "List of expressions",
+		labels = append(labels, models.Label{
+			Name:  Label_List_Expression, //"List of expressions",
 			Value: value,
 		})
 	case plan.Node_AGG:
@@ -368,8 +379,8 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 			if err != nil {
 				return nil, err
 			}
-			labels = append(labels, Label{
-				Name:  "Grouping keys",
+			labels = append(labels, models.Label{
+				Name:  Label_Grouping_Keys, //"Grouping keys",
 				Value: value,
 			})
 		}
@@ -380,8 +391,8 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 			if err != nil {
 				return nil, err
 			}
-			labels = append(labels, Label{
-				Name:  "Aggregate functions",
+			labels = append(labels, models.Label{
+				Name:  Label_Agg_Functions, //"Aggregate functions",
 				Value: value,
 			})
 		}
@@ -390,14 +401,14 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Filter conditions",
+		labels = append(labels, models.Label{
+			Name:  Label_Filter_Conditions, //"Filter conditions",
 			Value: value,
 		})
 	case plan.Node_JOIN:
 		// Get Join type
-		labels = append(labels, Label{
-			Name:  "Join type",
+		labels = append(labels, models.Label{
+			Name:  Label_Join_Type, //"Join type",
 			Value: m.node.JoinType.String(),
 		})
 
@@ -407,26 +418,26 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 			if err != nil {
 				return nil, err
 			}
-			labels = append(labels, Label{
-				Name:  "Join conditions",
+			labels = append(labels, models.Label{
+				Name:  Label_Join_Conditions, //"Join conditions",
 				Value: value,
 			})
 		}
-		labels = append(labels, Label{
-			Name:  "Left node id",
+		labels = append(labels, models.Label{
+			Name:  Label_Left_NodeId, //"Left node id",
 			Value: m.node.Children[0],
 		})
-		labels = append(labels, Label{
-			Name:  "Right node id",
+		labels = append(labels, models.Label{
+			Name:  Label_Right_NodeId, //"Right node id",
 			Value: m.node.Children[1],
 		})
 	case plan.Node_SORT:
-		result, err := GettOrderByLabelValue(ctx, m.node.OrderBy, options)
+		result, err := GetOrderByLabelValue(ctx, m.node.OrderBy, options)
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Sort keys",
+		labels = append(labels, models.Label{
+			Name:  Label_Sort_Keys, //"Sort keys",
 			Value: result,
 		})
 	case plan.Node_VALUE_SCAN:
@@ -434,17 +445,28 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "List of values",
+		labels = append(labels, models.Label{
+			Name:  Label_List_Values, //"List of values",
 			Value: value,
 		})
+
+		if len(m.node.BlockFilterList) > 0 {
+			value, err = GetExprsLabelValue(ctx, m.node.BlockFilterList, options)
+			if err != nil {
+				return nil, err
+			}
+			labels = append(labels, models.Label{
+				Name:  Label_Block_Filter_Conditions, // "Block Filter conditions",
+				Value: value,
+			})
+		}
 	case plan.Node_UNION:
 		value, err := GetExprsLabelValue(ctx, m.node.ProjectList, options)
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Union expressions",
+		labels = append(labels, models.Label{
+			Name:  Label_Union_Expressions, //"Union expressions",
 			Value: value,
 		})
 	case plan.Node_UNION_ALL:
@@ -452,8 +474,8 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Union all expressions",
+		labels = append(labels, models.Label{
+			Name:  Label_Union_All_Expressions, // "Union all expressions",
 			Value: value,
 		})
 	case plan.Node_INTERSECT:
@@ -461,8 +483,8 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Intersect expressions",
+		labels = append(labels, models.Label{
+			Name:  Label_Intersect_Expressions, //"Intersect expressions",
 			Value: value,
 		})
 	case plan.Node_INTERSECT_ALL:
@@ -470,8 +492,8 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Intersect All expressions",
+		labels = append(labels, models.Label{
+			Name:  Label_Intersect_All_Expressions, //"Intersect All expressions",
 			Value: value,
 		})
 	case plan.Node_MINUS:
@@ -479,49 +501,196 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Minus expressions",
+		labels = append(labels, models.Label{
+			Name:  Label_Minus_Expressions, //"Minus expressions",
 			Value: value,
 		})
+	case plan.Node_PRE_INSERT:
+		labels = append(labels, models.Label{
+			Name:  Label_Pre_Insert, //"pre insert",
+			Value: []string{},
+		})
+	case plan.Node_PRE_INSERT_UK:
+		labels = append(labels, models.Label{
+			Name:  Label_Pre_InsertUk, //"pre insert uk",
+			Value: []string{},
+		})
+	case plan.Node_PRE_INSERT_SK:
+		labels = append(labels, models.Label{
+			Name:  Label_Pre_InsertSk, //"pre insert sk",
+			Value: []string{},
+		})
+	case plan.Node_SINK:
+		labels = append(labels, models.Label{
+			Name:  Label_Sink, //"sink",
+			Value: []string{},
+		})
+	case plan.Node_SINK_SCAN:
+		labels = append(labels, models.Label{
+			Name:  Label_Sink_Scan, //"sink scan",
+			Value: []string{},
+		})
+	case plan.Node_RECURSIVE_SCAN:
+		labels = append(labels, models.Label{
+			Name:  Label_Recursive_SCAN, //"sink scan",
+			Value: []string{},
+		})
+	case plan.Node_RECURSIVE_CTE:
+		labels = append(labels, models.Label{
+			Name:  Label_Recursive_SCAN, //"sink scan",
+			Value: []string{},
+		})
+	case plan.Node_LOCK_OP:
+		labels = append(labels, models.Label{
+			Name:  Label_Lock_Op, //"lock op",
+			Value: []string{},
+		})
+	case plan.Node_TIME_WINDOW:
+		labels = append(labels, models.Label{
+			Name:  Label_Time_Window,
+			Value: []string{},
+		})
+	case plan.Node_PARTITION:
+		labels = append(labels, models.Label{
+			Name:  Label_Partition,
+			Value: []string{},
+		})
+	case plan.Node_BROADCAST:
+		labels = append(labels, models.Label{
+			Name:  Label_Boardcast,
+			Value: []string{},
+		})
+	case plan.Node_SPLIT:
+		labels = append(labels, models.Label{
+			Name:  Label_Split,
+			Value: []string{},
+		})
+	case plan.Node_GATHER:
+		labels = append(labels, models.Label{
+			Name:  Label_Gather,
+			Value: []string{},
+		})
+	case plan.Node_ASSERT:
+		labels = append(labels, models.Label{
+			Name:  Label_Assert,
+			Value: []string{},
+		})
+	case plan.Node_ON_DUPLICATE_KEY:
+		labels = append(labels, models.Label{
+			Name:  Label_On_Duplicate_Key,
+			Value: []string{},
+		})
+	case plan.Node_FUZZY_FILTER:
+		labels = append(labels, models.Label{
+			Name:  Label_Fuzzy_Filter,
+			Value: []string{},
+		})
+	case plan.Node_EXTERNAL_FUNCTION:
+		labels = append(labels, models.Label{
+			Name:  Label_External_Function,
+			Value: []string{},
+		})
+	case plan.Node_FILL:
+		labels = append(labels, models.Label{
+			Name:  Label_Fill,
+			Value: []string{},
+		})
+	case plan.Node_DISTINCT:
+		labels = append(labels, models.Label{
+			Name:  Label_Distinct,
+			Value: []string{},
+		})
+	case plan.Node_SAMPLE:
+		labels = append(labels, models.Label{
+			Name:  Label_Sample,
+			Value: []string{},
+		})
+	case plan.Node_WINDOW:
+		labels = append(labels, models.Label{
+			Name:  Label_Window,
+			Value: []string{},
+		})
+	case plan.Node_MINUS_ALL:
+		labels = append(labels, models.Label{
+			Name:  Label_Minus_All,
+			Value: []string{},
+		})
+	case plan.Node_UNIQUE:
+		labels = append(labels, models.Label{
+			Name:  Label_Unique,
+			Value: []string{},
+		})
+	case plan.Node_REPLACE:
+		labels = append(labels, models.Label{
+			Name:  Label_Replace,
+			Value: []string{},
+		})
+	case plan.Node_UNKNOWN:
+		labels = append(labels, models.Label{
+			Name:  Label_Unknown,
+			Value: []string{},
+		})
+	case plan.Node_MATERIAL:
+		labels = append(labels, models.Label{
+			Name:  Label_Material,
+			Value: []string{},
+		})
+	case plan.Node_APPLY:
+		labels = append(labels, models.Label{
+			Name:  Label_Apply,
+			Value: []string{},
+		})
+	case plan.Node_MULTI_UPDATE:
+		labels = append(labels, models.Label{
+			Name:  Label_Apply,
+			Value: []string{},
+		})
+	case plan.Node_POSTDML:
+		labels = append(labels, models.Label{
+			Name:  Label_PostDml,
+			Value: []string{},
+		})
 	default:
-		return nil, moerr.NewInternalError(ctx, "Unsupported node type when plan is serialized to json")
+		return nil, moerr.NewInternalError(ctx, errUnsupportedNodeType)
 	}
 
-	if m.node.NodeType != plan.Node_FILTER && m.node.FilterList != nil {
-		// Where condition
+	// 2. handle shared label information for all nodes, such as filter conditions
+	if len(m.node.FilterList) > 0 && m.node.NodeType != plan.Node_FILTER {
 		value, err := GetExprsLabelValue(ctx, m.node.FilterList, options)
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Filter conditions",
+		labels = append(labels, models.Label{
+			Name:  Label_Filter_Conditions, // "Filter conditions",
 			Value: value,
 		})
 	}
 
-	// Get Limit And Offset info
+	// 3. handle `Limit` and `Offset` label information for all nodes
 	if m.node.Limit != nil {
-		limitInfo, err := describeExpr(ctx, m.node.Limit, options)
+		buf := bytes.NewBuffer(make([]byte, 0, 80))
+		err := describeExpr(ctx, m.node.Limit, options, buf)
 		if err != nil {
 			return nil, err
 		}
-		labels = append(labels, Label{
-			Name:  "Number of rows",
-			Value: limitInfo,
+		labels = append(labels, models.Label{
+			Name:  Label_Row_Number, //"Number of rows",
+			Value: buf.String(),
 		})
 
 		if m.node.Offset != nil {
-			offsetInfo, err := describeExpr(ctx, m.node.Offset, options)
+			buf.Reset()
+			err := describeExpr(ctx, m.node.Offset, options, buf)
 			if err != nil {
 				return nil, err
 			}
-			labels = append(labels, Label{
-				Name:  "Offset",
-				Value: offsetInfo,
+			labels = append(labels, models.Label{
+				Name:  Label_Offset, // "Offset",
+				Value: buf.String(),
 			})
 		} else {
-			labels = append(labels, Label{
-				Name:  "Offset",
+			labels = append(labels, models.Label{
+				Name:  Label_Offset, // "Offset",
 				Value: 0,
 			})
 		}
@@ -531,6 +700,9 @@ func (m MarshalNodeImpl) GetNodeLabels(ctx context.Context, options *ExplainOpti
 
 const TimeConsumed = "Time Consumed"
 const WaitTime = "Wait Time"
+const ScanTime = "Scan Time"
+const InsertTime = "Insert Time"
+const WaitLockTime = "Wait Lock Time"
 
 const InputRows = "Input Rows"
 const OutputRows = "Output Rows"
@@ -538,86 +710,204 @@ const InputSize = "Input Size"
 const OutputSize = "Output Size"
 const MemorySize = "Memory Size"
 const DiskIO = "Disk IO"
-const S3IOByte = "S3 IO Byte"
-const S3IOInputCount = "S3 IO Input Count"
-const S3IOOutputCount = "S3 IO Output Count"
+const ScanBytes = "Scan Bytes"
 const Network = "Network"
+const S3List = "S3 List Count"
+const S3Head = "S3 Head Count"
+const S3Put = "S3 Put Count"
+const S3Get = "S3 Get Count"
+const S3Delete = "S3 Delete Count"
+const S3DeleteMul = "S3 DeleteMul Count"
+const FSCacheRead = "FileService Cache Read"
+const FSCacheHit = "FileService Cache Hit"
+const FSCacheMemoryRead = "FileService Cache Memory Read"
+const FSCacheMemoryHit = "FileService Cache Memory Hit"
+const FSCacheDiskRead = "FileService Cache Disk Read"
+const FSCacheDiskHit = "FileService Cache Disk Hit"
+const FSCacheRemoteRead = "FileService Cache Remote Read"
+const FSCacheRemoteHit = "FileService Cache Remote Hit"
 
-func (m MarshalNodeImpl) GetStatistics(ctx context.Context, options *ExplainOptions) Statistics {
-	statistics := NewStatistics()
+func GetStatistic4Trace(ctx context.Context, node *plan.Node, options *ExplainOptions) (s statistic.StatsArray) {
+	s.Reset()
+	if options.Analyze && node.AnalyzeInfo != nil {
+		analyzeInfo := node.AnalyzeInfo
+		s.WithTimeConsumed(float64(analyzeInfo.TimeConsumed)).
+			WithMemorySize(float64(analyzeInfo.MemorySize)).
+			// cc https://github.com/matrixorigin/MO-Cloud/issues/4175#issuecomment-2375813480
+			WithS3IOInputCount(float64(analyzeInfo.S3Put) + objectio.EstimateS3Input(analyzeInfo.WrittenRows) + objectio.EstimateS3Input(analyzeInfo.DeletedRows)).
+			WithS3IOOutputCount(float64(analyzeInfo.S3Head + analyzeInfo.S3Get)).
+			WithS3IOListCount(float64(analyzeInfo.S3List)).
+			WithS3IODeleteCount(float64(analyzeInfo.S3Delete + analyzeInfo.S3DeleteMul))
+	}
+	return
+}
+
+// GetInputRowsAndInputSize return plan.Node AnalyzeInfo InputRows and InputSize.
+// The method only records the original table's input data, and does not record index table's input data
+// migrate ExplainData.StatisticsRead to here
+func GetInputRowsAndInputSize(ctx context.Context, node *plan.Node, options *ExplainOptions) (rows int64, size int64) {
+	if util.IsIndexTableName(node.TableDef.Name) {
+		return 0, 0
+	}
+
+	if options.Analyze && node.AnalyzeInfo != nil {
+		return node.AnalyzeInfo.InputRows, node.AnalyzeInfo.InputSize
+	}
+	return
+}
+
+func (m MarshalNodeImpl) GetStatistics(ctx context.Context, options *ExplainOptions) models.Statistics {
+	statistics := models.NewStatistics()
 	if options.Analyze && m.node.AnalyzeInfo != nil {
 		analyzeInfo := m.node.AnalyzeInfo
-		times := []StatisticValue{
+		times := []models.StatisticValue{
 			{
 				Name:  TimeConsumed,
 				Value: analyzeInfo.TimeConsumed,
-				Unit:  "ns",
+				Unit:  Statistic_Unit_ns,
 			},
 			{
 				Name:  WaitTime,
 				Value: analyzeInfo.WaitTimeConsumed,
-				Unit:  "ns",
+				Unit:  Statistic_Unit_ns,
+			},
+			{
+				Name:  ScanTime,
+				Value: analyzeInfo.ScanTime,
+				Unit:  Statistic_Unit_ns,
+			},
+			{
+				Name:  InsertTime,
+				Value: analyzeInfo.InsertTime,
+				Unit:  Statistic_Unit_ns,
+			},
+			{
+				Name:  WaitLockTime,
+				Value: analyzeInfo.WaitLockTime,
+				Unit:  Statistic_Unit_ns,
 			},
 		}
-		mbps := []StatisticValue{
+		mbps := []models.StatisticValue{
 			{
 				Name:  InputRows,
 				Value: analyzeInfo.InputRows,
-				Unit:  "count",
+				Unit:  Statistic_Unit_count, //"count",
 			},
 			{
 				Name:  OutputRows,
 				Value: analyzeInfo.OutputRows,
-				Unit:  "count",
+				Unit:  Statistic_Unit_count, //"count",
 			},
 			{
 				Name:  InputSize,
 				Value: analyzeInfo.InputSize,
-				Unit:  "byte",
+				Unit:  Statistic_Unit_byte, //"byte",
 			},
 			{
 				Name:  OutputSize,
 				Value: analyzeInfo.OutputSize,
-				Unit:  "byte",
+				Unit:  Statistic_Unit_byte, //"byte",
 			},
 		}
 
-		mems := []StatisticValue{
+		mems := []models.StatisticValue{
 			{
 				Name:  MemorySize,
 				Value: analyzeInfo.MemorySize,
-				Unit:  "byte",
+				Unit:  Statistic_Unit_byte, //"byte",
 			},
 		}
 
-		io := []StatisticValue{
+		io := []models.StatisticValue{
 			{
 				Name:  DiskIO,
 				Value: analyzeInfo.DiskIO,
-				Unit:  "byte",
+				Unit:  Statistic_Unit_byte, //"byte",
 			},
 			{
-				Name:  S3IOByte,
-				Value: analyzeInfo.S3IOByte,
-				Unit:  "byte",
+				Name:  ScanBytes,
+				Value: analyzeInfo.ScanBytes,
+				Unit:  Statistic_Unit_byte, //"byte",
 			},
 			{
-				Name:  S3IOInputCount,
-				Value: analyzeInfo.S3IOInputCount,
-				Unit:  "count",
+				Name:  S3List,
+				Value: analyzeInfo.S3List,
+				Unit:  Statistic_Unit_count, //"count",
 			},
 			{
-				Name:  S3IOOutputCount,
-				Value: analyzeInfo.S3IOOutputCount,
-				Unit:  "count",
+				Name:  S3Head,
+				Value: analyzeInfo.S3Head,
+				Unit:  Statistic_Unit_count, //"count",
 			},
+			{
+				Name:  S3Put,
+				Value: analyzeInfo.S3Put,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  S3Get,
+				Value: analyzeInfo.S3Get,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  S3Delete,
+				Value: analyzeInfo.S3Delete,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  S3DeleteMul,
+				Value: analyzeInfo.S3DeleteMul,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			//--------------------------------------------------------------------------------------
+			{
+				Name:  FSCacheRead,
+				Value: analyzeInfo.CacheRead,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  FSCacheHit,
+				Value: analyzeInfo.CacheHit,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  FSCacheMemoryRead,
+				Value: analyzeInfo.CacheMemoryRead,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  FSCacheMemoryHit,
+				Value: analyzeInfo.CacheMemoryHit,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  FSCacheDiskRead,
+				Value: analyzeInfo.CacheDiskRead,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  FSCacheDiskHit,
+				Value: analyzeInfo.CacheDiskHit,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  FSCacheRemoteRead,
+				Value: analyzeInfo.CacheRemoteRead,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			{
+				Name:  FSCacheRemoteHit,
+				Value: analyzeInfo.CacheRemoteHit,
+				Unit:  Statistic_Unit_count, //"count",
+			},
+			//--------------------------------------------------------------------------------------
 		}
 
-		nw := []StatisticValue{
+		nw := []models.StatisticValue{
 			{
 				Name:  Network,
 				Value: analyzeInfo.NetworkIO,
-				Unit:  "byte",
+				Unit:  Statistic_Unit_byte, //"byte",
 			},
 		}
 
@@ -630,8 +920,8 @@ func (m MarshalNodeImpl) GetStatistics(ctx context.Context, options *ExplainOpti
 	return *statistics
 }
 
-func (m MarshalNodeImpl) GetTotalStats() TotalStats {
-	totalStats := TotalStats{
+func (m MarshalNodeImpl) GetTotalStats() models.TotalStats {
+	totalStats := models.TotalStats{
 		Name: "Time spent",
 		Unit: "ns",
 	}
@@ -649,54 +939,46 @@ func GetExprsLabelValue(ctx context.Context, exprList []*plan.Expr, options *Exp
 	if exprList == nil {
 		return make([]string, 0), nil
 	}
-	result := make([]string, 0)
+	result := make([]string, 0, len(exprList))
+	buf := bytes.NewBuffer(make([]byte, 0, 200))
 	for _, v := range exprList {
-		descV, err := describeExpr(ctx, v, options)
+		buf.Reset()
+		err := describeExpr(ctx, v, options, buf)
 		if err != nil {
 			return result, err
 		}
-		result = append(result, descV)
+		result = append(result, buf.String())
 	}
 	return result, nil
 }
 
-func GettOrderByLabelValue(ctx context.Context, orderbyList []*plan.OrderBySpec, options *ExplainOptions) ([]string, error) {
+func GetOrderByLabelValue(ctx context.Context, orderbyList []*plan.OrderBySpec, options *ExplainOptions) ([]string, error) {
 	if orderbyList == nil {
 		return make([]string, 0), nil
 	}
-	result := make([]string, 0)
+	result := make([]string, 0, len(orderbyList))
+	buf := bytes.NewBuffer(make([]byte, 0, 200))
 	for _, v := range orderbyList {
-		descExpr, err := describeExpr(ctx, v.Expr, options)
+		buf.Reset()
+		err := describeExpr(ctx, v.Expr, options, buf)
 		if err != nil {
 			return result, err
 		}
 
 		flagKey := int32(v.Flag)
 		orderbyFlag := plan.OrderBySpec_OrderByFlag_name[flagKey]
-		result = append(result, descExpr+" "+orderbyFlag)
+		result = append(result, buf.String()+" "+orderbyFlag)
 	}
 	return result, nil
 }
 
-func GetDeleteTableLableValue(ctx context.Context, deleteCtx *plan.DeleteCtx, options *ExplainOptions) []string {
+func GetDeleteTableLabelValue(deleteCtx *plan.DeleteCtx) []string {
 	if deleteCtx == nil {
 		return make([]string, 0)
 	}
 	result := make([]string, 0)
-	for _, ctx := range deleteCtx.Ref {
-		result = append(result, ctx.SchemaName+"."+ctx.ObjName)
-	}
-	return result
-}
-
-func GetUpdateTableLableValue(ctx context.Context, updateCtx *plan.UpdateCtx, options *ExplainOptions) []string {
-	if updateCtx == nil {
-		return make([]string, 0)
-	}
-	result := make([]string, 0)
-	for _, ctx := range updateCtx.Ref {
-		result = append(result, ctx.SchemaName+"."+ctx.ObjName)
-	}
+	ref := deleteCtx.Ref
+	result = append(result, ref.SchemaName+"."+ref.ObjName)
 	return result
 }
 
@@ -704,16 +986,6 @@ func GetTableColsLableValue(ctx context.Context, cols []*plan.ColDef, options *E
 	columns := make([]string, len(cols))
 	for i, col := range cols {
 		columns[i] = col.Name
-	}
-	return columns
-}
-
-func GetUpdateTableColsLableValue(cols map[string]int32, db string, tname string, options *ExplainOptions) []string {
-	columns := make([]string, len(cols))
-	i := 0
-	for col := range cols {
-		columns[i] = db + "." + tname + "." + col
-		i++
 	}
 	return columns
 }

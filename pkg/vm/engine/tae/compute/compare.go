@@ -16,90 +16,182 @@ package compute
 
 import (
 	"bytes"
+	"cmp"
 	"fmt"
+	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/vectorize/moarray"
 )
 
-func CompareOrdered[T types.OrderedT](v1, v2 any) int64 {
-	a, b := v1.(T), v2.(T)
-	if a > b {
-		return 1
-	} else if a < b {
-		return -1
-	}
-	return 0
+func CompareOrdered[T types.OrderedT](a, b T) int {
+	return cmp.Compare(a, b)
 }
 
-func CompareBool(a, b bool) int64 {
-	if a && b {
-		return 0
-	} else if !a && !b {
+func CompareBool(a, b bool) int {
+	if a == b {
 		return 0
 	} else if a {
 		return 1
 	}
-	return 0
+	return -1
 }
 
-func CompareBytes(a, b any) int64 {
-	res := bytes.Compare(a.([]byte), b.([]byte))
-	if res > 0 {
-		return 1
-	} else if res < 0 {
-		return -1
-	} else {
+func CompareBytes(a, b []byte) int {
+	return bytes.Compare(a, b)
+}
+
+func compareArrayFromBytes[T types.RealNumbers](a, b []byte) int {
+	return moarray.Compare[T](types.BytesToArray[T](a), types.BytesToArray[T](b))
+}
+
+func Compare(a, b []byte, t types.T, scale1, scale2 int32) int {
+	switch t {
+	case types.T_bool:
+		return CompareBool(types.DecodeBool(a), types.DecodeBool(b))
+	case types.T_bit:
+		return CompareOrdered(types.DecodeUint64(a), types.DecodeUint64(b))
+	case types.T_int8:
+		return CompareOrdered(types.DecodeInt8(a), types.DecodeInt8(b))
+	case types.T_int16:
+		return CompareOrdered(types.DecodeInt16(a), types.DecodeInt16(b))
+	case types.T_int32:
+		return CompareOrdered(types.DecodeInt32(a), types.DecodeInt32(b))
+	case types.T_int64:
+		return CompareOrdered(types.DecodeInt64(a), types.DecodeInt64(b))
+	case types.T_uint8:
+		return CompareOrdered(types.DecodeUint8(a), types.DecodeUint8(b))
+	case types.T_uint16:
+		return CompareOrdered(types.DecodeUint16(a), types.DecodeUint16(b))
+	case types.T_uint32:
+		return CompareOrdered(types.DecodeUint32(a), types.DecodeUint32(b))
+	case types.T_uint64:
+		return CompareOrdered(types.DecodeUint64(a), types.DecodeUint64(b))
+	case types.T_decimal64:
+		return types.CompareDecimal64WithScale(types.DecodeDecimal64(a), types.DecodeDecimal64(b), scale1, scale2)
+	case types.T_decimal128:
+		return types.CompareDecimal128WithScale(types.DecodeDecimal128(a), types.DecodeDecimal128(b), scale1, scale2)
+	case types.T_decimal256:
+		return types.CompareDecimal256(*(*types.Decimal256)(unsafe.Pointer(&a[0])), *(*types.Decimal256)(unsafe.Pointer(&b[0])))
+	case types.T_float32:
+		return CompareOrdered(types.DecodeFloat32(a), types.DecodeFloat32(b))
+	case types.T_float64:
+		return CompareOrdered(types.DecodeFloat64(a), types.DecodeFloat64(b))
+	case types.T_timestamp:
+		return CompareOrdered(types.DecodeTimestamp(a), types.DecodeTimestamp(b))
+	case types.T_date:
+		return CompareOrdered(types.DecodeDate(a), types.DecodeDate(b))
+	case types.T_time:
+		return CompareOrdered(types.DecodeTime(a), types.DecodeTime(b))
+	case types.T_datetime:
+		return CompareOrdered(types.DecodeDatetime(a), types.DecodeDatetime(b))
+	case types.T_enum:
+		return CompareOrdered(types.DecodeEnum(a), types.DecodeEnum(b))
+	case types.T_TS:
+		aa := (*types.TS)(unsafe.Pointer(&a[0]))
+		bb := (*types.TS)(unsafe.Pointer(&b[0]))
+		return aa.Compare(bb)
+
+	case types.T_Rowid:
+		// Row id is very special. it is not valena type but always be
+		// compared with prefix: Objectid or Blockid
+		if len(a) == types.RowidSize {
+			v1 := (*types.Rowid)(unsafe.Pointer(&a[0]))
+			return v1.ComparePrefix(b)
+		} else {
+			v2 := (*types.Rowid)(unsafe.Pointer(&b[0]))
+			if ret := v2.ComparePrefix(a); ret < 0 {
+				return 1
+			} else if ret > 0 {
+				return -1
+			}
+			return 0
+		}
+	case types.T_Blockid:
+		v1 := (*types.Blockid)(unsafe.Pointer(&a[0]))
+		v2 := (*types.Blockid)(unsafe.Pointer(&b[0]))
+		return v1.Compare(v2)
+	case types.T_uuid:
+		return types.CompareUuid(types.DecodeUuid(a), types.DecodeUuid(b))
+	case types.T_char, types.T_varchar, types.T_blob,
+		types.T_binary, types.T_varbinary, types.T_json, types.T_text, types.T_datalink:
+		return CompareBytes(a, b)
+	case types.T_array_float32:
+		//Zone map comparator
+		return compareArrayFromBytes[float32](a, b)
+	case types.T_array_float64:
+		return compareArrayFromBytes[float64](a, b)
+	case types.T_any:
 		return 0
+	default:
+		panic(fmt.Sprintf("unsupported type: %v", t))
 	}
 }
 
-func CompareGeneric(a, b any, t types.Type) int64 {
-	switch t.Oid {
+func CompareGeneric(a, b any, t types.T) int {
+	switch t {
 	case types.T_bool:
 		return CompareBool(a.(bool), b.(bool))
+	case types.T_bit:
+		return CompareOrdered(a.(uint64), b.(uint64))
 	case types.T_int8:
-		return CompareOrdered[int8](a, b)
+		return CompareOrdered(a.(int8), b.(int8))
 	case types.T_int16:
-		return CompareOrdered[int16](a, b)
+		return CompareOrdered(a.(int16), b.(int16))
 	case types.T_int32:
-		return CompareOrdered[int32](a, b)
+		return CompareOrdered(a.(int32), b.(int32))
 	case types.T_int64:
-		return CompareOrdered[int64](a, b)
+		return CompareOrdered(a.(int64), b.(int64))
 	case types.T_uint8:
-		return CompareOrdered[uint8](a, b)
+		return CompareOrdered(a.(uint8), b.(uint8))
 	case types.T_uint16:
-		return CompareOrdered[uint16](a, b)
+		return CompareOrdered(a.(uint16), b.(uint16))
 	case types.T_uint32:
-		return CompareOrdered[uint32](a, b)
+		return CompareOrdered(a.(uint32), b.(uint32))
 	case types.T_uint64:
-		return CompareOrdered[uint64](a, b)
+		return CompareOrdered(a.(uint64), b.(uint64))
 	case types.T_decimal64:
-		return int64(a.(types.Decimal64).Compare(b.(types.Decimal64)))
+		return a.(types.Decimal64).Compare(b.(types.Decimal64))
 	case types.T_decimal128:
-		return int64(a.(types.Decimal128).Compare(b.(types.Decimal128)))
+		return a.(types.Decimal128).Compare(b.(types.Decimal128))
 	case types.T_decimal256:
-		return int64(a.(types.Decimal256).Compare(b.(types.Decimal256)))
+		return a.(types.Decimal256).Compare(b.(types.Decimal256))
 	case types.T_float32:
-		return CompareOrdered[float32](a, b)
+		return CompareOrdered(a.(float32), b.(float32))
 	case types.T_float64:
-		return CompareOrdered[float64](a, b)
+		return CompareOrdered(a.(float64), b.(float64))
 	case types.T_timestamp:
-		return CompareOrdered[types.Timestamp](a, b)
+		return CompareOrdered(a.(types.Timestamp), b.(types.Timestamp))
 	case types.T_date:
-		return CompareOrdered[types.Date](a, b)
+		return CompareOrdered(a.(types.Date), b.(types.Date))
 	case types.T_time:
-		return CompareOrdered[types.Time](a, b)
+		return CompareOrdered(a.(types.Time), b.(types.Time))
 	case types.T_datetime:
-		return CompareOrdered[types.Datetime](a, b)
+		return CompareOrdered(a.(types.Datetime), b.(types.Datetime))
+	case types.T_enum:
+		return CompareOrdered(a.(types.Enum), b.(types.Enum))
 	case types.T_TS:
-		return int64(a.(types.TS).Compare(b.(types.TS)))
+		ts1 := a.(types.TS)
+		ts2 := b.(types.TS)
+		return ts1.Compare(&ts2)
 	case types.T_Rowid:
-		return CompareBytes(a, b)
+		v1 := a.(types.Rowid)
+		v2 := b.(types.Rowid)
+		return v1.Compare(&v2)
+	case types.T_Blockid:
+		v1 := a.(types.Blockid)
+		v2 := b.(types.Blockid)
+		return v1.Compare(&v2)
 	case types.T_uuid:
 		return types.CompareUuid(a.(types.Uuid), b.(types.Uuid))
 	case types.T_char, types.T_varchar, types.T_blob,
-		types.T_binary, types.T_varbinary, types.T_json, types.T_text:
-		return CompareBytes(a, b)
+		types.T_binary, types.T_varbinary, types.T_json, types.T_text, types.T_datalink:
+		return CompareBytes(a.([]byte), b.([]byte))
+	case types.T_array_float32:
+		// Used by GetRowByFilter in TAE.
+		return compareArrayFromBytes[float32](a.([]byte), b.([]byte))
+	case types.T_array_float64:
+		return compareArrayFromBytes[float64](a.([]byte), b.([]byte))
 	case types.T_any:
 		return 0
 	default:

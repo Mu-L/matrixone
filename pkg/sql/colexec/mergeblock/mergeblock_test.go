@@ -19,6 +19,14 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/vm/process"
+
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/blockio"
+
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
@@ -40,57 +48,192 @@ func (e *mockRelation) Write(_ context.Context, b *batch.Batch) error {
 func TestMergeBlock(t *testing.T) {
 	proc := testutil.NewProc()
 	proc.Ctx = context.TODO()
+	segmentid := objectio.NewSegmentid()
+	name1 := objectio.BuildObjectName(segmentid, 0)
+	name2 := objectio.BuildObjectName(segmentid, 1)
+	name3 := objectio.BuildObjectName(segmentid, 2)
+	loc1 := blockio.EncodeLocation(name1, objectio.Extent{}, 15, 0)
+	loc2 := blockio.EncodeLocation(name2, objectio.Extent{}, 15, 0)
+	loc3 := blockio.EncodeLocation(name3, objectio.Extent{}, 15, 0)
+
+	sid1 := loc1.Name().SegmentId()
+	blkInfo1 := objectio.BlockInfo{
+		BlockID: *objectio.NewBlockid(
+			&sid1,
+			loc1.Name().Num(),
+			loc1.ID()),
+		//non-appendable block
+		//Appendable: false,
+	}
+	blkInfo1.SetMetaLocation(loc1)
+
+	sid2 := loc2.Name().SegmentId()
+	blkInfo2 := objectio.BlockInfo{
+		BlockID: *objectio.NewBlockid(
+			&sid2,
+			loc2.Name().Num(),
+			loc2.ID()),
+		//non-appendable block
+		//Appendable: false,
+	}
+	blkInfo2.SetMetaLocation(loc2)
+
+	sid3 := loc3.Name().SegmentId()
+	blkInfo3 := objectio.BlockInfo{
+		BlockID: *objectio.NewBlockid(
+			&sid3,
+			loc3.Name().Num(),
+			loc3.ID()),
+		//non-appendable block
+		//Appendable: false,
+	}
+	blkInfo3.SetMetaLocation(loc3)
+
 	batch1 := &batch.Batch{
-		Attrs: []string{catalog.BlockMeta_TableIdx_Insert, catalog.BlockMeta_MetaLoc},
+		Attrs: []string{catalog.BlockMeta_TableIdx_Insert, catalog.BlockMeta_BlockInfo, catalog.ObjectMeta_ObjectStats},
 		Vecs: []*vector.Vector{
-			testutil.MakeInt16Vector([]int16{0, 1, 2}, nil),
+			testutil.MakeInt16Vector([]int16{0, 0, 0}, nil),
 			testutil.MakeTextVector([]string{
-				"a.seg:magic:15",
-				"b.seg:magic:15",
-				"c.seg:magic:15"}, nil),
+				string(objectio.EncodeBlockInfo(&blkInfo1)),
+				string(objectio.EncodeBlockInfo(&blkInfo2)),
+				string(objectio.EncodeBlockInfo(&blkInfo3))},
+				nil),
+			testutil.MakeTextVector([]string{
+				string(objectio.ZeroObjectStats[:]),
+				string(objectio.ZeroObjectStats[:]),
+				string(objectio.ZeroObjectStats[:])},
+				nil),
 		},
-		Zs: []int64{1, 1, 1},
 	}
-	argument1 := Argument{
-		Tbl:          &mockRelation{},
-		Unique_tbls:  []engine.Relation{&mockRelation{}, &mockRelation{}},
-		AffectedRows: 0,
-		notFreeBatch: true,
+	batch1.SetRowCount(3)
+
+	argument1 := MergeBlock{
+		container: Container{
+			source: &mockRelation{},
+			mp:     make(map[int]*batch.Batch),
+			mp2:    make(map[int][]*batch.Batch),
+		},
+		//Unique_tbls:  []engine.Relation{&mockRelation{}, &mockRelation{}},
+		OperatorBase: vm.OperatorBase{
+			OperatorInfo: vm.OperatorInfo{
+				Idx:     0,
+				IsFirst: false,
+				IsLast:  false,
+			},
+		},
+		AddAffectedRows: true,
 	}
-	proc.Reg.InputBatch = batch1
-	Prepare(proc, &argument1)
-	_, err := Call(0, proc, &argument1, false, false)
+	resetChildren(&argument1, batch1)
+
+	// argument1.Prepare(proc)
+	argument1.OpAnalyzer = process.NewAnalyzer(0, false, false, "mergeblock")
+	_, err := vm.Exec(&argument1, proc)
 	require.NoError(t, err)
-	require.Equal(t, uint64(15), argument1.AffectedRows)
+	require.Equal(t, uint64(15*3), argument1.container.affectedRows)
 	// Check Tbl
 	{
-		result := argument1.Tbl.(*mockRelation).result
+		result := argument1.container.source.(*mockRelation).result
 		// check attr names
 		require.True(t, reflect.DeepEqual(
-			[]string{catalog.BlockMeta_MetaLoc},
+			[]string{catalog.BlockMeta_BlockInfo, catalog.ObjectMeta_ObjectStats},
 			result.Attrs,
 		))
 		// check vector
-		require.Equal(t, 1, len(result.Vecs))
-		for i, vec := range result.Vecs {
-			require.Equal(t, 1, vec.Length(), fmt.Sprintf("column number: %d", i))
-		}
+		require.Equal(t, 2, len(result.Vecs))
+		//for i, vec := range result.Vecs {
+		require.Equal(t, 3, result.Vecs[0].Length(), fmt.Sprintf("column number: %d", 0))
+		require.Equal(t, 3, result.Vecs[1].Length(), fmt.Sprintf("column number: %d", 1))
+		//}
 	}
 	// Check UniqueTables
-	for j := range argument1.Unique_tbls {
-		tbl := argument1.Unique_tbls[j]
-		result := tbl.(*mockRelation).result
-		// check attr names
-		require.True(t, reflect.DeepEqual(
-			[]string{catalog.BlockMeta_MetaLoc},
-			result.Attrs,
-		))
-		// check vector
-		require.Equal(t, 1, len(result.Vecs))
-		for i, vec := range result.Vecs {
-			require.Equal(t, 1, vec.Length(), fmt.Sprintf("column number: %d", i))
-		}
+	//for j := range argument1.Unique_tbls {
+	//	tbl := argument1.Unique_tbls[j]
+	//	result := tbl.(*mockRelation).result
+	//	// check attr names
+	//	require.True(t, reflect.DeepEqual(
+	//		[]string{catalog.BlockMeta_MetaLoc},
+	//		result.Attrs,
+	//	))
+	//	// check vector
+	//	require.Equal(t, 1, len(result.Vecs))
+	//	for i, vec := range result.Vecs {
+	//		require.Equal(t, 1, vec.Length(), fmt.Sprintf("column number: %d", i))
+	//	}
+	//}
+	argument1.Free(proc, false, nil)
+	argument1.GetChildren(0).Free(proc, false, nil)
+	proc.Free()
+	require.Equal(t, int64(0), proc.GetMPool().CurrNB())
+}
+
+func resetChildren(arg *MergeBlock, bat *batch.Batch) {
+	op := colexec.NewMockOperator().WithBatchs([]*batch.Batch{bat})
+	arg.Children = nil
+	arg.AppendChild(op)
+}
+
+func mockBlockInfoBat(proc *process.Process, withStats bool) *batch.Batch {
+	var attrs []string
+	if withStats {
+		attrs = []string{catalog.BlockMeta_TableIdx_Insert, catalog.BlockMeta_BlockInfo, catalog.ObjectMeta_ObjectStats}
+	} else {
+		attrs = []string{catalog.BlockMeta_TableIdx_Insert, catalog.BlockMeta_BlockInfo}
 	}
-	argument1.Free(proc, false)
+
+	blockInfoBat := batch.NewWithSize(len(attrs))
+	blockInfoBat.Attrs = attrs
+	blockInfoBat.Vecs[0] = vector.NewVec(types.T_int16.ToType())
+	blockInfoBat.Vecs[1] = vector.NewVec(types.T_text.ToType())
+
+	if withStats {
+		blockInfoBat.Vecs[2], _ = vector.NewConstBytes(types.T_binary.ToType(),
+			objectio.ZeroObjectStats.Marshal(), 1, proc.GetMPool())
+	}
+
+	return blockInfoBat
+}
+
+func TestArgument_GetMetaLocBat(t *testing.T) {
+	arg := MergeBlock{
+		container: Container{
+			source: &mockRelation{},
+			mp:     make(map[int]*batch.Batch),
+			mp2:    make(map[int][]*batch.Batch),
+		},
+		//Unique_tbls:  []engine.Relation{&mockRelation{}, &mockRelation{}},
+		OperatorBase: vm.OperatorBase{
+			OperatorInfo: vm.OperatorInfo{
+				Idx:     0,
+				IsFirst: false,
+				IsLast:  false,
+			},
+		},
+		AddAffectedRows: true,
+	}
+
+	proc := testutil.NewProc()
+	proc.Ctx = context.TODO()
+
+	// arg.Prepare(proc)
+
+	bat := mockBlockInfoBat(proc, true)
+	arg.GetMetaLocBat(bat, proc)
+
+	require.Equal(t, 2, len(arg.container.mp[0].Vecs))
+
+	bat.Clean(proc.GetMPool())
+
+	bat = mockBlockInfoBat(proc, false)
+	arg.GetMetaLocBat(bat, proc)
+
+	require.Equal(t, 2, len(arg.container.mp[0].Vecs))
+
+	arg.Free(proc, false, nil)
+	for k := range arg.container.mp {
+		arg.container.mp[k].Clean(proc.GetMPool())
+	}
+
+	proc.Free()
+	bat.Clean(proc.GetMPool())
 	require.Equal(t, int64(0), proc.GetMPool().CurrNB())
 }

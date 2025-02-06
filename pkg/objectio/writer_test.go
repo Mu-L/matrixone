@@ -17,13 +17,12 @@ package objectio
 import (
 	"context"
 	"fmt"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"github.com/matrixorigin/matrixone/pkg/logutil"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
@@ -31,70 +30,71 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
-	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 const (
 	ModuleName = "ObjectIo"
 )
 
-func GetDefaultTestPath(module string, t *testing.T) string {
-	return filepath.Join("/tmp", module, t.Name())
+func GetDefaultTestPath(module string, name string) string {
+	return filepath.Join("/tmp", module, name)
 }
 
-func MakeDefaultTestPath(module string, t *testing.T) string {
-	path := GetDefaultTestPath(module, t)
-	err := os.MkdirAll(path, os.FileMode(0755))
-	assert.Nil(t, err)
+func MakeDefaultTestPath(module string, name string) string {
+	path := GetDefaultTestPath(module, name)
+	os.MkdirAll(path, os.FileMode(0755))
 	return path
 }
 
-func RemoveDefaultTestPath(module string, t *testing.T) {
-	path := GetDefaultTestPath(module, t)
+func RemoveDefaultTestPath(module string, name string) {
+	path := GetDefaultTestPath(module, name)
 	os.RemoveAll(path)
 }
 
-func InitTestEnv(module string, t *testing.T) string {
-	RemoveDefaultTestPath(module, t)
-	return MakeDefaultTestPath(module, t)
+func InitTestEnv(module string, name string) string {
+	RemoveDefaultTestPath(module, name)
+	return MakeDefaultTestPath(module, name)
 }
 
 func TestNewObjectWriter(t *testing.T) {
-	dir := InitTestEnv(ModuleName, t)
+	ctx := context.Background()
+
+	dir := InitTestEnv(ModuleName, t.Name())
 	dir = path.Join(dir, "/local")
 	id := 1
 	name := fmt.Sprintf("%d.blk", id)
 	mp := mpool.MustNewZero()
 	bat := newBatch(mp)
 	defer bat.Clean(mp)
+	bat2 := newBatch2(mp)
+	defer bat.Clean(mp)
 	c := fileservice.Config{
 		Name:    defines.LocalFileServiceName,
 		Backend: "DISK",
 		DataDir: dir,
+		Cache:   fileservice.DisabledCacheConfig,
 	}
-	service, err := fileservice.NewFileService(c, nil)
+	service, err := fileservice.NewFileService(ctx, c, nil)
 	assert.Nil(t, err)
+	defer service.Close(ctx)
 
-	objectWriter, err := NewObjectWriter(name, service)
+	objectWriter, err := NewObjectWriterSpecial(WriterNormal, name, service)
 	assert.Nil(t, err)
+	objectWriter.SetAppendable()
+	//objectWriter.pkColIdx = 3
 	fd, err := objectWriter.Write(bat)
 	assert.Nil(t, err)
 	for i := range bat.Vecs {
-		buf := fmt.Sprintf("test index %d", i)
-		index := NewBloomFilter(uint16(i), 0, []byte(buf))
-		err = objectWriter.WriteIndex(fd, index)
-		assert.Nil(t, err)
-
 		zbuf := make([]byte, 64)
 		zbuf[31] = 1
 		zbuf[63] = 10
-		index, err = NewZoneMap(uint16(i), zbuf)
-		assert.Nil(t, err)
-		err = objectWriter.WriteIndex(fd, index)
-		assert.Nil(t, err)
+		fd.ColumnMeta(uint16(i)).SetZoneMap(zbuf)
 	}
 	_, err = objectWriter.Write(bat)
+	assert.Nil(t, err)
+	_, err = objectWriter.WriteWithoutSeqnum(bat2)
 	assert.Nil(t, err)
 	ts := time.Now()
 	option := WriteOptions{
@@ -103,86 +103,116 @@ func TestNewObjectWriter(t *testing.T) {
 	}
 	blocks, err := objectWriter.WriteEnd(context.Background(), option)
 	assert.Nil(t, err)
-	assert.Equal(t, 2, len(blocks))
-	assert.Nil(t, objectWriter.(*ObjectWriter).buffer)
+	assert.Equal(t, 3, len(blocks))
+	assert.Nil(t, objectWriter.buffer)
+	require.Equal(t, objectWriter.objStats.Size(), blocks[0].GetExtent().End()+FooterSize)
 
-	objectReader, _ := NewObjectReader(name, service)
-	extents := make([]Extent, 2)
+	objectReader, _ := NewObjectReaderWithStr(name, service)
+	extents := make([]Extent, 3)
 	for i, blk := range blocks {
-		extents[i] = NewExtent(blk.GetID(), blk.GetExtent().offset, blk.GetExtent().length, blk.GetExtent().originSize)
+		extents[i] = NewExtent(1, blk.GetExtent().Offset(), blk.GetExtent().Length(), blk.GetExtent().OriginSize())
 	}
 	pool, err := mpool.NewMPool("objectio_test", 0, mpool.NoFixed)
 	assert.NoError(t, err)
 	nb0 := pool.CurrNB()
-	meta, err := objectReader.ReadMeta(context.Background(), extents, pool, nil)
+	objectReader.CacheMetaExtent(&extents[0])
+	metaHeader, err := objectReader.ReadMeta(context.Background(), pool)
 	assert.Nil(t, err)
-	bs := meta.BlkMetas
-	assert.Equal(t, 2, len(bs))
+	meta, _ := metaHeader.DataMeta()
+	oSize := uint32(0)
+	for i := uint32(0); i < 3; i++ {
+		blockMeta := meta.GetBlockMeta(i)
+		for y := uint16(0); y < blockMeta.GetColumnCount(); y++ {
+			oSize += blockMeta.MustGetColumn(y).Location().OriginSize()
+		}
+	}
+	oSize += meta.BlockHeader().BFExtent().OriginSize()
+	oSize += meta.BlockHeader().ZoneMapArea().OriginSize()
+	// 24 is the size of empty bf and zm
+	oSize += HeaderSize + FooterSize + 24 + extents[0].OriginSize()
+	require.Equal(t, objectWriter.objStats.OriginSize(), oSize)
+	assert.Equal(t, uint32(3), meta.BlockCount())
+	assert.True(t, meta.BlockHeader().Appendable())
+	assert.Equal(t, uint16(math.MaxUint16), meta.BlockHeader().SortKey())
 	idxs := make([]uint16, 3)
 	idxs[0] = 0
 	idxs[1] = 2
 	idxs[2] = 3
-	vec, err := objectReader.Read(context.Background(), blocks[0].GetExtent(), idxs, []uint32{blocks[0].GetExtent().id}, pool, nil, newDecompressToObject)
+	typs := []types.Type{types.T_int8.ToType(), types.T_int32.ToType(), types.T_int64.ToType()}
+	vec1, err := objectReader.ReadOneBlock(context.Background(), idxs, typs, 0, pool)
 	assert.Nil(t, err)
-	vector1 := newVector(types.T_int8.ToType(), vec.Entries[0].Object.([]byte))
-	assert.Equal(t, int8(3), vector.MustFixedCol[int8](vector1)[3])
-	vector2 := newVector(types.T_int32.ToType(), vec.Entries[1].Object.([]byte))
-	assert.Equal(t, int32(3), vector.MustFixedCol[int32](vector2)[3])
-	vector3 := newVector(types.T_int64.ToType(), vec.Entries[2].Object.([]byte))
-	assert.Equal(t, int64(3), vector.GetFixedAt[int64](vector3, 3))
-	blk, err := blocks[0].GetColumn(idxs[0])
+	defer vec1.Release()
+
+	obj, err := Decode(vec1.Entries[0].CachedData.Bytes())
 	assert.Nil(t, err)
-	index, err := blk.GetIndex(context.Background(), ZoneMapType, nil, pool)
+	vector1 := obj.(*vector.Vector)
+	assert.Equal(t, int8(3), vector.MustFixedColWithTypeCheck[int8](vector1)[3])
+
+	obj, err = Decode(vec1.Entries[1].CachedData.Bytes())
 	assert.Nil(t, err)
-	buf := index.(*ZoneMap).data.([]byte)
+	vector2 := obj.(*vector.Vector)
+	assert.Equal(t, int32(3), vector.MustFixedColWithTypeCheck[int32](vector2)[3])
+
+	obj, err = Decode(vec1.Entries[2].CachedData.Bytes())
+	assert.Nil(t, err)
+	vector3 := obj.(*vector.Vector)
+	assert.Equal(t, int64(3), vector.GetFixedAtWithTypeCheck[int64](vector3, 3))
+
+	blk := blocks[0].MustGetColumn(idxs[0])
+	buf := blk.ZoneMap()
 	assert.Equal(t, uint8(0x1), buf[31])
 	assert.Equal(t, uint8(0xa), buf[63])
-	index, err = blk.GetIndex(context.Background(), BloomFilterType, newDecompressToObject, pool)
-	assert.Nil(t, err)
-	assert.Equal(t, "test index 0", string(index.(*BloomFilter).data.([]byte)))
 	assert.True(t, nb0 == pool.CurrNB())
 
 	fs := NewObjectFS(service, dir)
-	dirs, err := fs.ListDir("")
+	dirs, err := fileservice.SortedList(fs.ListDir(""))
 	assert.Nil(t, err)
 	assert.Equal(t, 1, len(dirs))
-	objectReader, err = NewObjectReader(name, service)
+	objectReader, err = NewObjectReaderWithStr(name, service)
 	assert.Nil(t, err)
-	meta, err = objectReader.ReadAllMeta(context.Background(), dirs[0].Size, pool, nil)
+	metaHeader, err = objectReader.ReadAllMeta(context.Background(), pool)
 	assert.Nil(t, err)
-	bs = meta.BlkMetas
-	assert.Equal(t, 2, len(bs))
+	meta, _ = metaHeader.DataMeta()
+	assert.Equal(t, uint32(3), meta.BlockCount())
 	assert.Nil(t, err)
-	assert.Equal(t, 2, len(bs))
+	assert.Equal(t, uint32(3), meta.BlockCount())
 	idxs = make([]uint16, 3)
 	idxs[0] = 0
 	idxs[1] = 2
 	idxs[2] = 3
-	vec, err = objectReader.Read(context.Background(), bs[0].GetExtent(), idxs, []uint32{bs[0].GetExtent().id}, pool, nil, newDecompressToObject)
+	vec2, err := objectReader.ReadOneBlock(context.Background(), idxs, typs, 0, pool)
 	assert.Nil(t, err)
-	vector1 = newVector(types.T_int8.ToType(), vec.Entries[0].Object.([]byte))
-	assert.Equal(t, int8(3), vector.MustFixedCol[int8](vector1)[3])
-	vector2 = newVector(types.T_int32.ToType(), vec.Entries[1].Object.([]byte))
-	assert.Equal(t, int32(3), vector.MustFixedCol[int32](vector2)[3])
-	vector3 = newVector(types.T_int64.ToType(), vec.Entries[2].Object.([]byte))
-	assert.Equal(t, int64(3), vector.GetFixedAt[int64](vector3, 3))
-	blk, err = blocks[0].GetColumn(idxs[0])
+	defer vec2.Release()
+
+	obj, err = Decode(vec2.Entries[0].CachedData.Bytes())
 	assert.Nil(t, err)
-	index, err = blk.GetIndex(context.Background(), ZoneMapType, nil, pool)
+	vector1 = obj.(*vector.Vector)
+	assert.Equal(t, int8(3), vector.MustFixedColWithTypeCheck[int8](vector1)[3])
+
+	obj, err = Decode(vec2.Entries[1].CachedData.Bytes())
 	assert.Nil(t, err)
-	buf = index.(*ZoneMap).data.([]byte)
+	vector2 = obj.(*vector.Vector)
+	assert.Equal(t, int32(3), vector.MustFixedColWithTypeCheck[int32](vector2)[3])
+
+	obj, err = Decode(vec2.Entries[2].CachedData.Bytes())
+	assert.Nil(t, err)
+	vector3 = obj.(*vector.Vector)
+	assert.Equal(t, int64(3), vector.GetFixedAtWithTypeCheck[int64](vector3, 3))
+	blk = blocks[0].MustGetColumn(idxs[0])
+	buf = blk.ZoneMap()
 	assert.Equal(t, uint8(0x1), buf[31])
 	assert.Equal(t, uint8(0xa), buf[63])
-	index, err = blk.GetIndex(context.Background(), BloomFilterType, newDecompressToObject, pool)
-	assert.Nil(t, err)
-	assert.Equal(t, "test index 0", string(index.(*BloomFilter).data.([]byte)))
 	assert.True(t, nb0 == pool.CurrNB())
-
+	buf1, err := objectReader.ReadExtent(context.Background(), meta.BlockHeader().ZoneMapArea())
+	assert.Nil(t, err)
+	zma := ZoneMapArea(buf1)
+	buf = zma.GetZoneMap(0, 0)
+	assert.Equal(t, uint8(0x1), buf[31])
+	assert.Equal(t, uint8(0xa), buf[63])
 }
 
-func TestNewObjectReader(t *testing.T) {
-	t.Skip("use debug")
-	dir := InitTestEnv(ModuleName, t)
+func getObjectMeta(ctx context.Context, t *testing.B) ObjectDataMeta {
+	dir := InitTestEnv(ModuleName, t.Name())
 	dir = path.Join(dir, "/local")
 	id := 1
 	name := fmt.Sprintf("%d.blk", id)
@@ -194,28 +224,98 @@ func TestNewObjectReader(t *testing.T) {
 		Backend: "DISK",
 		DataDir: dir,
 	}
-	service, err := fileservice.NewFileService(c, nil)
+	service, err := fileservice.NewFileService(ctx, c, nil)
 	assert.Nil(t, err)
 
-	objectWriter, err := NewObjectWriter(name, service)
+	objectWriter, err := NewObjectWriterSpecial(WriterNormal, name, service)
+	assert.Nil(t, err)
+	for y := 0; y < 1; y++ {
+		fd, err := objectWriter.Write(bat)
+		assert.Nil(t, err)
+		for i := range bat.Vecs {
+			zbuf := make([]byte, 64)
+			zbuf[31] = 1
+			zbuf[63] = 10
+			fd.ColumnMeta(uint16(i)).SetZoneMap(zbuf)
+		}
+	}
+	ts := time.Now()
+	option := WriteOptions{
+		Type: WriteTS,
+		Val:  ts,
+	}
+	blocks, err := objectWriter.WriteEnd(context.Background(), option)
+	assert.Nil(t, err)
+	assert.Equal(t, 1, len(blocks))
+	assert.Nil(t, objectWriter.buffer)
+	objectReader, _ := NewObjectReaderWithStr(name, service)
+	ext := blocks[0].BlockHeader().MetaLocation()
+	objectReader.CacheMetaExtent(&ext)
+	metaHeader, err := objectReader.ReadMeta(context.Background(), nil)
+	assert.Nil(t, err)
+	meta, _ := metaHeader.DataMeta()
+	return meta
+}
+
+func BenchmarkMetadata(b *testing.B) {
+	ctx := context.Background()
+	meta := getObjectMeta(ctx, b)
+	b.Run("GetBlockMeta", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			meta.GetBlockMeta(0)
+		}
+	})
+	b.Log(meta.GetBlockMeta(0).GetID())
+	b.Run("GetColumnMeta", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			meta.Length()
+		}
+	})
+	b.Run("BlockCount", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			meta.BlockCount()
+		}
+	})
+	b.Log(meta.BlockCount())
+}
+
+func TestNewObjectReader(t *testing.T) {
+	ctx := context.Background()
+
+	dir := InitTestEnv(ModuleName, t.Name())
+	dir = path.Join(dir, "/local")
+	id := 1
+	name := fmt.Sprintf("%d.blk", id)
+	mp := mpool.MustNewZero()
+	bat := newBatch(mp)
+	defer bat.Clean(mp)
+	c := fileservice.Config{
+		Name:    defines.LocalFileServiceName,
+		Backend: "DISK",
+		DataDir: dir,
+	}
+	service, err := fileservice.NewFileService(ctx, c, nil)
+	assert.Nil(t, err)
+	defer service.Close(ctx)
+
+	objectWriter, err := NewObjectWriterSpecial(WriterNormal, name, service)
 	assert.Nil(t, err)
 	fd, err := objectWriter.Write(bat)
 	assert.Nil(t, err)
 	for i := range bat.Vecs {
-		buf := fmt.Sprintf("test index %d", i)
-		index := NewBloomFilter(uint16(i), 0, []byte(buf))
-		err = objectWriter.WriteIndex(fd, index)
-		assert.Nil(t, err)
-
 		zbuf := make([]byte, 64)
 		zbuf[31] = 1
 		zbuf[63] = 10
-		index, err = NewZoneMap(uint16(i), zbuf)
-		assert.Nil(t, err)
-		err = objectWriter.WriteIndex(fd, index)
-		assert.Nil(t, err)
+		fd.ColumnMeta(uint16(i)).SetZoneMap(zbuf)
 	}
 	_, err = objectWriter.Write(bat)
+	assert.Nil(t, err)
+	_, _, err = objectWriter.WriteSubBlock(bat, 2)
+	assert.Nil(t, err)
+	_, _, err = objectWriter.WriteSubBlock(bat, 26)
 	assert.Nil(t, err)
 	ts := time.Now()
 	option := WriteOptions{
@@ -224,16 +324,19 @@ func TestNewObjectReader(t *testing.T) {
 	}
 	blocks, err := objectWriter.WriteEnd(context.Background(), option)
 	assert.Nil(t, err)
-	assert.Equal(t, 2, len(blocks))
-	assert.Nil(t, objectWriter.(*ObjectWriter).buffer)
-	now := time.Now()
-	var ext Extent
-	buf := blocks[0].(*Block).MarshalMeta()
-	for i := 0; i < 1000000; i++ {
-		blocks[0].(*Block).UnmarshalMeta(buf, nil)
-	}
-	logutil.Infof("marshal&unmarshal: %v, ext: %v", time.Since(now), ext)
-
+	assert.Equal(t, 4, len(blocks))
+	assert.Nil(t, objectWriter.buffer)
+	objectReader, _ := NewObjectReaderWithStr(name, service)
+	ext := blocks[0].BlockHeader().MetaLocation()
+	objectReader.CacheMetaExtent(&ext)
+	metaHeader, err := objectReader.ReadMeta(context.Background(), nil)
+	assert.Nil(t, err)
+	meta, _ := metaHeader.DataMeta()
+	assert.Equal(t, uint32(2), meta.BlockCount())
+	meta, _ = metaHeader.SubMeta(0)
+	assert.Equal(t, uint32(1), meta.BlockCount())
+	meta, _ = metaHeader.SubMeta(24)
+	assert.Equal(t, uint32(1), meta.BlockCount())
 }
 
 func newBatch(mp *mpool.MPool) *batch.Batch {
@@ -247,11 +350,17 @@ func newBatch(mp *mpool.MPool) *batch.Batch {
 		types.T_uint8.ToType(),
 		types.T_uint64.ToType(),
 	}
-	return testutil.NewBatch(types, false, int(40000*2), mp)
+	return NewBatch(types, false, int(40000*2), mp)
 }
 
-func newVector(tye types.Type, buf []byte) *vector.Vector {
-	vector := vector.NewVec(tye)
-	vector.UnmarshalBinary(buf)
-	return vector
+func newBatch2(mp *mpool.MPool) *batch.Batch {
+	types := []types.Type{
+		types.T_int8.ToType(),
+		types.T_int16.ToType(),
+		types.T_int32.ToType(),
+		types.T_int64.ToType(),
+		types.T_uint16.ToType(),
+		types.T_uint32.ToType(),
+	}
+	return NewBatch(types, false, int(40000*2), mp)
 }

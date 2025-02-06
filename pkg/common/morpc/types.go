@@ -33,7 +33,7 @@ type Message interface {
 	// DebugString return debug string
 	DebugString() string
 	// Size size of message after marshal
-	Size() int
+	ProtoSize() int
 	// MarshalTo marshal to target byte slice
 	MarshalTo(data []byte) (int, error)
 	// Unmarshal unmarshal from data
@@ -63,14 +63,16 @@ type PayloadMessage interface {
 // So messages sent and received at the network level are RPCMessage.
 type RPCMessage struct {
 	// Ctx context
-	Ctx context.Context
+	Ctx    context.Context
+	Cancel context.CancelFunc
 	// Message raw rpc message
 	Message Message
 
+	oneWay         bool
 	internal       bool
-	cancel         context.CancelFunc
 	stream         bool
 	streamSequence uint32
+	createAt       time.Time
 }
 
 // InternalMessage returns true means the rpc message is the internal message in morpc.
@@ -94,6 +96,8 @@ type RPCClient interface {
 	Ping(ctx context.Context, backend string) error
 	// Close close the client
 	Close() error
+
+	CloseBackend() error
 }
 
 // ClientSession client session, which is used to send the response message.
@@ -101,8 +105,12 @@ type RPCClient interface {
 type ClientSession interface {
 	// Close close the client session
 	Close() error
+	// SessionCtx get the session context, if session is closed the context will be canceled.
+	SessionCtx() context.Context
 	// Write writing the response message to the client.
 	Write(ctx context.Context, response Message) error
+	// AsyncWrite only put message into write queue, and return immediately.
+	AsyncWrite(response Message) error
 	// CreateCache create a message cache using cache ID. Cache will removed if
 	// context is done.
 	CreateCache(ctx context.Context, cacheID uint64) (MessageCache, error)
@@ -110,6 +118,8 @@ type ClientSession interface {
 	DeleteCache(cacheID uint64)
 	// GetCache returns the message cache
 	GetCache(cacheID uint64) (MessageCache, error)
+	// RemoteAddress returns remote address, include ip and port
+	RemoteAddress() string
 }
 
 // MessageCache the client uses stream to send messages to the server, and when
@@ -138,7 +148,7 @@ type RPCServer interface {
 	// read goroutine of the current client connection. Sequence is the sequence of message received
 	// by the current client connection. If error returned by handler, client connection will closed.
 	// Handler can use the ClientSession to write response, both synchronous and asynchronous.
-	RegisterRequestHandler(func(ctx context.Context, request Message, sequence uint64, cs ClientSession) error)
+	RegisterRequestHandler(func(ctx context.Context, request RPCMessage, sequence uint64, cs ClientSession) error)
 }
 
 // Codec codec
@@ -162,7 +172,7 @@ type HeaderCodec interface {
 // BackendFactory backend factory
 type BackendFactory interface {
 	// Create create the corresponding backend based on the given address.
-	Create(address string) (Backend, error)
+	Create(address string, extraOptions ...BackendOption) (Backend, error)
 }
 
 // Backend backend represents a wrapper for a client communicating with a
@@ -202,8 +212,8 @@ type Stream interface {
 	// Receive returns a channel to read stream message from server. If nil is received, the receive
 	// loop needs to exit. In any case, Stream.Close needs to be called.
 	Receive() (chan Message, error)
-	// Close close the stream.
-	Close() error
+	// Close close the stream. If closeConn is true, the underlying connection will be closed.
+	Close(closeConn bool) error
 }
 
 // ClientOption client options for create client
@@ -217,3 +227,58 @@ type BackendOption func(*remoteBackend)
 
 // CodecOption codec options
 type CodecOption func(*messageCodec)
+
+// MethodBasedMessage defines messages based on Request and Response patterns in RPC. And
+// different processing logic can be implemented according to the Method in Request.
+type MethodBasedMessage interface {
+	Message
+	// Reset reset message
+	Reset()
+	// Method message type
+	Method() uint32
+	// SetMethod set message type.
+	SetMethod(uint32)
+	// WrapError wrap error into message, and transport to remote endpoint.
+	WrapError(error)
+	// UnwrapError parse error from the message.
+	UnwrapError() error
+}
+
+// HandlerOption message handler option
+type HandlerOption[REQ, RESP MethodBasedMessage] func(*methodBasedServer[REQ, RESP])
+
+// HandleFunc request handle func
+type HandleFunc[REQ, RESP MethodBasedMessage] func(context.Context, REQ, RESP, *Buffer) error
+
+// MethodBasedServer receives and handle requests from MethodBasedClient.
+type MethodBasedServer[REQ, RESP MethodBasedMessage] interface {
+	// Start start the txn server
+	Start() error
+	// Close the txn server
+	Close() error
+	// RegisterMethod register request handler func
+	RegisterMethod(method uint32, handleFunc HandleFunc[REQ, RESP], async bool) MethodBasedServer[REQ, RESP]
+	// Handle handle at local
+	Handle(ctx context.Context, req REQ, buf *Buffer) RESP
+}
+
+// MethodBasedClient is used for sending request by method.
+type MethodBasedClient[REQ, RESP MethodBasedMessage] interface {
+	// RegisterMethod register remote getter func, used to get remote address by method.
+	RegisterMethod(method uint32, remoteGetter func(REQ) (string, error))
+	// Send send request to remote, and wait for a response synchronously.
+	Send(context.Context, REQ) (RESP, error)
+	// AsyncSend async send request to remote.
+	AsyncSend(context.Context, REQ) (*Future, error)
+	// Close close the client
+	Close() error
+}
+
+// MessagePool message pool is used to reuse request and response to avoid allocate.
+type MessagePool[REQ, RESP MethodBasedMessage] interface {
+	AcquireRequest() REQ
+	ReleaseRequest(REQ)
+
+	AcquireResponse() RESP
+	ReleaseResponse(RESP)
+}

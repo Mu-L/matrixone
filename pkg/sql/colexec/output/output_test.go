@@ -18,12 +18,16 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
-	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -32,29 +36,54 @@ const (
 
 // add unit tests for cases
 type outputTestCase struct {
-	arg   *Argument
+	arg   *Output
 	types []types.Type
 	proc  *process.Process
 }
 
-var (
-	tcs []outputTestCase
-)
+var tcs []outputTestCase
 
-func sqlOutput(_ interface{}, _ *batch.Batch) error {
+func sqlOutput(_ *batch.Batch, _ *perfcounter.CounterSet) error {
 	return nil
 }
 
 func init() {
 	tcs = []outputTestCase{
 		{
-			proc: testutil.NewProcessWithMPool(mpool.MustNewZero()),
+			proc: testutil.NewProcessWithMPool("", mpool.MustNewZero()),
 			types: []types.Type{
 				types.T_int8.ToType(),
 			},
-			arg: &Argument{
+			arg: &Output{
 				Data: nil,
 				Func: sqlOutput,
+				OperatorBase: vm.OperatorBase{
+					OperatorInfo: vm.OperatorInfo{
+						Idx:     0,
+						IsFirst: false,
+						IsLast:  false,
+					},
+				},
+			},
+		},
+		{
+			proc: testutil.NewProcessWithMPool("", mpool.MustNewZero()),
+			types: []types.Type{
+				types.T_int8.ToType(),
+			},
+			arg: &Output{
+				ctr: container{
+					block: true,
+				},
+				Data: nil,
+				Func: sqlOutput,
+				OperatorBase: vm.OperatorBase{
+					OperatorInfo: vm.OperatorInfo{
+						Idx:     0,
+						IsFirst: false,
+						IsLast:  false,
+					},
+				},
 			},
 		},
 	}
@@ -63,38 +92,53 @@ func init() {
 func TestString(t *testing.T) {
 	buf := new(bytes.Buffer)
 	for _, tc := range tcs {
-		String(tc.arg, buf)
+		tc.arg.String(buf)
 	}
 }
 
 func TestPrepare(t *testing.T) {
 	for _, tc := range tcs {
-		err := Prepare(tc.proc, tc.arg)
+		err := tc.arg.Prepare(tc.proc)
 		require.NoError(t, err)
 	}
 }
 
 func TestOutput(t *testing.T) {
 	for _, tc := range tcs {
-		err := Prepare(tc.proc, tc.arg)
+		err := tc.arg.Prepare(tc.proc)
 		require.NoError(t, err)
-		tc.proc.Reg.InputBatch = newBatch(t, tc.types, tc.proc, Rows)
-		_, err = Call(0, tc.proc, tc.arg, false, false)
+		bats := []*batch.Batch{
+			newBatch(tc.types, tc.proc, Rows),
+			newBatch(tc.types, tc.proc, Rows),
+			batch.EmptyBatch,
+		}
+		resetChildren(tc.arg, bats)
+		_, err = vm.Exec(tc.arg, tc.proc)
 		require.NoError(t, err)
-		tc.proc.Reg.InputBatch = newBatch(t, tc.types, tc.proc, Rows)
-		_, err = Call(0, tc.proc, tc.arg, false, false)
+		tc.arg.GetChildren(0).Reset(tc.proc, false, nil)
+		tc.arg.Reset(tc.proc, false, nil)
+
+		err = tc.arg.Prepare(tc.proc)
 		require.NoError(t, err)
-		tc.proc.Reg.InputBatch = &batch.Batch{}
-		_, err = Call(0, tc.proc, tc.arg, false, false)
+		resetChildren(tc.arg, bats)
+		_, err = vm.Exec(tc.arg, tc.proc)
 		require.NoError(t, err)
-		tc.proc.Reg.InputBatch = nil
-		_, err = Call(0, tc.proc, tc.arg, false, false)
-		require.NoError(t, err)
+		tc.arg.GetChildren(0).Reset(tc.proc, false, nil)
+		tc.arg.GetChildren(0).Free(tc.proc, false, nil)
+		tc.arg.Reset(tc.proc, false, nil)
+		tc.arg.Free(tc.proc, false, nil)
+		tc.proc.Free()
 		require.Equal(t, int64(0), tc.proc.Mp().CurrNB())
 	}
 }
 
 // create a new block based on the type information
-func newBatch(t *testing.T, ts []types.Type, proc *process.Process, rows int64) *batch.Batch {
+func newBatch(ts []types.Type, proc *process.Process, rows int64) *batch.Batch {
 	return testutil.NewBatch(ts, false, int(rows), proc.Mp())
+}
+
+func resetChildren(arg *Output, bats []*batch.Batch) {
+	op := colexec.NewMockOperator().WithBatchs(bats)
+	arg.Children = nil
+	arg.AppendChild(op)
 }

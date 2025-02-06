@@ -15,6 +15,7 @@
 package fileservice
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -37,18 +38,22 @@ type Config struct {
 	// Backend fileservice backend. [MEM|DISK|DISK-ETL|S3|MINIO]
 	Backend string `toml:"backend"`
 	// S3 used to create fileservice using s3 as the backend
-	S3 S3Config `toml:"s3"`
+	S3 ObjectStorageArguments `toml:"s3"`
 	// Cache specifies configs for cache
 	Cache CacheConfig `toml:"cache"`
 	// DataDir used to create fileservice using DISK as the backend
 	DataDir string `toml:"data-dir"`
+	// FixMissing inidicates the file service to try its best to fix missing files
+	FixMissing bool `toml:"fix-missing"`
 }
 
 // NewFileServicesFunc creates a new *FileServices
 type NewFileServicesFunc = func(defaultName string) (*FileServices, error)
 
 // NewFileService create file service from config
-func NewFileService(cfg Config, perfCounterSets []*perfcounter.CounterSet) (FileService, error) {
+func NewFileService(
+	ctx context.Context, cfg Config, perfCounterSets []*perfcounter.CounterSet,
+) (FileService, error) {
 	if cfg.Name == "" {
 		panic("empty name")
 	}
@@ -56,34 +61,39 @@ func NewFileService(cfg Config, perfCounterSets []*perfcounter.CounterSet) (File
 	case memFileServiceBackend:
 		return newMemFileService(cfg, perfCounterSets)
 	case diskFileServiceBackend:
-		return newDiskFileService(cfg, perfCounterSets)
+		return newDiskFileService(ctx, cfg, perfCounterSets)
 	case diskETLFileServiceBackend:
 		return newDiskETLFileService(cfg, perfCounterSets)
 	case minioFileServiceBackend:
-		return newMinioFileService(cfg, perfCounterSets)
+		return newMinioFileService(ctx, cfg, perfCounterSets)
 	case s3FileServiceBackend:
-		return newS3FileService(cfg, perfCounterSets)
+		return newS3FileService(ctx, cfg, perfCounterSets)
 	default:
-		return nil, moerr.NewInternalErrorNoCtx("file service backend %s not implemented", cfg.Backend)
+		return nil, moerr.NewInternalErrorNoCtxf("file service backend %s not implemented", cfg.Backend)
 	}
 }
 
-func newMemFileService(cfg Config, _ []*perfcounter.CounterSet) (FileService, error) {
-	fs, err := NewMemoryFS(cfg.Name)
+func newMemFileService(cfg Config, perfCounters []*perfcounter.CounterSet) (FileService, error) {
+	fs, err := NewMemoryFS(
+		cfg.Name,
+		cfg.Cache,
+		perfCounters,
+	)
 	if err != nil {
 		return nil, err
 	}
 	return fs, nil
 }
 
-func newDiskFileService(cfg Config, perfCounters []*perfcounter.CounterSet) (FileService, error) {
+func newDiskFileService(ctx context.Context, cfg Config, perfCounters []*perfcounter.CounterSet) (FileService, error) {
 	if cfg.DataDir == "" {
 		panic(fmt.Sprintf("empty data dir: %+v", cfg))
 	}
 	fs, err := NewLocalFS(
+		ctx,
 		cfg.Name,
 		cfg.DataDir,
-		int64(cfg.Cache.MemoryCapacity),
+		cfg.Cache,
 		perfCounters,
 	)
 	if err != nil {
@@ -103,17 +113,17 @@ func newDiskETLFileService(cfg Config, _ []*perfcounter.CounterSet) (FileService
 	return fs, nil
 }
 
-func newMinioFileService(cfg Config, perfCounters []*perfcounter.CounterSet) (FileService, error) {
-	fs, err := NewS3FSOnMinio(
-		cfg.S3.SharedConfigProfile,
-		cfg.Name,
-		cfg.S3.Endpoint,
-		cfg.S3.Bucket,
-		cfg.S3.KeyPrefix,
-		int64(cfg.Cache.MemoryCapacity),
-		int64(cfg.Cache.DiskCapacity),
-		cfg.Cache.DiskPath,
+func newMinioFileService(
+	ctx context.Context, cfg Config, perfCounters []*perfcounter.CounterSet,
+) (FileService, error) {
+	cfg.S3.Name = cfg.Name
+	cfg.S3.IsMinio = true
+	fs, err := NewS3FS(
+		ctx,
+		cfg.S3,
+		cfg.Cache,
 		perfCounters,
+		false,
 		false,
 	)
 	if err != nil {
@@ -122,21 +132,27 @@ func newMinioFileService(cfg Config, perfCounters []*perfcounter.CounterSet) (Fi
 	return fs, nil
 }
 
-func newS3FileService(cfg Config, perfCounters []*perfcounter.CounterSet) (FileService, error) {
+func newS3FileService(
+	ctx context.Context, cfg Config, perfCounters []*perfcounter.CounterSet,
+) (FileService, error) {
+
+	cfg.S3.Name = cfg.Name
 	fs, err := NewS3FS(
-		cfg.S3.SharedConfigProfile,
-		cfg.Name,
-		cfg.S3.Endpoint,
-		cfg.S3.Bucket,
-		cfg.S3.KeyPrefix,
-		int64(cfg.Cache.MemoryCapacity),
-		int64(cfg.Cache.DiskCapacity),
-		cfg.Cache.DiskPath,
+		ctx,
+		cfg.S3,
+		cfg.Cache,
 		perfCounters,
+		false,
 		false,
 	)
 	if err != nil {
 		return nil, err
 	}
+
+	if cfg.FixMissing || *fixMissingFlag || fixMissingFromEnv {
+		//TODO use context.WithoutCancel(ctx)
+		go fs.restoreFromDiskCache(context.Background())
+	}
+
 	return fs, nil
 }

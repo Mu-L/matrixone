@@ -15,23 +15,81 @@
 package merge
 
 import (
-	"reflect"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
+var _ vm.Operator = new(Merge)
+
 type container struct {
-	aliveMergeReceiver int
-	// receiverListener is a structure to listen all the merge receiver.
-	receiverListener []reflect.SelectCase
+	receiver *process.PipelineSignalReceiver
 }
 
-type Argument struct {
-	ctr *container
+type Merge struct {
+	ctr      container
+	SinkScan bool
+	Partial  bool  // false means listening on all merge receivers
+	StartIDX int32 // if partial, listening on receivers[start:end]
+	EndIDX   int32
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	if arg.ctr != nil {
-		arg.ctr.receiverListener = nil
+func (merge *Merge) GetOperatorBase() *vm.OperatorBase {
+	return &merge.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Merge](
+		func() *Merge {
+			return &Merge{}
+		},
+		func(a *Merge) {
+			*a = Merge{}
+		},
+		reuse.DefaultOptions[Merge]().
+			WithEnableChecker(),
+	)
+}
+
+func (merge Merge) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Merge {
+	return reuse.Alloc[Merge](nil)
+}
+
+func (merge *Merge) WithSinkScan(sinkScan bool) *Merge {
+	merge.SinkScan = sinkScan
+	return merge
+}
+
+func (merge *Merge) WithPartial(start, end int32) *Merge {
+	merge.Partial = true
+	merge.StartIDX = start
+	merge.EndIDX = end
+	return merge
+}
+
+func (merge *Merge) Release() {
+	if merge != nil {
+		reuse.Free[Merge](merge, nil)
 	}
+}
+
+func (merge *Merge) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	if merge.ctr.receiver == nil {
+		_ = merge.Prepare(proc)
+	}
+	merge.ctr.receiver.WaitingEnd()
+}
+
+func (merge *Merge) Free(proc *process.Process, pipelineFailed bool, err error) {
+}
+
+func (merge *Merge) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }

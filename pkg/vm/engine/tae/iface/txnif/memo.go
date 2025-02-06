@@ -15,20 +15,21 @@
 package txnif
 
 import (
-	"encoding/binary"
 	"io"
 
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 )
 
 type TxnMemo struct {
-	*common.Tree
+	*model.Tree
+	IsFlushOrMerge   bool
 	isCatalogChanged bool
 }
 
 func NewTxnMemo() *TxnMemo {
 	return &TxnMemo{
-		Tree: common.NewTree(),
+		Tree: model.NewTree(),
 	}
 }
 
@@ -48,11 +49,11 @@ func (memo *TxnMemo) HasCatalogChanges() bool {
 	return memo.isCatalogChanged
 }
 
-func (memo *TxnMemo) GetDirtyTableByID(id uint64) *common.TableTree {
+func (memo *TxnMemo) GetDirtyTableByID(id uint64) *model.TableTree {
 	return memo.GetTable(id)
 }
 
-func (memo *TxnMemo) GetDirty() *common.Tree {
+func (memo *TxnMemo) GetDirty() *model.Tree {
 	return memo.Tree
 }
 
@@ -66,26 +67,26 @@ func (memo *TxnMemo) WriteTo(w io.Writer) (n int64, err error) {
 	if memo.isCatalogChanged {
 		isCatalogChanged = 1
 	}
-	if err = binary.Write(w, binary.BigEndian, isCatalogChanged); err != nil {
+	if _, err = w.Write(types.EncodeInt8(&isCatalogChanged)); err != nil {
 		return
 	}
 	n += 1
 	return
 }
 
-func (memo *TxnMemo) ReadFrom(r io.Reader) (n int64, err error) {
+func (memo *TxnMemo) ReadFromWithVersion(r io.Reader, ver uint16) (n int64, err error) {
 	var tmpn int64
-	if tmpn, err = memo.Tree.ReadFrom(r); err != nil {
+	if tmpn, err = memo.Tree.ReadFromWithVersion(r, ver); err != nil {
 		return
 	}
 	n += tmpn
 	isCatalogChanged := int8(0)
-	if err = binary.Read(r, binary.BigEndian, &isCatalogChanged); err != nil {
+	if _, err = r.Read(types.EncodeInt8(&isCatalogChanged)); err != nil {
 		return
 	}
-	n += 1
 	if isCatalogChanged == 1 {
 		memo.isCatalogChanged = true
 	}
+	n += 1
 	return
 }

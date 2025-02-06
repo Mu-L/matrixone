@@ -17,29 +17,125 @@ package output
 import (
 	"bytes"
 
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(arg any, buf *bytes.Buffer) {
-	buf.WriteString("sql output")
+const opName = "output"
+
+func (output *Output) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(": sql output")
 }
 
-func Prepare(_ *process.Process, _ any) error {
+func (output *Output) OpType() vm.OpType {
+	return vm.Output
+}
+
+func (output *Output) Prepare(_ *process.Process) error {
+	if output.OpAnalyzer == nil {
+		output.OpAnalyzer = process.NewAnalyzer(output.GetIdx(), output.IsFirst, output.IsLast, "output")
+	} else {
+		output.OpAnalyzer.Reset()
+	}
+
+	if output.ctr.block {
+		output.ctr.blockStep = stepCollect
+		output.ctr.cachedBatches = make([]*batch.Batch, 0)
+	}
+
 	return nil
 }
 
-func Call(_ int, proc *process.Process, arg any, isFirst bool, isLast bool) (bool, error) {
-	ap := arg.(*Argument)
-	if bat := proc.Reg.InputBatch; bat != nil && len(bat.Zs) > 0 {
-		for i := range bat.Zs {
-			bat.Zs[i] = 1
-		}
-		if err := ap.Func(ap.Data, bat); err != nil {
-			bat.Clean(proc.Mp())
-			return true, err
-		}
-		bat.Clean(proc.Mp())
-	}
+func (output *Output) Call(proc *process.Process) (vm.CallResult, error) {
+	analyzer := output.OpAnalyzer
 
-	return false, nil
+	if !output.ctr.block {
+		result, err := vm.ChildrenCall(output.GetChildren(0), proc, analyzer)
+		if err != nil {
+			return result, err
+		}
+
+		if result.Batch == nil {
+			result.Status = vm.ExecStop
+			return result, nil
+		}
+
+		if result.Batch.IsEmpty() {
+			return result, nil
+		}
+		bat := result.Batch
+
+		crs := analyzer.GetOpCounterSet()
+		if err = output.Func(bat, crs); err != nil {
+			result.Status = vm.ExecStop
+			return result, err
+		}
+		analyzer.AddS3RequestCount(crs)
+		analyzer.AddFileServiceCacheInfo(crs)
+		analyzer.AddDiskIO(crs)
+
+		// TODO: analyzer.Output(result.Batch)
+		return result, nil
+	} else {
+		if output.ctr.blockStep == stepCollect {
+			for {
+				result, err := vm.ChildrenCall(output.GetChildren(0), proc, analyzer)
+				if err != nil {
+					return result, err
+				}
+				bat := result.Batch
+				if bat == nil {
+					output.ctr.blockStep = stepSend
+					if len(output.ctr.cachedBatches) == 0 {
+						output.ctr.blockStep = stepEnd
+					}
+					break
+				}
+
+				if bat.IsEmpty() {
+					continue
+				}
+				appendBat, err := bat.Dup(proc.GetMPool())
+				if err != nil {
+					return result, err
+				}
+				output.ctr.cachedBatches = append(output.ctr.cachedBatches, appendBat)
+			}
+		}
+
+		result := vm.NewCallResult()
+
+		if output.ctr.blockStep == stepSend {
+			if output.ctr.currentIdx == len(output.ctr.cachedBatches) {
+				output.ctr.blockStep = stepEnd
+				return result, nil
+			} else {
+				bat := output.ctr.cachedBatches[output.ctr.currentIdx]
+				output.ctr.currentIdx = output.ctr.currentIdx + 1
+
+				crs := analyzer.GetOpCounterSet()
+				if err := output.Func(bat, crs); err != nil {
+					result.Status = vm.ExecStop
+					return result, err
+				}
+				analyzer.AddS3RequestCount(crs)
+				analyzer.AddFileServiceCacheInfo(crs)
+				analyzer.AddDiskIO(crs)
+
+				result.Batch = bat
+				// same as nonBlock
+				// analyzer.Output(result.Batch)
+				return result, nil
+			}
+		}
+
+		if output.ctr.blockStep == stepEnd {
+			result.Status = vm.ExecStop
+			return result, nil
+		}
+
+		panic("BUG")
+	}
 }

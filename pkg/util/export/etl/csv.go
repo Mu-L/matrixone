@@ -17,39 +17,79 @@ package etl
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"io"
-	"strings"
 	"sync"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/util"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/util/export/table"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
+
+const initedSize = 4 * mpool.MB
+
+var bufPool = sync.Pool{New: func() any {
+	return bytes.NewBuffer(make([]byte, 0, initedSize))
+}}
+
+func getBuffer() *bytes.Buffer {
+	return bufPool.Get().(*bytes.Buffer)
+}
+
+func putBuffer(buf *bytes.Buffer) {
+	if buf != nil {
+		buf.Reset()
+		bufPool.Put(buf)
+	}
+}
 
 var _ table.RowWriter = (*CSVWriter)(nil)
 
 type CSVWriter struct {
 	ctx    context.Context
-	buf    *bytes.Buffer
 	writer io.StringWriter
+
+	buf       *bytes.Buffer
+	formatter *csv.Writer
 }
 
-func NewCSVWriter(ctx context.Context, buf *bytes.Buffer, writer io.StringWriter) *CSVWriter {
+func NewCSVWriter(ctx context.Context, writer io.StringWriter) *CSVWriter {
 	w := &CSVWriter{
-		ctx:    ctx,
-		buf:    buf,
-		writer: writer,
+		ctx:       ctx,
+		writer:    writer,
+		buf:       nil,
+		formatter: nil,
 	}
 	return w
 }
 
+func (w *CSVWriter) initBuffer() {
+	if w.buf == nil {
+		w.buf = getBuffer()
+		w.formatter = csv.NewWriter(w.buf)
+	}
+}
+func (w *CSVWriter) releaseBuffer() {
+	if w.buf != nil {
+		w.formatter = nil
+		putBuffer(w.buf)
+	}
+}
+
 func (w *CSVWriter) WriteRow(row *table.Row) error {
-	writeCsvOneLine(w.ctx, w.buf, row.ToStrings())
-	return nil
+	return w.WriteStrings(row.ToStrings())
 }
 
 func (w *CSVWriter) WriteStrings(record []string) error {
-	writeCsvOneLine(w.ctx, w.buf, record)
+	w.initBuffer()
+	defer w.formatter.Flush()
+	err := w.formatter.Write(record)
+	if err != nil {
+		return moerr.ConvertGoError(w.ctx, err)
+	}
 	return nil
 }
 
@@ -57,8 +97,20 @@ func (w *CSVWriter) GetContent() string {
 	return w.buf.String()
 }
 
+func (w *CSVWriter) GetContentLength() int {
+	if w.buf == nil {
+		return 0
+	}
+	return w.buf.Len()
+}
+
 func (w *CSVWriter) FlushAndClose() (int, error) {
-	n, err := w.writer.WriteString(w.buf.String())
+	defer w.releaseBuffer()
+	if w.buf == nil || w.buf.Len() == 0 {
+		return 0, nil
+	}
+	v2.TraceMOLoggerExportCsvHistogram.Observe(float64(w.buf.Len()))
+	n, err := w.writer.WriteString(util.UnsafeBytesToString(w.buf.Bytes()))
 	if err != nil {
 		return 0, err
 	}
@@ -67,40 +119,19 @@ func (w *CSVWriter) FlushAndClose() (int, error) {
 	return n, nil
 }
 
-func writeCsvOneLine(ctx context.Context, buf *bytes.Buffer, fields []string) {
-	opts := table.CommonCsvOptions
-	for idx, field := range fields {
-		if idx > 0 {
-			buf.WriteRune(opts.FieldTerminator)
-		}
-		if strings.ContainsRune(field, opts.FieldTerminator) || strings.ContainsRune(field, opts.EncloseRune) || strings.ContainsRune(field, opts.Terminator) {
-			buf.WriteRune(opts.EncloseRune)
-			QuoteFieldFunc(ctx, buf, field, opts.EncloseRune)
-			buf.WriteRune(opts.EncloseRune)
-		} else {
-			buf.WriteString(field)
-		}
+// FlushBuffer flush the input buf content into file.
+// The writer should NOT call function WriteRow, WriteStrings, FlushAndClose.
+func (w *CSVWriter) FlushBuffer(buf *bytes.Buffer) (int, error) {
+	if buf == nil || buf.Len() == 0 {
+		return 0, nil
 	}
-	buf.WriteRune(opts.Terminator)
-}
-
-var QuoteFieldFunc = func(ctx context.Context, buf *bytes.Buffer, value string, enclose rune) string {
-	replaceRules := map[rune]string{
-		'"':  `""`,
-		'\'': `\'`,
+	v2.TraceMOLoggerExportCsvHistogram.Observe(float64(buf.Len()))
+	n, err := w.writer.WriteString(util.UnsafeBytesToString(buf.Bytes()))
+	if err != nil {
+		return 0, err
 	}
-	quotedClose, hasRule := replaceRules[enclose]
-	if !hasRule {
-		panic(moerr.NewInternalError(ctx, "not support csv enclose: %c", enclose))
-	}
-	for _, c := range value {
-		if c == enclose {
-			buf.WriteString(quotedClose)
-		} else {
-			buf.WriteRune(c)
-		}
-	}
-	return value
+	w.writer = nil
+	return n, nil
 }
 
 type FSWriter struct {
@@ -170,6 +201,6 @@ mkdirRetry:
 
 // WriteString implement io.StringWriter
 func (w *FSWriter) WriteString(s string) (n int, err error) {
-	var b = table.String2Bytes(s)
+	var b = util.UnsafeStringToBytes(s)
 	return w.Write(b)
 }

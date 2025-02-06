@@ -15,17 +15,20 @@
 package table
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"path"
-	"reflect"
 	"strings"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 )
+
+const DefaultWriterBufferSize = 10 * mpool.MB
 
 type MergeLogType string
 
@@ -38,11 +41,13 @@ const MergeLogTypeALL MergeLogType = "*"
 const FilenameSeparator = "_"
 const CsvExtension = ".csv"
 const TaeExtension = ".tae"
+const FSExtension = ".fs"
 
 const ETLParamTypeAll = MergeLogTypeALL
 const ETLParamAccountAll = "*"
 
 const AccountAll = ETLParamAccountAll
+const AccountSys = "sys"
 
 var ETLParamTSAll = time.Time{}
 
@@ -113,7 +118,7 @@ func (p *ETLPath) Parse(ctx context.Context) error {
 	// parse path => filename, table
 	elems := strings.Split(p.path, "/")
 	if len(elems) != PathElems {
-		return moerr.NewInternalError(ctx, "invalid etl path: %s", p.path)
+		return moerr.NewInternalErrorf(ctx, "invalid etl path: %s", p.path)
 	}
 	p.filename = elems[PathIdxFilename]
 	p.table = elems[PathIdxTable]
@@ -122,7 +127,7 @@ func (p *ETLPath) Parse(ctx context.Context) error {
 	filename := strings.Trim(p.filename, CsvExtension)
 	fnElems := strings.Split(filename, FilenameSeparator)
 	if len(fnElems) != FilenameElems && len(fnElems) != FilenameElemsV2 {
-		return moerr.NewInternalError(ctx, "invalid etl filename: %s", p.filename)
+		return moerr.NewInternalErrorf(ctx, "invalid etl filename: %s", p.filename)
 	}
 	if fnElems[FilenameIdxType] == string(MergeLogTypeMerged) {
 		p.fileType = MergeLogTypeMerged
@@ -275,6 +280,8 @@ func PathBuilderFactory(pathBuilder string) PathBuilder {
 	}
 }
 
+// GetExtension
+// deprecated.
 func GetExtension(ext string) string {
 	switch ext {
 	case CsvExtension, TaeExtension:
@@ -288,56 +295,163 @@ func GetExtension(ext string) string {
 	}
 }
 
-func String2Bytes(s string) (ret []byte) {
-	sliceHead := (*reflect.SliceHeader)(unsafe.Pointer(&ret))
-	strHead := (*reflect.StringHeader)(unsafe.Pointer(&s))
-
-	sliceHead.Data = strHead.Data
-	sliceHead.Len = strHead.Len
-	sliceHead.Cap = strHead.Len
-	return
+// BufferSettable for util/export/etl/ContentWriter, co-operate with RowWriter
+// mode 1: set empty buffer, do the WriteRow and FlushAndClose
+//
+//	if writer.NeedBuffer(); need {
+//	  writer.SetBuffer(buffer, releaseBufferCallback)
+//	}
+//	for _, row := range rows {
+//	  writer.WriteRow(row) // implement RowWriter interface
+//	}
+//	writer.FlushAndClose()
+//
+// mode 2: set the fulfill buffer, and do the FlushAndClose
+//
+//	buf := bytes.NewBuffer(...)
+//	buf.Write(....)
+//
+//	if writer.NeedBuffer(); need {
+//	  writer.SetBuffer(buffer, releaseBufferCallback)
+//	}
+//	writer.FlushAndClose()
+type BufferSettable interface {
+	// SetBuffer set the buffer into Writer, and the callback for Close or Release.
+	// @callback can be nil.
+	SetBuffer(buf *bytes.Buffer, callback func(buffer *bytes.Buffer))
+	// NeedBuffer return true, means the writer need outside buffer.
+	NeedBuffer() bool
 }
 
+// Flusher work for util/export/etl/ContentWriter
+type Flusher interface {
+	// FlushBuffer flush the buffer and close.
+	FlushBuffer(*bytes.Buffer) (int, error)
+}
+
+// RowWriter for etl export
+// base usage: WriteRow -> [ WriteRow -> [ WriteRow -> ... ]] -> FlushAndClose
 type RowWriter interface {
 	WriteRow(row *Row) error
 	// GetContent get buffer content
 	GetContent() string
+	GetContentLength() int
 	// FlushAndClose flush its buffer and close.
 	FlushAndClose() (int, error)
 }
 
+type BackOff interface {
+	// Count do the event count
+	// return true, means not in backoff cycle. You can run your code.
+	// return false, means you should skip this time.
+	Count() bool
+}
+
+// BackOffSettable work with reactWriter and ContentWriter
+type BackOffSettable interface {
+	SetupBackOff(BackOff)
+}
+
+// RowField work with Row
+// base usage:
+//
+// tbl := RowField.GetTable()
+// row := tbl.GetRow() // Table.GetRow
+// RowField.FillRow(row)
+// RowWriter.WriteRow(row)
 type RowField interface {
 	GetTable() *Table
 	FillRow(context.Context, *Row)
 }
 
+type AckHook func(context.Context)
+
+// AfterWrite for writer which implements RowWriter
+// basic work for reactWriter in util/export pkg.
+type AfterWrite interface {
+	AddAfter(AckHook)
+	RowWriter
+}
+
+// NeedAck co-operate with AfterWrite and RowField
+type NeedAck interface {
+	NeedCheckAck() bool
+	GetAckHook() AckHook
+	RowField
+}
+
+// NeedSyncWrite for item with need to do sync-write
+// It should trigger export ASAP.
+// Co-operate with NeedAck to receiver the ack. And the NeedAck.NeedCheckAck() should return true.
+type NeedSyncWrite interface {
+	NeedSyncWrite() bool
+	NeedAck
+}
+
+// WriteRequest work in Collector, is the req passing through the Collector's workflow.
+// work on flow: from Generate to Export.
 type WriteRequest interface {
 	Handle() (int, error)
-	GetContent() string
 }
 
 type ExportRequests []WriteRequest
 
 type RowRequest struct {
 	writer RowWriter
+	// backoff adapt BackOffSettable
+	backoff BackOff
 }
 
-func NewRowRequest(writer RowWriter) *RowRequest {
-	return &RowRequest{writer}
+func NewRowRequest(writer RowWriter, backoff BackOff) *RowRequest {
+	return &RowRequest{
+		writer:  writer,
+		backoff: backoff,
+	}
 }
 
-func (r *RowRequest) Handle() (int, error) {
+func (r *RowRequest) Handle() (n int, err error) {
 	if r.writer == nil {
 		return 0, nil
 	}
-	return r.writer.FlushAndClose()
+	if setter, ok := r.writer.(BackOffSettable); ok {
+		setter.SetupBackOff(r.backoff)
+	}
+	n, err = r.writer.FlushAndClose()
+	r.writer = nil
+	return
 }
 
+// GetContent for test
 func (r *RowRequest) GetContent() string {
 	return r.writer.GetContent()
 }
 
-type WriterFactory func(ctx context.Context, account string, tbl *Table, ts time.Time) RowWriter
+type WriterFactory interface {
+	GetRowWriter(ctx context.Context, account string, tbl *Table, ts time.Time) RowWriter
+	GetWriter(ctx context.Context, filepath string) io.WriteCloser
+}
+
+var _ WriterFactory = (*defaultWriterGetter)(nil)
+
+type defaultWriterGetter struct {
+	rowWriterGetter func(ctx context.Context, account string, tbl *Table, ts time.Time) RowWriter
+	writerGetter    func(ctx context.Context, filepath string) io.WriteCloser
+}
+
+func NewWriterFactoryGetter(
+	rowWriterGetter func(ctx context.Context, account string, tbl *Table, ts time.Time) RowWriter,
+	writerGetter func(ctx context.Context, filepath string) io.WriteCloser,
+) WriterFactory {
+	return &defaultWriterGetter{rowWriterGetter: rowWriterGetter, writerGetter: writerGetter}
+}
+
+func (f *defaultWriterGetter) GetRowWriter(ctx context.Context, account string, tbl *Table, ts time.Time) RowWriter {
+	return f.rowWriterGetter(ctx, account, tbl, ts)
+}
+
+func (f *defaultWriterGetter) GetWriter(ctx context.Context, filepath string) io.WriteCloser {
+	return f.writerGetter(ctx, filepath)
+}
 
 type FilePathCfg struct {
 	NodeUUID  string

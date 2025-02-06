@@ -20,10 +20,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mohae/deepcopy"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	logpb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
-	"github.com/stretchr/testify/assert"
 )
 
 func TestClusterReady(t *testing.T) {
@@ -57,8 +60,7 @@ func TestClusterForceRefresh(t *testing.T) {
 
 			hc.addCN("cn0")
 			cnt = 0
-			c.ForceRefresh()
-			time.Sleep(time.Millisecond * 100)
+			c.ForceRefresh(true)
 			c.GetCNService(NewServiceIDSelector("cn0"), apply)
 			assert.Equal(t, 1, cnt)
 		})
@@ -69,16 +71,16 @@ func TestClusterRefresh(t *testing.T) {
 		time.Millisecond*10,
 		func(hc *testHAKeeperClient, c *cluster) {
 			cnt := 0
-			apply := func(c metadata.DNService) bool {
+			apply := func(c metadata.TNService) bool {
 				cnt++
 				return true
 			}
-			c.GetDNService(NewServiceIDSelector("dn0"), apply)
+			c.GetTNService(NewServiceIDSelector("dn0"), apply)
 			assert.Equal(t, 0, cnt)
 
-			hc.addDN("dn0")
+			hc.addTN(0, "dn0")
 			time.Sleep(time.Millisecond * 100)
-			c.GetDNService(NewServiceIDSelector("dn0"), apply)
+			c.GetTNService(NewServiceIDSelector("dn0"), apply)
 			assert.Equal(t, 1, cnt)
 		})
 }
@@ -88,31 +90,98 @@ func BenchmarkGetService(b *testing.B) {
 		time.Hour,
 		func(hc *testHAKeeperClient, c *cluster) {
 			cnt := 0
-			apply := func(c metadata.DNService) bool {
+			apply := func(c metadata.TNService) bool {
 				cnt++
 				return true
 			}
-			c.GetDNService(NewServiceIDSelector("dn0"), apply)
+			c.GetTNService(NewServiceIDSelector("dn0"), apply)
 
-			hc.addDN("dn0")
-			c.ForceRefresh()
-			time.Sleep(time.Millisecond * 100)
+			hc.addTN(0, "dn0")
+			c.ForceRefresh(true)
 
 			b.ResetTimer()
 			for i := 0; i < b.N; i++ {
-				c.GetDNService(NewServiceIDSelector("dn0"), apply)
+				c.GetTNService(NewServiceIDSelector("dn0"), apply)
 			}
 		})
 }
 
+func TestCluster_DebugUpdateCNLabel(t *testing.T) {
+	runClusterTest(
+		time.Hour,
+		func(hc *testHAKeeperClient, c *cluster) {
+			var cns []metadata.CNService
+			apply := func(c metadata.CNService) bool {
+				cns = append(cns, c)
+				return true
+			}
+			hc.addCN("cn0")
+			err := c.DebugUpdateCNLabel("cn0", map[string][]string{"k1": {"v1"}})
+			require.NoError(t, err)
+			c.ForceRefresh(true)
+			c.GetCNService(NewServiceIDSelector("cn0"), apply)
+			require.Equal(t, 1, len(cns))
+			require.Equal(t, "cn0", cns[0].ServiceID)
+			require.Equal(t, map[string]metadata.LabelList{
+				"k1": {Labels: []string{"v1"}},
+			}, cns[0].Labels)
+		})
+}
+
+func TestCluster_DebugUpdateCNWorkState(t *testing.T) {
+	runClusterTest(
+		time.Hour,
+		func(hc *testHAKeeperClient, c *cluster) {
+			var cns []metadata.CNService
+			apply := func(c metadata.CNService) bool {
+				cns = append(cns, c)
+				return true
+			}
+			hc.addCN("cn0")
+			err := c.DebugUpdateCNWorkState("cn0", int(metadata.WorkState_Draining))
+			require.NoError(t, err)
+			c.ForceRefresh(true)
+			c.GetCNService(NewServiceIDSelector("cn0"), apply)
+			require.Equal(t, 0, len(cns))
+		})
+}
+
+func TestCluster_GetTNService(t *testing.T) {
+	runClusterTest(
+		time.Hour,
+		func(hc *testHAKeeperClient, c *cluster) {
+			hc.addTN(100, "dn0")
+			hc.addTN(200, "dn1")
+			hc.addTN(50, "dn2")
+			c.ForceRefresh(true)
+			var tns []metadata.TNService
+			c.GetTNService(
+				NewSelector(),
+				func(service metadata.TNService) bool {
+					tns = append(tns, service)
+					return true
+				},
+			)
+			require.Equal(t, 1, len(tns))
+			require.Equal(t, "dn1", tns[0].ServiceID)
+		},
+	)
+}
+
 func runClusterTest(
 	refreshInterval time.Duration,
-	fn func(*testHAKeeperClient, *cluster)) {
-	runtime.SetupProcessLevelRuntime(runtime.DefaultRuntime())
-	hc := &testHAKeeperClient{}
-	c := NewMOCluster(hc, refreshInterval)
-	defer c.Close()
-	fn(hc, c.(*cluster))
+	fn func(*testHAKeeperClient, *cluster),
+) {
+	sid := ""
+	runtime.RunTest(
+		sid,
+		func(rt runtime.Runtime) {
+			hc := &testHAKeeperClient{}
+			c := NewMOCluster(sid, hc, refreshInterval)
+			defer c.Close()
+			fn(hc, c.(*cluster))
+		},
+	)
 }
 
 type testHAKeeperClient struct {
@@ -126,17 +195,19 @@ func (c *testHAKeeperClient) addCN(serviceIDs ...string) {
 	defer c.Unlock()
 	for _, id := range serviceIDs {
 		c.value.CNStores = append(c.value.CNStores, logpb.CNStore{
-			UUID: id,
+			UUID:      id,
+			WorkState: metadata.WorkState_Working,
 		})
 	}
 }
 
-func (c *testHAKeeperClient) addDN(serviceIDs ...string) {
+func (c *testHAKeeperClient) addTN(tick uint64, serviceIDs ...string) {
 	c.Lock()
 	defer c.Unlock()
 	for _, id := range serviceIDs {
-		c.value.DNStores = append(c.value.DNStores, logpb.DNStore{
+		c.value.TNStores = append(c.value.TNStores, logpb.TNStore{
 			UUID: id,
+			Tick: tick,
 		})
 	}
 }
@@ -149,8 +220,33 @@ func (c *testHAKeeperClient) AllocateIDByKey(ctx context.Context, key string) (u
 func (c *testHAKeeperClient) GetClusterDetails(ctx context.Context) (logpb.ClusterDetails, error) {
 	c.RLock()
 	defer c.RUnlock()
-	return c.value, c.err
+	// deep copy the cluster details to avoid data race.
+	copied := deepcopy.Copy(c.value)
+	return copied.(logpb.ClusterDetails), c.err
 }
 func (c *testHAKeeperClient) GetClusterState(ctx context.Context) (logpb.CheckerState, error) {
 	return logpb.CheckerState{}, nil
+}
+func (c *testHAKeeperClient) GetCNState(ctx context.Context) (logpb.CNState, error) {
+	return logpb.CNState{}, nil
+}
+func (c *testHAKeeperClient) UpdateCNLabel(ctx context.Context, label logpb.CNStoreLabel) error {
+	c.Lock()
+	defer c.Unlock()
+	for i, cn := range c.value.CNStores {
+		if cn.UUID == label.UUID {
+			c.value.CNStores[i].Labels = label.Labels
+		}
+	}
+	return nil
+}
+func (c *testHAKeeperClient) UpdateCNWorkState(ctx context.Context, state logpb.CNWorkState) error {
+	c.Lock()
+	defer c.Unlock()
+	for i, cn := range c.value.CNStores {
+		if cn.UUID == state.UUID {
+			c.value.CNStores[i].WorkState = state.State
+		}
+	}
+	return nil
 }

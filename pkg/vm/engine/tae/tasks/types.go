@@ -15,6 +15,7 @@
 package tasks
 
 import (
+	"context"
 	"hash/fnv"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -33,7 +34,7 @@ type FuncT = func() error
 
 type TaskType uint16
 
-var taskIdAlloctor *common.IdAlloctor
+var taskIdAllocator *common.IdAllocator
 
 const (
 	NoopTask TaskType = iota
@@ -44,6 +45,7 @@ const (
 	CheckpointTask
 	GCTask
 	IOTask
+	FlushTableTailTask
 )
 
 var taskNames = map[TaskType]string{
@@ -53,12 +55,13 @@ var taskNames = map[TaskType]string{
 	CheckpointTask:     "Checkpoint",
 	GCTask:             "GC",
 	IOTask:             "IO",
+	FlushTableTailTask: "FlushTableTail",
 }
 
 func RegisterType(t TaskType, name string) {
 	_, ok := taskNames[t]
 	if ok {
-		panic(moerr.NewInternalErrorNoCtx("duplicate task type: %d, %s", t, name))
+		panic(moerr.NewInternalErrorNoCtxf("duplicate task type: %d, %s", t, name))
 	}
 	taskNames[t] = name
 }
@@ -68,13 +71,13 @@ func TaskName(t TaskType) string {
 }
 
 func init() {
-	taskIdAlloctor = common.NewIdAlloctor(1)
+	taskIdAllocator = common.NewIdAllocator(1)
 }
 
 type TxnTaskFactory = func(ctx *Context, txn txnif.AsyncTxn) (Task, error)
 
 func NextTaskId() uint64 {
-	return taskIdAlloctor.Alloc()
+	return taskIdAllocator.Alloc()
 }
 
 type Task interface {
@@ -101,12 +104,12 @@ var DefaultScopeSharder = func(scope *common.ID) int {
 	}
 	hasher := fnv.New64a()
 	hasher.Write(types.EncodeUint64(&scope.TableID))
-	hasher.Write(types.EncodeUuid(&scope.SegmentID))
+	hasher.Write(types.EncodeUuid(scope.SegmentID()))
 	return int(hasher.Sum64())
 }
 
 func IsSameScope(left, right *common.ID) bool {
-	return left.TableID == right.TableID && left.SegmentID == right.SegmentID
+	return left.TableID == right.TableID && left.SegmentID().Eq(*right.SegmentID())
 }
 
 type FnTask struct {
@@ -122,7 +125,7 @@ func NewFnTask(ctx *Context, taskType TaskType, fn FuncT) *FnTask {
 	return task
 }
 
-func (task *FnTask) Execute() error {
+func (task *FnTask) Execute(ctx context.Context) error {
 	return task.Fn()
 }
 

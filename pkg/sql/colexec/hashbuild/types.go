@@ -15,87 +15,95 @@
 package hashbuild
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/common/hashmap"
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/hashmap_util"
+	"github.com/matrixorigin/matrixone/pkg/vm"
+	"github.com/matrixorigin/matrixone/pkg/vm/message"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
+var _ vm.Operator = new(HashBuild)
+
 const (
-	Build = iota
-	End
+	BuildHashMap = iota
+	HandleRuntimeFilter
+	SendJoinMap
+	SendSucceed
 )
 
-type evalVector struct {
-	needFree bool
-	vec      *vector.Vector
-}
-
 type container struct {
-	state int
-
-	hasNull bool
-
-	sels [][]int32
-
-	bat *batch.Batch
-
-	evecs []evalVector
-	vecs  []*vector.Vector
-
-	mp *hashmap.StrHashMap
-
-	nullSels []int32
+	state           int
+	runtimeFilterIn bool
+	hashmapBuilder  hashmap_util.HashmapBuilder
 }
 
-type Argument struct {
-	ctr *container
-	// need to generate a push-down filter expression
-	NeedExpr       bool
-	NeedHashMap    bool
-	NeedSelectList bool
-	Ibucket        uint64
-	Nbucket        uint64
-	Typs           []types.Type
-	Conditions     []*plan.Expr
+type HashBuild struct {
+	ctr               container
+	NeedHashMap       bool
+	HashOnPK          bool
+	NeedBatches       bool
+	NeedAllocateSels  bool
+	Conditions        []*plan.Expr
+	JoinMapTag        int32
+	JoinMapRefCnt     int32
+	RuntimeFilterSpec *plan.RuntimeFilterSpec
 
-	IsRight bool
+	IsDedup           bool
+	DelColIdx         int32
+	OnDuplicateAction plan.Node_OnDuplicateAction
+	DedupColName      string
+	DedupColTypes     []plan.Type
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
-	if ctr != nil {
-		mp := proc.Mp()
-		ctr.cleanBatch(mp)
-		ctr.cleanEvalVectors(mp)
-		if !arg.NeedHashMap {
-			ctr.cleanHashMap()
-		}
+func (hashBuild *HashBuild) GetOperatorBase() *vm.OperatorBase {
+	return &hashBuild.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[HashBuild](
+		func() *HashBuild {
+			return &HashBuild{}
+		},
+		func(a *HashBuild) {
+			*a = HashBuild{}
+		},
+		reuse.DefaultOptions[HashBuild]().
+			WithEnableChecker(),
+	)
+}
+
+func (hashBuild HashBuild) TypeName() string {
+	return opName
+}
+
+func NewArgument() *HashBuild {
+	return reuse.Alloc[HashBuild](nil)
+}
+
+func (hashBuild *HashBuild) Release() {
+	if hashBuild != nil {
+		reuse.Free[HashBuild](hashBuild, nil)
 	}
 }
 
-func (ctr *container) cleanBatch(mp *mpool.MPool) {
-	if ctr.bat != nil {
-		ctr.bat.Clean(mp)
-		ctr.bat = nil
-	}
+func (hashBuild *HashBuild) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	runtimeSucceed := hashBuild.ctr.state > HandleRuntimeFilter
+	mapSucceed := hashBuild.ctr.state == SendSucceed
+
+	hashBuild.ctr.hashmapBuilder.Reset(proc, !mapSucceed)
+	hashBuild.ctr.state = BuildHashMap
+	hashBuild.ctr.runtimeFilterIn = false
+	message.FinalizeRuntimeFilter(hashBuild.RuntimeFilterSpec, runtimeSucceed, proc.GetMessageBoard())
+	message.FinalizeJoinMapMessage(proc.GetMessageBoard(), hashBuild.JoinMapTag, false, 0, mapSucceed)
+}
+func (hashBuild *HashBuild) Free(proc *process.Process, pipelineFailed bool, err error) {
+	hashBuild.ctr.hashmapBuilder.Free(proc)
 }
 
-func (ctr *container) cleanEvalVectors(mp *mpool.MPool) {
-	for i := range ctr.evecs {
-		if ctr.evecs[i].needFree && ctr.evecs[i].vec != nil {
-			ctr.evecs[i].vec.Free(mp)
-			ctr.evecs[i].vec = nil
-		}
-	}
-}
-
-func (ctr *container) cleanHashMap() {
-	if ctr.mp != nil {
-		ctr.mp.Free()
-		ctr.mp = nil
-	}
+func (hashBuild *HashBuild) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }

@@ -19,17 +19,17 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/cnservice"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
-	"github.com/matrixorigin/matrixone/pkg/dnservice"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/tnservice"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
 
 const (
 	// default cluster initial information
-	defaultDNServiceNum  = 1
-	defaultDNShardNum    = 1
+	defaultTNServiceNum  = 1
+	defaultTNShardNum    = 1
 	defaultLogServiceNum = 1
 	defaultLogShardNum   = 1
 	defaultLogReplicaNum = 1
@@ -40,8 +40,8 @@ const (
 	defaultHostAddr    = "127.0.0.1"
 	defaultRootDataDir = "/tmp/mo/tests"
 
-	// default configuration for dn service
-	defaultDNStorage = dnservice.StorageTAE
+	// default configuration for tn service
+	defaultTNStorage = tnservice.StorageTAE
 	defaultCNEngine  = cnservice.EngineDistributedTAE
 
 	// default configuration for log service
@@ -54,21 +54,21 @@ const (
 	// default hakeeper configuration
 	defaultTickPerSecond   = 10
 	defaultLogStoreTimeout = 4 * time.Second
-	defaultDNStoreTimeout  = 3 * time.Second
+	defaultTNStoreTimeout  = 3 * time.Second
 	defaultCNStoreTimeout  = 3 * time.Second
 	defaultCheckInterval   = 1 * time.Second
 
 	// default heartbeat configuration
 	defaultLogHeartbeatInterval = 1 * time.Second
-	defaultDNHeartbeatInterval  = 1 * time.Second
+	defaultTNHeartbeatInterval  = 1 * time.Second
 	defaultCNHeartbeatInterval  = 1 * time.Second
 
 	// default logtail push server configuration
 	defaultRpcMaxMessageSize          = 16 * mpool.KB
-	defaultRpcPayloadCopyBufferSize   = 16 * mpool.KB
+	defaultRPCStreamPoisonTime        = 5 * time.Second
 	defaultLogtailCollectInterval     = 50 * time.Millisecond
 	defaultLogtailResponseSendTimeout = 10 * time.Second
-	defaultMaxLogtailFetchFailure     = 5
+	defaultPullWorkerPoolSize         = 50
 )
 
 // Options are params for creating test cluster.
@@ -79,23 +79,23 @@ type Options struct {
 	logger      *zap.Logger
 
 	initial struct {
-		dnServiceNum  int
+		tnServiceNum  int
 		logServiceNum int
 		cnServiceNum  int
-		dnShardNum    uint64
+		tnShardNum    uint64
 		logShardNum   uint64
 		cnShardNum    uint64
 		logReplicaNum uint64
 	}
 
 	heartbeat struct {
-		dn  time.Duration
+		tn  time.Duration
 		cn  time.Duration
 		log time.Duration
 	}
 
 	storage struct {
-		dnStorage dnservice.StorageType
+		tnStorage tnservice.StorageType
 		cnEngine  cnservice.EngineType
 	}
 
@@ -103,23 +103,26 @@ type Options struct {
 		tickPerSecond   int
 		checkInterval   time.Duration
 		logStoreTimeout time.Duration
-		dnStoreTimeout  time.Duration
+		tnStoreTimeout  time.Duration
 		cnStoreTimeout  time.Duration
 	}
 
 	logtailPushServer struct {
 		rpcMaxMessageSize          int64
-		rpcPayloadCopyBufferSize   int64
+		logtailRPCStreamPoisonTIme time.Duration
 		logtailCollectInterval     time.Duration
 		logtailResponseSendTimeout time.Duration
-		maxLogtailFetchFailure     int
+		pullWorkerPoolSize         int64
+	}
+
+	cn struct {
+		optionFunc func(i int) []cnservice.Option
 	}
 }
 
 // DefaultOptions sets a list of recommended options.
 func DefaultOptions() Options {
 	opt := Options{}
-	opt.validate()
 	return opt
 }
 
@@ -131,8 +134,8 @@ func (opt *Options) validate() {
 	if opt.rootDataDir == "" {
 		opt.rootDataDir = defaultRootDataDir
 	}
-	if opt.initial.dnServiceNum <= 0 {
-		opt.initial.dnServiceNum = defaultDNServiceNum
+	if opt.initial.tnServiceNum <= 0 {
+		opt.initial.tnServiceNum = defaultTNServiceNum
 	}
 	if opt.initial.logServiceNum <= 0 {
 		opt.initial.logServiceNum = defaultLogServiceNum
@@ -140,8 +143,8 @@ func (opt *Options) validate() {
 	if opt.initial.cnServiceNum <= 0 {
 		opt.initial.cnServiceNum = defaultCNServiceNum
 	}
-	if opt.initial.dnShardNum <= 0 {
-		opt.initial.dnShardNum = defaultDNShardNum
+	if opt.initial.tnShardNum <= 0 {
+		opt.initial.tnShardNum = defaultTNShardNum
 	}
 	if opt.initial.logShardNum <= 0 {
 		opt.initial.logShardNum = defaultLogShardNum
@@ -152,8 +155,8 @@ func (opt *Options) validate() {
 	if opt.initial.logReplicaNum <= 0 {
 		opt.initial.logReplicaNum = defaultLogReplicaNum
 	}
-	if opt.storage.dnStorage == "" {
-		opt.storage.dnStorage = defaultDNStorage
+	if opt.storage.tnStorage == "" {
+		opt.storage.tnStorage = defaultTNStorage
 	}
 	if opt.storage.cnEngine == "" {
 		opt.storage.cnEngine = defaultCNEngine
@@ -166,8 +169,8 @@ func (opt *Options) validate() {
 	if opt.hakeeper.logStoreTimeout == 0 {
 		opt.hakeeper.logStoreTimeout = defaultLogStoreTimeout
 	}
-	if opt.hakeeper.dnStoreTimeout == 0 {
-		opt.hakeeper.dnStoreTimeout = defaultDNStoreTimeout
+	if opt.hakeeper.tnStoreTimeout == 0 {
+		opt.hakeeper.tnStoreTimeout = defaultTNStoreTimeout
 	}
 	if opt.hakeeper.cnStoreTimeout == 0 {
 		opt.hakeeper.cnStoreTimeout = defaultCNStoreTimeout
@@ -180,8 +183,8 @@ func (opt *Options) validate() {
 	if opt.heartbeat.log == 0 {
 		opt.heartbeat.log = defaultLogHeartbeatInterval
 	}
-	if opt.heartbeat.dn == 0 {
-		opt.heartbeat.dn = defaultDNHeartbeatInterval
+	if opt.heartbeat.tn == 0 {
+		opt.heartbeat.tn = defaultTNHeartbeatInterval
 	}
 	if opt.heartbeat.cn == 0 {
 		opt.heartbeat.cn = defaultCNHeartbeatInterval
@@ -194,8 +197,8 @@ func (opt *Options) validate() {
 	if opt.logtailPushServer.rpcMaxMessageSize <= 0 {
 		opt.logtailPushServer.rpcMaxMessageSize = defaultRpcMaxMessageSize
 	}
-	if opt.logtailPushServer.rpcPayloadCopyBufferSize <= 0 {
-		opt.logtailPushServer.rpcPayloadCopyBufferSize = defaultRpcPayloadCopyBufferSize
+	if opt.logtailPushServer.logtailRPCStreamPoisonTIme <= 0 {
+		opt.logtailPushServer.logtailRPCStreamPoisonTIme = defaultRPCStreamPoisonTime
 	}
 	if opt.logtailPushServer.logtailCollectInterval <= 0 {
 		opt.logtailPushServer.logtailCollectInterval = defaultLogtailCollectInterval
@@ -203,8 +206,8 @@ func (opt *Options) validate() {
 	if opt.logtailPushServer.logtailResponseSendTimeout <= 0 {
 		opt.logtailPushServer.logtailResponseSendTimeout = defaultLogtailResponseSendTimeout
 	}
-	if opt.logtailPushServer.maxLogtailFetchFailure <= 0 {
-		opt.logtailPushServer.maxLogtailFetchFailure = defaultMaxLogtailFetchFailure
+	if opt.logtailPushServer.pullWorkerPoolSize <= 0 {
+		opt.logtailPushServer.pullWorkerPoolSize = defaultPullWorkerPoolSize
 	}
 }
 
@@ -215,14 +218,14 @@ func (opt Options) BuildHAKeeperConfig() hakeeper.Config {
 	return hakeeper.Config{
 		TickPerSecond:   opt.hakeeper.tickPerSecond,
 		LogStoreTimeout: opt.hakeeper.logStoreTimeout,
-		DNStoreTimeout:  opt.hakeeper.dnStoreTimeout,
+		TNStoreTimeout:  opt.hakeeper.tnStoreTimeout,
 		CNStoreTimeout:  opt.hakeeper.cnStoreTimeout,
 	}
 }
 
-// WithDNServiceNum sets dn service number in the cluster.
-func (opt Options) WithDNServiceNum(num int) Options {
-	opt.initial.dnServiceNum = num
+// WithTNServiceNum sets tn service number in the cluster.
+func (opt Options) WithTNServiceNum(num int) Options {
+	opt.initial.tnServiceNum = num
 	return opt
 }
 
@@ -243,9 +246,9 @@ func (opt Options) WithLogShardNum(num uint64) Options {
 	return opt
 }
 
-// WithDNShardNum sets dn shard number in the cluster.
-func (opt Options) WithDNShardNum(num uint64) Options {
-	opt.initial.dnShardNum = num
+// WithTNShardNum sets tn shard number in the cluster.
+func (opt Options) WithTNShardNum(num uint64) Options {
+	opt.initial.tnShardNum = num
 	return opt
 }
 
@@ -266,21 +269,15 @@ func (opt Options) WithRootDataDir(root string) Options {
 	return opt
 }
 
-// WithDNUseTAEStorage sets dn transaction use tae storage.
-func (opt Options) WithDNUseTAEStorage() Options {
-	opt.storage.dnStorage = dnservice.StorageTAE
+// WithTNUseTAEStorage sets tn transaction use tae storage.
+func (opt Options) WithTNUseTAEStorage() Options {
+	opt.storage.tnStorage = tnservice.StorageTAE
 	return opt
 }
 
-// WithDNUseMEMStorage sets dn transaction use mem storage.
-func (opt Options) WithDNUseMEMStorage() Options {
-	opt.storage.dnStorage = dnservice.StorageMEM
-	return opt
-}
-
-// WithCNUseTAEEngine use tae engine as cn engine
-func (opt Options) WithCNUseTAEEngine() Options {
-	opt.storage.cnEngine = cnservice.EngineTAE
+// WithTNUseMEMStorage sets tn transaction use mem storage.
+func (opt Options) WithTNUseMEMStorage() Options {
+	opt.storage.tnStorage = tnservice.StorageMEM
 	return opt
 }
 
@@ -326,9 +323,9 @@ func (opt Options) WithHKLogStoreTimeout(timeout time.Duration) Options {
 	return opt
 }
 
-// WithHKDNStoreTimeout sets dn store timeout for hakeeper.
-func (opt Options) WithHKDNStoreTimeout(timeout time.Duration) Options {
-	opt.hakeeper.dnStoreTimeout = timeout
+// WithHKTNStoreTimeout sets tn store timeout for hakeeper.
+func (opt Options) WithHKTNStoreTimeout(timeout time.Duration) Options {
+	opt.hakeeper.tnStoreTimeout = timeout
 	return opt
 }
 
@@ -343,9 +340,9 @@ func (opt Options) WithHKCheckInterval(interval time.Duration) Options {
 	return opt
 }
 
-// WithDNHeartbeatInterval sets heartbeat interval fo dn service.
-func (opt Options) WithDNHeartbeatInterval(interval time.Duration) Options {
-	opt.heartbeat.dn = interval
+// WithTNHeartbeatInterval sets heartbeat interval fo tn service.
+func (opt Options) WithTNHeartbeatInterval(interval time.Duration) Options {
+	opt.heartbeat.tn = interval
 	return opt
 }
 
@@ -361,14 +358,14 @@ func (opt Options) WithCNHeartbeatInterval(interval time.Duration) Options {
 	return opt
 }
 
-// GetDNStorageType returns the storage type that the dnservice used
-func (opt Options) GetDNStorageType() dnservice.StorageType {
-	return opt.storage.dnStorage
+// GetTNStorageType returns the storage type that the tnservice used
+func (opt Options) GetTNStorageType() tnservice.StorageType {
+	return opt.storage.tnStorage
 }
 
 // GetCNEngineType returns the engine type that the cnservice used
-func (opt Options) GetCNEngineType() dnservice.StorageType {
-	return opt.storage.dnStorage
+func (opt Options) GetCNEngineType() tnservice.StorageType {
+	return opt.storage.tnStorage
 }
 
 // WithKeepData sets keep data after cluster closed.
@@ -380,12 +377,6 @@ func (opt Options) WithKeepData() Options {
 // WithLogtailRpcMaxMessageSize sets max rpc message size for logtail push server.
 func (opt Options) WithLogtailRpcMaxMessageSize(size int64) Options {
 	opt.logtailPushServer.rpcMaxMessageSize = size
-	return opt
-}
-
-// WithLogtailRpcPayloadCopyBufferSize sets max rpc payload copy buffer size.
-func (opt Options) WithLogtailRpcPayloadCopyBufferSize(size int64) Options {
-	opt.logtailPushServer.rpcPayloadCopyBufferSize = size
 	return opt
 }
 
@@ -401,9 +392,15 @@ func (opt Options) WithLogtailResponseSendTimeout(timeout time.Duration) Options
 	return opt
 }
 
-// WithLogtailMaxFetchFailure sets max failure times when collecting logtail.
-func (opt Options) WithLogtailMaxFetchFailure(max int) Options {
-	opt.logtailPushServer.maxLogtailFetchFailure = max
+// WithLogtailResponseSendTimeout sets response send timeout for logtail push server.
+func (opt Options) WithPullWorkerPoolSize(s int64) Options {
+	opt.logtailPushServer.pullWorkerPoolSize = s
+	return opt
+}
+
+// WithCNOptionFunc set build cn options func
+func (opt Options) WithCNOptionFunc(fn func(i int) []cnservice.Option) Options {
+	opt.cn.optionFunc = fn
 	return opt
 }
 

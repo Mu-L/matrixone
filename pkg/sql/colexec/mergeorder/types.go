@@ -15,49 +15,141 @@
 package mergeorder
 
 import (
-	"reflect"
-
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/compare"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
-	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-type container struct {
-	n     int               // result vector number
-	poses []int32           // sorted list of attributes
-	cmps  []compare.Compare // compare structures used to do sort work for attrs
+const maxBatchSizeToSend = 64 * mpool.MB
+const defaultCacheBatchSize = 16
 
-	bat *batch.Batch // bat store the result of merge-order
+var _ vm.Operator = new(MergeOrder)
 
-	// aliveMergeReceiver is a count for no-close receiver
-	aliveMergeReceiver int
-	// receiverListener is a structure to listen all the merge receiver.
-	receiverListener []reflect.SelectCase
+const (
+	receiving = iota
+	normalSending
+	pickUpSending
+	finish
+)
 
-	// some reused memory
-	unionFlag                    []uint8
-	compare0Index, compare1Index []int32
-	finalSelectList              []int64
+type MergeOrder struct {
+	ctr container
+
+	OrderBySpecs []*plan.OrderBySpec
+
+	vm.OperatorBase
 }
 
-type Argument struct {
-	ctr *container          // ctr stores the attributes needn't do Serialization work
-	Fs  []*plan.OrderBySpec // Fields store the order information
+func (mergeOrder *MergeOrder) GetOperatorBase() *vm.OperatorBase {
+	return &mergeOrder.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
-	if ctr != nil {
-		mp := proc.Mp()
-		ctr.cleanBatch(mp)
+func init() {
+	reuse.CreatePool[MergeOrder](
+		func() *MergeOrder {
+			return &MergeOrder{}
+		},
+		func(a *MergeOrder) {
+			*a = MergeOrder{}
+		},
+		reuse.DefaultOptions[MergeOrder]().
+			WithEnableChecker(),
+	)
+}
+
+func (mergeOrder MergeOrder) TypeName() string {
+	return opName
+}
+
+func NewArgument() *MergeOrder {
+	return reuse.Alloc[MergeOrder](nil)
+}
+
+func (mergeOrder *MergeOrder) Release() {
+	if mergeOrder != nil {
+		reuse.Free[MergeOrder](mergeOrder, nil)
 	}
 }
 
-func (ctr *container) cleanBatch(mp *mpool.MPool) {
-	if ctr.bat != nil {
-		ctr.bat.Clean(mp)
-		ctr.bat = nil
+type container struct {
+	// operator status
+	status int
+
+	// batchList is the data structure to store the all the received batches
+	batchList []*batch.Batch
+	orderCols [][]*vector.Vector
+	// indexList[i] = k means the number of rows before k in batchList[i] has been merged and send.
+	indexList []int64
+
+	// expression executors for order columns.
+	executors []colexec.ExpressionExecutor
+	compares  []compare.Compare
+
+	buf *batch.Batch
+}
+
+func (mergeOrder *MergeOrder) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	mergeOrder.cleanBatchAndCol(proc)
+	ctr := &mergeOrder.ctr
+	ctr.batchList = ctr.batchList[:0]
+	ctr.orderCols = ctr.orderCols[:0]
+	ctr.indexList = nil
+	ctr.status = receiving
+
+	for i := range ctr.executors {
+		if ctr.executors[i] != nil {
+			ctr.executors[i].ResetForNextQuery()
+		}
+	}
+	if ctr.buf != nil {
+		ctr.buf.CleanOnlyData()
+	}
+}
+
+func (mergeOrder *MergeOrder) Free(proc *process.Process, pipelineFailed bool, err error) {
+	mergeOrder.cleanBatchAndCol(proc)
+	ctr := &mergeOrder.ctr
+	ctr.batchList = nil
+	ctr.orderCols = nil
+	for i := range ctr.executors {
+		if ctr.executors[i] != nil {
+			ctr.executors[i].Free()
+		}
+	}
+	ctr.executors = nil
+
+	if ctr.buf != nil {
+		ctr.buf.Clean(proc.Mp())
+		ctr.buf = nil
+	}
+
+}
+
+func (mergeOrder *MergeOrder) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
+}
+
+func (mergeOrder *MergeOrder) cleanBatchAndCol(proc *process.Process) {
+	mp := proc.Mp()
+	ctr := &mergeOrder.ctr
+	for i := range ctr.batchList {
+		if ctr.batchList[i] != nil {
+			ctr.batchList[i].Clean(mp)
+		}
+	}
+	for i := range ctr.orderCols {
+		if ctr.orderCols[i] != nil {
+			for j := range ctr.orderCols[i] {
+				if ctr.orderCols[i][j] != nil {
+					ctr.orderCols[i][j].Free(mp)
+				}
+			}
+		}
 	}
 }

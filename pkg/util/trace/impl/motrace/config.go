@@ -19,15 +19,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/config"
 	"github.com/matrixorigin/matrixone/pkg/util"
 	"github.com/matrixorigin/matrixone/pkg/util/export/table"
 	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
-)
-
-const (
-	InternalExecutor = "InternalExecutor"
-	FileService      = "FileService"
 )
 
 const (
@@ -36,6 +33,10 @@ const (
 	MOLogType       = "log"
 	MOErrorType     = "error"
 	MORawLogType    = "rawlog"
+)
+
+const (
+	MaxStatementSize = "MaxStatementSize"
 )
 
 // tracerProviderConfig.
@@ -49,20 +50,37 @@ type tracerProviderConfig struct {
 
 	enable bool // SetEnable
 
+	// service used to get global config from mo.runtime
+	service string // WithService
+
 	// idGenerator is used to generate all Span and Trace IDs when needed.
 	idGenerator trace.IDGenerator
 
 	// resource contains attributes representing an entity that produces telemetry.
 	resource *trace.Resource // withMOVersion, WithNode,
 
+	// disableSpan
+	disableSpan bool
+	// enableSpanProfile, do profile while span been record.
+	// work in MOSpan.doProfile()
+	enableSpanProfile bool
+	// disableError
+	disableError bool
 	// debugMode used in Tracer.Debug
 	debugMode bool // DebugMode
 
-	batchProcessMode string         // WithBatchProcessMode
-	batchProcessor   BatchProcessor // WithBatchProcessor
+	batchProcessor BatchProcessor // WithBatchProcessor
 
 	// writerFactory gen writer for CSV output
 	writerFactory table.WriterFactory // WithFSWriterFactory, default from export.GetFSWriterFactory4Trace
+	// disableSqlWriter
+	disableSqlWriter bool // set by WithSQLWriterDisable
+
+	// stmt aggregation
+	disableStmtAggregation bool          // set by WithStmtAggregationDisable
+	enableStmtMerge        bool          // set by WithStmtMergeDisable
+	aggregationWindow      time.Duration // WithAggregationWindow
+	selectAggrThreshold    time.Duration // WithSelectThreshold
 
 	sqlExecutor func() ie.InternalExecutor // WithSQLExecutor
 	// needInit control table schema create
@@ -71,8 +89,23 @@ type tracerProviderConfig struct {
 	exportInterval time.Duration //  WithExportInterval
 	// longQueryTime unit ns
 	longQueryTime int64 //  WithLongQueryTime
+	// longSpanTime
+	longSpanTime time.Duration
+	// skipRunningStmt
+	skipRunningStmt bool // set by WithSkipRunningStmt
 
 	bufferSizeThreshold int64 // WithBufferSizeThreshold
+
+	cuConfig   config.OBCUConfig // WithCUConfig
+	cuConfigV1 config.OBCUConfig // WithCUConfig
+
+	tcpPacket bool // WithTCPPacket
+
+	MaxLogMessageSize int // WithMaxLogMessageSize
+	MaxStatementSize  int // WithMaxStatementSize
+
+	// labels for db_logger select target cn as operator.
+	labels map[string]string
 
 	mux sync.RWMutex
 }
@@ -116,6 +149,12 @@ func (f tracerProviderOption) apply(config *tracerProviderConfig) {
 	f(config)
 }
 
+func WithService(service string) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.service = service
+	}
+}
+
 func withMOVersion(v string) tracerProviderOption {
 	return func(config *tracerProviderConfig) {
 		config.resource.Put("version", v)
@@ -156,6 +195,99 @@ func WithLongQueryTime(secs float64) tracerProviderOption {
 	})
 }
 
+func WithLongSpanTime(d time.Duration) TracerProviderOption {
+	return tracerProviderOption(func(cfg *tracerProviderConfig) {
+		cfg.longSpanTime = d
+	})
+}
+
+func WithSpanDisable(disable bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.disableSpan = disable
+	}
+}
+
+func EnableSpanProfile(enable bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.enableSpanProfile = enable
+	}
+}
+
+func WithErrorDisable(disable bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.disableError = disable
+	}
+}
+
+func WithSkipRunningStmt(skip bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.skipRunningStmt = skip
+	}
+}
+
+func WithSQLWriterDisable(disable bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.disableSqlWriter = disable
+	}
+}
+
+func WithAggregatorDisable(disable bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.disableStmtAggregation = disable
+	}
+}
+
+func WithStmtMergeEnable(enable bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.enableStmtMerge = enable
+	}
+}
+
+func WithCUConfig(cu config.OBCUConfig, cuv1 config.OBCUConfig) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.cuConfig = cu
+		cfg.cuConfigV1 = cuv1
+	}
+}
+
+func WithTCPPacket(count bool) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.tcpPacket = count
+	}
+}
+
+func WithMaxLogMessageSize(size int) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.MaxLogMessageSize = size
+	}
+}
+
+func WithMaxStatementSize(service string) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		if s, exist := runtime.ServiceRuntime(service).GetGlobalVariables(MaxStatementSize); exist {
+			cfg.MaxStatementSize = s.(int)
+		}
+	}
+}
+
+func WithLabels(l map[string]string) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.labels = l
+	}
+}
+
+func WithAggregatorWindow(window time.Duration) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.aggregationWindow = window
+	}
+}
+
+func WithSelectThreshold(window time.Duration) tracerProviderOption {
+	return func(cfg *tracerProviderConfig) {
+		cfg.selectAggrThreshold = window
+	}
+}
+
 func WithBufferSizeThreshold(size int64) tracerProviderOption {
 	return tracerProviderOption(func(cfg *tracerProviderConfig) {
 		cfg.bufferSizeThreshold = size
@@ -168,11 +300,6 @@ func DebugMode(debug bool) tracerProviderOption {
 	}
 }
 
-func WithBatchProcessMode(mode string) tracerProviderOption {
-	return func(cfg *tracerProviderConfig) {
-		cfg.batchProcessMode = mode
-	}
-}
 func WithBatchProcessor(p BatchProcessor) tracerProviderOption {
 	return func(cfg *tracerProviderConfig) {
 		cfg.batchProcessor = p

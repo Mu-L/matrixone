@@ -237,7 +237,7 @@ select '2007-01-01' + interval i day from t2;
 select b + interval i day from t2;
 
 update t1 set c = c + INTERVAL 1 DAY where i > 6;
--- @bvt:issue#3290
+-- @bvt:issue#10895
 select * from t1 where i > 6;
 -- @bvt:issue
 drop table if exists t1;
@@ -282,3 +282,11 @@ insert into t1 select date_add('2000-01-04', INTERVAL NULL DAY);
 select * from t1;
 drop table t1;
 
+
+set @tt=now();
+-- @ignore:0
+select @tt;
+-- @ignore:0
+select date_add(@tt, Interval 30 SECOND);
+-- @ignore:0
+select date_sub(@tt, Interval 30 SECOND);

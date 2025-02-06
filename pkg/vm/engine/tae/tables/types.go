@@ -15,10 +15,19 @@
 package tables
 
 import (
-	"github.com/RoaringBitmap/roaring"
+	"context"
+
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+
+	// "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 )
 
 type NodeT interface {
@@ -26,28 +35,49 @@ type NodeT interface {
 
 	IsPersisted() bool
 
-	PrepareAppend(rows uint32) (n uint32, err error)
-	ApplyAppend(
-		bat *containers.Batch,
-		txn txnif.AsyncTxn,
-	) (from int, err error)
-
-	GetDataWindow(from, to uint32) (bat *containers.Batch, err error)
-	GetColumnDataWindow(
-		from uint32,
-		to uint32,
-		colIdx int,
-	) (vec containers.Vector, err error)
-
-	GetValueByRow(row, col int) (v any)
-	GetRowsByKey(key any) (rows []uint32, err error)
-	BatchDedup(
+	Contains(
+		ctx context.Context,
 		keys containers.Vector,
-		skipFn func(row uint32) error,
-	) (sels *roaring.Bitmap, err error)
-	ContainsKey(key any) (ok bool, err error)
+		keysZM index.ZM,
+		txn txnif.TxnReader,
+		mp *mpool.MPool,
+	) (err error)
+	GetDuplicatedRows(
+		ctx context.Context,
+		txn txnif.TxnReader,
+		getRowOffset func() (min, max int32, err error),
+		keys containers.Vector,
+		keysZM index.ZM,
+		rowIDs containers.Vector,
+		mp *mpool.MPool,
+	) (err error)
 
-	Rows() uint32
+	Rows() (uint32, error)
+
+	Scan(
+		ctx context.Context,
+		bat **containers.Batch,
+		txn txnif.TxnReader,
+		readSchema *catalog.Schema,
+		blkID uint16,
+		colIdxes []int,
+		mp *mpool.MPool,
+	) (err error)
+	CollectObjectTombstoneInRange(
+		ctx context.Context,
+		start, end types.TS,
+		objID *types.Objectid,
+		bat **containers.Batch,
+		mp *mpool.MPool,
+		vpool *containers.VectorPool,
+	) (err error)
+	FillBlockTombstones(
+		ctx context.Context,
+		txn txnif.TxnReader,
+		blkID *objectio.Blockid,
+		deletes **nulls.Nulls,
+		deleteStartOffset uint64,
+		mp *mpool.MPool) error
 }
 
 type Node struct {

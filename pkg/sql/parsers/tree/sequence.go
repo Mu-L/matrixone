@@ -16,7 +16,29 @@ package tree
 
 import (
 	"fmt"
+
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 )
+
+func init() {
+	reuse.CreatePool[AlterSequence](
+		func() *AlterSequence { return &AlterSequence{} },
+		func(a *AlterSequence) { a.reset() },
+		reuse.DefaultOptions[AlterSequence](), //.
+	) //WithEnableChecker()
+
+	reuse.CreatePool[CreateSequence](
+		func() *CreateSequence { return &CreateSequence{} },
+		func(c *CreateSequence) { c.reset() },
+		reuse.DefaultOptions[CreateSequence](), //.
+	) //WithEnableChecker()
+
+	reuse.CreatePool[DropSequence](
+		func() *DropSequence { return &DropSequence{} },
+		func(a *DropSequence) { a.reset() },
+		reuse.DefaultOptions[DropSequence](), //.
+	) //WithEnableChecker()
+}
 
 type CreateSequence struct {
 	statementImpl
@@ -29,6 +51,23 @@ type CreateSequence struct {
 	MaxValue    *MaxValueOption
 	StartWith   *StartWithOption
 	Cycle       bool
+}
+
+func NewCreateSequence(name *TableName, typ ResolvableTypeReference, ifnotexists bool, incrementby *IncrementByOption, minvalue *MinValueOption, maxvalue *MaxValueOption, startwith *StartWithOption, cycle bool) *CreateSequence {
+	create := reuse.Alloc[CreateSequence](nil)
+	create.Name = name
+	create.Type = typ
+	create.IfNotExists = ifnotexists
+	create.IncrementBy = incrementby
+	create.MinValue = minvalue
+	create.MaxValue = maxvalue
+	create.StartWith = startwith
+	create.Cycle = cycle
+	return create
+}
+
+func (node *CreateSequence) Free() {
+	reuse.Free[CreateSequence](node, nil)
 }
 
 func (node *CreateSequence) Format(ctx *FmtCtx) {
@@ -61,6 +100,27 @@ func (node *CreateSequence) Format(ctx *FmtCtx) {
 		ctx.WriteString("no cycle")
 	}
 }
+
+func (node *CreateSequence) reset() {
+	// if node.Name != nil {
+	// node.Name.Free()
+	// }
+	// if node.IncrementBy != nil {
+	// node.IncrementBy.Free()
+	// }
+	// if node.MinValue != nil {
+	// node.MinValue.Free()
+	// }
+	// if node.MaxValue != nil {
+	// node.MaxValue.Free()
+	// }
+	// if node.StartWith != nil {
+	// node.StartWith.Free()
+	// }
+	*node = CreateSequence{}
+}
+
+func (node CreateSequence) TypeName() string { return "tree.CreateSequence" }
 
 func (node *CreateSequence) GetStatementType() string { return "Create Sequence" }
 func (node *CreateSequence) GetQueryType() string     { return QueryTypeDDL }
@@ -105,6 +165,27 @@ func (node *StartWithOption) Format(ctx *FmtCtx) {
 	formatAny(node.Minus, node.Num, ctx)
 }
 
+type CycleOption struct {
+	Cycle bool
+}
+
+func (node *CycleOption) Format(ctx *FmtCtx) {
+	if node.Cycle {
+		ctx.WriteString("cycle")
+	} else {
+		ctx.WriteString("no cycle")
+	}
+}
+
+type TypeOption struct {
+	Type ResolvableTypeReference
+}
+
+func (node *TypeOption) Format(ctx *FmtCtx) {
+	ctx.WriteString(" as ")
+	node.Type.(*T).InternalType.Format(ctx)
+}
+
 func formatAny(minus bool, num any, ctx *FmtCtx) {
 	switch num := num.(type) {
 	case uint64:
@@ -126,6 +207,21 @@ type DropSequence struct {
 	Names    TableNames
 }
 
+func (node *DropSequence) Free() { reuse.Free[DropSequence](node, nil) }
+
+func (node DropSequence) TypeName() string { return "tree.DropSequence" }
+
+func (node *DropSequence) reset() {
+	*node = DropSequence{}
+}
+
+func NewDropSequence(ifexists bool, names TableNames) *DropSequence {
+	drop := reuse.Alloc[DropSequence](nil)
+	drop.IfExists = ifexists
+	drop.Names = names
+	return drop
+}
+
 func (node *DropSequence) Format(ctx *FmtCtx) {
 	ctx.WriteString("drop sequence")
 	if node.IfExists {
@@ -137,3 +233,68 @@ func (node *DropSequence) Format(ctx *FmtCtx) {
 
 func (node *DropSequence) GetStatementType() string { return "Drop Sequence" }
 func (node *DropSequence) GetQueryType() string     { return QueryTypeDDL }
+
+type AlterSequence struct {
+	statementImpl
+
+	Name        *TableName
+	Type        *TypeOption
+	IfExists    bool
+	IncrementBy *IncrementByOption
+	MinValue    *MinValueOption
+	MaxValue    *MaxValueOption
+	StartWith   *StartWithOption
+	Cycle       *CycleOption
+}
+
+func NewAlterSequence(ifexists bool, name *TableName, typ *TypeOption, incrementby *IncrementByOption, minvalue *MinValueOption, maxvalue *MaxValueOption, startwith *StartWithOption, cycle *CycleOption) *AlterSequence {
+	alter := reuse.Alloc[AlterSequence](nil)
+	alter.IfExists = ifexists
+	alter.Name = name
+	alter.Type = typ
+	alter.IncrementBy = incrementby
+	alter.MinValue = minvalue
+	alter.MaxValue = maxvalue
+	alter.StartWith = startwith
+	alter.Cycle = cycle
+	return alter
+}
+
+func (node *AlterSequence) Free() { reuse.Free[AlterSequence](node, nil) }
+
+func (node *AlterSequence) Format(ctx *FmtCtx) {
+	ctx.WriteString("alter sequence ")
+
+	if node.IfExists {
+		ctx.WriteString("if exists ")
+	}
+
+	node.Name.Format(ctx)
+
+	if node.Type != nil {
+		node.Type.Format(ctx)
+	}
+	ctx.WriteString(" ")
+	if node.IncrementBy != nil {
+		node.IncrementBy.Format(ctx)
+	}
+	if node.MinValue != nil {
+		node.MinValue.Format(ctx)
+	}
+	if node.MaxValue != nil {
+		node.MaxValue.Format(ctx)
+	}
+	if node.StartWith != nil {
+		node.StartWith.Format(ctx)
+	}
+	if node.Cycle != nil {
+		node.Cycle.Format(ctx)
+	}
+}
+
+func (node AlterSequence) TypeName() string          { return "tree.AlterSequence" }
+func (node *AlterSequence) GetStatementType() string { return "Alter Sequence" }
+func (node *AlterSequence) GetQueryType() string     { return QueryTypeDDL }
+func (node *AlterSequence) reset() {
+	*node = AlterSequence{}
+}

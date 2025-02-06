@@ -4,12 +4,8 @@
 -- @desc:test for [in] subquery with constant operand
 -- @label:bvt
 SELECT 1 IN (SELECT 1);
--- @bvt:issue#3307
 SELECT 1 FROM (SELECT 1 as a) b WHERE 1 IN (SELECT (SELECT a));
--- @bvt:issue
--- @bvt:issue#3556
 SELECT 1 FROM (SELECT 1 as a) b WHERE 1 not IN (SELECT (SELECT a));
--- @bvt:issue
 SELECT * FROM (SELECT 1 as id) b WHERE id IN (SELECT * FROM (SELECT 1 as id) c ORDER BY id);
 SELECT * FROM (SELECT 1) a  WHERE 1 IN (SELECT 1,1);
 SELECT * FROM (SELECT 1) b WHERE 1 IN (SELECT *);
@@ -103,9 +99,7 @@ CREATE TABLE `c` (
 INSERT INTO `c` VALUES (9,9), (0,0), (8,6), (3,6), (7,6), (0,4),
 (1,7), (9,4), (0,8), (9,4), (0,7), (5,5), (0,0), (8,5), (8,7),
 (5,2), (1,8), (7,0), (0,9), (9,5);
--- @bvt:issue#3307
 SELECT * FROM c WHERE `int_key` IN (SELECT `int_nokey`);
--- @bvt:issue
 DROP TABLE IF EXISTS c;
 
 drop table if exists t1;
@@ -217,15 +211,11 @@ drop table if exists t2;
 CREATE TABLE t2 (id int(11) default NULL);
 INSERT INTO t2 VALUES (1),(2);
 SELECT * FROM t2 WHERE id IN (SELECT 1);
--- @bvt:issue#4354
 SELECT * FROM t2 WHERE id IN (SELECT 1 UNION SELECT 3);
--- @bvt:issue
 SELECT * FROM t2 WHERE id IN (SELECT 1+(select 1));
--- @bvt:issue#4354
 SELECT * FROM t2 WHERE id IN (SELECT 5 UNION SELECT 3);
 SELECT * FROM t2 WHERE id IN (SELECT 5 UNION SELECT 2);
 SELECT * FROM t2 WHERE id NOT IN (SELECT 5 UNION SELECT 2);
--- @bvt:issue
 
 -- @case
 -- @desc:test for [in] subquery with null
@@ -342,13 +332,11 @@ PRIMARY KEY (pk)
 );
 INSERT INTO t1 VALUES (1, 1, 7, '2001-11-04 19:07:55.051133');
 CREATE TABLE t2(field1 INT, field2 INT);
--- @bvt:issue#3307
 SELECT * FROM t2 WHERE (field1, field2) IN (
   SELECT MAX(col_datetime_key), col_int_key
   FROM t1
   WHERE col_int_key > col_int_nokey
   GROUP BY col_int_key);
--- @bvt:issue
 
 DROP TABLE IF EXISTS t1;
 drop table if exists t2;
@@ -1125,11 +1113,73 @@ SELECT (NULL IS NULL) IN  (SELECT 1 FROM t1);
 DROP TABLE IF EXISTS t1;
 CREATE TABLE t1 (a INTEGER);
 INSERT INTO t1 VALUES (1), (2), (3);
--- @bvt:issue#4354
 SELECT 2 IN ( SELECT 5 UNION SELECT NULL ) FROM t1;
--- @bvt:issue
 DROP TABLE IF EXISTS t1;
 
+drop database if exists test;
+create database test;
+use test;
+drop table if exists test;
+CREATE TABLE `test` (
+ `id` BIGINT NOT NULL,
+ `tenant_id` VARCHAR(50),
+ `bill_no` VARCHAR(255) DEFAULT null,
+ `category` VARCHAR(50) DEFAULT '',
+ `type` VARCHAR(50) DEFAULT '',
+ `reference_type` VARCHAR(50) DEFAULT '',
+ `reference_no` VARCHAR(255) DEFAULT null,
+ `reference_code` VARCHAR(255) DEFAULT null,
+ `reference_name` VARCHAR(255) DEFAULT null,
+ `in_wh_id` BIGINT DEFAULT null,
+ `in_wh_code` VARCHAR(50) DEFAULT null,
+ `in_wh_name` VARCHAR(50) DEFAULT null,
+ `out_wh_id` BIGINT DEFAULT null,
+ `out_wh_code` VARCHAR(50) DEFAULT null,
+ `out_wh_name` VARCHAR(50) DEFAULT null,
+ `audit_user` BIGINT DEFAULT null,
+ `audit_time` TIMESTAMP DEFAULT null,
+ `posting_date` TIMESTAMP DEFAULT null,
+ `count_qty` DECIMAL(20,6) DEFAULT 0.000000,
+ `count_plan_qty` DECIMAL(20,6) DEFAULT null,
+ `create_user` BIGINT DEFAULT null,
+ `create_org` BIGINT DEFAULT null,
+ `use_org` BIGINT DEFAULT null,
+ `create_dept` BIGINT DEFAULT null,
+ `create_user_name` VARCHAR(50) DEFAULT null,
+ `create_time` TIMESTAMP NOT NULL,
+ `update_user` BIGINT DEFAULT null,
+ `update_user_name` VARCHAR(50) DEFAULT null,
+ `update_time` TIMESTAMP DEFAULT null,
+ `remark` TEXT DEFAULT null,
+ `status` INT NOT NULL,
+ `is_deleted` INT NOT NULL,
+ PRIMARY KEY (`id`),
+ KEY `reference_no` (`reference_no`),
+ KEY `type` (`category`)
+);
 
+insert into test values (10,'000000','1111111111111111','in','house','',NULL,'a',NULL,1,'mark01','warehoue A',NULL,NULL,NULL,NULL,NULL,NULL,'3346.000000','180339.000000',200,134,134,256,'lisi','2023-12-25 12:09:37',200,'lisi','2023-12-25 12:09:37',NULL,3,0);
+insert into test values (11,'000000','1111111111111112','in','house','',NULL,'a',NULL,2,'mark01','warehoue A',NULL,NULL,NULL,NULL,NULL,NULL,'2703.000000','38084.000000',200,134,134,256,'lisi','2023-12-25 12:33:49',200,'lisi','2023-12-25 12:33:49',NULL,3,0);
+insert into test values (12,'000000','1111111111111113','in','house','',NULL,'a',NULL,2,'mark01','warehoue A',NULL,NULL,NULL,NULL,NULL,NULL,'3313.000000','24144.000000',200,134,134,256,'lisi','2023-12-25 12:38:28',200,'lisi','2023-12-25 12:38:28',NULL,3,0);
+insert into test values (13,'000000','1111111111111114','in','house','',NULL,'a',NULL,4,'mark01','warehoue A',NULL,NULL,NULL,NULL,NULL,NULL,'4351.000000','4351.000000',200,134,134,256,'lisi','2023-12-25 12:42:50',200,'lisi','2023-12-25 12:42:50',NULL,3,0);
+insert into test values (14,'000000','1111111111111115','out','outhouse','',NULL,NULL,NULL,NULL,NULL,NULL,5,'mark01','warehoue A',NULL,NULL,NULL,'0.000000','54080.000000',300,134,134,111,'zhangsan','2023-12-25 16:32:58',300,'zhangsan','2023-12-25 16:32:58',NULL,2,0);
+insert into test values (15,'000000','1111111111111116','out','outhouse','',NULL,NULL,NULL,NULL,NULL,NULL,6,'mark01','warehoue A',NULL,NULL,NULL,'0.000000','52100.000000',300,134,134,111,'zhangsan','2023-12-25 20:14:04',300,'zhangsan','2023-12-25 20:14:04',NULL,2,0);
+insert into test values (16,'000000','1111111111111117','out','outhouse','',NULL,NULL,NULL,NULL,NULL,NULL,7,'mark01','warehoue A',NULL,NULL,NULL,'0.000000','95700.000000',300,134,134,111,'zhangsan','2023-12-25 20:34:16',300,'zhangsan','2023-12-25 20:34:16',NULL,2,0);
+insert into test values (17,'000000','1111111111111119','out','outhouse','',NULL,NULL,NULL,NULL,NULL,NULL,9,'mark02','warehouse B',NULL,NULL,NULL,'0.000000','260000.000000',300,134,134,111,'zhangsan','2024-01-02 10:09:24',300,'zhangsan','2024-01-02 10:09:24',NULL,2,1);
+insert into test values (18,'000000','1111111111111120','out','outhouse','',NULL,NULL,NULL,NULL,NULL,NULL,10,'mark02','warehouse B',NULL,NULL,NULL,'12000.000000','624000.000000',300,134,134,111,'zhangsan','2024-01-02 10:24:01',300,'zhangsan','2024-01-02 10:24:01',NULL,2,0);
+insert into test values (19,'000000','1111111111111121','out','outhouse','',NULL,NULL,NULL,NULL,NULL,NULL,11,'mark02','warehouse B',NULL,NULL,NULL,'10440.000000','260000.000000',300,134,134,111,'zhangsan','2024-01-02 10:49:10',300,'zhangsan','2024-01-02 10:49:10',NULL,2,0);
+insert into test values (20,'000000','1111111111111122','in','house','',NULL,'c',NULL,12,'mark02','warehouse B',NULL,NULL,NULL,NULL,NULL,NULL,'10000.000000','847020.000000',300,134,134,111,'zhangsan','2024-01-04 11:14:39',300,'zhangsan','2024-01-04 11:14:39',NULL,3,0);
+insert into test values (21,'000000','1111111111111123','in','house','',NULL,'c',NULL,13,'mark02','warehouse B',NULL,NULL,NULL,NULL,NULL,NULL,'0.000000','108216.000000',200,134,134,256,'lisi','2024-01-04 11:32:12',200,'lisi','2024-01-04 11:32:12',NULL,3,0);
+insert into test values (22,'000000','1111111111111124','in','house','',NULL,'c',NULL,14,'mark02','warehouse B',NULL,NULL,NULL,NULL,NULL,NULL,'0.000000','332512.000000',200,134,134,256,'lisi','2024-01-04 11:35:41',200,'lisi','2024-01-04 11:35:41',NULL,3,0);
+insert into test values (23,'000000','1111111111111125','in','house','',NULL,'c',NULL,15,'mark02','warehouse B1',NULL,NULL,NULL,NULL,NULL,NULL,'0.000000','881.000000',200,134,134,256,'lisi','2024-01-04 12:03:55',200,'lisi','2024-01-04 12:03:55',NULL,3,0);
+insert into test values (24,'000000','1111111111111126','in','house','',NULL,'c',NULL,16,'mark02','warehouse B1',NULL,NULL,NULL,NULL,NULL,NULL,'10000.000000','20000.000000',200,134,134,256,'lisi','2024-01-04 12:05:53',200,'lisi','2024-01-04 12:05:53',NULL,3,0);
+insert into test values (25,'000000','1111111111111127','in','house','',NULL,'c',NULL,17,'mark02','warehouse B1',NULL,NULL,NULL,NULL,NULL,NULL,'0.000000','326780.000000',200,134,134,256,'lisi','2024-01-04 12:07:19',200,'lisi','2024-01-04 12:07:19',NULL,3,0);
+insert into test values (26,'000000','1111111111111128','in','house','',NULL,NULL,NULL,18,'mark02','warehouse B',NULL,NULL,NULL,NULL,NULL,NULL,'137.000000','33878.000000',300,112,900,111,'zhangsan','2024-01-04 16:22:31',300,'zhangsan','2024-01-04 16:22:31',NULL,3,0);
+-- @separator:table
+select mo_ctl('dn','flush','test.test');
+select id, count(*) from test group by id order by count(*) desc;
+update test set status = 3 where is_deleted = 0 and (id in (10, 11, 12, 10, 13, 10) and is_deleted = 0 and tenant_id = '000000');
+select id, count(*) from test group by id order by count(*) desc;
 
-
+drop table test;
+drop database test;

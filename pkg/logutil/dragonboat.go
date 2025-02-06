@@ -70,13 +70,13 @@ func (d DragonboatAdaptLogger) Panicf(format string, args ...interface{}) {
 func DragonboatFactory(name string) logger.ILogger {
 	var cores = make([]zapcore.Core, 0, 2)
 	cfg := getGlobalLogConfig()
-	atom := cfg.getLevel()
+	atom := cfg.GetLevel()
 	sinks := cfg.getSinks()
 	for _, sink := range sinks {
 		cores = append(cores, zapcore.NewCore(sink.enc, sink.out, atom))
 	}
 	options := cfg.getOptions()
-	options = append(options, zap.AddCallerSkip(2), zap.AddStacktrace(zap.ErrorLevel))
+	options = append(options, zap.AddCallerSkip(2))
 	return &DragonboatAdaptLogger{
 		logger:  zap.New(zapcore.NewTee(cores...), options...).Named(name).Sugar(),
 		atom:    &atom,

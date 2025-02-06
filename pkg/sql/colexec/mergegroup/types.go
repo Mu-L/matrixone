@@ -1,4 +1,4 @@
-// Copyright 2021 Matrix Origin
+// Copyright 2024 Matrix Origin
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,71 +15,87 @@
 package mergegroup
 
 import (
-	"reflect"
-
-	"github.com/matrixorigin/matrixone/pkg/common/hashmap"
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/group"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
 const (
-	Build = iota
-	Eval
-	End
+	thisOperatorName = "merge_group"
 )
 
-const (
-	H0 = iota
-	H8
-	HStr
-)
+type MergeGroup struct {
+	vm.OperatorBase
+	colexec.Projection
+
+	ctr container
+
+	PartialResults     []any
+	PartialResultTypes []types.T
+}
+
+func (mergeGroup *MergeGroup) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	if mergeGroup.ProjectList == nil {
+		return input, nil
+	}
+	return mergeGroup.EvalProjection(input, proc)
+}
 
 type container struct {
-	state     int
-	typ       int
-	inserted  []uint8
-	zInserted []uint8
+	state vm.CtrState
 
-	intHashMap *hashmap.IntHashMap
-	strHashMap *hashmap.StrHashMap
-
-	bat *batch.Batch
-
-	// aliveMergeReceiver is a count for no-close receiver
-	aliveMergeReceiver int
-	// receiverListener is a structure to listen all the merge receiver.
-	receiverListener []reflect.SelectCase
+	// hash.
+	hr group.ResHashRelated
+	// res.
+	result group.GroupResultBuffer
 }
 
-type Argument struct {
-	NeedEval bool // need to projection the aggregate column
-	ctr      *container
+func (mergeGroup *MergeGroup) Reset(proc *process.Process, _ bool, _ error) {
+	mergeGroup.Free(proc, false, nil)
+	mergeGroup.ResetProjection(proc)
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
-	if ctr != nil {
-		mp := proc.Mp()
-		ctr.cleanBatch(mp)
-		ctr.cleanHashMap()
-	}
+func (mergeGroup *MergeGroup) Free(proc *process.Process, _ bool, _ error) {
+	mergeGroup.ctr.result.Free0(proc.Mp())
+	mergeGroup.ctr.hr.Free0()
+	mergeGroup.FreeProjection(proc)
 }
 
-func (ctr *container) cleanBatch(mp *mpool.MPool) {
-	if ctr.bat != nil {
-		ctr.bat.Clean(mp)
-		ctr.bat = nil
-	}
+func (mergeGroup *MergeGroup) GetOperatorBase() *vm.OperatorBase {
+	return &mergeGroup.OperatorBase
 }
 
-func (ctr *container) cleanHashMap() {
-	if ctr.intHashMap != nil {
-		ctr.intHashMap.Free()
-		ctr.intHashMap = nil
-	}
-	if ctr.strHashMap != nil {
-		ctr.strHashMap.Free()
-		ctr.strHashMap = nil
+func (mergeGroup *MergeGroup) OpType() vm.OpType {
+	return vm.MergeGroup
+}
+
+func (mergeGroup MergeGroup) TypeName() string {
+	return thisOperatorName
+}
+
+func init() {
+	reuse.CreatePool[MergeGroup](
+		func() *MergeGroup {
+			return &MergeGroup{}
+		},
+		func(a *MergeGroup) {
+			*a = MergeGroup{}
+		},
+		reuse.DefaultOptions[MergeGroup]().
+			WithEnableChecker(),
+	)
+}
+
+func NewArgument() *MergeGroup {
+	return reuse.Alloc[MergeGroup](nil)
+}
+
+func (mergeGroup *MergeGroup) Release() {
+	if mergeGroup != nil {
+		reuse.Free[MergeGroup](mergeGroup, nil)
 	}
 }

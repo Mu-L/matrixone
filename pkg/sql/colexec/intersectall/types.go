@@ -16,40 +16,90 @@ package intersectall
 
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/hashmap"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
+var _ vm.Operator = new(IntersectAll)
+
 type container struct {
+
 	// operator state: Build, Probe or End
 	state int
 
 	// helper data structure during probe
 	counter []uint64
 
-	// process mark
-	inBuckets []uint8
-
 	// built for the smaller of the two relations
 	hashTable *hashmap.StrHashMap
 
 	inserted      []uint8
 	resetInserted []uint8
+
+	buf *batch.Batch
 }
 
-type Argument struct {
+type IntersectAll struct {
 	// execution container
-	ctr *container
-	// index in buckets
-	IBucket uint64
-	// buckets count
-	NBucket uint64
+	ctr container
+
+	vm.OperatorBase
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
-	if ctr != nil {
-		ctr.cleanHashMap()
+func (intersectAll *IntersectAll) GetOperatorBase() *vm.OperatorBase {
+	return &intersectAll.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[IntersectAll](
+		func() *IntersectAll {
+			return &IntersectAll{}
+		},
+		func(a *IntersectAll) {
+			*a = IntersectAll{}
+		},
+		reuse.DefaultOptions[IntersectAll]().
+			WithEnableChecker(),
+	)
+}
+
+func (intersectAll IntersectAll) TypeName() string {
+	return opName
+}
+
+func NewArgument() *IntersectAll {
+	return reuse.Alloc[IntersectAll](nil)
+}
+
+func (intersectAll *IntersectAll) Release() {
+	if intersectAll != nil {
+		reuse.Free[IntersectAll](intersectAll, nil)
 	}
+}
+
+func (intersectAll *IntersectAll) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	ctr := &intersectAll.ctr
+	ctr.state = Build
+	ctr.cleanHashMap()
+	if ctr.buf != nil {
+		ctr.buf.CleanOnlyData()
+	}
+	ctr.counter = nil
+}
+
+func (intersectAll *IntersectAll) Free(proc *process.Process, pipelineFailed bool, err error) {
+	ctr := &intersectAll.ctr
+	ctr.cleanHashMap()
+	if ctr.buf != nil {
+		ctr.buf.Clean(proc.Mp())
+		ctr.buf = nil
+	}
+}
+
+func (intersectAll *IntersectAll) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }
 
 func (ctr *container) cleanHashMap() {

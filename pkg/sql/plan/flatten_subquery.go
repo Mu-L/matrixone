@@ -23,15 +23,28 @@ import (
 
 var (
 	constTrue = &plan.Expr{
-		Expr: &plan.Expr_C{
-			C: &plan.Const{
-				Isnull: false,
-				Value: &plan.Const_Bval{
+		Expr: &plan.Expr_Lit{
+			Lit: &plan.Literal{
+				Value: &plan.Literal_Bval{
 					Bval: true,
 				},
 			},
 		},
-		Typ: &plan.Type{
+		Typ: plan.Type{
+			Id:          int32(types.T_bool),
+			NotNullable: true,
+		},
+	}
+
+	constFalse = &plan.Expr{
+		Expr: &plan.Expr_Lit{
+			Lit: &plan.Literal{
+				Value: &plan.Literal_Bval{
+					Bval: false,
+				},
+			},
+		},
+		Typ: plan.Type{
 			Id:          int32(types.T_bool),
 			NotNullable: true,
 		},
@@ -51,6 +64,9 @@ func (builder *QueryBuilder) flattenSubqueries(nodeID int32, expr *plan.Expr, ct
 		}
 
 	case *plan.Expr_Sub:
+		if builder.isForUpdate {
+			return 0, nil, moerr.NewInternalError(builder.GetContext(), "not support subquery for update")
+		}
 		nodeID, expr, err = builder.flattenSubquery(nodeID, exprImpl.Sub, ctx)
 	}
 
@@ -58,8 +74,55 @@ func (builder *QueryBuilder) flattenSubqueries(nodeID int32, expr *plan.Expr, ct
 }
 
 func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.SubqueryRef, ctx *BindContext) (int32, *plan.Expr, error) {
+	if subquery.Child != nil && hasSubquery(subquery.Child) {
+		return 0, nil, moerr.NewNotSupported(builder.GetContext(), "a quantified subquery's left operand can't contain subquery")
+	}
+
 	subID := subquery.NodeId
 	subCtx := builder.ctxByNode[subID]
+
+	// Strip unnecessary subqueries which have no FROM clause
+	subNode := builder.qry.Nodes[subID]
+	if subNode.NodeType == plan.Node_PROJECT && builder.qry.Nodes[subNode.Children[0]].NodeType == plan.Node_VALUE_SCAN {
+		switch subquery.Typ {
+		case plan.SubqueryRef_SCALAR:
+			newProj, _ := decreaseDepth(subNode.ProjectList[0])
+			return nodeID, newProj, nil
+
+		case plan.SubqueryRef_EXISTS:
+			return nodeID, constTrue, nil
+
+		case plan.SubqueryRef_NOT_EXISTS:
+			return nodeID, constFalse, nil
+
+		case plan.SubqueryRef_IN:
+			newExpr, err := builder.generateRowComparison("=", subquery.Child, subCtx, true)
+			if err != nil {
+				return 0, nil, err
+			}
+
+			return nodeID, newExpr, nil
+
+		case plan.SubqueryRef_NOT_IN:
+			newExpr, err := builder.generateRowComparison("<>", subquery.Child, subCtx, true)
+			if err != nil {
+				return 0, nil, err
+			}
+
+			return nodeID, newExpr, nil
+
+		case plan.SubqueryRef_ANY, plan.SubqueryRef_ALL:
+			newExpr, err := builder.generateRowComparison(subquery.Op, subquery.Child, subCtx, true)
+			if err != nil {
+				return 0, nil, err
+			}
+
+			return nodeID, newExpr, nil
+
+		default:
+			return 0, nil, moerr.NewNotSupportedf(builder.GetContext(), "%s subquery not supported", subquery.Typ.String())
+		}
+	}
 
 	subID, preds, err := builder.pullupCorrelatedPredicates(subID, subCtx)
 	if err != nil {
@@ -67,22 +130,20 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 	}
 
 	if subquery.Typ == plan.SubqueryRef_SCALAR && len(subCtx.aggregates) > 0 && builder.findNonEqPred(preds) {
-		return 0, nil, moerr.NewNYI(builder.GetContext(), "aggregation with non equal predicate in %s subquery  will be supported in future version", subquery.Typ.String())
+		return 0, nil, moerr.NewNYIf(builder.GetContext(), "aggregation with non equal predicate in %s subquery  will be supported in future version", subquery.Typ.String())
 	}
 
 	filterPreds, joinPreds := decreaseDepthAndDispatch(preds)
 
 	if len(filterPreds) > 0 && subquery.Typ >= plan.SubqueryRef_SCALAR {
-		return 0, nil, moerr.NewNYI(builder.GetContext(), "correlated columns in %s subquery deeper than 1 level will be supported in future version", subquery.Typ.String())
+		return 0, nil, moerr.NewNYIf(builder.GetContext(), "correlated columns in %s subquery deeper than 1 level will be supported in future version", subquery.Typ.String())
 	}
 
 	switch subquery.Typ {
 	case plan.SubqueryRef_SCALAR:
 		var rewrite bool
 		// Uncorrelated subquery
-		if len(joinPreds) == 0 {
-			joinPreds = append(joinPreds, constTrue)
-		} else if builder.findAggrCount(subCtx.aggregates) {
+		if len(joinPreds) > 0 && builder.findAggrCount(subCtx.aggregates) {
 			rewrite = true
 		}
 
@@ -110,7 +171,7 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 			Typ: subCtx.results[0].Typ,
 			Expr: &plan.Expr_Col{
 				Col: &plan.ColRef{
-					RelPos: subCtx.rootTag(),
+					RelPos: subCtx.topTag(),
 					ColPos: 0,
 				},
 			},
@@ -118,7 +179,11 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 		if rewrite {
 			argsType := make([]types.Type, 1)
 			argsType[0] = makeTypeByPlan2Expr(retExpr)
-			funcID, returnType, _, _ := function.GetFunctionByName(builder.GetContext(), "isnull", argsType)
+			fGet, err := function.GetFunctionByName(builder.GetContext(), "isnull", argsType)
+			if err != nil {
+				return nodeID, retExpr, err
+			}
+			funcID, returnType := fGet.GetEncodedOverloadID(), fGet.GetReturnType()
 			isNullExpr := &Expr{
 				Expr: &plan.Expr_F{
 					F: &plan.Function{
@@ -133,7 +198,11 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 			argsType[0] = makeTypeByPlan2Expr(isNullExpr)
 			argsType[1] = makeTypeByPlan2Expr(zeroExpr)
 			argsType[2] = makeTypeByPlan2Expr(retExpr)
-			funcID, returnType, _, _ = function.GetFunctionByName(builder.GetContext(), "case", argsType)
+			fGet, err = function.GetFunctionByName(builder.GetContext(), "case", argsType)
+			if err != nil {
+				return nodeID, retExpr, nil
+			}
+			funcID, returnType = fGet.GetEncodedOverloadID(), fGet.GetReturnType()
 			retExpr = &Expr{
 				Expr: &plan.Expr_F{
 					F: &plan.Function{
@@ -163,7 +232,7 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 		return builder.insertMarkJoin(nodeID, subID, joinPreds, nil, true, ctx)
 
 	case plan.SubqueryRef_IN:
-		outerPred, err := builder.generateComparison("=", subquery.Child, subCtx)
+		outerPred, err := builder.generateRowComparison("=", subquery.Child, subCtx, false)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -171,7 +240,7 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 		return builder.insertMarkJoin(nodeID, subID, joinPreds, outerPred, false, ctx)
 
 	case plan.SubqueryRef_NOT_IN:
-		outerPred, err := builder.generateComparison("=", subquery.Child, subCtx)
+		outerPred, err := builder.generateRowComparison("=", subquery.Child, subCtx, false)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -179,7 +248,7 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 		return builder.insertMarkJoin(nodeID, subID, joinPreds, outerPred, true, ctx)
 
 	case plan.SubqueryRef_ANY:
-		outerPred, err := builder.generateComparison(subquery.Op, subquery.Child, subCtx)
+		outerPred, err := builder.generateRowComparison(subquery.Op, subquery.Child, subCtx, false)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -187,12 +256,12 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 		return builder.insertMarkJoin(nodeID, subID, joinPreds, outerPred, false, ctx)
 
 	case plan.SubqueryRef_ALL:
-		outerPred, err := builder.generateComparison(subquery.Op, subquery.Child, subCtx)
+		outerPred, err := builder.generateRowComparison(subquery.Op, subquery.Child, subCtx, false)
 		if err != nil {
 			return 0, nil, err
 		}
 
-		outerPred, err = bindFuncExprImplByPlanExpr(builder.GetContext(), "not", []*plan.Expr{outerPred})
+		outerPred, err = BindFuncExprImplByPlanExpr(builder.GetContext(), "not", []*plan.Expr{outerPred})
 		if err != nil {
 			return 0, nil, err
 		}
@@ -200,7 +269,7 @@ func (builder *QueryBuilder) flattenSubquery(nodeID int32, subquery *plan.Subque
 		return builder.insertMarkJoin(nodeID, subID, joinPreds, outerPred, true, ctx)
 
 	default:
-		return 0, nil, moerr.NewNotSupported(builder.GetContext(), "%s subquery not supported", subquery.Typ.String())
+		return 0, nil, moerr.NewNotSupportedf(builder.GetContext(), "%s subquery not supported", subquery.Typ.String())
 	}
 }
 
@@ -209,7 +278,7 @@ func (builder *QueryBuilder) insertMarkJoin(left, right int32, joinPreds []*plan
 
 	for i, pred := range joinPreds {
 		if !pred.Typ.NotNullable {
-			joinPreds[i], err = bindFuncExprImplByPlanExpr(builder.GetContext(), "istrue", []*plan.Expr{pred})
+			joinPreds[i], err = BindFuncExprImplByPlanExpr(builder.GetContext(), "istrue", []*plan.Expr{pred})
 			if err != nil {
 				return
 			}
@@ -232,7 +301,7 @@ func (builder *QueryBuilder) insertMarkJoin(left, right int32, joinPreds []*plan
 	}, ctx)
 
 	markExpr = &plan.Expr{
-		Typ: &plan.Type{
+		Typ: plan.Type{
 			Id:          int32(types.T_bool),
 			NotNullable: notNull,
 		},
@@ -245,52 +314,53 @@ func (builder *QueryBuilder) insertMarkJoin(left, right int32, joinPreds []*plan
 	}
 
 	if negate {
-		markExpr, err = bindFuncExprImplByPlanExpr(builder.GetContext(), "not", []*plan.Expr{markExpr})
+		markExpr, err = BindFuncExprImplByPlanExpr(builder.GetContext(), "not", []*plan.Expr{markExpr})
 	}
 
 	return
 }
 
-func (builder *QueryBuilder) generateComparison(op string, child *plan.Expr, ctx *BindContext) (*plan.Expr, error) {
+func getProjectExpr(idx int, ctx *BindContext, strip bool) *plan.Expr {
+	if strip {
+		newProj, _ := decreaseDepth(ctx.results[idx])
+		return newProj
+	} else {
+		return &plan.Expr{
+			Typ: ctx.results[idx].Typ,
+			Expr: &plan.Expr_Col{
+				Col: &plan.ColRef{
+					RelPos: ctx.rootTag(),
+					ColPos: int32(idx),
+				},
+			},
+		}
+	}
+}
+
+func (builder *QueryBuilder) generateRowComparison(op string, child *plan.Expr, ctx *BindContext, strip bool) (*plan.Expr, error) {
 	switch childImpl := child.Expr.(type) {
 	case *plan.Expr_List:
 		childList := childImpl.List.List
 		switch op {
 		case "=":
-			leftExpr, err := bindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
+			leftExpr, err := BindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
 				childList[0],
-				{
-					Typ: ctx.results[0].Typ,
-					Expr: &plan.Expr_Col{
-						Col: &plan.ColRef{
-							RelPos: ctx.rootTag(),
-							ColPos: 0,
-						},
-					},
-				},
+				getProjectExpr(0, ctx, strip),
 			})
 			if err != nil {
 				return nil, err
 			}
 
 			for i := 1; i < len(childList); i++ {
-				rightExpr, err := bindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
+				rightExpr, err := BindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
 					childList[i],
-					{
-						Typ: ctx.results[i].Typ,
-						Expr: &plan.Expr_Col{
-							Col: &plan.ColRef{
-								RelPos: ctx.rootTag(),
-								ColPos: int32(i),
-							},
-						},
-					},
+					getProjectExpr(i, ctx, strip),
 				})
 				if err != nil {
 					return nil, err
 				}
 
-				leftExpr, err = bindFuncExprImplByPlanExpr(builder.GetContext(), "and", []*plan.Expr{leftExpr, rightExpr})
+				leftExpr, err = BindFuncExprImplByPlanExpr(builder.GetContext(), "and", []*plan.Expr{leftExpr, rightExpr})
 				if err != nil {
 					return nil, err
 				}
@@ -299,40 +369,24 @@ func (builder *QueryBuilder) generateComparison(op string, child *plan.Expr, ctx
 			return leftExpr, nil
 
 		case "<>":
-			leftExpr, err := bindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
+			leftExpr, err := BindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
 				childList[0],
-				{
-					Typ: ctx.results[0].Typ,
-					Expr: &plan.Expr_Col{
-						Col: &plan.ColRef{
-							RelPos: ctx.rootTag(),
-							ColPos: 0,
-						},
-					},
-				},
+				getProjectExpr(0, ctx, strip),
 			})
 			if err != nil {
 				return nil, err
 			}
 
 			for i := 1; i < len(childList); i++ {
-				rightExpr, err := bindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
+				rightExpr, err := BindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
 					childList[i],
-					{
-						Typ: ctx.results[i].Typ,
-						Expr: &plan.Expr_Col{
-							Col: &plan.ColRef{
-								RelPos: ctx.rootTag(),
-								ColPos: int32(i),
-							},
-						},
-					},
+					getProjectExpr(i, ctx, strip),
 				})
 				if err != nil {
 					return nil, err
 				}
 
-				leftExpr, err = bindFuncExprImplByPlanExpr(builder.GetContext(), "or", []*plan.Expr{leftExpr, rightExpr})
+				leftExpr, err = BindFuncExprImplByPlanExpr(builder.GetContext(), "or", []*plan.Expr{leftExpr, rightExpr})
 				if err != nil {
 					return nil, err
 				}
@@ -343,15 +397,8 @@ func (builder *QueryBuilder) generateComparison(op string, child *plan.Expr, ctx
 		case "<", "<=", ">", ">=":
 			projList := make([]*plan.Expr, len(childList))
 			for i := range projList {
-				projList[i] = &plan.Expr{
-					Typ: ctx.results[i].Typ,
-					Expr: &plan.Expr_Col{
-						Col: &plan.ColRef{
-							RelPos: ctx.rootTag(),
-							ColPos: int32(i),
-						},
-					},
-				}
+				projList[i] = getProjectExpr(i, ctx, strip)
+
 			}
 
 			nonEqOp := op[:1] // <= -> <, >= -> >
@@ -362,17 +409,9 @@ func (builder *QueryBuilder) generateComparison(op string, child *plan.Expr, ctx
 		}
 
 	default:
-		return bindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
+		return BindFuncExprImplByPlanExpr(builder.GetContext(), op, []*plan.Expr{
 			child,
-			{
-				Typ: ctx.results[0].Typ,
-				Expr: &plan.Expr_Col{
-					Col: &plan.ColRef{
-						RelPos: ctx.rootTag(),
-						ColPos: 0,
-					},
-				},
-			},
+			getProjectExpr(0, ctx, strip),
 		})
 	}
 }

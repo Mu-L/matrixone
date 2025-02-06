@@ -14,6 +14,10 @@
 
 package plan
 
+const (
+	SystemExternalRel = "e"
+)
+
 // when autocommit is set to false, and no active txn is started
 // an implicit txn need to be started for statements , like insert/delete/update
 // and most select statement, like select * from t1.
@@ -41,12 +45,39 @@ func (p *Plan) UnmarshalBinary(data []byte) error {
 	return p.Unmarshal(data)
 }
 
-func (p *PartitionByDef) MarshalPartitionInfo() ([]byte, error) {
-	data := make([]byte, p.ProtoSize())
-	_, err := p.MarshalTo(data)
-	return data, err
+func (m *OnUpdate) MarshalBinary() ([]byte, error) {
+	return m.Marshal()
 }
 
-func (p *PartitionByDef) UnMarshalPartitionInfo(data []byte) error {
-	return p.Unmarshal(data)
+func (m *OnUpdate) UnmarshalBinary(data []byte) error {
+	return m.Unmarshal(data)
+}
+
+func (m *Default) MarshalBinary() ([]byte, error) {
+	return m.Marshal()
+}
+
+func (m *Default) UnmarshalBinary(data []byte) error {
+	return m.Unmarshal(data)
+}
+
+func (m CreateTable) IsSystemExternalRel() bool {
+	return m.TableDef.TableType == SystemExternalRel
+}
+
+func (t *Type) IsEmpty() bool {
+	return t == nil || (t.Id == 0 &&
+		!t.NotNullable &&
+		!t.AutoIncr &&
+		t.Width == 0 &&
+		t.Scale == 0 &&
+		t.Table == "" &&
+		t.Enumvalues == "")
+}
+
+func (def *ColDef) GetOriginCaseName() string {
+	if def.OriginName == "" {
+		return def.Name
+	}
+	return def.OriginName
 }

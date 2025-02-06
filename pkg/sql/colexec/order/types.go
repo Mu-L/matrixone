@@ -16,40 +16,119 @@ package order
 
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-type evalVector struct {
-	needFree bool
-	vec      *vector.Vector
+var _ vm.Operator = new(Order)
+
+const maxBatchSizeToSort = 64 * mpool.MB
+
+type Order struct {
+	ctr container
+
+	OrderBySpec []*plan.OrderBySpec
+
+	vm.OperatorBase
 }
 
-type container struct {
-	desc      []bool // ds[i] == true: the attrs[i] are in descending order
-	nullsLast []bool
-	vecs      []evalVector // sorted list of attributes
+func (order *Order) GetOperatorBase() *vm.OperatorBase {
+	return &order.OperatorBase
 }
 
-type Argument struct {
-	ctr *container
-	Fs  []*plan.OrderBySpec
+func init() {
+	reuse.CreatePool[Order](
+		func() *Order {
+			return &Order{}
+		},
+		func(a *Order) {
+			*a = Order{}
+		},
+		reuse.DefaultOptions[Order]().
+			WithEnableChecker(),
+	)
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
-	if ctr != nil {
-		mp := proc.Mp()
-		ctr.cleanEvalVectors(mp)
+func (order Order) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Order {
+	return reuse.Alloc[Order](nil)
+}
+
+func (order *Order) Release() {
+	if order != nil {
+		reuse.Free[Order](order, nil)
 	}
 }
 
-func (ctr *container) cleanEvalVectors(mp *mpool.MPool) {
-	for i := range ctr.vecs {
-		if ctr.vecs[i].needFree && ctr.vecs[i].vec != nil {
-			ctr.vecs[i].vec.Free(mp)
-			ctr.vecs[i].vec = nil
+type container struct {
+	state          vm.CtrState
+	batWaitForSort *batch.Batch
+	rbat           *batch.Batch
+
+	desc      []bool // ds[i] == true: the attrs[i] are in descending order
+	nullsLast []bool
+
+	sortExprExecutor []colexec.ExpressionExecutor
+	sortVectors      []*vector.Vector
+	resultOrderList  []int64
+}
+
+func (order *Order) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	ctr := &order.ctr
+	if ctr.batWaitForSort != nil {
+		if ctr.batWaitForSort.RowCount() > colexec.DefaultBatchSize {
+			ctr.batWaitForSort.Clean(proc.Mp())
+			ctr.batWaitForSort = nil
+		} else {
+			ctr.batWaitForSort.CleanOnlyData()
 		}
+	}
+	if ctr.rbat != nil {
+		ctr.rbat.Clean(proc.Mp())
+		ctr.rbat = nil
+	}
+	ctr.state = vm.Build
+	for i := range ctr.sortExprExecutor {
+		if ctr.sortExprExecutor[i] != nil {
+			ctr.sortExprExecutor[i].ResetForNextQuery()
+		}
+	}
+	ctr.resultOrderList = nil
+}
+
+func (order *Order) Free(proc *process.Process, _ bool, err error) {
+	order.cleanBatch(proc)
+	ctr := &order.ctr
+	for i := range ctr.sortExprExecutor {
+		if ctr.sortExprExecutor[i] != nil {
+			ctr.sortExprExecutor[i].Free()
+		}
+	}
+	ctr.sortExprExecutor = nil
+	ctr.resultOrderList = nil
+}
+
+func (order *Order) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
+}
+
+func (order *Order) cleanBatch(proc *process.Process) {
+	//big memory, just clean
+	ctr := &order.ctr
+	if ctr.batWaitForSort != nil {
+		ctr.batWaitForSort.Clean(proc.Mp())
+		ctr.batWaitForSort = nil
+	}
+	if ctr.rbat != nil {
+		ctr.rbat.Clean(proc.Mp())
+		ctr.rbat = nil
 	}
 }

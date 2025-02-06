@@ -1,10 +1,10 @@
-FROM  matrixorigin/tester:go1.19-java8
+FROM matrixorigin/tester:go1.23.0-jdk8
 
 ARG GOPROXY="https://proxy.golang.org,direct"
 
 ENV UT_PARALLEL=1
 ENV LC_ALL="C.UTF-8"
-ENV LAUNCH="launch-tae-CN-tae-DN"
+ENV LAUNCH="launch"
 ENV ENABLE_UT="false"
 
 RUN go env -w GOPROXY=$GOPROXY

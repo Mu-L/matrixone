@@ -15,23 +15,60 @@
 package cnservice
 
 import (
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/operator"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	"go.uber.org/zap"
 )
 
-func Check(cfg hakeeper.Config, infos pb.CNState, user pb.TaskTableUser, currentTick uint64) (operators []*operator.Operator) {
-	if user.Username == "" {
+type cnServiceChecker struct {
+	hakeeper.CheckerCommonFields
+	cnState pb.CNState
+}
+
+func NewCNServiceChecker(
+	commonFields hakeeper.CheckerCommonFields,
+	cnState pb.CNState,
+) hakeeper.ModuleChecker {
+	return &cnServiceChecker{
+		CheckerCommonFields: commonFields,
+		cnState:             cnState,
+	}
+}
+
+func (c *cnServiceChecker) Check() (operators []*operator.Operator) {
+	if c.User.Username == "" {
+		runtime.ServiceRuntime(c.ServiceID).Logger().Warn("username is still empty.")
 		return
 	}
-	working, expired := parseCNStores(cfg, infos, currentTick)
+	working, expired := parseCNStores(c.Cfg, c.cnState, c.CurrentTick)
+	if len(working)+len(expired) == 0 {
+		runtime.ServiceRuntime(c.ServiceID).Logger().Error("there are no CNs yet.")
+		return
+	}
 	for _, store := range working {
-		if !infos.Stores[store].TaskServiceCreated {
+		if !c.cnState.Stores[store].TaskServiceCreated {
+			runtime.ServiceRuntime(c.ServiceID).Logger().Info("create task service for CN.",
+				zap.String("uuid", store))
 			operators = append(operators, operator.CreateTaskServiceOp("",
-				store, pb.CNService, user))
+				store, pb.CNService, c.User))
+		}
+		// If this instance has not joined gossip cluster, we generate join command.
+		if !c.cnState.Stores[store].GossipJoined {
+			addresses := getGossipAddresses(c.Cfg, c.cnState, c.CurrentTick, store)
+			if len(addresses) > 0 {
+				runtime.ServiceRuntime(c.ServiceID).Logger().Info("join gossip cluster for CN",
+					zap.String("uuid", store),
+					zap.Any("addresses", addresses))
+				operators = append(operators, operator.JoinGossipClusterOp("",
+					store, addresses))
+			}
 		}
 	}
 	for _, store := range expired {
+		runtime.ServiceRuntime(c.ServiceID).Logger().Warn("expired CN.",
+			zap.String("uuid", store))
 		operators = append(operators, operator.CreateDeleteCNOp("", store))
 	}
 	return operators
@@ -50,4 +87,22 @@ func parseCNStores(cfg hakeeper.Config, infos pb.CNState, currentTick uint64) ([
 	}
 
 	return working, expired
+}
+
+// getGossipAddresses returns the gossip addresses of CN stores that are in working state.
+func getGossipAddresses(cfg hakeeper.Config, infos pb.CNState, currentTick uint64, self string) []string {
+	var addresses []string
+	var count int
+	for uuid, storeInfo := range infos.Stores {
+		if !cfg.CNStoreExpired(storeInfo.Tick, currentTick) && uuid != self {
+			if len(storeInfo.GossipAddress) > 0 {
+				addresses = append(addresses, storeInfo.GossipAddress)
+				count++
+				if count > 2 {
+					break
+				}
+			}
+		}
+	}
+	return addresses
 }

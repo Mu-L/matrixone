@@ -17,20 +17,29 @@ package external
 import (
 	"bufio"
 	"context"
-	"encoding/csv"
 	"io"
-	"sync/atomic"
 
+	"github.com/parquet-go/parquet-go"
+
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/pipeline"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
+	"github.com/matrixorigin/matrixone/pkg/sql/util/csvparser"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func ColumnCntLargerErrorInfo() string {
-	return "the table column is larger than input data column"
-}
+var _ vm.Operator = new(External)
+
+const (
+	ColumnCntLargerErrorInfo = "the table column is larger than input data column"
+)
 
 // Use for External table scan param
 type ExternalParam struct {
@@ -43,19 +52,25 @@ type ExternalParam struct {
 type ExParamConst struct {
 	IgnoreLine    int
 	IgnoreLineTag int
+	ParallelLoad  bool
+	StrictSqlMode bool
+	Close         byte
 	maxBatchSize  uint64
+	Idx           int
+	ColumnListLen int32 // load ...  (col1, col2 , col3), ColumnListLen is 3
 	CreateSql     string
-	Attrs         []string
-	Cols          []*plan.ColDef
-	OriginCols    []*plan.ColDef
-	FileList      []string
-	FileSize      []int64
-	FileOffset    [][2]int
-	Name2ColIndex map[string]int32
-	Ctx           context.Context
-	Extern        *tree.ExternParam
-	tableDef      *plan.TableDef
-	ClusterTable  *plan.ClusterTable
+
+	// letter case: origin
+	Attrs           []plan.ExternAttr
+	Cols            []*plan.ColDef
+	FileList        []string
+	FileSize        []int64
+	FileOffset      []int64
+	FileOffsetTotal []*pipeline.FileOffset
+	Ctx             context.Context
+	Extern          *tree.ExternParam
+	tableDef        *plan.TableDef
+	ClusterTable    *plan.ClusterTable
 }
 
 type ExParam struct {
@@ -65,6 +80,7 @@ type ExParam struct {
 	Fileparam *ExFileparam
 	Zoneparam *ZonemapFileparam
 	Filter    *FilterParam
+	parqh     *ParquetHandler
 }
 
 type ExFileparam struct {
@@ -81,90 +97,162 @@ type ZonemapFileparam struct {
 }
 
 type FilterParam struct {
-	maxCol      int
-	exprMono    bool
-	columns     []uint16 // save real index in table to read column's data from files
-	defColumns  []uint16 // save col index in tableDef.Cols, cooperate with columnMap
-	columnMap   map[int]int
-	File2Size   map[string]int64
-	FilterExpr  *plan.Expr
-	blockReader *blockio.BlockReader
+	zonemappable bool
+	columnMap    map[int]int
+	FilterExpr   *plan.Expr
+	blockReader  *ioutil.BlockReader
 }
 
-type Argument struct {
-	Es *ExternalParam
+type container struct {
+	maxAllocSize int
+	buf          *batch.Batch
+}
+type External struct {
+	ctr container
+	Es  *ExternalParam
+
+	vm.OperatorBase
+	colexec.Projection
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
+func (external *External) GetOperatorBase() *vm.OperatorBase {
+	return &external.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[External](
+		func() *External {
+			return &External{}
+		},
+		func(a *External) {
+			*a = External{}
+		},
+		reuse.DefaultOptions[External]().
+			WithEnableChecker(),
+	)
+}
+
+func (external External) TypeName() string {
+	return opName
+}
+
+func NewArgument() *External {
+	return reuse.Alloc[External](nil)
+}
+
+func (external *External) WithEs(es *ExternalParam) *External {
+	external.Es = es
+	return external
+}
+
+func (external *External) Release() {
+	if external != nil {
+		reuse.Free[External](external, nil)
+	}
+}
+
+func (external *External) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	if external.ctr.buf != nil {
+		external.ctr.buf.CleanOnlyData()
+	}
+
+	allocSize := int64(external.ctr.maxAllocSize)
+	if external.ProjectList != nil {
+		allocSize += external.ProjectAllocSize
+		external.ResetProjection(proc)
+	}
+
+	if external.OpAnalyzer != nil {
+		external.OpAnalyzer.Alloc(allocSize)
+	}
+	external.ctr.maxAllocSize = 0
+}
+
+func (external *External) Free(proc *process.Process, pipelineFailed bool, err error) {
+	if external.ctr.buf != nil {
+		external.ctr.buf.Clean(proc.Mp())
+		external.ctr.buf = nil
+	}
+	external.FreeProjection(proc)
+}
+
+func (external *External) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	batch := input
+	var err error
+	if external.ProjectList != nil {
+		batch, err = external.EvalProjection(input, proc)
+	}
+	return batch, err
 }
 
 type ParseLineHandler struct {
-	moCsvReader *MOCsvReader
-	//csv read put lines into the channel
-	moCsvGetParsedLinesChan atomic.Value // chan simdcsv.LineOut
-	//batch
-	batchSize int
-	//mo csv
-	moCsvLineArray [][]string
+	csvReader *csvparser.CSVParser
 }
 
-type LineOut struct {
-	Lines [][]string
-	Line  []string
-}
+func newReaderWithParam(param *ExternalParam) (*csvparser.CSVParser, error) {
+	fieldsTerminatedBy := "\t"
+	fieldsEnclosedBy := "\""
+	fieldsEscapedBy := "\\"
 
-type MOCsvReader struct {
-	// Comma is the field delimiter.
-	// It is set to comma (',') by NewReader.
-	// Comma must be a valid rune and must not be \r, \n,
-	// or the Unicode replacement character (0xFFFD).
-	Comma rune
+	linesTerminatedBy := "\n"
+	linesStartingBy := ""
 
-	// Comment, if not 0, is the comment character. Lines beginning with the
-	// Comment character without preceding whitespace are ignored.
-	// With leading whitespace the Comment character becomes part of the
-	// field, even if TrimLeadingSpace is true.
-	// Comment must be a valid rune and must not be \r, \n,
-	// or the Unicode replacement character (0xFFFD).
-	// It must also not be equal to Comma.
-	Comment rune
-
-	// FieldsPerRecord is the number of expected fields per record.
-	// If FieldsPerRecord is positive, Read requires each record to
-	// have the given number of fields. If FieldsPerRecord is 0, Read sets it to
-	// the number of fields in the first record, so that future records must
-	// have the same field count. If FieldsPerRecord is negative, no check is
-	// made and records may have a variable number of fields.
-	FieldsPerRecord int
-
-	// If LazyQuotes is true, a quote may appear in an unquoted field and a
-	// non-doubled quote may appear in a quoted field.
-	LazyQuotes bool
-
-	// If TrimLeadingSpace is true, leading white space in a field is ignored.
-	// This is done even if the field delimiter, Comma, is white space.
-	TrimLeadingSpace bool
-
-	ReuseRecord   bool // Deprecated: Unused by simdcsv.
-	TrailingComma bool // Deprecated: No longer used.
-
-	r *bufio.Reader
-
-	//for ReadOneLine
-	first bool
-	rCsv  *csv.Reader
-}
-
-// NewReader returns a new Reader with options that reads from r.
-func NewReaderWithOptions(r io.Reader, cma, cmnt rune, lazyQt, tls bool) *MOCsvReader {
-	return &MOCsvReader{
-		Comma:            cma,
-		Comment:          cmnt,
-		FieldsPerRecord:  -1,
-		LazyQuotes:       lazyQt,
-		TrimLeadingSpace: tls,
-		ReuseRecord:      false,
-		TrailingComma:    false,
-		r:                bufio.NewReader(r),
+	if param.Extern.Tail.Fields != nil {
+		if terminated := param.Extern.Tail.Fields.Terminated; terminated != nil && terminated.Value != "" {
+			fieldsTerminatedBy = terminated.Value
+		}
+		if enclosed := param.Extern.Tail.Fields.EnclosedBy; enclosed != nil && enclosed.Value != 0 {
+			fieldsEnclosedBy = string(enclosed.Value)
+		}
+		if escaped := param.Extern.Tail.Fields.EscapedBy; escaped != nil {
+			if escaped.Value == 0 {
+				fieldsEscapedBy = ""
+			} else {
+				fieldsEscapedBy = string(escaped.Value)
+			}
+		}
 	}
+
+	if param.Extern.Tail.Lines != nil {
+		if terminated := param.Extern.Tail.Lines.TerminatedBy; terminated != nil && terminated.Value != "" {
+			linesTerminatedBy = param.Extern.Tail.Lines.TerminatedBy.Value
+		}
+		if param.Extern.Tail.Lines.StartingBy != "" {
+			linesStartingBy = param.Extern.Tail.Lines.StartingBy
+		}
+	}
+
+	if param.Extern.Format == tree.JSONLINE {
+		fieldsTerminatedBy = "\t"
+		fieldsEscapedBy = ""
+	}
+
+	config := csvparser.CSVConfig{
+		FieldsTerminatedBy: fieldsTerminatedBy,
+		FieldsEnclosedBy:   fieldsEnclosedBy,
+		FieldsEscapedBy:    fieldsEscapedBy,
+		LinesTerminatedBy:  linesTerminatedBy,
+		LinesStartingBy:    linesStartingBy,
+		NotNull:            false,
+		Null:               []string{`\N`},
+		UnescapedQuote:     true,
+		Comment:            '#',
+	}
+
+	return csvparser.NewCSVParser(&config, bufio.NewReader(param.reader), csvparser.ReadBlockSize, false)
+}
+
+type ParquetHandler struct {
+	file     *parquet.File
+	offset   int64
+	batchCnt int64
+	cols     []*parquet.Column
+	mappers  []*columnMapper
+}
+
+type columnMapper struct {
+	srcNull, dstNull   bool
+	maxDefinitionLevel byte
+
+	mapper func(mp *columnMapper, page parquet.Page, proc *process.Process, vec *vector.Vector) error
 }

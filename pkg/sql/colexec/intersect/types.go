@@ -16,9 +16,13 @@ package intersect
 
 import (
 	"github.com/matrixorigin/matrixone/pkg/common/hashmap"
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
+
+var _ vm.Operator = new(Intersect)
 
 const (
 	build = iota
@@ -26,15 +30,45 @@ const (
 	end
 )
 
-type Argument struct {
+type Intersect struct {
 	ctr container
 
-	// hash table bucket related information.
-	IBucket uint64
-	NBucket uint64
+	vm.OperatorBase
+}
+
+func (intersect *Intersect) GetOperatorBase() *vm.OperatorBase {
+	return &intersect.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Intersect](
+		func() *Intersect {
+			return &Intersect{}
+		},
+		func(a *Intersect) {
+			*a = Intersect{}
+		},
+		reuse.DefaultOptions[Intersect]().
+			WithEnableChecker(),
+	)
+}
+
+func (intersect Intersect) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Intersect {
+	return reuse.Alloc[Intersect](nil)
+}
+
+func (intersect *Intersect) Release() {
+	if intersect != nil {
+		reuse.Free[Intersect](intersect, nil)
+	}
 }
 
 type container struct {
+
 	// operator state
 	state int
 
@@ -45,26 +79,41 @@ type container struct {
 	hashTable *hashmap.StrHashMap
 
 	// Result batch of intersec column execute operator
-	btc *batch.Batch
-
-	// process bucket mark
-	inBuckets []uint8
+	buf *batch.Batch
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
-	ctr := arg.ctr
+func (intersect *Intersect) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	ctr := &intersect.ctr
+	ctr.state = build
+	ctr.cleanHashMap()
+	ctr.putCnts(proc)
+	if ctr.buf != nil {
+		ctr.buf.CleanOnlyData()
+	}
+}
+
+func (intersect *Intersect) Free(proc *process.Process, pipelineFailed bool, err error) {
+	ctr := &intersect.ctr
+	if ctr.buf != nil {
+		ctr.buf.Clean(proc.Mp())
+		ctr.buf = nil
+	}
+}
+
+func (intersect *Intersect) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
+}
+
+func (ctr *container) cleanHashMap() {
 	if ctr.hashTable != nil {
 		ctr.hashTable.Free()
 		ctr.hashTable = nil
 	}
-	if ctr.btc != nil {
-		ctr.btc.Clean(proc.Mp())
-		ctr.btc = nil
+}
+
+func (ctr *container) putCnts(proc *process.Process) {
+	for i := range ctr.cnts {
+		proc.Mp().PutSels(ctr.cnts[i])
 	}
-	if ctr.cnts != nil {
-		for i := range ctr.cnts {
-			proc.Mp().PutSels(ctr.cnts[i])
-		}
-		ctr.cnts = nil
-	}
+	ctr.cnts = nil
 }

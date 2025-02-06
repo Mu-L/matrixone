@@ -16,83 +16,68 @@ package table_function
 
 import (
 	"github.com/matrixorigin/matrixone/pkg/catalog"
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func metaScanPrepare(_ *process.Process, arg *Argument) error {
-	return nil
+// metaScanState still uses simpleOneBatchState
+type metaScanState struct {
+	simpleOneBatchState
 }
 
-func metaScanCall(_ int, proc *process.Process, arg *Argument) (bool, error) {
-	var (
-		err  error
-		rbat *batch.Batch
-	)
-	defer func() {
-		if err != nil && rbat != nil {
-			rbat.Clean(proc.Mp())
-		}
-	}()
-	bat := proc.InputBatch()
-	if bat == nil {
-		return true, nil
-	}
-	v, err := colexec.EvalExpr(bat, proc, arg.Args[0])
-	if err != nil {
-		return false, err
-	}
-	uuid := vector.MustFixedCol[types.Uuid](v)[0]
+func metaScanPrepare(proc *process.Process, tableFunction *TableFunction) (tvfState, error) {
+	var err error
+	tableFunction.ctr.executorsForArgs, err = colexec.NewExpressionExecutorsFromPlanExpressions(proc, tableFunction.Args)
+	tableFunction.ctr.argVecs = make([]*vector.Vector, len(tableFunction.Args))
+	return &metaScanState{}, err
+}
+
+func (s *metaScanState) start(tf *TableFunction, proc *process.Process, nthRow int, analyzer process.Analyzer) error {
+	s.startPreamble(tf, proc, nthRow)
+
+	// Get uuid
+	uuid := vector.GetFixedAtWithTypeCheck[types.Uuid](tf.ctr.argVecs[0], nthRow)
 	// get file size
-	path := catalog.BuildQueryResultMetaPath(proc.SessionInfo.Account, uuid.ToString())
-	e, err := proc.FileService.StatFile(proc.Ctx, path)
+	path := catalog.BuildQueryResultMetaPath(proc.GetSessionInfo().Account, uuid.String())
+
+	// Get reader
+	reader, err := ioutil.NewFileReader(proc.Base.FileService, path)
 	if err != nil {
-		if moerr.IsMoErrCode(err, moerr.ErrFileNotFound) {
-			return false, moerr.NewResultFileNotFound(proc.Ctx, path)
-		}
-		return false, err
+		return err
 	}
-	// read meta's meta
-	reader, err := blockio.NewFileReader(proc.FileService, path)
-	if err != nil {
-		return false, err
-	}
+
 	var idxs []uint16
 	for i, name := range catalog.MetaColNames {
-		for _, attr := range arg.Attrs {
+		for _, attr := range tf.Attrs {
 			if name == attr {
 				idxs = append(idxs, uint16(i))
 			}
 		}
 	}
+
 	// read meta's data
-	bats, err := reader.LoadAllColumns(proc.Ctx, idxs, e.Size, common.DefaultAllocator)
+	bats, closeCB, err := reader.LoadAllColumns(proc.Ctx, idxs, common.DefaultAllocator)
 	if err != nil {
-		return false, err
+		return err
 	}
-	metaVecs := make([]*vector.Vector, len(bats[0].Vecs))
+	defer func() {
+		if closeCB != nil {
+			closeCB()
+		}
+	}()
+
+	// Note that later s.batch.Vecs will be dupped from sbat.   So we must clean.
+	s.batch.CleanOnlyData()
 	for i, vec := range bats[0].Vecs {
-		if vec.NeedDup() {
-			metaVecs[i], err = vec.Dup(proc.Mp())
-			if err != nil {
-				return false, err
-			}
-		} else {
-			metaVecs[i] = vec
+		s.batch.Vecs[i], err = vec.Dup(proc.Mp())
+		if err != nil {
+			return err
 		}
 	}
-	rbat = &batch.Batch{
-		Vecs: metaVecs,
-	}
-	rbat.SetAttributes(catalog.MetaColNames)
-	rbat.Cnt = 1
-	rbat.InitZsOne(1)
-	proc.SetInputBatch(rbat)
-	return false, nil
+	s.batch.SetRowCount(1)
+	return nil
 }

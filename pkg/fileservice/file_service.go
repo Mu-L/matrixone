@@ -16,8 +16,15 @@ package fileservice
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"iter"
+	"strings"
 	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
+
+	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
 )
 
 // FileService is a write-once file system
@@ -39,8 +46,12 @@ type FileService interface {
 	// returns ErrEmptyVector if no IOEntry is passed
 	Read(ctx context.Context, vector *IOVector) error
 
+	// ReadCache reads cached data if any
+	// if cache hit, IOEntry.CachedData will be set
+	ReadCache(ctx context.Context, vector *IOVector) error
+
 	// List lists sub-entries in a dir
-	List(ctx context.Context, dirPath string) ([]DirEntry, error)
+	List(ctx context.Context, dirPath string) iter.Seq2[*DirEntry, error]
 
 	// Delete deletes multi file
 	// returns ErrFileNotFound if requested file not found
@@ -50,11 +61,17 @@ type FileService interface {
 	// returns ErrFileNotFound if requested file not found
 	StatFile(ctx context.Context, filePath string) (*DirEntry, error)
 
-	// Preload indicates the service to preload a file
-	Preload(ctx context.Context, filePath string) error
+	// PrefetchFile prefetches a file
+	PrefetchFile(ctx context.Context, filePath string) error
+
+	// Cost returns the cost attr of the file service
+	Cost() *CostAttr
+
+	Close(ctx context.Context)
 }
 
 type IOVector struct {
+
 	// FilePath indicates where to find the file
 	// a path has two parts, service name and file name, separated by ':'
 	// service name is optional, if omitted, the receiver FileService will use the default name of the service
@@ -64,18 +81,22 @@ type IOVector struct {
 	// example:
 	// s3:a/b/c S3:a/b/c represents the same file 'a/b/c' located in 'S3' service
 	FilePath string
+
 	// io entries
 	// empty Entries is not allowed
 	// when writing, overlapping Entries is not allowed
 	Entries []IOEntry
+
 	// ExpireAt specifies the expire time of the file
 	// implementations may or may not delete the file after this time
 	// zero value means no expire
 	ExpireAt time.Time
-	// NoCache true, means the data NOT read/update FileService cache.
-	NoCache bool
-	// Preloading indicates whether the I/O is for preloading
-	Preloading bool
+
+	// Policy controls policy for the vector
+	Policy Policy
+
+	// Caches indicates extra caches to operate on
+	Caches []IOVectorCache
 }
 
 type IOEntry struct {
@@ -90,7 +111,8 @@ type IOEntry struct {
 
 	// raw content
 	// when reading, if len(Data) < Size, a new Size-lengthed byte slice will be allocated
-	Data []byte
+	Data        []byte
+	releaseData func()
 
 	// when reading, if Writer is not nil, write data to it instead of setting Data field
 	WriterForRead io.Writer
@@ -103,29 +125,39 @@ type IOEntry struct {
 	// if number of bytes is unknown, set Size field to -1
 	ReaderForWrite io.Reader
 
-	// when reading, if the ToObject field is not nil, the returning object will be set to this field
-	// caches may choose to cache this object instead of caching []byte
-	// Data, WriterForRead, ReadCloserForRead may be empty if Object is not null
-	// if ToObject is provided, caller should always read Object instead of Data, WriterForRead or ReadCloserForRead
-	Object any
+	// When reading, if the ToCacheData field is not nil, the returning object's byte slice will be set to this field
+	// Data, WriterForRead, ReadCloserForRead may be empty if CachedData is not null
+	// if ToCacheData is provided, caller should always read CachedData instead of Data, WriterForRead or ReadCloserForRead
+	CachedData fscache.Data
 
-	// ToObject constructs an object from entry contents
+	// ToCacheData constructs an object byte slice from entry contents
 	// reader or data must not be retained after returns
 	// reader always contains entry contents
 	// data may contains entry contents if available
 	// if data is empty, the io.Reader must be fully read before returning nil error
-	// return an *RC value to make the object pinnable
-	// cache implementations should not evict an *RC value with non-zero reference
-	ToObject func(reader io.Reader, data []byte) (object any, objectSize int64, err error)
-
-	// ObjectSize indicates the memory bytes to hold the object
-	// set from ToObject returning value
-	// used in capacity limited caches
-	ObjectSize int64
+	ToCacheData func(ctx context.Context, reader io.Reader, data []byte, allocator CacheDataAllocator) (cacheData fscache.Data, err error)
 
 	// done indicates whether the entry is filled with data
 	// for implementing cascade cache
 	done bool
+
+	// fromCache indicates which cache filled the entry
+	fromCache IOVectorCache
+}
+
+func (i IOEntry) String() string {
+	buf := new(strings.Builder)
+	buf.WriteString("IOEntry(")
+	fmt.Fprintf(buf, "offset = %v", i.Offset)
+	fmt.Fprintf(buf, ", size = %v", i.Size)
+	buf.WriteString(")")
+	return buf.String()
+}
+
+type CacheDataAllocator interface {
+	AllocateCacheData(ctx context.Context, size int) fscache.Data
+	AllocateCacheDataWithHint(ctx context.Context, size int, hints malloc.Hints) fscache.Data
+	CopyToCacheData(ctx context.Context, data []byte) fscache.Data
 }
 
 // DirEntry is a file or dir
@@ -134,4 +166,16 @@ type DirEntry struct {
 	Name  string
 	IsDir bool
 	Size  int64
+}
+
+type CostItem uint8
+
+const (
+	CostLow CostItem = iota
+	CostHigh
+)
+
+type CostAttr struct {
+	// List is the cost of List from FileService
+	List CostItem
 }

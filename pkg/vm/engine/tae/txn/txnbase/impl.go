@@ -15,22 +15,25 @@
 package txnbase
 
 import (
+	"context"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 )
 
-func (txn *Txn) rollback1PC() (err error) {
+func (txn *Txn) rollback1PC(ctx context.Context) (err error) {
 	if txn.IsReplay() {
-		panic(moerr.NewTAERollbackNoCtx("1pc txn %s should not be called here", txn.String()))
+		panic(moerr.NewTAERollbackNoCtxf("1pc txn %s should not be called here", txn.String()))
 	}
 	state := txn.GetTxnState(false)
 	if state != txnif.TxnStateActive {
-		return moerr.NewTAERollbackNoCtx("unexpected txn status : %s", txnif.TxnStrState(state))
+		return moerr.NewTAERollbackNoCtxf("unexpected txn status : %s", txnif.TxnStrState(state))
 	}
 
 	txn.Add(1)
 	err = txn.Mgr.OnOpTxn(&OpTxn{
+		ctx: ctx,
 		Txn: txn,
 		Op:  OpRollback,
 	})
@@ -47,22 +50,28 @@ func (txn *Txn) rollback1PC() (err error) {
 	return txn.Err
 }
 
-func (txn *Txn) commit1PC(_ bool) (err error) {
+func (txn *Txn) commit1PC(ctx context.Context, _ bool) (err error) {
 	state := txn.GetTxnState(false)
 	if state != txnif.TxnStateActive {
 		logutil.Warnf("unexpected txn state : %s", txnif.TxnStrState(state))
-		return moerr.NewTAECommitNoCtx("invalid txn state %s", txnif.TxnStrState(state))
+		return moerr.NewTAECommitNoCtxf("invalid txn state %s", txnif.TxnStrState(state))
 	}
 	txn.Add(1)
-	err = txn.Mgr.OnOpTxn(&OpTxn{
-		Txn: txn,
-		Op:  OpCommit,
-	})
+	if err = txn.Freeze(ctx); err == nil {
+		txn.GetStore().StartTrace()
+		err = txn.Mgr.OnOpTxn(&OpTxn{
+			ctx: ctx,
+			Txn: txn,
+			Op:  OpCommit,
+		})
+	}
+
 	// TxnManager is closed
 	if err != nil {
 		txn.SetError(err)
 		txn.Lock()
-		_ = txn.ToRollbackingLocked(txn.GetStartTS().Next())
+		ts := txn.GetStartTS()
+		_ = txn.ToRollbackingLocked(ts.Next())
 		txn.Unlock()
 		_ = txn.PrepareRollback()
 		_ = txn.ApplyRollback()
@@ -78,13 +87,14 @@ func (txn *Txn) commit1PC(_ bool) (err error) {
 	return txn.GetError()
 }
 
-func (txn *Txn) rollback2PC() (err error) {
+func (txn *Txn) rollback2PC(ctx context.Context) (err error) {
 	state := txn.GetTxnState(false)
 
 	switch state {
 	case txnif.TxnStateActive:
 		txn.Add(1)
 		err = txn.Mgr.OnOpTxn(&OpTxn{
+			ctx: ctx,
 			Txn: txn,
 			Op:  OpRollback,
 		})
@@ -105,7 +115,7 @@ func (txn *Txn) rollback2PC() (err error) {
 
 	default:
 		logutil.Warnf("unexpected txn state : %s", txnif.TxnStrState(state))
-		return moerr.NewTAERollbackNoCtx("unexpected txn status : %s", txnif.TxnStrState(state))
+		return moerr.NewTAERollbackNoCtxf("unexpected txn status : %s", txnif.TxnStrState(state))
 	}
 
 	txn.Mgr.DeleteTxn(txn.GetID())
@@ -115,6 +125,7 @@ func (txn *Txn) rollback2PC() (err error) {
 
 func (txn *Txn) commit2PC(inRecovery bool) (err error) {
 	state := txn.GetTxnState(false)
+	txn.Mgr.OnCommitTxn(txn)
 
 	switch state {
 	//It's a 2PC transaction running on Coordinator
@@ -154,7 +165,7 @@ func (txn *Txn) commit2PC(inRecovery bool) (err error) {
 
 	default:
 		logutil.Warnf("unexpected txn state : %s", txnif.TxnStrState(state))
-		return moerr.NewTAECommitNoCtx("invalid txn state %s", txnif.TxnStrState(state))
+		return moerr.NewTAECommitNoCtxf("invalid txn state %s", txnif.TxnStrState(state))
 	}
 	txn.Mgr.DeleteTxn(txn.GetID())
 

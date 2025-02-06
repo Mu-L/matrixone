@@ -15,42 +15,47 @@
 package batch
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
-	"github.com/matrixorigin/matrixone/pkg/sql/colexec/agg"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec/aggexec"
 )
 
-type EncodeBatch struct {
-	Zs       []int64
-	Vecs     []*vector.Vector
-	Attrs    []string
-	AggInfos []aggInfo
-}
+// special batch that will never been free.
+var (
+	EmptyBatch = &Batch{rowCount: 0}
 
-type aggInfo struct {
-	Op         int
-	Dist       bool
-	inputTypes types.Type
-	Agg        agg.Agg[any]
-}
+	EmptyForConstFoldBatch = &Batch{
+		Vecs:     make([]*vector.Vector, 0),
+		rowCount: 1,
+	}
 
-// Batch represents a part of a relationship
-// including an optional list of row numbers, columns and list of attributes
+	CteEndBatch = &Batch{
+		Recursive: 2,
+		rowCount:  1,
+	}
+)
+
+// Batch represents a part of a relationship,
+// it's the basic unit for data transmission in the computing layer of MatrixOne.
 //
-//	(SelsData, Sels) - list of row numbers
-//	(Attrs) - list of attributes
-//	(vecs) 	- columns
+// this includes information such as
+// column names (Attrs), column data (Vecs), the number of rows (rowCount),
+// aggregation intermediate data (Aggs),
+// and some specific flags like Recursive, ShuffleIDX.
+//
+// offHeap is true means this batch was allocated outside mpool.
 type Batch struct {
-	// Ro if true, Attrs is read only
-	Ro bool
-	// reference count, default is 1
-	Cnt int64
-	// Attrs column name list
+	// For recursive CTE, 1 is last batch, 2 is end of batch
+	Recursive  int32
+	ShuffleIDX int32 //used only in shuffle
+	// Attrs column name list, letter case: origin
 	Attrs []string
 	// Vecs col data
 	Vecs []*vector.Vector
-	// ring
-	Zs   []int64
-	Aggs []agg.Agg[any]
-	Ht   any // hash table
+
+	Aggs []aggexec.AggFuncExec
+
+	// row count of batch, to instead of old len(Zs).
+	rowCount int
+
+	offHeap bool
 }

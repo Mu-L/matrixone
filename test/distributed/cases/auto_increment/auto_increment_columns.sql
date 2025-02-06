@@ -317,7 +317,7 @@ select * from t9 order by c;
 drop table t8;
 drop table t9;
 
--- test truncate tabel,auto_increment columns whether it will be cleared.
+-- test truncate table,auto_increment columns whether it will be cleared.
 drop table if exists t10;
 create table t10(
 a int auto_increment primary key,
@@ -342,7 +342,7 @@ b bigint auto_increment,
 c varchar(25)
 );
 
-load data infile '$resources/auto_increment_columns/auto_increment_1.csv' into table t11;
+load data infile '$resources/auto_increment_columns/auto_increment_1.csv' into table t11 fields terminated by ',';
 select * from t11 order by a;
 drop table t11;
 
@@ -353,7 +353,7 @@ a int primary key auto_increment,
 b bigint auto_increment,
 c varchar(25)
 );
-load data infile '$resources/auto_increment_columns/auto_increment_2.csv' into table t12;
+load data infile '$resources/auto_increment_columns/auto_increment_2.csv' into table t12 fields terminated by ',';
 select * from t12 order by a;
 
 drop table t12;
@@ -365,7 +365,7 @@ b bigint auto_increment,
 c varchar(25)
 );
 
-load data infile '$resources/auto_increment_columns/auto_increment_3.csv' into table t13;
+load data infile '$resources/auto_increment_columns/auto_increment_3.csv' into table t13 fields terminated by ',';
 select * from t13 order by a;
 
 drop table t13;
@@ -447,3 +447,41 @@ insert into t1 values();
 select last_insert_id();
 insert into t2 values();
 select last_insert_id();
+
+-- test for auto_increment column with default value
+drop table if exists t1;
+create table t1(a int auto_increment primary key) auto_increment = 0;
+insert into t1 values();
+select last_insert_id();
+insert into t1 values(11);
+insert into t1 values();
+select last_insert_id();
+
+drop table if exists t1;
+create table t1(a int auto_increment primary key) auto_increment = 10;
+insert into t1 values();
+select last_insert_id();
+insert into t1 values(101);
+insert into t1 values();
+select last_insert_id();
+
+drop table if exists t1;
+create table t1(a int auto_increment primary key) auto_increment = 100;
+insert into t1 values();
+select last_insert_id();
+insert into t1 values(7);
+insert into t1 values();
+select last_insert_id();
+
+Drop table if exists auto_increment02;
+Create table auto_increment02(col1 int auto_increment unique key)auto_increment = 10;
+Select * from auto_increment02;
+select last_insert_id();
+Insert into auto_increment02 values();
+Select * from auto_increment02;
+select last_insert_id();
+-- @pattern
+Insert into auto_increment02 values(10);
+Select * from auto_increment02;
+select last_insert_id();
+Drop table auto_increment02;

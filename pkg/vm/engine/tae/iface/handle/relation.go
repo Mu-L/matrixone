@@ -15,10 +15,13 @@
 package handle
 
 import (
+	"context"
 	"io"
 
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
@@ -27,37 +30,34 @@ import (
 type Relation interface {
 	io.Closer
 	ID() uint64
-	Rows() int64
 	String() string
 	SimplePPString(common.PPLevel) string
-	GetCardinality(attr string) int64
-	Schema() any
-	UpdateConstraint([]byte) error
-	MakeSegmentIt() SegmentIt
-	MakeSegmentItOnSnap() SegmentIt
-	MakeBlockIt() BlockIt
+	Schema(bool) any
+	AlterTable(ctx context.Context, req *apipb.AlterTableReq) error
+	MakeObjectIt(bool) ObjectIt
+	MakeObjectItOnSnap(bool) ObjectIt
 
 	DeleteByPhyAddrKey(key any) error
-	GetValueByPhyAddrKey(key any, col int) (any, error)
-	DeleteByPhyAddrKeys(keys containers.Vector) error
-
+	GetValueByPhyAddrKey(key any, col int) (any, bool, error)
+	DeleteByPhyAddrKeys(keys containers.Vector, pkVec containers.Vector, dt DeleteType) error
 	RangeDelete(id *common.ID, start, end uint32, dt DeleteType) error
-	Update(id *common.ID, row uint32, col uint16, v any) error
-	GetByFilter(filter *Filter) (id *common.ID, offset uint32, err error)
-	GetValue(id *common.ID, row uint32, col uint16) (any, error)
-	GetValueByFilter(filter *Filter, col int) (any, error)
-	UpdateByFilter(filter *Filter, col uint16, v any) error
-	DeleteByFilter(filter *Filter) error
+	AddPersistedTombstoneFile(id *common.ID, stats objectio.ObjectStats) (ok bool, err error)
+	GetByFilter(ctx context.Context, filter *Filter) (id *common.ID, offset uint32, err error)
+	GetValue(id *common.ID, row uint32, col uint16, skipCheckDelete bool) (any, bool, error)
+	GetValueByFilter(ctx context.Context, filter *Filter, col int) (any, bool, error)
+	UpdateByFilter(ctx context.Context, filter *Filter, col uint16, v any, isNull bool) error
+	DeleteByFilter(ctx context.Context, filter *Filter) error
 
 	BatchDedup(col containers.Vector) error
-	Append(data *containers.Batch) error
-	AddBlksWithMetaLoc(zm []dataio.Index, metaLcos []string) error
+	Append(ctx context.Context, data *containers.Batch) error
+	AddDataFiles(ctx context.Context, stats containers.Vector) error
 
 	GetMeta() any
-	CreateSegment(bool) (Segment, error)
-	CreateNonAppendableSegment(is1PC bool) (Segment, error)
-	GetSegment(id types.Uuid) (Segment, error)
-	SoftDeleteSegment(id types.Uuid) (err error)
+	CreateObject(bool) (Object, error)
+	CreateNonAppendableObject(isTombstone bool, opt *objectio.CreateObjOpt) (Object, error)
+	GetObject(id *types.Objectid, isTombstone bool) (Object, error)
+	SoftDeleteObject(id *types.Objectid, isTombstone bool) (err error)
+	FillInWorkspaceDeletes(blkID types.Blockid, view **nulls.Nulls, deleteStartOffset uint64) error
 
 	GetDB() (Database, error)
 }

@@ -20,11 +20,25 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/RoaringBitmap/roaring"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestSortAndDedup(t *testing.T) {
+	defer testutils.AfterTest(t)()
+	vals := []int{2, 1, 3, 4, 5, 1, 2, 3, 4, 5}
+	vals = SortAndDedup(vals, func(a, b *int) bool {
+		return *a < *b
+	}, func(a, b *int) bool {
+		return *a == *b
+	})
+	assert.Equal(t, 5, len(vals))
+	assert.Equal(t, []int{1, 2, 3, 4, 5}, vals)
+	t.Log(vals)
+}
 
 func TestShuffleByDeletes(t *testing.T) {
 	defer testutils.AfterTest(t)()
@@ -39,7 +53,7 @@ func TestShuffleByDeletes(t *testing.T) {
 	origMask.Add(30)
 	origVals[30] = 30
 
-	deletes := roaring.New()
+	deletes := nulls.NewWithSize(1)
 	deletes.Add(0)
 	deletes.Add(8)
 	deletes.Add(22)
@@ -66,19 +80,19 @@ func TestCheckRowExists(t *testing.T) {
 	_, exist = GetOffsetByVal(vec, int32(114514), nil)
 	require.False(t, exist)
 
-	dels := roaring.NewBitmap()
-	dels.Add(uint32(55))
+	dels := nulls.NewWithSize(1)
+	dels.Add(uint64(55))
 	_, exist = GetOffsetByVal(vec, int32(55), dels)
 	require.False(t, exist)
 }
 
 func TestAppendNull(t *testing.T) {
 	defer testutils.AfterTest(t)()
-	colTypes := types.MockColTypes(17)
+	colTypes := types.MockColTypes()
 	check := func(typ types.Type) {
 		vec := containers.MockVector2(typ, 10, 0)
 		defer vec.Close()
-		vec.Append(types.Null{})
+		vec.Append(nil, true)
 		assert.Equal(t, 11, vec.Length())
 		assert.True(t, vec.IsNull(10))
 		t.Log(vec.String())
@@ -86,13 +100,4 @@ func TestAppendNull(t *testing.T) {
 	for _, typ := range colTypes {
 		check(typ)
 	}
-}
-
-func TestBinarySearch(t *testing.T) {
-	defer testutils.AfterTest(t)()
-	slice := []int{1, 2, 6, 9, 12}
-	pos := BinarySearch(slice, 3)
-	assert.Equal(t, -1, pos)
-	pos = BinarySearch(slice, 6)
-	assert.Equal(t, 2, pos)
 }

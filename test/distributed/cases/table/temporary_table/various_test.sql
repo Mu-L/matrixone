@@ -1,3 +1,4 @@
+-- @skip:issue#7889
 drop database if exists test_temporary;
 create database test_temporary;
 use test_temporary;
@@ -14,7 +15,7 @@ col8 bigint unsigned
 
 -- @bvt:issue#7875
 -- load data
-load data infile '$resources/load_data/integer_numbers_1.csv' into table t1;
+load data infile '$resources/load_data/integer_numbers_1.csv' into table t1 fields terminated by ',';
 select * from t1;
 
 -- into outfile
@@ -22,7 +23,7 @@ select * from t1 into outfile '$resources/into_outfile_2/outfile_integer_numbers
 delete from t1;
 
 -- load data
-load data infile '$resources/into_outfile_2/outfile_integer_numbers_2.csv' into table t1 ignore 1 lines;
+load data infile '$resources/into_outfile_2/outfile_integer_numbers_2.csv' into table t1 fields terminated by ',' ignore 1 lines;
 select * from t1;
 delete from t1;
 

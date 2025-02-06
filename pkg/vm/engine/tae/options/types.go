@@ -15,44 +15,48 @@
 package options
 
 import (
+	"context"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/taskservice"
+
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/txn/clock"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/logservicedriver"
 )
 
 const (
-	// Temp unlimit the txn cache size.
-	// In v0.6, we will limit the cache to a reasonable value
-	DefaultTxnCacheSize   = mpool.TB
-	DefaultIndexCacheSize = 128 * common.M
-	DefaultMTCacheSize    = 4 * common.G
+	DefaultBulkTomestoneTxnThreshold = 10000 // rows
+	DefaultLockMergePruneInterval    = time.Minute
 
-	DefaultBlockMaxRows     = uint32(8192)
-	DefaultBlocksPerSegment = uint16(256)
+	DefaultBlockMaxRows    = objectio.BlockMaxRows
+	DefaultBlocksPerObject = uint16(256)
 
 	DefaultScannerInterval              = time.Second * 5
 	DefaultCheckpointFlushInterval      = time.Minute
+	DefaultCheckpointTransferInterval   = time.Second * 5
 	DefaultCheckpointMinCount           = int64(100)
 	DefaultCheckpointIncremetalInterval = time.Minute
 	DefaultCheckpointGlobalMinCount     = 10
 	DefaultGlobalVersionInterval        = time.Hour
 	DefaultGCCheckpointInterval         = time.Minute
+	DefaultOverallFlushMemControl       = common.Const1GBytes
 
-	DefaultScanGCInterval = time.Minute * 30
-	DefaultGCTTL          = time.Hour
+	DefaultScanGCInterval    = time.Minute * 30
+	DefaultGCTTL             = time.Hour
+	DefaultGCMergeCount      = 40
+	DefaultGCDeleteBatchSize = 1000
+	DefaultGCDeleteTimeout   = time.Minute * 10
 
-	DefaultCatalogGCInterval = time.Minute * 30
+	DefaultCatalogGCInterval = time.Minute * 3
 
 	DefaultIOWorkers    = int(16)
 	DefaultAsyncWorkers = int(16)
 
-	DefaultLogtailTxnPageSize = 100
+	DefaultLogtailTxnPageSize = 256
 
 	DefaultLogstoreType = LogstoreBatchStore
 )
@@ -65,20 +69,28 @@ const (
 )
 
 type Options struct {
-	CacheCfg      *CacheCfg      `toml:"cache-cfg"`
 	StorageCfg    *StorageCfg    `toml:"storage-cfg"`
 	CheckpointCfg *CheckpointCfg `toml:"checkpoint-cfg"`
 	SchedulerCfg  *SchedulerCfg  `toml:"scheduler-cfg"`
-	GCCfg         *GCCfg
+	GCCfg         *GCCfg         `toml:"gc-cfg"`
 	LogtailCfg    *LogtailCfg
+	MergeCfg      *MergeConfig
 	CatalogCfg    *CatalogCfg
-	Catalog       *catalog.Catalog
 
+	BulkTomestoneTxnThreshold uint64
+	// MaxMessageSize is the size of max message which is sent to log-service.
+	MaxMessageSize   uint64
 	TransferTableTTL time.Duration
+	IncrementalDedup bool
+	IsStandalone     bool
+	LogStoreT        LogstoreType
 
-	Clock     clock.Clock
-	Fs        fileservice.FileService
-	Lc        logservicedriver.LogServiceClientFactory
-	Shard     metadata.DNShard
-	LogStoreT LogstoreType
+	Fs                fileservice.FileService                  `toml:"-"`
+	LocalFs           fileservice.FileService                  `toml:"-"`
+	Lc                logservicedriver.LogServiceClientFactory `toml:"-"`
+	Ctx               context.Context                          `toml:"-"`
+	Shard             metadata.TNShard                         `toml:"-"`
+	Clock             clock.Clock                              `toml:"-"`
+	TaskServiceGetter taskservice.Getter                       `toml:"-"`
+	SID               string                                   `toml:"-"`
 }

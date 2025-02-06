@@ -27,7 +27,7 @@ func NewPredicatePushdown() *PredicatePushdown {
 }
 
 func (r *PredicatePushdown) Match(n *plan.Node) bool {
-	return n.NodeType != plan.Node_TABLE_SCAN && n.NodeType != plan.Node_EXTERNAL_SCAN && n.NodeType != plan.Node_FUNCTION_SCAN && len(n.FilterList) > 0
+	return n.NodeType != plan.Node_TABLE_SCAN && n.NodeType != plan.Node_EXTERNAL_SCAN && n.NodeType != plan.Node_FUNCTION_SCAN && len(n.FilterList) > 0 && n.NodeType != plan.Node_SOURCE_SCAN
 }
 
 func (r *PredicatePushdown) Apply(n *plan.Node, qry *plan.Query) {
@@ -68,15 +68,15 @@ func (r *PredicatePushdown) pushdown(e *plan.Expr, n *plan.Node, qry *plan.Query
 
 func (r *PredicatePushdown) newExpr(relPos int32, expr *plan.Expr, n *plan.Node, qry *plan.Query) (int32, *plan.Expr) {
 	switch e := expr.Expr.(type) {
-	case *plan.Expr_C:
+	case *plan.Expr_Lit:
 		return relPos, expr
 	case *plan.Expr_F:
 		overloadID := e.F.Func.GetObj()
-		f, exists := function.GetFunctionByIDWithoutError(overloadID)
+		f, exists := function.GetFunctionByIdWithoutError(overloadID)
 		if !exists {
 			return relPos, nil
 		}
-		if f.TestFlag(plan.Function_AGG) {
+		if f.IsAgg() {
 			return relPos, nil
 		}
 		args := make([]*plan.Expr, len(e.F.Args))

@@ -17,6 +17,7 @@ package txn
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -24,8 +25,6 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/tests/service"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
-	"go.uber.org/multierr"
-	"go.uber.org/zap"
 )
 
 var (
@@ -39,7 +38,7 @@ type sqlClient struct {
 	cn service.CNService
 }
 
-func newSQLClient(logger *zap.Logger, env service.Cluster) (Client, error) {
+func newSQLClient(env service.Cluster) (Client, error) {
 	cn, err := env.GetCNServiceIndexed(0)
 	if err != nil {
 		return nil, err
@@ -52,25 +51,25 @@ func newSQLClient(logger *zap.Logger, env service.Cluster) (Client, error) {
 
 	_, err = db.Exec(createDB)
 	if err != nil {
-		return nil, multierr.Append(err, db.Close())
+		return nil, errors.Join(err, db.Close())
 	}
 
 	_, err = db.Exec(useDB)
 	if err != nil {
-		return nil, multierr.Append(err, db.Close())
+		return nil, errors.Join(err, db.Close())
 	}
 
 	_, err = db.Exec(createSql)
 	if err != nil {
-		return nil, multierr.Append(err, db.Close())
+		return nil, errors.Join(err, db.Close())
 	}
 
 	return &sqlClient{
 		cn: cn,
-	}, multierr.Append(err, db.Close())
+	}, errors.Join(err, db.Close())
 }
 
-func (c *sqlClient) NewTxn(options ...client.TxnOption) (Txn, error) {
+func (c *sqlClient) NewTxn(...client.TxnOption) (Txn, error) {
 	return newSQLTxn(c.cn)
 }
 
@@ -92,7 +91,7 @@ func newSQLTxn(cn service.CNService) (Txn, error) {
 
 	txn, err := db.Begin()
 	if err != nil {
-		return nil, multierr.Append(err, db.Close())
+		return nil, errors.Join(err, db.Close())
 	}
 	return &sqlTxn{
 		db:  db,
@@ -108,11 +107,7 @@ func (kop *sqlTxn) Commit() error {
 	}
 
 	kop.mu.closed = true
-	err := kop.txn.Commit()
-	if err != nil {
-		return multierr.Append(err, kop.db.Close())
-	}
-	return kop.db.Close()
+	return errors.Join(kop.txn.Commit(), kop.db.Close())
 }
 
 func (kop *sqlTxn) Rollback() error {
@@ -123,27 +118,25 @@ func (kop *sqlTxn) Rollback() error {
 	}
 
 	kop.mu.closed = true
-	err := kop.txn.Rollback()
-	if err != nil {
-		return multierr.Append(err, kop.db.Close())
-	}
-	return kop.db.Close()
+	return errors.Join(kop.txn.Rollback(), kop.db.Close())
 }
 
-func (kop *sqlTxn) Read(key string) (string, error) {
+func (kop *sqlTxn) Read(key string) (_ string, err error) {
 	rows, err := kop.txn.Query(fmt.Sprintf("select kv_value from txn_test_kv where kv_key = '%s'", key))
 	if err != nil {
 		return "", err
 	}
-
+	defer func() {
+		err = errors.Join(err, rows.Close(), rows.Err())
+	}()
 	if !rows.Next() {
-		return "", rows.Close()
+		return "", nil
 	}
 	v := ""
 	if err := rows.Scan(&v); err != nil {
-		return "", multierr.Append(err, rows.Close())
+		return "", err
 	}
-	return v, multierr.Append(err, rows.Close())
+	return v, nil
 }
 
 func (kop *sqlTxn) Write(key, value string) error {

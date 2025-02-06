@@ -21,6 +21,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/statsinfo"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 )
@@ -37,20 +38,8 @@ func (e *EntireEngine) New(ctx context.Context, op client.TxnOperator) error {
 	return err
 }
 
-func (e *EntireEngine) Commit(ctx context.Context, op client.TxnOperator) error {
-	err := e.Engine.Commit(ctx, op)
-	if err == nil && e.TempEngine != nil {
-		return e.TempEngine.Commit(ctx, op)
-	}
-	return err
-}
-
-func (e *EntireEngine) Rollback(ctx context.Context, op client.TxnOperator) error {
-	err := e.Engine.Rollback(ctx, op)
-	if err == nil && e.TempEngine != nil {
-		return e.TempEngine.Rollback(ctx, op)
-	}
-	return err
+func (e *EntireEngine) LatestLogtailAppliedTime() timestamp.Timestamp {
+	return e.Engine.LatestLogtailAppliedTime()
 }
 
 func (e *EntireEngine) Delete(ctx context.Context, databaseName string, op client.TxnOperator) error {
@@ -76,17 +65,25 @@ func (e *EntireEngine) Database(ctx context.Context, databaseName string, op cli
 	return e.Engine.Database(ctx, databaseName, op)
 }
 
-func (e *EntireEngine) Nodes() (cnNodes Nodes, err error) {
-	return e.Engine.Nodes()
+func (e *EntireEngine) Nodes(
+	isInternal bool, tenant string, username string, cnLabel map[string]string) (cnNodes Nodes, err error,
+) {
+	return e.Engine.Nodes(isInternal, tenant, username, cnLabel)
 }
 
 func (e *EntireEngine) Hints() Hints {
 	return e.Engine.Hints()
 }
 
-func (e *EntireEngine) NewBlockReader(ctx context.Context, num int, ts timestamp.Timestamp,
-	expr *plan.Expr, ranges [][]byte, tblDef *plan.TableDef) ([]Reader, error) {
-	return e.Engine.NewBlockReader(ctx, num, ts, expr, ranges, tblDef)
+func (e *EntireEngine) BuildBlockReaders(
+	ctx context.Context,
+	proc any,
+	ts timestamp.Timestamp,
+	expr *plan.Expr,
+	def *plan.TableDef,
+	relData RelData,
+	num int) ([]Reader, error) {
+	return e.Engine.BuildBlockReaders(ctx, proc, ts, expr, def, relData, num)
 }
 
 func (e *EntireEngine) GetNameById(ctx context.Context, op client.TxnOperator, tableId uint64) (dbName string, tblName string, err error) {
@@ -99,4 +96,28 @@ func (e *EntireEngine) GetRelationById(ctx context.Context, op client.TxnOperato
 
 func (e *EntireEngine) AllocateIDByKey(ctx context.Context, key string) (uint64, error) {
 	return e.Engine.AllocateIDByKey(ctx, key)
+}
+
+func (e *EntireEngine) TryToSubscribeTable(ctx context.Context, dbID, tbID uint64) error {
+	return e.Engine.TryToSubscribeTable(ctx, dbID, tbID)
+}
+
+func (e *EntireEngine) UnsubscribeTable(ctx context.Context, dbID, tbID uint64) error {
+	return e.Engine.UnsubscribeTable(ctx, dbID, tbID)
+}
+
+func (e *EntireEngine) PrefetchTableMeta(ctx context.Context, key pb.StatsInfoKey) bool {
+	return e.Engine.PrefetchTableMeta(ctx, key)
+}
+
+func (e *EntireEngine) Stats(ctx context.Context, key pb.StatsInfoKey, sync bool) *pb.StatsInfo {
+	return e.Engine.Stats(ctx, key, sync)
+}
+
+func (e *EntireEngine) GetMessageCenter() any {
+	return e.Engine.GetMessageCenter()
+}
+
+func (e *EntireEngine) GetService() string {
+	return e.Engine.GetService()
 }

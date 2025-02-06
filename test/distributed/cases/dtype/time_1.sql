@@ -47,14 +47,18 @@ select count(t1),t2 from time_01 group by t2 order by t2;
 select min(t1),max(t2) from time_01;
 drop table time_02;
 -- primary key default and compk
+-- @bvt:issue#16438
 create table time_02 (t1 int,t2 time primary key,t3 varchar(25))partition by hash(t2)partitions 4;
+-- @bvt:issue
 create table time_03 (t1 int,t2 time primary key,t3 varchar(25));
 insert into time_03 values (30,"101412","yellow");
+-- @pattern
 insert into time_03 values (40,"101412","apple");
 select * from time_03;
 drop table time_03;
 create table time_03 (t1 int,t2 time,t3 varchar(25),t4 time default '110034',primary key(t1,t2));
 insert into time_03(t1,t2,t3) values (30,"24:59:09.932823","yellow");
+ -- @pattern
 insert into time_03(t1,t2,t3) values (30,"24:59:09.932823","oooppppp");
 insert into time_03(t1,t2,t3) values (31,"24:59:09.932823","postttttt");
 insert into time_03(t1,t2,t3) values (32,NULL,"vinda");
@@ -70,7 +74,7 @@ delete from time_03 where t2 is not null;
 select * from time_03;
 insert into time_03 values (40,"37","gloooooooge","35:50");
 truncate table time_03;
-load data infile "$resources/external_table_file/time_ex_table.csv" into table time_03;
+load data infile "$resources/external_table_file/time_ex_table.csv" into table time_03 fields terminated by ',';
 create external table time_ex_01(t1 int,t2 time,t3 varchar(25),t4 time)  infile{"filepath"='$resources/external_table_file/time_ex_table.csv'} fields terminated by ',' enclosed by '\"';
 select * from time_ex_01;
 select * from time_01 time1 join time_03 time3 on time1.t1=time3.t2;
@@ -102,3 +106,43 @@ select * from (select timediff(t1,t2) from time_01) as t;
 
 select cast('02 10:11:12' as time);
 select cast('255 10:11:12' as time);
+
+create database if not exists test;
+use test;
+drop table if exists mysql_ts_test;
+create table if not exists mysql_ts_test (id int, col_date date, col_time time, col timestamp);
+select * from mysql_ts_test;
+insert into mysql_ts_test values (1, '2024-03-13', '11:30:00', '2024-03-13 11:30:00');
+insert into mysql_ts_test values (2, DATE '2024-03-14', TIME '2024', TIMESTAMP '2024-03-14 11:30:00');
+insert into mysql_ts_test values (3, {d '2024-03-15'}, {t '11:30:30'}, {ts '2024-03-15 11:30:00'});
+-- @ignore:3
+select * from mysql_ts_test;
+insert into mysql_ts_test values (4, {d '2024-03-16'}, {t '23:59:59'}, {ts now()});
+insert into mysql_ts_test values (4, {d '2024-03-16'}, {t '23:59:59'}, {ts current_timestamp});
+-- @ignore:3
+select * from mysql_ts_test;
+drop table mysql_ts_test;
+
+drop table if exists stockpriceus2_5min_copy1;
+create table stockpriceus2_5min_copy1 (
+    id int auto_increment primary key,
+    time_1 datetime,
+    price decimal(10, 2));
+
+insert into stockpriceus2_5min_copy1 (time_1, price) values
+    ('2023-06-25 14:00:00', 150.50),
+    ('2023-06-25 14:05:00', 151.00),
+    ('2022-06-25 14:10:00', 149.75),
+    ('2021-06-25 14:15:00', 148.25),
+    ('2020-06-25 14:20:00', 147.00);
+
+select * from stockpriceus2_5min_copy1;
+select year(`time_1`) as yr_time_1_ok
+    from stockpriceus2_5min_copy1
+    group by year(`time_1`);
+select year(`time_1`) as yr_time_1_ok
+    from stockpriceus2_5min_copy1
+group by 1;
+drop table stockpriceus2_5min_copy1;
+
+drop database test;

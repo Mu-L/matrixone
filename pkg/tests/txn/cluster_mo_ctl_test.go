@@ -15,13 +15,14 @@
 package txn
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"testing"
 
 	"github.com/lni/goutils/leaktest"
-	pb "github.com/matrixorigin/matrixone/pkg/pb/ctl"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function/ctl"
 	"github.com/matrixorigin/matrixone/pkg/util/json"
 	"github.com/stretchr/testify/require"
 )
@@ -32,12 +33,13 @@ func TestMoCtlGetSnapshot(t *testing.T) {
 		t.Skip("skipping in short mode.")
 		return
 	}
+	ctx := context.Background()
 
 	// this case will start a mo cluster with 1 CNService, 1 DNService and 3 LogService.
 	// A Txn read and write will success.
 	for name, options := range testOptionsSet {
 		t.Run(name, func(t *testing.T) {
-			c, err := NewCluster(t,
+			c, err := NewCluster(ctx, t,
 				getBasicClusterOptions(options...))
 			require.NoError(t, err)
 			defer c.Stop()
@@ -58,12 +60,13 @@ func TestMoCtlUseSnapshot(t *testing.T) {
 		t.Skip("skipping in short mode.")
 		return
 	}
+	ctx := context.Background()
 
 	// this case will start a mo cluster with 1 CNService, 1 DNService and 3 LogService.
 	// A Txn read and write will success.
 	for name, options := range testOptionsSet {
 		t.Run(name, func(t *testing.T) {
-			c, err := NewCluster(t,
+			c, err := NewCluster(ctx, t,
 				getBasicClusterOptions(options...))
 			require.NoError(t, err)
 			defer c.Stop()
@@ -100,11 +103,17 @@ func mustGetSnapshot(t *testing.T, cli Client) string {
 
 	rows, err := sqlTxn.ExecSQLQuery("select mo_ctl('cn', 'GetSnapshot', '')")
 	require.NoError(t, err)
+	defer func() {
+		err := rows.Close()
+		require.NoError(t, err)
+		err = rows.Err()
+		require.NoError(t, err)
+	}()
 
 	defer mustCloseRows(t, rows)
 	require.True(t, rows.Next())
 
-	var result pb.CtlResult
+	var result ctl.Result
 	value := ""
 	require.NoError(t, rows.Scan(&value))
 	json.MustUnmarshal([]byte(value), &result)

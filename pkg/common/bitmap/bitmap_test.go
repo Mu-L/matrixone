@@ -26,15 +26,22 @@ const (
 	BenchmarkRows = 8192
 )
 
+func newBm(n int) *Bitmap {
+	var bm Bitmap
+	bm.InitWithSize(int64(n))
+	return &bm
+}
+
 func TestNulls(t *testing.T) {
-	np := New(Rows)
+	np := newBm(Rows)
 	np.AddRange(0, 0)
 	np.AddRange(1, 10)
 	require.Equal(t, 9, np.Count())
-	np.Clear()
+	np.Reset()
 
 	ok := np.IsEmpty()
 	require.Equal(t, true, ok)
+	np.TryExpandWithSize(10)
 	np.Add(0)
 	ok = np.Contains(0)
 	require.Equal(t, true, ok)
@@ -60,16 +67,16 @@ func TestNulls(t *testing.T) {
 	fmt.Printf("size: %v\n", np.Size())
 	fmt.Printf("numbers: %v\n", np.Count())
 
-	nq := New(Rows)
+	nq := newBm(Rows)
 	nq.Unmarshal(np.Marshal())
 
 	require.Equal(t, np.ToArray(), nq.ToArray())
 
-	np.Clear()
+	np.Reset()
 }
 
 func BenchmarkAdd(b *testing.B) {
-	np := New(BenchmarkRows)
+	np := newBm(BenchmarkRows)
 	for i := 0; i < b.N; i++ {
 		for j := 0; j < BenchmarkRows; j++ {
 			np.Add(uint64(j))
@@ -84,8 +91,8 @@ func BenchmarkAdd(b *testing.B) {
 }
 
 func TestC(t *testing.T) {
-	bm3 := New(10000)
-	bm5 := New(10000)
+	bm3 := newBm(10000)
+	bm5 := newBm(10000)
 
 	require.True(t, bm3.IsEmpty())
 	require.True(t, bm3.C_IsEmpty())
@@ -123,7 +130,7 @@ func TestC(t *testing.T) {
 }
 
 func TestBitmapIterator_Next(t *testing.T) {
-	np := New(BenchmarkRows)
+	np := newBm(BenchmarkRows)
 	np.AddRange(0, 64)
 
 	// | 63 -- 0 | 127 -- 64 | 191 -- 128 | 255 -- 192 | 319 -- 256 | 383 -- 320 | ... |
@@ -141,4 +148,72 @@ func TestBitmapIterator_Next(t *testing.T) {
 			t.Logf("r now is %d\n", r)
 		}
 	}
+}
+
+func TestBitmap_Compatibility(t *testing.T) {
+	np := newBm(BenchmarkRows)
+	np.AddRange(0, 64)
+
+	rows := []uint64{127, 192, 320}
+	np.AddMany(rows)
+
+	npV1 := &Bitmap{
+		len:  np.len,
+		data: np.data,
+	}
+	data := npV1.MarshalV1()
+
+	np2 := newBm(BenchmarkRows)
+	np2.UnmarshalV1(data)
+	require.Equal(t, np.Count(), np2.Count())
+	require.Equal(t, np.ToArray(), np2.ToArray())
+	require.Equal(t, np.ToI64Array(), np2.ToI64Array())
+
+	np3 := newBm(BenchmarkRows)
+	np3.UnmarshalNoCopyV1(data)
+	require.Equal(t, np.Count(), np3.Count())
+	require.Equal(t, np.ToArray(), np3.ToArray())
+	require.Equal(t, np.ToI64Array(), np3.ToI64Array())
+}
+
+func TestBitmap_Clear(t *testing.T) {
+	np := newBm(BenchmarkRows)
+	np.AddRange(100, 1000)
+	require.Equal(t, 900, np.Count())
+	np.Clear()
+	require.True(t, np.IsEmpty())
+	require.Equal(t, 0, np.Count())
+}
+
+func TestBitmap_Or(t *testing.T) {
+	np := newBm(BenchmarkRows)
+	np.AddRange(100, 1000)
+	require.Equal(t, 900, np.Count())
+	np2 := newBm(BenchmarkRows)
+	np2.AddRange(500, 1500)
+	require.Equal(t, 1000, np2.Count())
+	np.Or(np2)
+	require.Equal(t, 1400, np.Count())
+}
+
+func TestBitmap_And(t *testing.T) {
+	np := newBm(BenchmarkRows)
+	np.AddRange(100, 1000)
+	require.Equal(t, 900, np.Count())
+	np2 := newBm(BenchmarkRows)
+	np2.AddRange(500, 1500)
+	require.Equal(t, 1000, np2.Count())
+	np.And(np2)
+	require.Equal(t, 500, np.Count())
+}
+
+func TestBitmap_And2(t *testing.T) {
+	np := newBm(BenchmarkRows)
+	np.AddRange(0, 1000)
+	require.Equal(t, 1000, np.Count())
+	np2 := newBm(BenchmarkRows)
+	np2.AddRange(500, 600)
+	require.Equal(t, 100, np2.Count())
+	np.And(np2)
+	require.Equal(t, 100, np.Count())
 }

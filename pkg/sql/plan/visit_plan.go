@@ -66,7 +66,7 @@ func (vq *VisitPlan) visitNode(ctx context.Context, qry *Query, node *Node, idx 
 	return nil
 }
 
-func (vq *VisitPlan) exploreNode(ctx context.Context, rule VisitPlanRule, node *Node, idx int32) error {
+func (vq *VisitPlan) exploreNode(ctx context.Context, rule VisitPlanRule, node *Node, _ int32) error {
 	var err error
 	if node.Limit != nil {
 		node.Limit, err = rule.ApplyExpr(node.Limit)
@@ -96,15 +96,61 @@ func (vq *VisitPlan) exploreNode(ctx context.Context, rule VisitPlanRule, node *
 		}
 	}
 
+	for i := range node.OrderBy {
+		node.OrderBy[i].Expr, err = rule.ApplyExpr(node.OrderBy[i].Expr)
+		if err != nil {
+			return err
+		}
+	}
+
+	for i := range node.BlockFilterList {
+		node.BlockFilterList[i], err = rule.ApplyExpr(node.BlockFilterList[i])
+		if err != nil {
+			return err
+		}
+	}
+
+	if node.OnDuplicateKey != nil {
+		for key := range node.OnDuplicateKey.OnDuplicateExpr {
+			oldExpr := node.OnDuplicateKey.OnDuplicateExpr[key]
+			node.OnDuplicateKey.OnDuplicateExpr[key], err = rule.ApplyExpr(oldExpr)
+			if err != nil {
+				return err
+			}
+		}
+	} else {
+		for i := range node.OnUpdateExprs {
+			node.OnUpdateExprs[i], err = rule.ApplyExpr(node.OnUpdateExprs[i])
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	for i := range node.TblFuncExprList {
+		node.TblFuncExprList[i], err = rule.ApplyExpr(node.TblFuncExprList[i])
+		if err != nil {
+			return err
+		}
+	}
+
+	typ := types.New(types.T_varchar, 65000, 0)
+	toTyp := makePlan2Type(&typ)
+	targetTyp := &plan.Expr{
+		Typ: toTyp,
+		Expr: &plan.Expr_T{
+			T: &plan.TargetType{},
+		},
+	}
+
 	applyAndResetType := func(e *Expr) (*Expr, error) {
-		oldType := DeepCopyTyp(e.Typ)
+		oldType := e.Typ
 		e, err = rule.ApplyExpr(e)
 		if err != nil {
 			return nil, err
 		}
 		if (oldType.Id == int32(types.T_float32) || oldType.Id == int32(types.T_float64)) && (e.Typ.Id == int32(types.T_decimal64) || e.Typ.Id == int32(types.T_decimal128)) {
-			toTyp := types.New(types.T_varchar, 65000, 0)
-			e, err = forceCastExpr(ctx, e, makePlan2Type(&toTyp))
+			e, err = forceCastExpr2(ctx, e, typ, targetTyp)
 			if err != nil {
 				return nil, err
 			}
@@ -115,10 +161,19 @@ func (vq *VisitPlan) exploreNode(ctx context.Context, rule VisitPlanRule, node *
 	if node.RowsetData != nil {
 		for i := range node.RowsetData.Cols {
 			for j := range node.RowsetData.Cols[i].Data {
-				node.RowsetData.Cols[i].Data[j], err = applyAndResetType(node.RowsetData.Cols[i].Data[j])
+				node.RowsetData.Cols[i].Data[j].Expr, err = applyAndResetType(node.RowsetData.Cols[i].Data[j].Expr)
 				if err != nil {
 					return err
 				}
+			}
+		}
+	}
+
+	if node.DedupJoinCtx != nil {
+		for i := range node.DedupJoinCtx.UpdateColExprList {
+			node.DedupJoinCtx.UpdateColExprList[i], err = applyAndResetType(node.DedupJoinCtx.UpdateColExprList[i])
+			if err != nil {
+				return err
 			}
 		}
 	}

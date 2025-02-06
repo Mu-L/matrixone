@@ -15,8 +15,8 @@
 package txnimpl
 
 import (
+	"context"
 	"fmt"
-	"math/rand"
 	"path"
 	"sync"
 	"testing"
@@ -25,10 +25,11 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/objectio"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
@@ -46,10 +47,6 @@ const (
 // 2. 10000 node
 // 3. 512K buffer
 // 4. 1K(30%), 4K(25%), 8K(%20), 16K(%15), 32K(%10)
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 //func getNodes() int {
 //	v := rand.Intn(100)
@@ -81,9 +78,9 @@ func init() {
 //	defer testutils.AfterTest(t)()
 //	testutils.EnsureNoLeak(t)
 //	dir := testutils.InitTestEnv(ModuleName, t)
-//	tbl := makeTable(t, dir, 2, 1, common.K*6)
+//	tbl := makeTable(t, dir, 2, 1, mpool.KB*6)
 //	defer tbl.store.driver.Close()
-//	bat := catalog.MockBatch(tbl.GetSchema(), int(common.K))
+//	bat := catalog.MockBatch(tbl.GetSchema(), int(mpool.KB))
 //	defer bat.Close()
 //	p, _ := ants.NewPool(5)
 //	defer p.Release()
@@ -104,12 +101,12 @@ func init() {
 //				nodes[i] = n
 //				h := tbl.store.nodesMgr.Pin(n.storage.mnode)
 //				var err error
-//				if err = n.storage.mnode.Expand(common.K*1, func() error {
-//					_, err := n.Append(bat, 0)
+//				if err = n.storage.mnode.Expand(mpool.KB*1, func() error {
+//					_, err := n.Append(context.Background(), bat, 0)
 //					return err
 //				}); err != nil {
-//					err = n.storage.mnode.Expand(common.K*1, func() error {
-//						_, err := n.Append(bat, 0)
+//					err = n.storage.mnode.Expand(mpool.KB*1, func() error {
+//						_, err := n.Append(context.Background(), bat, 0)
 //						return err
 //					})
 //				}
@@ -125,7 +122,7 @@ func init() {
 //			atomic.AddUint64(&all, uint64(len(nodes)))
 //		}
 //	}
-//	idAlloc := common.NewIdAlloctor(1)
+//	idAlloc := common.NewIdAllocator(1)
 //	for {
 //		id := idAlloc.Alloc()
 //		if id > 10 {
@@ -142,26 +139,27 @@ func init() {
 
 func TestTable(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer c.Close()
 	defer mgr.Stop()
 
 	schema := catalog.MockSchemaAll(3, 2)
-	schema.BlockMaxRows = 10000
-	schema.SegmentMaxBlocks = 10
+	schema.Extra.BlockMaxRows = 10000
+	schema.Extra.ObjectMaxBlocks = 10
 	{
 		txn, _ := mgr.StartTxn(nil)
 		db, err := txn.CreateDatabase("db", "", "")
 		assert.Nil(t, err)
 		rel, _ := db.CreateRelation(schema)
-		bat := catalog.MockBatch(schema, int(common.K)*100)
+		bat := catalog.MockBatch(schema, int(mpool.KB)*100)
 		defer bat.Close()
 		bats := bat.Split(100)
 		for _, data := range bats {
-			err := rel.Append(data)
+			err := rel.Append(context.Background(), data)
 			assert.Nil(t, err)
 		}
 		tDB, _ := txn.GetStore().(*txnStore).getOrSetDB(db.GetID())
@@ -172,69 +170,70 @@ func TestTable(t *testing.T) {
 		assert.Nil(t, err)
 		err = tbl.RangeDeleteLocalRows(1024*10+38, 1024*40+40)
 		assert.Nil(t, err)
-		assert.True(t, tbl.IsLocalDeleted(1024+20))
-		assert.True(t, tbl.IsLocalDeleted(1024+30))
-		assert.True(t, tbl.IsLocalDeleted(1024*10+38))
-		assert.True(t, tbl.IsLocalDeleted(1024*40+40))
-		assert.True(t, tbl.IsLocalDeleted(1024*30+40))
-		assert.False(t, tbl.IsLocalDeleted(1024+19))
-		assert.False(t, tbl.IsLocalDeleted(1024+31))
-		assert.False(t, tbl.IsLocalDeleted(1024*10+37))
-		assert.False(t, tbl.IsLocalDeleted(1024*40+41))
-		err = txn.Commit()
+		assert.True(t, tbl.dataTable.tableSpace.IsDeleted(1024+20))
+		assert.True(t, tbl.dataTable.tableSpace.IsDeleted(1024+30))
+		assert.True(t, tbl.dataTable.tableSpace.IsDeleted(1024*10+38))
+		assert.True(t, tbl.dataTable.tableSpace.IsDeleted(1024*40+40))
+		assert.True(t, tbl.dataTable.tableSpace.IsDeleted(1024*30+40))
+		assert.False(t, tbl.dataTable.tableSpace.IsDeleted(1024+19))
+		assert.False(t, tbl.dataTable.tableSpace.IsDeleted(1024+31))
+		assert.False(t, tbl.dataTable.tableSpace.IsDeleted(1024*10+37))
+		assert.False(t, tbl.dataTable.tableSpace.IsDeleted(1024*40+41))
+		err = txn.Commit(context.Background())
 		assert.Nil(t, err)
 	}
 }
 
 func TestAppend(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer c.Close()
 	defer mgr.Stop()
 
 	schema := catalog.MockSchemaAll(3, 1)
-	schema.BlockMaxRows = 10000
-	schema.SegmentMaxBlocks = 10
+	schema.Extra.BlockMaxRows = 10000
+	schema.Extra.ObjectMaxBlocks = 10
 
 	txn, _ := mgr.StartTxn(nil)
 	db, _ := txn.CreateDatabase("db", "", "")
 	rel, _ := db.CreateRelation(schema)
 	tDB, _ := txn.GetStore().(*txnStore).getOrSetDB(db.GetID())
 	tbl, _ := tDB.getOrSetTable(rel.ID())
-	rows := uint64(txnbase.MaxNodeRows) / 8 * 3
+	rows := uint64(MaxNodeRows) / 8 * 3
 	brows := rows / 3
 
-	bat := catalog.MockBatch(tbl.GetSchema(), int(rows))
+	bat := catalog.MockBatch(tbl.GetLocalSchema(false), int(rows))
 	defer bat.Close()
 	bats := bat.Split(3)
 
 	err := tbl.BatchDedupLocal(bats[0])
 	assert.Nil(t, err)
-	err = tbl.Append(bats[0])
+	err = tbl.Append(context.Background(), bats[0])
 	assert.Nil(t, err)
-	assert.Equal(t, int(brows), int(tbl.UncommittedRows()))
-	assert.Equal(t, int(brows), int(tbl.localSegment.index.Count()))
+	assert.Equal(t, int(brows), int(tbl.dataTable.tableSpace.Rows()))
+	assert.Equal(t, int(brows), int(tbl.dataTable.tableSpace.index.Count()))
 
 	err = tbl.BatchDedupLocal(bats[0])
 	assert.NotNil(t, err)
 
 	err = tbl.BatchDedupLocal(bats[1])
 	assert.Nil(t, err)
-	err = tbl.Append(bats[1])
+	err = tbl.Append(context.Background(), bats[1])
 	assert.Nil(t, err)
-	assert.Equal(t, 2*int(brows), int(tbl.UncommittedRows()))
-	assert.Equal(t, 2*int(brows), int(tbl.localSegment.index.Count()))
+	assert.Equal(t, 2*int(brows), int(tbl.dataTable.tableSpace.Rows()))
+	assert.Equal(t, 2*int(brows), int(tbl.dataTable.tableSpace.index.Count()))
 
 	err = tbl.BatchDedupLocal(bats[2])
 	assert.Nil(t, err)
-	err = tbl.Append(bats[2])
+	err = tbl.Append(context.Background(), bats[2])
 	assert.Nil(t, err)
-	assert.Equal(t, 3*int(brows), int(tbl.UncommittedRows()))
-	assert.Equal(t, 3*int(brows), int(tbl.localSegment.index.Count()))
-	assert.NoError(t, txn.Commit())
+	assert.Equal(t, 3*int(brows), int(tbl.dataTable.tableSpace.Rows()))
+	assert.Equal(t, 3*int(brows), int(tbl.dataTable.tableSpace.index.Count()))
+	assert.NoError(t, txn.Commit(context.Background()))
 }
 
 func TestIndex(t *testing.T) {
@@ -286,20 +285,36 @@ func TestIndex(t *testing.T) {
 	assert.Equal(t, 2, window.Length())
 	err = idx.BatchDedup(bat.Attrs[12], window)
 	assert.Error(t, err)
+
+	// T_array
+	schema = catalog.MockSchemaAll(20, 12)
+	bat = catalog.MockBatch(schema, 500)
+	defer bat.Close()
+	idx = NewSimpleTableIndex()
+	err = idx.BatchDedup(bat.Attrs[19], bat.Vecs[19])
+	assert.Nil(t, err)
+	err = idx.BatchInsert(bat.Attrs[19], bat.Vecs[19], 0, bat.Vecs[19].Length(), 0, false)
+	assert.Nil(t, err)
+
+	window = bat.Vecs[19].Window(20, 2)
+	assert.Equal(t, 2, window.Length())
+	err = idx.BatchDedup(bat.Attrs[19], window)
+	assert.Error(t, err)
 }
 
 func TestLoad(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer c.Close()
 	defer mgr.Stop()
 
 	schema := catalog.MockSchemaAll(14, 13)
-	schema.BlockMaxRows = 10000
-	schema.SegmentMaxBlocks = 10
+	schema.Extra.BlockMaxRows = 10000
+	schema.Extra.ObjectMaxBlocks = 10
 
 	bat := catalog.MockBatch(schema, 60000)
 	defer bat.Close()
@@ -311,29 +326,28 @@ func TestLoad(t *testing.T) {
 	tDB, _ := txn.GetStore().(*txnStore).getOrSetDB(db.GetID())
 	tbl, _ := tDB.getOrSetTable(rel.ID())
 
-	err := tbl.Append(bats[0])
+	err := tbl.Append(context.Background(), bats[0])
 	assert.NoError(t, err)
 
-	t.Log(tbl.store.nodesMgr.String())
-	v, err := tbl.GetLocalValue(100, 0)
+	v, _, err := tbl.dataTable.tableSpace.GetValue(100, 0)
 	assert.NoError(t, err)
-	t.Log(tbl.store.nodesMgr.String())
 	t.Logf("Row %d, Col %d, Val %v", 100, 0, v)
-	assert.NoError(t, txn.Commit())
+	assert.NoError(t, txn.Commit(context.Background()))
 }
 
 func TestNodeCommand(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer c.Close()
 	defer mgr.Stop()
 
 	schema := catalog.MockSchemaAll(14, 13)
-	schema.BlockMaxRows = 10000
-	schema.SegmentMaxBlocks = 10
+	schema.Extra.BlockMaxRows = 10000
+	schema.Extra.ObjectMaxBlocks = 10
 
 	bat := catalog.MockBatch(schema, 15000)
 	defer bat.Close()
@@ -344,33 +358,32 @@ func TestNodeCommand(t *testing.T) {
 
 	tDB, _ := txn.GetStore().(*txnStore).getOrSetDB(db.GetID())
 	tbl, _ := tDB.getOrSetTable(rel.ID())
-	err := tbl.Append(bat)
+	err := tbl.Append(context.Background(), bat)
 	assert.Nil(t, err)
 
 	err = tbl.RangeDeleteLocalRows(100, 200)
 	assert.NoError(t, err)
 
-	for i, inode := range tbl.localSegment.nodes {
-		cmd, err := inode.MakeCommand(uint32(i))
-		assert.NoError(t, err)
-		assert.Equal(t, 1, len(cmd.(*AppendCmd).Cmds))
-		//if entry != nil {
-		//	_ = entry.WaitDone()
-		//	entry.Free()
-		//}
-		if cmd != nil {
-			t.Log(cmd.String())
-		}
+	inode := tbl.dataTable.tableSpace.node
+	cmd, err := inode.MakeCommand(uint32(0))
+	assert.NoError(t, err)
+	assert.NotNil(t, cmd.(*AppendCmd).Data)
+	//if entry != nil {
+	//	_ = entry.WaitDone()
+	//	entry.Free()
+	//}
+	if cmd != nil {
+		t.Log(cmd.String())
 	}
-	assert.NoError(t, txn.Commit())
+	assert.NoError(t, txn.Commit(context.Background()))
 }
 
 func TestTxnManager1(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	testutils.EnsureNoLeak(t)
-	mgr := txnbase.NewTxnManager(TxnStoreFactory(nil, nil, nil, nil, nil),
+	mgr := txnbase.NewTxnManager(TxnStoreFactory(context.Background(), nil, nil, nil, nil, 0),
 		TxnFactory(nil), types.NewMockHLCClock(1))
-	mgr.Start()
+	mgr.Start(context.Background())
 	txn, _ := mgr.StartTxn(nil)
 	txn.MockIncWriteCnt()
 
@@ -404,7 +417,7 @@ func TestTxnManager1(t *testing.T) {
 		lock.Lock()
 		seqs = append(seqs, 3)
 		lock.Unlock()
-		err := txn2.Commit()
+		err := txn2.Commit(context.Background())
 		assert.Nil(t, err)
 	}
 
@@ -413,7 +426,7 @@ func TestTxnManager1(t *testing.T) {
 		go short()
 	}
 
-	err := txn.Commit()
+	err := txn.Commit(context.Background())
 	assert.Nil(t, err)
 	wg.Wait()
 	defer mgr.Stop()
@@ -421,18 +434,20 @@ func TestTxnManager1(t *testing.T) {
 	assert.Equal(t, expected, seqs)
 }
 
-func initTestContext(t *testing.T, dir string) (*catalog.Catalog, *txnbase.TxnManager, wal.Driver) {
-	c := catalog.MockCatalog(nil)
-	driver := wal.NewDriverWithBatchStore(dir, "store", nil)
-	txnBufMgr := buffer.NewNodeManager(common.G, nil)
-	mutBufMgr := buffer.NewNodeManager(common.G, nil)
+func initTestContext(ctx context.Context, t *testing.T, dir string) (*catalog.Catalog, *txnbase.TxnManager, wal.Driver) {
+	c := catalog.MockCatalog()
+	driver := wal.NewBatchStoreDriver(ctx, dir, "store", nil)
 	serviceDir := path.Join(dir, "data")
-	service := objectio.TmpNewFileservice(path.Join(dir, "data"))
+	service := objectio.TmpNewFileservice(ctx, path.Join(dir, "data"))
 	fs := objectio.NewObjectFS(service, serviceDir)
-	factory := tables.NewDataFactory(fs, mutBufMgr, nil, dir)
-	mgr := txnbase.NewTxnManager(TxnStoreFactory(c, driver, nil, txnBufMgr, factory),
+	rt := dbutils.NewRuntime(
+		dbutils.WithRuntimeObjectFS(fs),
+	)
+	factory := tables.NewDataFactory(rt, dir)
+	mgr := txnbase.NewTxnManager(TxnStoreFactory(context.Background(), c, driver, rt, factory, 0),
 		TxnFactory(c), types.NewMockHLCClock(1))
-	mgr.Start()
+	rt.Now = mgr.Now
+	mgr.Start(context.Background())
 	return c, mgr, driver
 }
 
@@ -443,9 +458,10 @@ func initTestContext(t *testing.T, dir string) (*catalog.Catalog, *txnbase.TxnMa
 // 5. Txn3 commit
 func TestTransaction1(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer c.Close()
 	defer mgr.Stop()
@@ -457,7 +473,7 @@ func TestTransaction1(t *testing.T) {
 	assert.Nil(t, err)
 	_, err = db.CreateRelation(schema)
 	assert.Nil(t, err)
-	err = txn1.Commit()
+	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
 	t.Log(c.SimplePPString(common.PPL1))
 
@@ -475,9 +491,9 @@ func TestTransaction1(t *testing.T) {
 	assert.Nil(t, err)
 	t.Log(rel.String())
 
-	err = txn2.Commit()
+	err = txn2.Commit(context.Background())
 	assert.Nil(t, err)
-	err = txn3.Commit()
+	err = txn3.Commit(context.Background())
 	assert.NoError(t, err)
 	// assert.Equal(t, txnif.TxnStateRollbacked, txn3.GetTxnState(true))
 	t.Log(txn3.String())
@@ -488,9 +504,10 @@ func TestTransaction1(t *testing.T) {
 
 func TestTransaction2(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer c.Close()
 	defer mgr.Stop()
@@ -506,13 +523,13 @@ func TestTransaction2(t *testing.T) {
 	assert.Nil(t, err)
 	t.Log(rel.String())
 
-	err = txn1.Commit()
+	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
 	t.Log(db.String())
-	assert.Equal(t, txn1.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAt())
-	assert.True(t, db.GetMeta().(*catalog.DBEntry).IsCommitted())
-	assert.Equal(t, txn1.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAt())
-	assert.True(t, rel.GetMeta().(*catalog.TableEntry).IsCommitted())
+	assert.Equal(t, txn1.GetCommitTS(), db.GetMeta().(*catalog.DBEntry).GetCreatedAtLocked())
+	assert.True(t, db.GetMeta().(*catalog.DBEntry).IsCommittedLocked())
+	assert.Equal(t, txn1.GetCommitTS(), rel.GetMeta().(*catalog.TableEntry).GetCreatedAtLocked())
+	assert.True(t, rel.GetMeta().(*catalog.TableEntry).IsCommittedLocked())
 
 	txn2, _ := mgr.StartTxn(nil)
 	get, err := txn2.GetDatabase(name)
@@ -539,9 +556,10 @@ func TestTransaction2(t *testing.T) {
 
 func TestTransaction3(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer mgr.Stop()
 	defer c.Close()
@@ -561,7 +579,7 @@ func TestTransaction3(t *testing.T) {
 			schema := catalog.MockSchemaAll(13, 12)
 			_, err = db.CreateRelation(schema)
 			assert.Nil(t, err)
-			err = txn.Commit()
+			err = txn.Commit(context.Background())
 			assert.Nil(t, err)
 		}
 	}
@@ -574,11 +592,12 @@ func TestTransaction3(t *testing.T) {
 	wg.Wait()
 }
 
-func TestSegment1(t *testing.T) {
+func TestObject1(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer mgr.Stop()
 	defer c.Close()
@@ -590,9 +609,9 @@ func TestSegment1(t *testing.T) {
 	assert.Nil(t, err)
 	rel, err := db.CreateRelation(schema)
 	assert.Nil(t, err)
-	_, err = rel.CreateSegment(false)
+	_, err = rel.CreateObject(false)
 	assert.Nil(t, err)
-	err = txn1.Commit()
+	err = txn1.Commit(context.Background())
 	assert.Nil(t, err)
 
 	txn2, _ := mgr.StartTxn(nil)
@@ -600,61 +619,58 @@ func TestSegment1(t *testing.T) {
 	assert.Nil(t, err)
 	rel, err = db.GetRelationByName(schema.Name)
 	assert.Nil(t, err)
-	segIt := rel.MakeSegmentIt()
+	objIt := rel.MakeObjectIt(false)
 	cnt := 0
-	for segIt.Valid() {
-		iseg := segIt.GetSegment()
-		t.Log(iseg.String())
+	for objIt.Next() {
+		iobj := objIt.GetObject()
+		t.Log(iobj.String())
 		cnt++
-		segIt.Next()
 	}
 	assert.Equal(t, 1, cnt)
 
-	_, err = rel.CreateSegment(false)
+	_, err = rel.CreateObject(false)
 	assert.Nil(t, err)
 
-	segIt = rel.MakeSegmentIt()
+	objIt = rel.MakeObjectIt(false)
 	cnt = 0
-	for segIt.Valid() {
-		iseg := segIt.GetSegment()
-		t.Log(iseg.String())
+	for objIt.Next() {
+		iobj := objIt.GetObject()
+		t.Log(iobj.String())
 		cnt++
-		segIt.Next()
 	}
 	assert.Equal(t, 2, cnt)
 
 	txn3, _ := mgr.StartTxn(nil)
 	db, _ = txn3.GetDatabase(name)
 	rel, _ = db.GetRelationByName(schema.Name)
-	segIt = rel.MakeSegmentIt()
+	objIt = rel.MakeObjectIt(false)
 	cnt = 0
-	for segIt.Valid() {
-		iseg := segIt.GetSegment()
-		t.Log(iseg.String())
+	for objIt.Next() {
+		iobj := objIt.GetObject()
+		t.Log(iobj.String())
 		cnt++
-		segIt.Next()
 	}
 	assert.Equal(t, 1, cnt)
 
-	err = txn2.Commit()
+	err = txn2.Commit(context.Background())
 	assert.Nil(t, err)
 
-	segIt = rel.MakeSegmentIt()
+	objIt = rel.MakeObjectIt(false)
 	cnt = 0
-	for segIt.Valid() {
-		iseg := segIt.GetSegment()
-		t.Log(iseg.String())
+	for objIt.Next() {
+		iobj := objIt.GetObject()
+		t.Log(iobj.String())
 		cnt++
-		segIt.Next()
 	}
 	assert.Equal(t, 1, cnt)
 }
 
-func TestSegment2(t *testing.T) {
+func TestObject2(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer mgr.Stop()
 	defer c.Close()
@@ -663,87 +679,39 @@ func TestSegment2(t *testing.T) {
 	db, _ := txn1.CreateDatabase("db", "", "")
 	schema := catalog.MockSchema(1, 0)
 	rel, _ := db.CreateRelation(schema)
-	segCnt := 10
-	for i := 0; i < segCnt; i++ {
-		_, err := rel.CreateSegment(false)
+	objCnt := 10
+	for i := 0; i < objCnt; i++ {
+		_, err := rel.CreateObject(false)
 		assert.Nil(t, err)
 	}
 
-	it := rel.MakeSegmentIt()
+	it := rel.MakeObjectIt(false)
 	cnt := 0
-	for it.Valid() {
+	for it.Next() {
 		cnt++
-		// iseg := it.GetSegment()
-		it.Next()
+		// iobj := it.GetObject()
 	}
-	assert.Equal(t, segCnt, cnt)
+	assert.Equal(t, objCnt, cnt)
 	// err := txn1.Commit()
 	// assert.Nil(t, err)
 	t.Log(c.SimplePPString(common.PPL1))
 }
 
-func TestBlock1(t *testing.T) {
-	defer testutils.AfterTest(t)()
-	testutils.EnsureNoLeak(t)
-	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
-	defer driver.Close()
-	defer mgr.Stop()
-	defer c.Close()
-
-	txn1, _ := mgr.StartTxn(nil)
-	db, _ := txn1.CreateDatabase("db", "", "")
-	schema := catalog.MockSchema(1, 0)
-	rel, _ := db.CreateRelation(schema)
-	seg, _ := rel.CreateSegment(false)
-
-	blkCnt := 100
-	for i := 0; i < blkCnt; i++ {
-		_, err := seg.CreateBlock(false)
-		assert.Nil(t, err)
-	}
-
-	it := seg.MakeBlockIt()
-	cnt := 0
-	for it.Valid() {
-		cnt++
-		it.Next()
-	}
-	assert.Equal(t, blkCnt, cnt)
-
-	err := txn1.Commit()
-	assert.Nil(t, err)
-	txn2, _ := mgr.StartTxn(nil)
-	db, _ = txn2.GetDatabase("db")
-	rel, _ = db.GetRelationByName(schema.Name)
-	segIt := rel.MakeSegmentIt()
-	cnt = 0
-	for segIt.Valid() {
-		seg = segIt.GetSegment()
-		it = seg.MakeBlockIt()
-		for it.Valid() {
-			cnt++
-			it.Next()
-		}
-		segIt.Next()
-	}
-	assert.Equal(t, blkCnt, cnt)
-}
-
 func TestDedup1(t *testing.T) {
 	defer testutils.AfterTest(t)()
+	ctx := context.Background()
 	testutils.EnsureNoLeak(t)
 	dir := testutils.InitTestEnv(ModuleName, t)
-	c, mgr, driver := initTestContext(t, dir)
+	c, mgr, driver := initTestContext(ctx, t, dir)
 	defer driver.Close()
 	defer c.Close()
 	defer mgr.Stop()
 
 	schema := catalog.MockSchemaAll(4, 2)
-	schema.BlockMaxRows = 20
-	schema.SegmentMaxBlocks = 4
+	schema.Extra.BlockMaxRows = 20
+	schema.Extra.ObjectMaxBlocks = 4
 	cnt := uint64(10)
-	rows := uint64(schema.BlockMaxRows) / 2 * cnt
+	rows := uint64(schema.Extra.BlockMaxRows) / 2 * cnt
 	bat := catalog.MockBatch(schema, int(rows))
 	defer bat.Close()
 	bats := bat.Split(int(cnt))
@@ -752,63 +720,63 @@ func TestDedup1(t *testing.T) {
 		db, _ := txn.CreateDatabase("db", "", "")
 		_, err := db.CreateRelation(schema)
 		assert.Nil(t, err)
-		assert.Nil(t, txn.Commit())
+		assert.Nil(t, txn.Commit(context.Background()))
 	}
 	{
 		txn, _ := mgr.StartTxn(nil)
 		db, _ := txn.GetDatabase("db")
 		rel, _ := db.GetRelationByName(schema.Name)
-		err := rel.Append(bats[0])
+		err := rel.Append(context.Background(), bats[0])
 		assert.NoError(t, err)
-		err = rel.Append(bats[0])
+		err = rel.Append(context.Background(), bats[0])
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry))
-		assert.Nil(t, txn.Rollback())
+		assert.Nil(t, txn.Rollback(context.Background()))
 	}
 
 	{
 		txn, _ := mgr.StartTxn(nil)
 		db, _ := txn.GetDatabase("db")
 		rel, _ := db.GetRelationByName(schema.Name)
-		err := rel.Append(bats[0])
+		err := rel.Append(context.Background(), bats[0])
 		assert.Nil(t, err)
-		assert.Nil(t, txn.Commit())
+		assert.Nil(t, txn.Commit(context.Background()))
 	}
 	{
 		txn, _ := mgr.StartTxn(nil)
 		db, _ := txn.GetDatabase("db")
 		rel, _ := db.GetRelationByName(schema.Name)
-		err := rel.Append(bats[0])
+		err := rel.Append(context.Background(), bats[0])
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrDuplicateEntry))
-		assert.Nil(t, txn.Rollback())
+		assert.Nil(t, txn.Rollback(context.Background()))
 	}
 	{
 		txn, _ := mgr.StartTxn(nil)
 		db, _ := txn.GetDatabase("db")
 		rel, _ := db.GetRelationByName(schema.Name)
-		err := rel.Append(bats[1])
+		err := rel.Append(context.Background(), bats[1])
 		assert.Nil(t, err)
 
 		txn2, _ := mgr.StartTxn(nil)
 		db2, _ := txn2.GetDatabase("db")
 		rel2, _ := db2.GetRelationByName(schema.Name)
-		err = rel2.Append(bats[2])
+		err = rel2.Append(context.Background(), bats[2])
 		assert.Nil(t, err)
-		err = rel2.Append(bats[3])
+		err = rel2.Append(context.Background(), bats[3])
 		assert.Nil(t, err)
-		assert.Nil(t, txn2.Commit())
+		assert.Nil(t, txn2.Commit(context.Background()))
 
 		txn3, _ := mgr.StartTxn(nil)
 		db3, _ := txn3.GetDatabase("db")
 		rel3, _ := db3.GetRelationByName(schema.Name)
-		err = rel3.Append(bats[4])
+		err = rel3.Append(context.Background(), bats[4])
 		assert.Nil(t, err)
-		err = rel3.Append(bats[5])
+		err = rel3.Append(context.Background(), bats[5])
 		assert.Nil(t, err)
-		assert.Nil(t, txn3.Commit())
+		assert.Nil(t, txn3.Commit(context.Background()))
 
-		err = rel.Append(bats[3])
+		err = rel.Append(context.Background(), bats[3])
 		assert.NoError(t, err)
-		err = txn.Commit()
+		err = txn.Commit(context.Background())
 		assert.True(t, moerr.IsMoErrCode(err, moerr.ErrTxnWWConflict))
 	}
 	t.Log(c.SimplePPString(common.PPL1))

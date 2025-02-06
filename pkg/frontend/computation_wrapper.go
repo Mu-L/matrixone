@@ -15,87 +15,63 @@
 package frontend
 
 import (
+	"bytes"
 	"context"
+	"time"
+
 	"github.com/google/uuid"
-	"github.com/matrixorigin/matrixone/pkg/clusterservice"
+	"github.com/mohae/deepcopy"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/defines"
-	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
-	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/perfcounter"
 	"github.com/matrixorigin/matrixone/pkg/sql/compile"
+	"github.com/matrixorigin/matrixone/pkg/sql/models"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
 	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
-	"github.com/matrixorigin/matrixone/pkg/txn/clock"
-	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/memoryengine"
+	"github.com/matrixorigin/matrixone/pkg/sql/util"
+	"github.com/matrixorigin/matrixone/pkg/txn/storage/memorystorage"
+	util2 "github.com/matrixorigin/matrixone/pkg/util"
+	"github.com/matrixorigin/matrixone/pkg/util/trace"
+	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae/cache"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-var _ ComputationWrapper = &TxnComputationWrapper{}
-var _ ComputationWrapper = &NullComputationWrapper{}
-
-type NullComputationWrapper struct {
-	*TxnComputationWrapper
-}
-
-func InitNullComputationWrapper(ses *Session, stmt tree.Statement, proc *process.Process) *NullComputationWrapper {
-	return &NullComputationWrapper{
-		TxnComputationWrapper: InitTxnComputationWrapper(ses, stmt, proc),
-	}
-}
-
-func (ncw *NullComputationWrapper) GetAst() tree.Statement {
-	return ncw.stmt
-}
-
-func (ncw *NullComputationWrapper) SetDatabaseName(db string) error {
-	return nil
-}
-
-func (ncw *NullComputationWrapper) GetColumns() ([]interface{}, error) {
-	return []interface{}{}, nil
-}
-
-func (ncw *NullComputationWrapper) GetAffectedRows() uint64 {
-	return 0
-}
-
-func (ncw *NullComputationWrapper) Compile(requestCtx context.Context, u interface{}, fill func(interface{}, *batch.Batch) error) (interface{}, error) {
-	return nil, nil
-}
-
-func (ncw *NullComputationWrapper) RecordExecPlan(ctx context.Context) error {
-	return nil
-}
-
-func (ncw *NullComputationWrapper) GetUUID() []byte {
-	return ncw.uuid[:]
-}
-
-func (ncw *NullComputationWrapper) Run(ts uint64) error {
-	return nil
-}
-
-func (ncw *NullComputationWrapper) GetLoadTag() bool {
-	return false
-}
+var (
+	_ ComputationWrapper = &TxnComputationWrapper{}
+)
 
 type TxnComputationWrapper struct {
-	stmt    tree.Statement
-	plan    *plan2.Plan
-	proc    *process.Process
-	ses     *Session
-	compile *compile.Compile
+	stmt      tree.Statement
+	plan      *plan2.Plan
+	proc      *process.Process
+	ses       FeSession
+	compile   *compile.Compile
+	runResult *util2.RunResult
 
-	uuid uuid.UUID
+	ifIsExeccute bool
+	uuid         uuid.UUID
+	//holds values of params in the PREPARE
+	paramVals []any
+
+	explainBuffer *bytes.Buffer
+	binaryPrepare bool
+	prepareName   string
 }
 
-func InitTxnComputationWrapper(ses *Session, stmt tree.Statement, proc *process.Process) *TxnComputationWrapper {
-	uuid, _ := uuid.NewUUID()
+func InitTxnComputationWrapper(
+	ses FeSession,
+	stmt tree.Statement,
+	proc *process.Process,
+) *TxnComputationWrapper {
+	uuid, _ := uuid.NewV7()
 	return &TxnComputationWrapper{
 		stmt: stmt,
 		proc: proc,
@@ -104,270 +80,512 @@ func InitTxnComputationWrapper(ses *Session, stmt tree.Statement, proc *process.
 	}
 }
 
+func (cwft *TxnComputationWrapper) BinaryExecute() (bool, string) {
+	return cwft.binaryPrepare, cwft.prepareName
+}
+
+func (cwft *TxnComputationWrapper) Plan() *plan.Plan {
+	return cwft.plan
+}
+
+func (cwft *TxnComputationWrapper) ResetPlanAndStmt(stmt tree.Statement) {
+	cwft.plan = nil
+	cwft.freeStmt()
+	cwft.stmt = stmt
+}
+
 func (cwft *TxnComputationWrapper) GetAst() tree.Statement {
 	return cwft.stmt
+}
+
+func (cwft *TxnComputationWrapper) Free() {
+	cwft.freeStmt()
+	cwft.Clear()
+}
+
+func (cwft *TxnComputationWrapper) freeStmt() {
+	if cwft.stmt != nil {
+		if !cwft.ifIsExeccute {
+			cwft.stmt.Free()
+			cwft.stmt = nil
+		}
+	}
+}
+
+func (cwft *TxnComputationWrapper) Clear() {
+	cwft.plan = nil
+	cwft.proc = nil
+	cwft.ses = nil
+	cwft.compile = nil
+	cwft.runResult = nil
+	cwft.paramVals = nil
+	cwft.prepareName = ""
+	cwft.binaryPrepare = false
+}
+
+func (cwft *TxnComputationWrapper) ParamVals() []any {
+	return cwft.paramVals
 }
 
 func (cwft *TxnComputationWrapper) GetProcess() *process.Process {
 	return cwft.proc
 }
 
-func (cwft *TxnComputationWrapper) SetDatabaseName(db string) error {
-	return nil
-}
-
-func (cwft *TxnComputationWrapper) GetColumns() ([]interface{}, error) {
+func (cwft *TxnComputationWrapper) GetColumns(ctx context.Context) ([]interface{}, error) {
 	var err error
 	cols := plan2.GetResultColumnsFromPlan(cwft.plan)
 	switch cwft.GetAst().(type) {
 	case *tree.ShowColumns:
 		if len(cols) == 7 {
 			cols = []*plan2.ColDef{
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Field"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Type"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Null"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Key"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Default"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Extra"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Comment"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Field"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Type"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Null"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Key"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Default"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Extra"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Comment"},
 			}
 		} else {
 			cols = []*plan2.ColDef{
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Field"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Type"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Collation"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Null"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Key"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Default"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Extra"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Privileges"},
-				{Typ: &plan2.Type{Id: int32(types.T_char)}, Name: "Comment"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Field"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Type"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Collation"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Null"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Key"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Default"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Extra"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Privileges"},
+				{Typ: plan2.Type{Id: int32(types.T_char)}, Name: "Comment"},
 			}
 		}
 	}
 	columns := make([]interface{}, len(cols))
 	for i, col := range cols {
-		c := new(MysqlColumn)
-		c.SetName(col.Name)
-		c.SetOrgName(col.Name)
-		c.SetTable(col.Typ.Table)
-		c.SetOrgTable(col.Typ.Table)
-		c.SetAutoIncr(col.Typ.AutoIncr)
-		c.SetSchema(cwft.ses.GetTxnCompileCtx().DefaultDatabase())
-		err = convertEngineTypeToMysqlType(cwft.ses.requestCtx, types.T(col.Typ.Id), c)
+		c, err := colDef2MysqlColumn(ctx, col)
 		if err != nil {
 			return nil, err
 		}
-		setColFlag(c)
-		setColLength(c, col.Typ.Width)
-		setCharacter(c)
-
-		// For binary/varbinary with mysql_type_varchar.Change the charset.
-		if types.T(col.Typ.Id) == types.T_binary || types.T(col.Typ.Id) == types.T_varbinary {
-			c.SetCharset(0x3f)
-		}
-
-		c.SetDecimal(col.Typ.Scale)
-		convertMysqlTextTypeToBlobType(c)
 		columns[i] = c
 	}
 	return columns, err
 }
 
-func (cwft *TxnComputationWrapper) GetClock() clock.Clock {
-	rt := runtime.ProcessLevelRuntime()
-	return rt.Clock()
+func (cwft *TxnComputationWrapper) GetServerStatus() uint16 {
+	return uint16(cwft.ses.GetTxnHandler().GetServerStatus())
 }
 
-func (cwft *TxnComputationWrapper) GetAffectedRows() uint64 {
-	return cwft.compile.GetAffectedRows()
-}
-
-func (cwft *TxnComputationWrapper) Compile(requestCtx context.Context, u interface{}, fill func(interface{}, *batch.Batch) error) (interface{}, error) {
+func checkResultQueryPrivilege(proc *process.Process, p *plan.Plan, reqCtx context.Context, sid string, ses *Session) (statistic.StatsArray, error) {
+	var ids []string
 	var err error
-	defer RecordStatementTxnID(requestCtx, cwft.ses)
-	if cwft.ses.IfInitedTempEngine() {
-		requestCtx = context.WithValue(requestCtx, defines.TemporaryDN{}, cwft.ses.GetTempTableStorage())
-		cwft.ses.SetRequestContext(requestCtx)
-		cwft.proc.Ctx = context.WithValue(cwft.proc.Ctx, defines.TemporaryDN{}, cwft.ses.GetTempTableStorage())
-		cwft.ses.GetTxnHandler().AttachTempStorageToTxnCtx()
+	var stats statistic.StatsArray
+	stats.Reset()
+
+	if ids, err = isResultQuery(proc, p); err != nil || ids == nil {
+		return stats, err
 	}
+	return checkPrivilege(sid, ids, reqCtx, ses)
+}
+
+// Compile build logical plan and then build physical plan `Compile` object
+func (cwft *TxnComputationWrapper) Compile(any any, fill func(*batch.Batch, *perfcounter.CounterSet) error) (interface{}, error) {
+	var originSQL string
+	var span trace.Span
+	var err error
+
+	execCtx := any.(*ExecCtx)
+	execCtx.reqCtx, span = trace.Start(execCtx.reqCtx, "TxnComputationWrapper.Compile",
+		trace.WithKind(trace.SpanKindStatement))
+	defer span.End(trace.WithStatementExtra(cwft.ses.GetTxnId(), cwft.ses.GetStmtId(), cwft.ses.GetSqlOfStmt()))
+
+	defer RecordStatementTxnID(execCtx.reqCtx, cwft.ses)
+	if cwft.ses.GetTxnHandler().HasTempEngine() {
+		updateTempStorageInCtx(execCtx, cwft.proc, cwft.ses.GetTxnHandler().GetTempStorage())
+	}
+	stats := statistic.StatsInfoFromContext(execCtx.reqCtx)
+
 	cacheHit := cwft.plan != nil
 	if !cacheHit {
-		cwft.plan, err = buildPlan(requestCtx, cwft.ses, cwft.ses.GetTxnCompileCtx(), cwft.stmt)
-	} else if cwft.ses != nil && cwft.ses.GetTenantInfo() != nil {
-		cwft.ses.accountId = getAccountId(requestCtx)
-		err = authenticateCanExecuteStatementAndPlan(requestCtx, cwft.ses, cwft.stmt, cwft.plan)
-	}
-	if err != nil {
-		return nil, err
-	}
-	cwft.ses.p = cwft.plan
-	if ids := isResultQuery(cwft.plan); ids != nil {
-		if err = checkPrivilege(ids, requestCtx, cwft.ses); err != nil {
-			return nil, err
-		}
-	}
-	if _, ok := cwft.stmt.(*tree.Execute); ok {
-		executePlan := cwft.plan.GetDcl().GetExecute()
-		stmtName := executePlan.GetName()
-		prepareStmt, err := cwft.ses.GetPrepareStmt(stmtName)
+		cwft.plan, err = buildPlanWithAuthorization(execCtx.reqCtx, cwft.ses, cwft.ses.GetTxnCompileCtx(), cwft.stmt)
 		if err != nil {
 			return nil, err
 		}
-
-		// TODO check if schema change, obj.Obj is zero all the time in 0.6
-		// for _, obj := range preparePlan.GetSchemas() {
-		// 	newObj, _ := cwft.ses.txnCompileCtx.Resolve(obj.SchemaName, obj.ObjName)
-		// 	if newObj == nil || newObj.Obj != obj.Obj {
-		// 		return nil, moerr.NewInternalError("", fmt.Sprintf(ctx, "table '%s' has been changed, please reset Prepare statement '%s'", obj.ObjName, stmtName))
-		// 	}
-		// }
-
-		preparePlan := prepareStmt.PreparePlan.GetDcl().GetPrepare()
-		if len(executePlan.Args) != len(preparePlan.ParamTypes) {
-			return nil, moerr.NewInvalidInput(requestCtx, "Incorrect arguments to EXECUTE")
-		}
-		newPlan := plan2.DeepCopyPlan(preparePlan.Plan)
-
-		// replace ? and @var with their values
-		resetParamRule := plan2.NewResetParamRefRule(requestCtx, executePlan.Args)
-		resetVarRule := plan2.NewResetVarRefRule(cwft.ses.GetTxnCompileCtx(), cwft.ses.GetTxnCompileCtx().GetProcess())
-		constantFoldRule := plan2.NewConstantFoldRule(cwft.ses.GetTxnCompileCtx())
-		vp := plan2.NewVisitPlan(newPlan, []plan2.VisitPlanRule{resetParamRule, resetVarRule, constantFoldRule})
-		err = vp.Visit(requestCtx)
+		//cwft.plan, err = buildPlan(execCtx.reqCtx, cwft.ses, cwft.ses.GetTxnCompileCtx(), cwft.stmt)
+	} else if cwft.ses != nil && cwft.ses.GetTenantInfo() != nil && !cwft.ses.IsBackgroundSession() {
+		var accId uint32
+		accId, err = defines.GetAccountId(execCtx.reqCtx)
 		if err != nil {
 			return nil, err
 		}
+		cwft.ses.SetAccountId(accId)
 
-		// reset plan & stmt
-		cwft.stmt = prepareStmt.PrepareStmt
-		cwft.plan = newPlan
+		//err = authenticateCanExecuteStatementAndPlan(execCtx.reqCtx, cwft.ses.(*Session), cwft.stmt, cwft.plan)
+		authStats, err := authenticateCanExecuteStatementAndPlan(execCtx.reqCtx, cwft.ses.(*Session), cwft.stmt, cwft.plan)
+		if err != nil {
+			return nil, err
+		}
+		// record permission statistics.
+		stats.PermissionAuth.Add(&authStats)
+	}
+	//if err != nil {
+	//	return nil, err
+	//}
+	if !cwft.ses.IsBackgroundSession() {
+		cwft.ses.SetPlan(cwft.plan)
+		//if err := checkResultQueryPrivilege(cwft.proc, cwft.plan, execCtx.reqCtx, cwft.ses.GetService(), cwft.ses.(*Session)); err != nil {
+		//	return nil, err
+		//}
+
+		authStats, err := checkResultQueryPrivilege(cwft.proc, cwft.plan, execCtx.reqCtx, cwft.ses.GetService(), cwft.ses.(*Session))
+		if err != nil {
+			return nil, err
+		}
+		stats.PermissionAuth.Add(&authStats)
+	}
+
+	if _, isTextProtExecute := cwft.stmt.(*tree.Execute); isTextProtExecute || execCtx.input.isBinaryProtExecute {
+		var retComp *compile.Compile
+		var plan *plan.Plan
+		var stmt tree.Statement
+		var sql string
+		if isTextProtExecute {
+			executePlan := cwft.plan.GetDcl().GetExecute()
+			retComp, plan, stmt, sql, err = initExecuteStmtParam(execCtx.reqCtx, cwft.ses.(*Session), cwft, executePlan, executePlan.GetName())
+			if err != nil {
+				return nil, err
+			}
+			//if err := checkResultQueryPrivilege(cwft.proc, plan, execCtx.reqCtx, cwft.ses.GetService(), cwft.ses.(*Session)); err != nil {
+			//	return nil, err
+			//}
+			authStats, err := checkResultQueryPrivilege(cwft.proc, plan, execCtx.reqCtx, cwft.ses.GetService(), cwft.ses.(*Session))
+			if err != nil {
+				return nil, err
+			}
+			stats.PermissionAuth.Add(&authStats)
+
+			cwft.plan = plan
+			cwft.stmt.Free()
+			// reset plan & stmt
+			cwft.stmt = stmt
+		} else {
+			// binary protocol execute
+			retComp, _, _, sql, err = initExecuteStmtParam(execCtx.reqCtx, cwft.ses.(*Session), cwft, nil, execCtx.input.stmtName)
+			if err != nil {
+				return nil, err
+			}
+		}
+		originSQL = sql
+		cwft.ifIsExeccute = true
+
 		// reset some special stmt for execute statement
 		switch cwft.stmt.(type) {
 		case *tree.ShowTableStatus:
-			cwft.ses.showStmtType = ShowTableStatus
+			cwft.ses.SetShowStmtType(ShowTableStatus)
 			cwft.ses.SetData(nil)
-		case *tree.SetVar, *tree.ShowVariables, *tree.ShowErrors, *tree.ShowWarnings:
+		case *tree.SetVar, *tree.ShowVariables, *tree.ShowErrors, *tree.ShowWarnings,
+			*tree.CreateAccount, *tree.AlterAccount, *tree.DropAccount:
 			return nil, nil
 		}
 
-		//check privilege
-		err = authenticateUserCanExecutePrepareOrExecute(requestCtx, cwft.ses, prepareStmt.PrepareStmt, newPlan)
-		if err != nil {
-			return nil, err
-		}
-	} else {
-		var vp *plan2.VisitPlan
-		if cacheHit {
-			vp = plan2.NewVisitPlan(cwft.plan, []plan2.VisitPlanRule{plan2.NewResetVarRefRule(cwft.ses.GetTxnCompileCtx(), cwft.ses.GetTxnCompileCtx().GetProcess()), plan2.NewRecomputeRealTimeRelatedFuncRule(cwft.ses.GetTxnCompileCtx().GetProcess())})
+		if retComp == nil {
+			cwft.compile, err = createCompile(execCtx, cwft.ses, cwft.proc, cwft.ses.GetSql(), cwft.stmt, cwft.plan, fill, false)
+			if err != nil {
+				return nil, err
+			}
+			cwft.compile.SetOriginSQL(originSQL)
 		} else {
-			vp = plan2.NewVisitPlan(cwft.plan, []plan2.VisitPlanRule{plan2.NewResetVarRefRule(cwft.ses.GetTxnCompileCtx(), cwft.ses.GetTxnCompileCtx().GetProcess())})
+			// retComp
+			cwft.proc.ReplaceTopCtx(execCtx.reqCtx)
+			retComp.Reset(cwft.proc, getStatementStartAt(execCtx.reqCtx), fill, cwft.ses.GetSql())
+			cwft.compile = retComp
 		}
-		err = vp.Visit(requestCtx)
+
+		//check privilege
+		/* prepare not need check privilege
+		   err = authenticateUserCanExecutePrepareOrExecute(requestCtx, cwft.ses, prepareStmt.PrepareStmt, newPlan)
+		   if err != nil {
+		   	return nil, err
+		   }
+		*/
+	} else {
+		cwft.compile, err = createCompile(execCtx, cwft.ses, cwft.proc, execCtx.sqlOfStmt, cwft.stmt, cwft.plan, fill, false)
 		if err != nil {
 			return nil, err
 		}
 	}
 
-	txnHandler := cwft.ses.GetTxnHandler()
-	if cacheHit && cwft.plan.NeedImplicitTxn() {
-		cwft.proc.TxnOperator, err = txnHandler.GetTxn()
-		if err != nil {
-			return nil, err
-		}
-	} else if cwft.plan.GetQuery().GetLoadTag() {
-		cwft.proc.TxnOperator = txnHandler.GetTxnOperator()
-	} else if cwft.plan.NeedImplicitTxn() {
-		cwft.proc.TxnOperator, err = txnHandler.GetTxn()
-		if err != nil {
-			return nil, err
-		}
-	}
-	addr := ""
-	if len(cwft.ses.GetParameterUnit().ClusterNodes) > 0 {
-		addr = cwft.ses.GetParameterUnit().ClusterNodes[0].Addr
-	}
-	cwft.proc.FileService = cwft.ses.GetParameterUnit().FileService
-	cwft.compile = compile.New(addr, cwft.ses.GetDatabaseName(), cwft.ses.GetSql(), cwft.ses.GetUserName(), txnHandler.GetTxnCtx(), cwft.ses.GetStorage(), cwft.proc, cwft.stmt)
-
-	if _, ok := cwft.stmt.(*tree.ExplainAnalyze); ok {
-		fill = func(obj interface{}, bat *batch.Batch) error { return nil }
-	}
-	err = cwft.compile.Compile(txnHandler.GetTxnCtx(), cwft.plan, cwft.ses, fill)
-	if err != nil {
-		return nil, err
-	}
-	// check if it is necessary to initialize the temporary engine
-	if cwft.compile.NeedInitTempEngine(cwft.ses.IfInitedTempEngine()) {
-		// 0. init memory-non-dist storage
-		dnStore, err := cwft.ses.SetTempTableStorage(cwft.GetClock())
-		if err != nil {
-			return nil, err
-		}
-
-		// temporary storage is passed through Ctx
-		requestCtx = context.WithValue(requestCtx, defines.TemporaryDN{}, cwft.ses.GetTempTableStorage())
-
-		// 1. init memory-non-dist engine
-		tempEngine := memoryengine.New(
-			requestCtx,
-			memoryengine.NewDefaultShardPolicy(
-				mpool.MustNewZeroNoFixed(),
-			),
-			memoryengine.RandomIDGenerator,
-			clusterservice.NewMOCluster(
-				nil,
-				0,
-				clusterservice.WithDisableRefresh(),
-				clusterservice.WithServices(nil, []metadata.DNService{
-					*dnStore,
-				})),
-		)
-
-		// 2. bind the temporary engine to the session and txnHandler
-		_ = cwft.ses.SetTempEngine(requestCtx, tempEngine)
-		cwft.compile.SetTempEngine(requestCtx, tempEngine)
-		txnHandler.SetTempEngine(tempEngine)
-		cwft.ses.GetTxnHandler().AttachTempStorageToTxnCtx()
-
-		// 3. init temp-db to store temporary relations
-		err = tempEngine.Create(requestCtx, defines.TEMPORARY_DBNAME, cwft.ses.txnHandler.txnOperator)
-		if err != nil {
-			return nil, err
-		}
-
-		// 4. add auto_IncrementTable fortemp-db
-		err = colexec.CreateAutoIncrTable(cwft.ses.GetStorage(), requestCtx, cwft.proc, defines.TEMPORARY_DBNAME)
-		if err != nil {
-			return nil, err
-		}
-
-		cwft.ses.EnableInitTempEngine()
-	}
 	return cwft.compile, err
 }
 
-func (cwft *TxnComputationWrapper) RecordExecPlan(ctx context.Context) error {
-	if stm := motrace.StatementFromContext(ctx); stm != nil {
-		stm.SetExecPlan(cwft.plan, SerializeExecPlan)
+func updateTempStorageInCtx(execCtx *ExecCtx, proc *process.Process, tempStorage *memorystorage.Storage) {
+	if execCtx != nil && execCtx.reqCtx != nil {
+		execCtx.reqCtx = attachValue(execCtx.reqCtx, defines.TemporaryTN{}, tempStorage)
+		proc.ReplaceTopCtx(execCtx.reqCtx)
+	}
+}
+
+func (cwft *TxnComputationWrapper) RecordExecPlan(ctx context.Context, phyPlan *models.PhyPlan) error {
+	if stm := cwft.ses.GetStmtInfo(); stm != nil {
+		waitActiveCost := time.Duration(0)
+		if handler := cwft.ses.GetTxnHandler(); handler.InActiveTxn() {
+			txn := handler.GetTxn()
+			if txn != nil {
+				waitActiveCost = txn.GetWaitActiveCost()
+			}
+		}
+		stm.SetSerializableExecPlan(NewJsonPlanHandler(ctx, stm, cwft.ses, cwft.plan, phyPlan, WithWaitActiveCost(waitActiveCost)))
 	}
 	return nil
+}
+
+// RecordCompoundStmt Check if it is a compound statement, What is a compound statement?
+func (cwft *TxnComputationWrapper) RecordCompoundStmt(ctx context.Context, statsBytes statistic.StatsArray) error {
+	if stm := cwft.ses.GetStmtInfo(); stm != nil {
+		// Check if it is a compound statement, What is a compound statement?
+		jsonHandle := &jsonPlanHandler{
+			jsonBytes:  sqlQueryIgnoreExecPlan,
+			statsBytes: statsBytes,
+		}
+		stm.SetSerializableExecPlan(jsonHandle)
+	}
+	return nil
+}
+
+func (cwft *TxnComputationWrapper) StatsCompositeSubStmtResource(ctx context.Context) (statsByte statistic.StatsArray) {
+	waitActiveCost := time.Duration(0)
+	if handler := cwft.ses.GetTxnHandler(); handler.InActiveTxn() {
+		txn := handler.GetTxn()
+		if txn != nil {
+			waitActiveCost = txn.GetWaitActiveCost()
+		}
+	}
+
+	h := NewMarshalPlanHandlerCompositeSubStmt(ctx, cwft.plan, WithWaitActiveCost(waitActiveCost))
+	statsByte, _ = h.Stats(ctx, cwft.ses)
+	return statsByte
+}
+
+func (cwft *TxnComputationWrapper) SetExplainBuffer(buf *bytes.Buffer) {
+	cwft.explainBuffer = buf
 }
 
 func (cwft *TxnComputationWrapper) GetUUID() []byte {
 	return cwft.uuid[:]
 }
 
-func (cwft *TxnComputationWrapper) Run(ts uint64) error {
-	logDebugf(cwft.ses.GetDebugString(), "compile.Run begin")
-	defer func() {
-		logDebugf(cwft.ses.GetDebugString(), "compile.Run end")
-	}()
-	err := cwft.compile.Run(ts)
-	return err
+func (cwft *TxnComputationWrapper) Run(ts uint64) (*util2.RunResult, error) {
+	runResult, err := cwft.compile.Run(ts)
+	cwft.compile.Release()
+	cwft.runResult = runResult
+	cwft.compile = nil
+	return runResult, err
 }
 
 func (cwft *TxnComputationWrapper) GetLoadTag() bool {
 	return cwft.plan.GetQuery().GetLoadTag()
+}
+
+func appendStatementAt(ctx context.Context, value time.Time) context.Context {
+	return context.WithValue(ctx, defines.StartTS{}, value)
+}
+
+func getStatementStartAt(ctx context.Context) time.Time {
+	v := ctx.Value(defines.StartTS{})
+	if v == nil {
+		return time.Now()
+	}
+	return v.(time.Time)
+}
+
+func CheckTableDefChange(catalogCache *cache.CatalogCache, tblKey *cache.TableChangeQuery) bool {
+	return catalogCache.HasNewerVersion(tblKey)
+}
+
+// initExecuteStmtParam replaces the plan of the EXECUTE by the plan generated by
+// the PREPARE and setups the params for the plan.
+func initExecuteStmtParam(reqCtx context.Context, ses *Session, cwft *TxnComputationWrapper, execPlan *plan.Execute, stmtName string) (*compile.Compile, *plan.Plan, tree.Statement, string, error) {
+	if execPlan != nil { // binary protocol, don't have to buildplan, execPlan is nil
+		stmtName = execPlan.GetName()
+	}
+	prepareStmt, err := ses.GetPrepareStmt(reqCtx, stmtName)
+	if err != nil {
+		return nil, nil, nil, "", err
+	}
+	originSQL := prepareStmt.Sql
+	preparePlan := prepareStmt.PreparePlan.GetDcl().GetPrepare()
+
+	// TODO check if schema change, obj.Obj is zero all the time in 0.6
+	eng := ses.proc.Base.SessionInfo.StorageEngine
+	catalogCache := eng.(*disttae.Engine).GetLatestCatalogCache()
+
+	for _, obj := range preparePlan.GetSchemas() {
+		accountId := ses.GetAccountId()
+		if ShouldSwitchToSysAccount(obj.SchemaName, obj.ObjName) {
+			accountId = uint32(sysAccountID)
+		}
+		tblKey := &cache.TableChangeQuery{
+			AccountId:  accountId,
+			DatabaseId: uint64(obj.Db),
+			Name:       obj.ObjName,
+			Version:    uint32(obj.Server),
+			TableId:    uint64(obj.Obj),
+			Ts:         prepareStmt.Ts,
+		}
+
+		change := CheckTableDefChange(catalogCache, tblKey)
+		if change {
+			return nil, nil, nil, originSQL, moerr.NewInternalErrorf(reqCtx, "table '%s' has been changed, please reset prepare statement '%s'", obj.ObjName, stmtName)
+		}
+	}
+
+	numParams := len(preparePlan.ParamTypes)
+	if prepareStmt.params != nil && prepareStmt.params.Length() > 0 { // use binary protocol
+		if prepareStmt.params.Length() != numParams {
+			return nil, nil, nil, originSQL, moerr.NewInvalidInput(reqCtx, "Incorrect arguments to EXECUTE")
+		}
+		cwft.proc.SetPrepareParams(prepareStmt.params)
+	} else if execPlan != nil && len(execPlan.Args) > 0 {
+		if len(execPlan.Args) != numParams {
+			return nil, nil, nil, originSQL, moerr.NewInvalidInput(reqCtx, "Incorrect arguments to EXECUTE")
+		}
+		params := vector.NewVec(types.T_text.ToType())
+		paramVals := make([]any, numParams)
+		for i, arg := range execPlan.Args {
+			exprImpl := arg.Expr.(*plan.Expr_V)
+			param, err := cwft.proc.GetResolveVariableFunc()(exprImpl.V.Name, exprImpl.V.System, exprImpl.V.Global)
+			if err != nil {
+				return nil, nil, nil, originSQL, err
+			}
+			if param == nil {
+				return nil, nil, nil, originSQL, moerr.NewInvalidInput(reqCtx, "Incorrect arguments to EXECUTE")
+			}
+			err = util.AppendAnyToStringVector(cwft.proc, param, params)
+			if err != nil {
+				return nil, nil, nil, originSQL, err
+			}
+			paramVals[i] = param
+		}
+		cwft.proc.SetPrepareParams(params)
+		cwft.paramVals = paramVals
+	} else {
+		if numParams > 0 {
+			return nil, nil, nil, originSQL, moerr.NewInvalidInput(reqCtx, "Incorrect arguments to EXECUTE")
+		}
+	}
+	return prepareStmt.compile, preparePlan.Plan, prepareStmt.PrepareStmt, originSQL, nil
+}
+
+func createCompile(
+	execCtx *ExecCtx,
+	ses FeSession,
+	proc *process.Process,
+	originSQL string,
+	stmt tree.Statement,
+	plan *plan2.Plan,
+	fill func(*batch.Batch, *perfcounter.CounterSet) error,
+	isPrepare bool,
+) (retCompile *compile.Compile, err error) {
+
+	addr := ""
+	pu := getPu(ses.GetService())
+	if len(pu.ClusterNodes) > 0 {
+		addr = pu.ClusterNodes[0].Addr
+	}
+	proc.ReplaceTopCtx(execCtx.reqCtx)
+	proc.Base.FileService = pu.FileService
+
+	var tenant string
+	tInfo := ses.GetTenantInfo()
+	if tInfo != nil {
+		tenant = tInfo.GetTenant()
+	}
+
+	stats := statistic.StatsInfoFromContext(execCtx.reqCtx)
+	stats.CompileStart()
+	crs := new(perfcounter.CounterSet)
+	execCtx.reqCtx = perfcounter.AttachCompilePlanMarkKey(execCtx.reqCtx, crs)
+	defer func() {
+		stats.AddCompileS3Request(statistic.S3Request{
+			List:      crs.FileService.S3.List.Load(),
+			Head:      crs.FileService.S3.Head.Load(),
+			Put:       crs.FileService.S3.Put.Load(),
+			Get:       crs.FileService.S3.Get.Load(),
+			Delete:    crs.FileService.S3.Delete.Load(),
+			DeleteMul: crs.FileService.S3.DeleteMulti.Load(),
+		})
+		stats.CompileEnd()
+	}()
+
+	defer func() {
+		if err != nil && retCompile != nil {
+			retCompile.SetIsPrepare(false)
+			retCompile.Release()
+			retCompile = nil
+		}
+	}()
+	retCompile = compile.NewCompile(
+		addr,
+		ses.GetDatabaseName(),
+		ses.GetSql(),
+		tenant,
+		ses.GetUserName(),
+		ses.GetTxnHandler().GetStorage(),
+		proc,
+		stmt,
+		ses.GetIsInternal(),
+		deepcopy.Copy(ses.getCNLabels()).(map[string]string),
+		getStatementStartAt(execCtx.reqCtx),
+	)
+	retCompile.SetIsPrepare(isPrepare)
+	retCompile.SetBuildPlanFunc(func(ctx context.Context) (*plan2.Plan, error) {
+		// No permission verification is required when retry execute buildPlan
+		plan, err := buildPlan(ctx, ses, ses.GetTxnCompileCtx(), stmt)
+		if err != nil {
+			return nil, err
+		}
+		if plan.IsPrepare {
+			_, _, err = plan2.ResetPreparePlan(ses.GetTxnCompileCtx(), plan)
+		}
+		return plan, err
+	})
+
+	if _, ok := stmt.(*tree.ExplainAnalyze); ok {
+		fill = func(bat *batch.Batch, crs *perfcounter.CounterSet) error { return nil }
+	}
+
+	if _, ok := stmt.(*tree.ExplainPhyPlan); ok {
+		fill = func(bat *batch.Batch, crs *perfcounter.CounterSet) error { return nil }
+	}
+
+	err = retCompile.Compile(execCtx.reqCtx, plan, fill)
+	if err != nil {
+		return
+	}
+	// check if it is necessary to initialize the temporary engine
+	if !ses.GetTxnHandler().HasTempEngine() && retCompile.NeedInitTempEngine() {
+		// 0. init memory-non-dist storage
+		err = ses.GetTxnHandler().CreateTempStorage(runtime.ServiceRuntime(ses.GetService()).Clock())
+		if err != nil {
+			return
+		}
+
+		// temporary storage is passed through Ctx
+		updateTempStorageInCtx(execCtx, proc, ses.GetTxnHandler().GetTempStorage())
+
+		// 1. init memory-non-dist engine
+		ses.GetTxnHandler().CreateTempEngine()
+		tempEngine := ses.GetTxnHandler().GetTempEngine()
+
+		// 2. bind the temporary engine to the session and txnHandler
+		retCompile.SetTempEngine(tempEngine, ses.GetTxnHandler().GetTempStorage())
+
+		// 3. init temp-db to store temporary relations
+		txnOp2 := ses.GetTxnHandler().GetTxn()
+		err = tempEngine.Create(execCtx.reqCtx, defines.TEMPORARY_DBNAME, txnOp2)
+		if err != nil {
+			return
+		}
+	}
+	retCompile.SetOriginSQL(originSQL)
+	return
 }

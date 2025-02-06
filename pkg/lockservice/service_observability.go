@@ -27,26 +27,106 @@ func (s *service) GetWaitingList(
 	if txn == nil {
 		return false, nil, nil
 	}
-	v := txn.toWaitTxn(s.cfg.ServiceID, false)
-	waitingList, err := s.getTxnWaitingList(txnID, v.CreatedOn)
+	v := txn.toWaitTxn(s.serviceID, false)
+	if v.CreatedOn == s.serviceID {
+		values := make([]pb.WaitTxn, 0, 1)
+		txn.fetchWhoWaitingMe(
+			s.serviceID,
+			txnID,
+			func(w pb.WaitTxn) bool {
+				values = append(values, w)
+				return true
+			},
+			s.getLockTable)
+		return true, values, nil
+	}
+
+	waitingList, err := s.getTxnWaitingListOnRemote(txnID, v.CreatedOn)
 	if err != nil {
 		return false, nil, nil
 	}
 	return true, waitingList, nil
 }
 
-func (s *service) ForceRefreshLockTableBinds() {
-	s.tables.Range(func(key, value any) bool {
-		value.(lockTable).close()
-		s.tables.Delete(key)
-		return true
-	})
+func (s *service) ForceRefreshLockTableBinds(
+	targets []uint64,
+	matcher func(bind pb.LockTable) bool) {
+	contains := func(id uint64, l lockTable) bool {
+		if len(targets) == 0 {
+			return true
+		}
+
+		for _, v := range targets {
+			if v == id && (matcher == nil || matcher(l.getBind())) {
+				return true
+			}
+		}
+		return false
+	}
+
+	s.tableGroups.removeWithFilter(contains)
 }
 
-func (s *service) GetLockTableBind(tableID uint64) (pb.LockTable, error) {
-	l, err := s.getLockTable(tableID)
+func (s *service) GetLockTableBind(
+	group uint32,
+	tableID uint64) (pb.LockTable, error) {
+	l, err := s.getLockTable(group, tableID)
 	if err != nil {
 		return pb.LockTable{}, err
 	}
+	if l == nil {
+		return pb.LockTable{}, nil
+	}
 	return l.getBind(), nil
+}
+
+func (s *service) IterLocks(fn func(tableID uint64, keys [][]byte, lock Lock) bool) {
+	var lockTables []*localLockTable
+	s.tableGroups.iter(func(_ uint64, v lockTable) bool {
+		l, ok := v.(*localLockTable)
+		if !ok {
+			return true
+		}
+		lockTables = append(lockTables, l)
+		return true
+	})
+
+	for _, l := range lockTables {
+		keys := make([][]byte, 0, 2)
+		ok := func() bool {
+			stop := false
+			l.mu.RLock()
+			defer l.mu.RUnlock()
+			l.mu.store.Iter(func(key []byte, lock Lock) bool {
+				keys = append(keys, key)
+				if lock.isLockRangeStart() {
+					return true
+				}
+				stop = !fn(l.bind.OriginTable, keys, lock)
+				keys = keys[:0]
+				return !stop
+			})
+			return !stop
+		}()
+		if !ok {
+			return
+		}
+	}
+}
+
+func (s *service) CloseRemoteLockTable(
+	group uint32,
+	tableID uint64,
+	version uint64) (bool, error) {
+	removed := false
+	s.tableGroups.removeWithFilter(func(id uint64, lt lockTable) bool {
+		ok := id == tableID &&
+			lt.getBind().Version == version &&
+			lt.getBind().Group == group
+		if ok {
+			removed = ok
+		}
+		return ok
+	})
+	return removed, nil
 }

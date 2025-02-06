@@ -1,10 +1,10 @@
-// Copyright 2022 Matrix Origin
+// Copyright 2021 - 2022 Matrix Origin
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-// http://www.apache.org/licenses/LICENSE-2.0
+//      http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -14,49 +14,35 @@
 
 package function
 
-import (
-	"context"
-	"sync"
+var AndFunctionEncodedID = encodeOverloadID(AND, 0)
+var AndFunctionName = "and"
+var EqualFunctionName = "="
+var EqualFunctionEncodedID = encodeOverloadID(EQUAL, 0)
+var SerialFunctionEncodeID = encodeOverloadID(SERIAL, 0)
+var CastFunctionEncodeID = encodeOverloadID(CAST, 0)
+var SerialFunctionName = "serial"
+var GroupConcatFunctionID = encodeOverloadID(GROUP_CONCAT, 0)
+var AggSumOverloadID = encodeOverloadID(SUM, 0)
+var AggAvgTwCacheOverloadID = encodeOverloadID(AVG_TW_CACHE, 0)
+var AggAvgTwResultOverloadID = encodeOverloadID(AVG_TW_RESULT, 0)
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-)
+var InFunctionEncodedID = encodeOverloadID(IN, 0)
+var InFunctionName = "in"
+var PrefixInFunctionEncodedID = encodeOverloadID(PREFIX_IN, 0)
+var PrefixInFunctionName = "prefix_in"
+var PrefixEqualFunctionEncodedID = encodeOverloadID(PREFIX_EQ, 0)
+var PrefixEqualFunctionName = "prefix_eq"
+var L2DistanceFunctionEncodedID = encodeOverloadID(L2_DISTANCE, 0)
 
-// init function fills the functionRegister with
-// aggregates,	see initAggregateFunction
-// builtins,	see initBuiltIns
-// operators,	see initOperators
 func init() {
-	initRelatedStructure()
+	// init fixed type cast rule for binary operator like
+	// +, -, x, /, div, >=, =, != and so on.
+	initFixed1()
+	initFixed2()
 
-	initOperators()
-	initBuiltIns()
-	initAggregateFunction()
+	// init implicit type cast rule.
+	initFixed3()
 
-	initTypeCheckRelated()
-}
-
-var registerMutex sync.RWMutex
-
-func initRelatedStructure() {
-	functionRegister = make([]Functions, FUNCTION_END_NUMBER)
-}
-
-// appendFunction is a method only used at init-functions to add a new function into supported-function list.
-// Ensure that no duplicate functions will be added.
-func appendFunction(ctx context.Context, fid int, newFunctions Functions) error {
-	functionRegister[fid].TypeCheckFn = newFunctions.TypeCheckFn
-	functionRegister[fid].Id = newFunctions.Id
-	registerMutex.Lock()
-	defer registerMutex.Unlock()
-	for _, newFunction := range newFunctions.Overloads {
-		newFunction.flag = newFunctions.Flag
-		newFunction.layout = newFunctions.Layout
-
-		requiredIndex := len(functionRegister[fid].Overloads)
-		if int(newFunction.Index) != requiredIndex {
-			return moerr.NewInternalError(ctx, "function (fid = %d, index = %d)'s index should be %d", fid, newFunction.Index, requiredIndex)
-		}
-		functionRegister[fid].Overloads = append(functionRegister[fid].Overloads, newFunction)
-	}
-	return nil
+	// init supported functions.
+	initAllSupportedFunctions()
 }

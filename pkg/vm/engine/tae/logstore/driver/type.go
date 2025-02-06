@@ -14,16 +14,45 @@
 
 package driver
 
-import "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
+import (
+	"context"
+
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/entry"
+)
 
 type Driver interface {
 	Append(*entry.Entry) error
 	Truncate(lsn uint64) error
 	GetTruncated() (lsn uint64, err error)
-	Read(lsn uint64) (*entry.Entry, error)
 	Close() error
-	Replay(h ApplyHandle) error
-	GetCurrSeqNum() uint64
+	Replay(ctx context.Context, h ApplyHandle, modeGetter func() ReplayMode) error
+	GetDSN() uint64
 }
 
-type ApplyHandle = func(*entry.Entry)
+type ReplayEntryState int8
+
+const (
+	RE_Truncate ReplayEntryState = iota
+	RE_Internal
+	RE_Nomal
+	RE_Invalid
+)
+
+type ApplyHandle = func(*entry.Entry) (replayEntryState ReplayEntryState)
+
+type DriverMode int32
+
+const (
+	DriverMode_Invalid DriverMode = iota
+	DriverMode_Writable
+	DriverMode_Readonly
+)
+
+type ReplayMode int32
+
+const (
+	ReplayMode_Invalid ReplayMode = iota
+	ReplayMode_ReplayForWrite
+	ReplayMode_ReplayForRead
+	ReplayMode_ReplayForever
+)

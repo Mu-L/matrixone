@@ -52,7 +52,6 @@ drop table if exists t1;
 create table t1 (a int);
 insert into t1 values(1),(2),(3),(4);
 select case a when 1 then 2 when 2 then 3 else 0 end as fcase, count(*) from t1 group by fcase;
-select case a when 1 then 2 when 2 then 3 else 0 end as fcase, count(*) from t1 group by fcase;
 select case a when 1 then "one" when 2 then "two" else "nothing" end as fcase, count(*) from t1 group by fcase;
 drop table if exists t1;
 
@@ -61,6 +60,7 @@ drop table if exists t1;
 -- @label:bvt
 create table t1 (`row` int not null, col int not null, val varchar(255) not null);
 insert into t1 values (1,1,'orange'),(1,2,'large'),(2,1,'yellow'),(2,2,'medium'),(3,1,'green'),(3,2,'small');
+select col,val, case when val="orange" then 1 when upper(val)="LARGE" then 2  else 3 end from t1;
 select max(case col when 1 then val else null end) as color from t1 group by `row`;
 drop table if exists t1;
 
@@ -133,3 +133,40 @@ select Case When Count(*) < MAX_REQ Then 1 Else 0 End from t1 where t1.USR_ID = 
 DROP TABLE if exists t1;
 
 select case when 1 in (1.0, 2.0, 3.0) then true else false end;
+
+DROP TABLE if exists t1;
+CREATE TABLE t1 (
+                    id int NOT NULL AUTO_INCREMENT,
+                    key_num int NOT NULL DEFAULT '0',
+                    hiredate date NOT NULL,
+                    PRIMARY KEY (id),
+                    KEY key_num (key_num)
+);
+
+insert into t1 values
+                   (1, 7369, '1980-12-17'),
+                   (2, 7499, '1981-02-20'),
+                   (3, 7521, '1981-02-22'),
+                   (4, 7566, '1981-04-02'),
+                   (5, 7654, '1981-09-28'),
+                   (6, 7698, '1981-05-01'),
+                   (7, 7782, '1981-06-09'),
+                   (8, 7788, '0087-07-13'),
+                   (9, 7839, '1981-11-17'),
+                   (10, 7844, '1981-09-08'),
+                   (11, 7876, '2007-07-13'),
+                   (12, 7900, '1981-12-03'),
+                   (13, 7980, '1987-07-13'),
+                   (14, 7981, '2001-11-17'),
+                   (15, 7982, '1951-11-08'),
+                   (16, 7983, '1927-10-13'),
+                   (17, 7984, '1671-12-09'),
+                   (18, 7985, '1981-11-06'),
+                   (19, 7986, '1771-12-06'),
+                   (20, 7987, '1985-10-06');
+select id, case when id < 5 then 0 when id < 10 then 1 when id < 15 then 2 when true then 3 else -1 end as xxx from t1;
+DROP TABLE t1;
+create table t1(a varchar(100));
+insert into t1 values ("a");
+select a, case when a="a" then 1 when upper(a)="b" then 2 end from t1;
+drop table if exists t1;

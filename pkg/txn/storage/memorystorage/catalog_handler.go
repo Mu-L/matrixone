@@ -45,9 +45,12 @@ type CatalogHandler struct {
 
 var _ Handler = new(CatalogHandler)
 
-func NewCatalogHandler(upstream *MemHandler) (*CatalogHandler, error) {
+func NewCatalogHandler(
+	sid string,
+	upstream *MemHandler,
+) (*CatalogHandler, error) {
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Hour, moerr.CauseNewCatalogHandler)
 	defer cancel()
 
 	handler := &CatalogHandler{
@@ -111,14 +114,14 @@ func NewCatalogHandler(upstream *MemHandler) (*CatalogHandler, error) {
 
 	// attributes
 	// databases
-	for i, def := range catalog.MoDatabaseTableDefs {
+	for i, def := range catalog.GetDefines(sid).MoDatabaseTableDefs {
 		attr, ok := def.(*engine.AttributeDef)
 		if !ok {
 			continue
 		}
 		id, err := upstream.idGenerator.NewID(ctx)
 		if err != nil {
-			return nil, err
+			return nil, moerr.AttachCause(ctx, err)
 		}
 		row := &AttributeRow{
 			ID:         id,
@@ -132,14 +135,14 @@ func NewCatalogHandler(upstream *MemHandler) (*CatalogHandler, error) {
 		}
 	}
 	// relations
-	for i, def := range catalog.MoTablesTableDefs {
+	for i, def := range catalog.GetDefines(sid).MoTablesTableDefs {
 		attr, ok := def.(*engine.AttributeDef)
 		if !ok {
 			continue
 		}
 		id, err := upstream.idGenerator.NewID(ctx)
 		if err != nil {
-			return nil, err
+			return nil, moerr.AttachCause(ctx, err)
 		}
 		row := &AttributeRow{
 			ID:         id,
@@ -153,14 +156,14 @@ func NewCatalogHandler(upstream *MemHandler) (*CatalogHandler, error) {
 		}
 	}
 	// attributes
-	for i, def := range catalog.MoColumnsTableDefs {
+	for i, def := range catalog.GetDefines(sid).MoColumnsTableDefs {
 		attr, ok := def.(*engine.AttributeDef)
 		if !ok {
 			continue
 		}
 		id, err := upstream.idGenerator.NewID(ctx)
 		if err != nil {
-			return nil, err
+			return nil, moerr.AttachCause(ctx, err)
 		}
 		row := &AttributeRow{
 			ID:         id,
@@ -177,10 +180,10 @@ func NewCatalogHandler(upstream *MemHandler) (*CatalogHandler, error) {
 	return handler, nil
 }
 
-func (c *CatalogHandler) HandleAddTableDef(ctx context.Context, meta txn.TxnMeta, req memoryengine.AddTableDefReq, resp *memoryengine.AddTableDefResp) (err error) {
+func (c *CatalogHandler) HandleAddTableDef(ctx context.Context, meta txn.TxnMeta, req *memoryengine.AddTableDefReq, resp *memoryengine.AddTableDefResp) (err error) {
 	if _, ok := c.sysRelationIDs[req.TableID]; ok {
 		defer logReq("catalog", req, meta, resp, &err)()
-		return moerr.NewInternalError(ctx,
+		return moerr.NewInternalErrorf(ctx,
 			"read only, db %v, table %v",
 			req.DatabaseName,
 			req.TableName,
@@ -193,7 +196,7 @@ func (c *CatalogHandler) HandleClose(ctx context.Context) error {
 	return c.upstream.HandleClose(ctx)
 }
 
-func (c *CatalogHandler) HandleCloseTableIter(ctx context.Context, meta txn.TxnMeta, req memoryengine.CloseTableIterReq, resp *memoryengine.CloseTableIterResp) (err error) {
+func (c *CatalogHandler) HandleCloseTableIter(ctx context.Context, meta txn.TxnMeta, req *memoryengine.CloseTableIterReq, resp *memoryengine.CloseTableIterResp) (err error) {
 
 	c.iterators.Lock()
 	v, ok := c.iterators.Map[req.IterID]
@@ -233,7 +236,7 @@ func (c *CatalogHandler) HandleCommitting(ctx context.Context, meta txn.TxnMeta)
 	return c.upstream.HandleCommitting(ctx, meta)
 }
 
-func (c *CatalogHandler) HandleCreateDatabase(ctx context.Context, meta txn.TxnMeta, req memoryengine.CreateDatabaseReq, resp *memoryengine.CreateDatabaseResp) (err error) {
+func (c *CatalogHandler) HandleCreateDatabase(ctx context.Context, meta txn.TxnMeta, req *memoryengine.CreateDatabaseReq, resp *memoryengine.CreateDatabaseResp) (err error) {
 
 	tx := c.upstream.getTx(meta)
 	if err := c.upstream.ensureAccount(ctx, tx, req.AccessInfo); err != nil {
@@ -247,14 +250,14 @@ func (c *CatalogHandler) HandleCreateDatabase(ctx context.Context, meta txn.TxnM
 	return c.upstream.HandleCreateDatabase(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleCreateRelation(ctx context.Context, meta txn.TxnMeta, req memoryengine.CreateRelationReq, resp *memoryengine.CreateRelationResp) (err error) {
+func (c *CatalogHandler) HandleCreateRelation(ctx context.Context, meta txn.TxnMeta, req *memoryengine.CreateRelationReq, resp *memoryengine.CreateRelationResp) (err error) {
 	return c.upstream.HandleCreateRelation(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleDelTableDef(ctx context.Context, meta txn.TxnMeta, req memoryengine.DelTableDefReq, resp *memoryengine.DelTableDefResp) (err error) {
+func (c *CatalogHandler) HandleDelTableDef(ctx context.Context, meta txn.TxnMeta, req *memoryengine.DelTableDefReq, resp *memoryengine.DelTableDefResp) (err error) {
 	if _, ok := c.sysRelationIDs[req.TableID]; ok {
 		defer logReq("catalog", req, meta, resp, &err)()
-		return moerr.NewInternalError(ctx,
+		return moerr.NewInternalErrorf(ctx,
 			"read only, db %v, table %v",
 			req.DatabaseName,
 			req.TableName,
@@ -263,10 +266,10 @@ func (c *CatalogHandler) HandleDelTableDef(ctx context.Context, meta txn.TxnMeta
 	return c.upstream.HandleDelTableDef(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleDelete(ctx context.Context, meta txn.TxnMeta, req memoryengine.DeleteReq, resp *memoryengine.DeleteResp) (err error) {
+func (c *CatalogHandler) HandleDelete(ctx context.Context, meta txn.TxnMeta, req *memoryengine.DeleteReq, resp *memoryengine.DeleteResp) (err error) {
 	if _, ok := c.sysRelationIDs[req.TableID]; ok {
 		defer logReq("catalog", req, meta, resp, &err)()
-		return moerr.NewInternalError(ctx,
+		return moerr.NewInternalErrorf(ctx,
 			"read only, db %v, table %v",
 			req.DatabaseName,
 			req.TableName,
@@ -275,7 +278,7 @@ func (c *CatalogHandler) HandleDelete(ctx context.Context, meta txn.TxnMeta, req
 	return c.upstream.HandleDelete(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleDeleteDatabase(ctx context.Context, meta txn.TxnMeta, req memoryengine.DeleteDatabaseReq, resp *memoryengine.DeleteDatabaseResp) (err error) {
+func (c *CatalogHandler) HandleDeleteDatabase(ctx context.Context, meta txn.TxnMeta, req *memoryengine.DeleteDatabaseReq, resp *memoryengine.DeleteDatabaseResp) (err error) {
 
 	tx := c.upstream.getTx(meta)
 	if err := c.upstream.ensureAccount(ctx, tx, req.AccessInfo); err != nil {
@@ -289,12 +292,12 @@ func (c *CatalogHandler) HandleDeleteDatabase(ctx context.Context, meta txn.TxnM
 	return c.upstream.HandleDeleteDatabase(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleDeleteRelation(ctx context.Context, meta txn.TxnMeta, req memoryengine.DeleteRelationReq, resp *memoryengine.DeleteRelationResp) (err error) {
+func (c *CatalogHandler) HandleDeleteRelation(ctx context.Context, meta txn.TxnMeta, req *memoryengine.DeleteRelationReq, resp *memoryengine.DeleteRelationResp) (err error) {
 	if req.DatabaseID == c.dbID {
 		for _, name := range c.sysRelationIDs {
 			if req.Name == name {
 				defer logReq("catalog", req, meta, resp, &err)()
-				return moerr.NewInternalError(ctx,
+				return moerr.NewInternalErrorf(ctx,
 					"read only, db %v, table %v",
 					req.DatabaseName,
 					req.Name,
@@ -305,10 +308,10 @@ func (c *CatalogHandler) HandleDeleteRelation(ctx context.Context, meta txn.TxnM
 	return c.upstream.HandleDeleteRelation(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleTruncateRelation(ctx context.Context, meta txn.TxnMeta, req memoryengine.TruncateRelationReq, resp *memoryengine.TruncateRelationResp) (err error) {
+func (c *CatalogHandler) HandleTruncateRelation(ctx context.Context, meta txn.TxnMeta, req *memoryengine.TruncateRelationReq, resp *memoryengine.TruncateRelationResp) (err error) {
 	if _, ok := c.sysRelationIDs[req.OldTableID]; ok {
 		defer logReq("catalog", req, meta, resp, &err)
-		return moerr.NewInternalError(ctx,
+		return moerr.NewInternalErrorf(ctx,
 			"read only, db %v, table %v",
 			req.DatabaseName,
 			req.Name,
@@ -321,7 +324,7 @@ func (c *CatalogHandler) HandleDestroy(ctx context.Context) error {
 	return c.upstream.HandleDestroy(ctx)
 }
 
-func (c *CatalogHandler) HandleGetDatabases(ctx context.Context, meta txn.TxnMeta, req memoryengine.GetDatabasesReq, resp *memoryengine.GetDatabasesResp) error {
+func (c *CatalogHandler) HandleGetDatabases(ctx context.Context, meta txn.TxnMeta, req *memoryengine.GetDatabasesReq, resp *memoryengine.GetDatabasesResp) error {
 
 	tx := c.upstream.getTx(meta)
 	if err := c.upstream.ensureAccount(ctx, tx, req.AccessInfo); err != nil {
@@ -334,27 +337,27 @@ func (c *CatalogHandler) HandleGetDatabases(ctx context.Context, meta txn.TxnMet
 	return nil
 }
 
-func (c *CatalogHandler) HandleGetPrimaryKeys(ctx context.Context, meta txn.TxnMeta, req memoryengine.GetPrimaryKeysReq, resp *memoryengine.GetPrimaryKeysResp) (err error) {
+func (c *CatalogHandler) HandleGetPrimaryKeys(ctx context.Context, meta txn.TxnMeta, req *memoryengine.GetPrimaryKeysReq, resp *memoryengine.GetPrimaryKeysResp) (err error) {
 	return c.upstream.HandleGetPrimaryKeys(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleGetRelations(ctx context.Context, meta txn.TxnMeta, req memoryengine.GetRelationsReq, resp *memoryengine.GetRelationsResp) (err error) {
+func (c *CatalogHandler) HandleGetRelations(ctx context.Context, meta txn.TxnMeta, req *memoryengine.GetRelationsReq, resp *memoryengine.GetRelationsResp) (err error) {
 	return c.upstream.HandleGetRelations(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleGetTableDefs(ctx context.Context, meta txn.TxnMeta, req memoryengine.GetTableDefsReq, resp *memoryengine.GetTableDefsResp) (err error) {
+func (c *CatalogHandler) HandleGetTableDefs(ctx context.Context, meta txn.TxnMeta, req *memoryengine.GetTableDefsReq, resp *memoryengine.GetTableDefsResp) (err error) {
 	return c.upstream.HandleGetTableDefs(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleGetTableColumns(ctx context.Context, meta txn.TxnMeta, req memoryengine.GetTableColumnsReq, resp *memoryengine.GetTableColumnsResp) (err error) {
+func (c *CatalogHandler) HandleGetTableColumns(ctx context.Context, meta txn.TxnMeta, req *memoryengine.GetTableColumnsReq, resp *memoryengine.GetTableColumnsResp) (err error) {
 	return c.upstream.HandleGetTableColumns(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleGetHiddenKeys(ctx context.Context, meta txn.TxnMeta, req memoryengine.GetHiddenKeysReq, resp *memoryengine.GetHiddenKeysResp) (err error) {
+func (c *CatalogHandler) HandleGetHiddenKeys(ctx context.Context, meta txn.TxnMeta, req *memoryengine.GetHiddenKeysReq, resp *memoryengine.GetHiddenKeysResp) (err error) {
 	return c.upstream.HandleGetHiddenKeys(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleNewTableIter(ctx context.Context, meta txn.TxnMeta, req memoryengine.NewTableIterReq, resp *memoryengine.NewTableIterResp) (err error) {
+func (c *CatalogHandler) HandleNewTableIter(ctx context.Context, meta txn.TxnMeta, req *memoryengine.NewTableIterReq, resp *memoryengine.NewTableIterResp) (err error) {
 
 	if name, ok := c.sysRelationIDs[req.TableID]; ok {
 		defer logReq("catalog", req, meta, resp, &err)()
@@ -422,7 +425,7 @@ func (c *CatalogHandler) HandleNewTableIter(ctx context.Context, meta txn.TxnMet
 	return c.upstream.HandleNewTableIter(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleOpenDatabase(ctx context.Context, meta txn.TxnMeta, req memoryengine.OpenDatabaseReq, resp *memoryengine.OpenDatabaseResp) (err error) {
+func (c *CatalogHandler) HandleOpenDatabase(ctx context.Context, meta txn.TxnMeta, req *memoryengine.OpenDatabaseReq, resp *memoryengine.OpenDatabaseResp) (err error) {
 
 	tx := c.upstream.getTx(meta)
 	if err := c.upstream.ensureAccount(ctx, tx, req.AccessInfo); err != nil {
@@ -432,7 +435,7 @@ func (c *CatalogHandler) HandleOpenDatabase(ctx context.Context, meta txn.TxnMet
 	return c.upstream.HandleOpenDatabase(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleOpenRelation(ctx context.Context, meta txn.TxnMeta, req memoryengine.OpenRelationReq, resp *memoryengine.OpenRelationResp) (err error) {
+func (c *CatalogHandler) HandleOpenRelation(ctx context.Context, meta txn.TxnMeta, req *memoryengine.OpenRelationReq, resp *memoryengine.OpenRelationResp) (err error) {
 	return c.upstream.HandleOpenRelation(ctx, meta, req, resp)
 }
 
@@ -440,7 +443,7 @@ func (c *CatalogHandler) HandlePrepare(ctx context.Context, meta txn.TxnMeta) (t
 	return c.upstream.HandlePrepare(ctx, meta)
 }
 
-func (c *CatalogHandler) HandleRead(ctx context.Context, meta txn.TxnMeta, req memoryengine.ReadReq, resp *memoryengine.ReadResp) (err error) {
+func (c *CatalogHandler) HandleRead(ctx context.Context, meta txn.TxnMeta, req *memoryengine.ReadReq, resp *memoryengine.ReadResp) (err error) {
 	tx := c.upstream.getTx(meta)
 	resp.SetHeap(c.upstream.mheap)
 
@@ -450,7 +453,7 @@ func (c *CatalogHandler) HandleRead(ctx context.Context, meta txn.TxnMeta, req m
 	if ok {
 		defer logReq("catalog", req, meta, resp, &err)()
 
-		b := batch.New(false, req.ColNames)
+		b := batch.New(req.ColNames)
 		maxRows := 4096
 		rows := 0
 
@@ -549,7 +552,7 @@ func (c *CatalogHandler) HandleRead(ctx context.Context, meta txn.TxnMeta, req m
 		}
 
 		if rows > 0 {
-			b.InitZsOne(rows)
+			b.SetRowCount(rows)
 			for _, vec := range b.Vecs {
 				nulls.TryExpand(vec.GetNulls(), rows)
 			}
@@ -570,10 +573,10 @@ func (c *CatalogHandler) HandleStartRecovery(ctx context.Context, ch chan txn.Tx
 	c.upstream.HandleStartRecovery(ctx, ch)
 }
 
-func (c *CatalogHandler) HandleUpdate(ctx context.Context, meta txn.TxnMeta, req memoryengine.UpdateReq, resp *memoryengine.UpdateResp) (err error) {
+func (c *CatalogHandler) HandleUpdate(ctx context.Context, meta txn.TxnMeta, req *memoryengine.UpdateReq, resp *memoryengine.UpdateResp) (err error) {
 	if _, ok := c.sysRelationIDs[req.TableID]; ok {
 		defer logReq("catalog", req, meta, resp, &err)()
-		return moerr.NewInternalError(ctx,
+		return moerr.NewInternalErrorf(ctx,
 			"read only, db %v, table %v",
 			req.DatabaseName,
 			req.TableName,
@@ -582,10 +585,10 @@ func (c *CatalogHandler) HandleUpdate(ctx context.Context, meta txn.TxnMeta, req
 	return c.upstream.HandleUpdate(ctx, meta, req, resp)
 }
 
-func (c *CatalogHandler) HandleWrite(ctx context.Context, meta txn.TxnMeta, req memoryengine.WriteReq, resp *memoryengine.WriteResp) (err error) {
+func (c *CatalogHandler) HandleWrite(ctx context.Context, meta txn.TxnMeta, req *memoryengine.WriteReq, resp *memoryengine.WriteResp) (err error) {
 	if _, ok := c.sysRelationIDs[req.TableID]; ok {
 		defer logReq("catalog", req, meta, resp, &err)()
-		return moerr.NewInternalError(ctx,
+		return moerr.NewInternalErrorf(ctx,
 			"read only, db %v, table %v",
 			req.DatabaseName,
 			req.TableName,
@@ -595,6 +598,6 @@ func (c *CatalogHandler) HandleWrite(ctx context.Context, meta txn.TxnMeta, req 
 	return
 }
 
-func (c *CatalogHandler) HandleTableStats(ctx context.Context, meta txn.TxnMeta, req memoryengine.TableStatsReq, resp *memoryengine.TableStatsResp) (err error) {
+func (c *CatalogHandler) HandleTableStats(ctx context.Context, meta txn.TxnMeta, req *memoryengine.TableStatsReq, resp *memoryengine.TableStatsResp) (err error) {
 	return c.upstream.HandleTableStats(ctx, meta, req, resp)
 }

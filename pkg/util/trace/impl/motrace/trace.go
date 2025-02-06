@@ -22,15 +22,21 @@
 package motrace
 
 import (
+	"bytes"
 	"context"
 	"sync/atomic"
 	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/config"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/util/batchpipe"
 	"github.com/matrixorigin/matrixone/pkg/util/errutil"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	db_holder "github.com/matrixorigin/matrixone/pkg/util/export/etl/db"
+	"github.com/matrixorigin/matrixone/pkg/util/export/table"
 	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
@@ -50,34 +56,57 @@ func init() {
 
 var inited uint32
 
-func InitWithConfig(ctx context.Context, SV *config.ObservabilityParameters, opts ...TracerProviderOption) error {
+func InitWithConfig(ctx context.Context, SV *config.ObservabilityParameters, opts ...TracerProviderOption) (error, bool) {
 	opts = append(opts,
 		withMOVersion(SV.MoVersion),
 		EnableTracer(!SV.DisableTrace),
-		WithBatchProcessMode(SV.BatchProcessor),
 		WithExportInterval(SV.TraceExportInterval),
 		WithLongQueryTime(SV.LongQueryTime),
+		WithLongSpanTime(SV.LongSpanTime.Duration),
+		WithSpanDisable(SV.DisableSpan),
+		EnableSpanProfile(SV.EnableSpanProfile),
+		WithErrorDisable(SV.DisableError),
+		WithSkipRunningStmt(SV.SkipRunningStmt),
+		WithSQLWriterDisable(SV.DisableSqlWriter),
+		WithAggregatorDisable(SV.DisableStmtAggregation),
+		WithAggregatorWindow(SV.AggregationWindow.Duration),
+		WithSelectThreshold(SV.SelectAggThreshold.Duration),
+		WithStmtMergeEnable(SV.EnableStmtMerge),
+		WithCUConfig(SV.CU, SV.CUv1),
+		WithTCPPacket(SV.TCPPacket),
+		WithLabels(SV.LabelSelector),
+		WithMaxLogMessageSize(int(SV.MaxLogMessageSize)),
+
 		DebugMode(SV.EnableTraceDebug),
 		WithBufferSizeThreshold(SV.BufferSize),
 	)
 	return Init(ctx, opts...)
 }
 
-func Init(ctx context.Context, opts ...TracerProviderOption) error {
+// Init initializes the tracer with the given options.
+// If EnableTracer is set to false, this function does nothing.
+// If EnableTracer is set to true, the tracer is initialized.
+// Init only allow called once.
+func Init(ctx context.Context, opts ...TracerProviderOption) (err error, act bool) {
 	// fix multi-init in standalone
 	if !atomic.CompareAndSwapUint32(&inited, 0, 1) {
-		return nil
+		return nil, false
 	}
 
 	// init TraceProvider
 	SetTracerProvider(newMOTracerProvider(opts...))
 	config := &GetTracerProvider().tracerProviderConfig
 
-	// init Tracer
-	gTracer = GetTracerProvider().Tracer("MatrixOne")
-	_, span := gTracer.Start(ctx, "TraceInit")
-	defer span.End()
-	defer trace.SetDefaultTracer(gTracer)
+	if !config.disableSpan {
+		// init Tracer
+		gTracer = GetTracerProvider().Tracer("MatrixOne")
+		_, span := gTracer.Start(ctx, "TraceInit")
+		defer span.End()
+		defer trace.SetDefaultTracer(gTracer)
+	}
+	if config.disableError {
+		DisableLogErrorReport(true)
+	}
 
 	// init DefaultContext / DefaultSpanContext
 	var spanId trace.SpanID
@@ -86,20 +115,29 @@ func Init(ctx context.Context, opts ...TracerProviderOption) error {
 	SetDefaultSpanContext(&sc)
 	serviceCtx := context.Background()
 	SetDefaultContext(trace.ContextWithSpanContext(serviceCtx, sc))
+	SetCuConfig(&config.cuConfig, &config.cuConfigV1)
 
 	// init Exporter
 	if err := initExporter(ctx, config); err != nil {
-		return err
+		return err, true
 	}
+
+	// init all mo_ctl controlled spans
+	trace.InitMOCtledSpan()
 
 	// init tool dependence
 	logutil.SetLogReporter(&logutil.TraceReporter{ReportZap: ReportZap, ContextField: trace.ContextField})
 	logutil.SpanFieldKey.Store(trace.SpanFieldKey)
 	errutil.SetErrorReporter(ReportError)
 
-	logutil.Infof("trace with LongQueryTime: %v", time.Duration(GetTracerProvider().longQueryTime))
+	// init db_hodler
+	db_holder.SetLabelSelector(config.labels)
 
-	return nil
+	logutil.Debugf("trace with LongQueryTime: %v", time.Duration(GetTracerProvider().longQueryTime))
+	logutil.Debugf("trace with LongSpanTime: %v", GetTracerProvider().longSpanTime)
+	logutil.Debugf("trace with DisableSpan: %v", GetTracerProvider().disableSpan)
+
+	return nil, true
 }
 
 func initExporter(ctx context.Context, config *tracerProviderConfig) error {
@@ -115,18 +153,10 @@ func initExporter(ctx context.Context, config *tracerProviderConfig) error {
 	defaultOptions := []BufferOption{BufferWithReminder(defaultReminder), BufferWithSizeThreshold(config.bufferSizeThreshold)}
 	var p = config.batchProcessor
 	// init BatchProcess for trace/log/error
-	switch {
-	case config.batchProcessMode == InternalExecutor:
-		// register buffer pipe implements
-		panic(moerr.NewNotSupported(ctx, "not support process mode: %s", config.batchProcessMode))
-	case config.batchProcessMode == FileService:
-		p.Register(&MOSpan{}, NewBufferPipe2CSVWorker(defaultOptions...))
-		p.Register(&MOZapLog{}, NewBufferPipe2CSVWorker(defaultOptions...))
-		p.Register(&StatementInfo{}, NewBufferPipe2CSVWorker(defaultOptions...))
-		p.Register(&MOErrorHolder{}, NewBufferPipe2CSVWorker(defaultOptions...))
-	default:
-		return moerr.NewInternalError(ctx, "unknown batchProcessMode: %s", config.batchProcessMode)
-	}
+	p.Register(&MOSpan{}, NewBufferPipe2CSVWorker(defaultOptions...))
+	p.Register(&MOZapLog{}, NewBufferPipe2CSVWorker(defaultOptions...))
+	p.Register(&StatementInfo{}, NewBufferPipe2CSVWorker(defaultOptions...))
+	p.Register(&MOErrorHolder{}, NewBufferPipe2CSVWorker(defaultOptions...))
 	logutil.Info("init GlobalBatchProcessor")
 	if !p.Start() {
 		return moerr.NewInternalError(ctx, "trace exporter already started")
@@ -139,15 +169,43 @@ func initExporter(ctx context.Context, config *tracerProviderConfig) error {
 // InitSchema
 // PS: only in standalone or CN node can init schema
 func InitSchema(ctx context.Context, sqlExecutor func() ie.InternalExecutor) error {
-	config := &GetTracerProvider().tracerProviderConfig
-	switch config.batchProcessMode {
-	case InternalExecutor, FileService:
-		if err := InitSchemaByInnerExecutor(ctx, sqlExecutor); err != nil {
+	ctx = defines.AttachAccount(ctx, catalog.System_Account, catalog.System_User, catalog.System_Role)
+	c := &GetTracerProvider().tracerProviderConfig
+	WithSQLExecutor(sqlExecutor).apply(c)
+	if err := InitSchemaByInnerExecutor(ctx, sqlExecutor); err != nil {
+		return err
+	}
+	return nil
+}
+
+// InitSchemaWithTxn
+// PS: only in system bootstrap init schema with `executor.TxnExecutor`
+func InitSchemaWithTxn(ctx context.Context, txn executor.TxnExecutor) error {
+	_, err := txn.Exec(sqlCreateDBConst, executor.StatementOption{})
+	if err != nil {
+		return err
+	}
+
+	var createCost time.Duration
+	defer func() {
+		logutil.Debugf("[Trace] init tables: create cost %d ms", createCost.Milliseconds())
+	}()
+
+	instant := time.Now()
+	for _, tbl := range tables {
+		_, err = txn.Exec(tbl.ToCreateSql(ctx, true), executor.StatementOption{})
+		if err != nil {
 			return err
 		}
-	default:
-		return moerr.NewInternalError(ctx, "unknown batchProcessMode: %s", config.batchProcessMode)
 	}
+
+	for _, v := range views {
+		_, err = txn.Exec(v.ToCreateSql(ctx, true), executor.StatementOption{})
+		if err != nil {
+			return err
+		}
+	}
+	createCost = time.Since(instant)
 	return nil
 }
 
@@ -157,11 +215,11 @@ func Shutdown(ctx context.Context) error {
 	}
 	GetTracerProvider().SetEnable(false)
 
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	shutdownCtx, cancel := context.WithTimeoutCause(context.Background(), 5*time.Minute, moerr.CauseShutdown)
 	defer cancel()
 	for _, p := range GetTracerProvider().spanProcessors {
 		if err := p.Shutdown(shutdownCtx); err != nil {
-			return err
+			return moerr.AttachCause(shutdownCtx, err)
 		}
 	}
 	logutil.Info("Shutdown trace complete.")
@@ -195,17 +253,55 @@ func GetNodeResource() *trace.MONodeResource {
 func SetTracerProvider(p *MOTracerProvider) {
 	gTracerProvider.Store(p)
 }
-func GetTracerProvider() *MOTracerProvider {
+
+// GetTracerProvider returns the global TracerProvider.
+// It will be initialized at startup.
+var GetTracerProvider = func() *MOTracerProvider {
 	return gTracerProvider.Load().(*MOTracerProvider)
 }
 
-type PipeImpl batchpipe.PipeImpl[batchpipe.HasName, any]
+func GetSQLExecutorFactory() func() ie.InternalExecutor {
+	p := GetTracerProvider()
+	if p != nil {
+		p.mux.Lock()
+		defer p.mux.Unlock()
+		return p.tracerProviderConfig.sqlExecutor
+	}
+	return nil
+}
+
+// PipeImpl implements batchpipe.PipeImpl[batchpipe.HasName, any]
+type PipeImpl interface {
+	NewItemBuffer(name string) batchpipe.ItemBuffer[batchpipe.HasName, any]
+	// NewItemBatchHandler handle the StoreBatch from an ItemBuffer, for example, execute an insert sql.
+	// this handle may be running on multiple goroutine
+	NewItemBatchHandler(ctx context.Context) func(batch any)
+
+	// NewAggregator get new aggr
+	NewAggregator(context.Context, string) table.Aggregator
+}
+
+// Buffer implements batchpipe.ItemBuffer[batchpipe.HasName, any]
+type Buffer interface {
+	batchpipe.Reminder
+	Add(item batchpipe.HasName)
+	Reset()
+	IsEmpty() bool
+	ShouldFlush() bool
+	Size() int64
+	// GetBatch use bytes.Buffer to mitigate mem allocation and the returned bytes should own its data
+	GetBatch(ctx context.Context, buf *bytes.Buffer) any
+}
 
 type BatchProcessor interface {
 	Collect(context.Context, batchpipe.HasName) error
 	Start() bool
 	Stop(graceful bool) error
 	Register(name batchpipe.HasName, impl PipeImpl)
+}
+
+type DiscardableCollector interface {
+	DiscardableCollect(context.Context, batchpipe.HasName) error
 }
 
 var _ BatchProcessor = &NoopBatchProcessor{}

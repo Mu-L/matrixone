@@ -15,211 +15,444 @@
 package plan
 
 import (
+	"bufio"
 	"encoding/json"
+	"io"
 	"strings"
+	"time"
 
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	"github.com/matrixorigin/matrixone/pkg/sql/util/csvparser"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
-func buildLoad(stmt *tree.Load, ctx CompilerContext) (*Plan, error) {
-	if stmt.Param.Tail.Lines != nil && stmt.Param.Tail.Lines.StartingBy != "" {
-		return nil, moerr.NewBadConfig(ctx.GetContext(), "load operation do not support StartingBy field.")
+const (
+	LoadParallelMinSize = int(colexec.WriteS3Threshold)
+	LoadWriteS3MinSize  = 1 << 20
+)
+
+func getNormalExternalProject(stmt *tree.Load, ctx CompilerContext, tableDef *TableDef, tblName string) ([]*Expr, map[string]int32, map[string]int32, *TableDef, error) {
+	var externalProject []*Expr
+	colToIndex := make(map[string]int32, 0)
+	for i, col := range tableDef.Cols {
+		if col.Name != catalog.FakePrimaryKeyColName {
+			colExpr := &plan.Expr{
+				Typ: tableDef.Cols[i].Typ,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						ColPos: int32(i),
+						Name:   tblName + "." + tableDef.Cols[i].Name,
+					},
+				},
+			}
+			externalProject = append(externalProject, colExpr)
+			colToIndex[col.Name] = int32(i)
+		}
 	}
-	if stmt.Param.Tail.Fields != nil && stmt.Param.Tail.Fields.EscapedBy != 0 {
-		return nil, moerr.NewBadConfig(ctx.GetContext(), "load operation do not support EscapedBy field.")
+	return externalProject, colToIndex, colToIndex, tableDef, nil
+}
+
+func getExternalWithColListProject(stmt *tree.Load, ctx CompilerContext, tableDef *TableDef, tblName string) ([]*Expr, map[string]int32, map[string]int32, *TableDef, error) {
+	var externalProject []*Expr
+	colToIndex := make(map[string]int32, 0)
+	tbColToDataCol := make(map[string]int32, 0)
+	var newCols []*ColDef
+
+	newTableDef := DeepCopyTableDef(tableDef, true)
+	colPos := 0
+	for i, col := range stmt.Param.Tail.ColumnList {
+		switch realCol := col.(type) {
+		case *tree.UnresolvedName:
+			colName := realCol.ColName()
+			if _, ok := newTableDef.Name2ColIndex[colName]; !ok {
+				return nil, nil, nil, nil, moerr.NewInternalErrorf(ctx.GetContext(), "column '%s' does not exist", colName)
+			}
+			tbColIdx := newTableDef.Name2ColIndex[colName]
+			colExpr := &plan.Expr{
+				Typ: newTableDef.Cols[tbColIdx].Typ,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						ColPos: int32(colPos),
+						Name:   tblName + "." + colName,
+					},
+				},
+			}
+			externalProject = append(externalProject, colExpr)
+			colToIndex[colName] = int32(colPos)
+			colPos++
+			tbColToDataCol[colName] = int32(i)
+			newCols = append(newCols, newTableDef.Cols[tbColIdx])
+		case *tree.VarExpr:
+			//NOTE:variable like '@abc' will be passed by.
+			name := realCol.Name
+			tbColToDataCol[name] = -1 // when in external call, can use len of the map to check load data row whether valid
+		default:
+			return nil, nil, nil, nil, moerr.NewInternalErrorf(ctx.GetContext(), "unsupported column type %v", realCol)
+		}
 	}
+
+	newTableDef.Cols = newCols
+	return externalProject, colToIndex, tbColToDataCol, newTableDef, nil
+}
+
+func getExternalProject(stmt *tree.Load, ctx CompilerContext, tableDef *TableDef, tblName string) ([]*Expr, map[string]int32, map[string]int32, *TableDef, error) {
+	if len(stmt.Param.Tail.ColumnList) == 0 {
+		return getNormalExternalProject(stmt, ctx, tableDef, tblName)
+	} else {
+		return getExternalWithColListProject(stmt, ctx, tableDef, tblName)
+	}
+}
+
+func newReaderWithParam(param *tree.ExternParam, reader io.ReadCloser) (*csvparser.CSVParser, error) {
+	fieldsTerminatedBy := "\t"
+	fieldsEnclosedBy := "\""
+	fieldsEscapedBy := "\\"
+
+	linesTerminatedBy := "\n"
+	linesStartingBy := ""
+
+	if param.Tail.Fields != nil {
+		if terminated := param.Tail.Fields.Terminated; terminated != nil && terminated.Value != "" {
+			fieldsTerminatedBy = terminated.Value
+		}
+		if enclosed := param.Tail.Fields.EnclosedBy; enclosed != nil && enclosed.Value != 0 {
+			fieldsEnclosedBy = string(enclosed.Value)
+		}
+		if escaped := param.Tail.Fields.EscapedBy; escaped != nil {
+			if escaped.Value == 0 {
+				fieldsEscapedBy = ""
+			} else {
+				fieldsEscapedBy = string(escaped.Value)
+			}
+		}
+	}
+
+	if param.Tail.Lines != nil {
+		if terminated := param.Tail.Lines.TerminatedBy; terminated != nil && terminated.Value != "" {
+			linesTerminatedBy = param.Tail.Lines.TerminatedBy.Value
+		}
+		if param.Tail.Lines.StartingBy != "" {
+			linesStartingBy = param.Tail.Lines.StartingBy
+		}
+	}
+
+	if param.Format == tree.JSONLINE {
+		fieldsTerminatedBy = "\t"
+		fieldsEscapedBy = ""
+	}
+
+	config := csvparser.CSVConfig{
+		FieldsTerminatedBy: fieldsTerminatedBy,
+		FieldsEnclosedBy:   fieldsEnclosedBy,
+		FieldsEscapedBy:    fieldsEscapedBy,
+		LinesTerminatedBy:  linesTerminatedBy,
+		LinesStartingBy:    linesStartingBy,
+		NotNull:            false,
+		Null:               []string{`\N`},
+		UnescapedQuote:     true,
+		Comment:            '#',
+	}
+
+	return csvparser.NewCSVParser(&config, bufio.NewReader(reader), csvparser.ReadBlockSize, false)
+}
+
+func IgnoredLines(param *tree.ExternParam, ctx CompilerContext) (offset int64, err error) {
+	fs, readPath, err := GetForETLWithType(param, param.Filepath)
+	if err != nil {
+		return 0, err
+	}
+	var r io.ReadCloser
+	vec := fileservice.IOVector{
+		FilePath: readPath,
+		Entries: []fileservice.IOEntry{
+			0: {
+				Offset:            0,
+				Size:              -1,
+				ReadCloserForRead: &r,
+			},
+		},
+	}
+
+	param.Ctx = ctx.GetContext()
+	if err = fs.Read(param.Ctx, &vec); err != nil {
+		return 0, err
+	}
+
+	bufR := bufio.NewReader(r)
+	skipLines := param.Tail.IgnoredLines
+
+	csvReader, err := newReaderWithParam(param, io.NopCloser(bufR))
+	if err != nil {
+		return 0, err
+	}
+
+	var lastRow []csvparser.Field
+	for skipLines > 0 {
+		lastRow, err = csvReader.Read(lastRow)
+		if err != nil {
+			if err == io.EOF {
+				param.Tail.IgnoredLines = 0
+				param.Ctx = nil
+				return csvReader.Pos(), nil
+			}
+			return 0, err
+		}
+		skipLines--
+	}
+
+	param.Tail.IgnoredLines = 0
+	param.Ctx = nil
+	return csvReader.Pos(), nil
+}
+
+func buildLoad(stmt *tree.Load, ctx CompilerContext, isPrepareStmt bool) (*Plan, error) {
+	start := time.Now()
+	defer func() {
+		v2.TxnStatementBuildLoadHistogram.Observe(time.Since(start).Seconds())
+	}()
+	tblName := string(stmt.Table.ObjectName)
+	tblInfo, err := getDmlTableInfo(ctx, tree.TableExprs{stmt.Table}, nil, nil, "insert")
+	if err != nil {
+		return nil, err
+	}
+
 	stmt.Param.Local = stmt.Local
-	if err := checkFileExist(stmt.Param, ctx); err != nil {
+	fileName, err := checkFileExist(stmt.Param, ctx)
+	if err != nil {
 		return nil, err
 	}
 
 	if err := InitNullMap(stmt.Param, ctx); err != nil {
 		return nil, err
 	}
-	tblName := string(stmt.Table.ObjectName)
-	tblInfo, err := getDmlTableInfo(ctx, tree.TableExprs{stmt.Table}, nil, nil)
+	tableDef := tblInfo.tableDefs[0]
+	objRef := tblInfo.objRef[0]
+	originTableDef := tableDef
+	// load with columnlist will copy a new tableDef
+	externalProject, colToIndex, tbColToDataCol, tableDef, err := getExternalProject(stmt, ctx, tableDef, tblName)
 	if err != nil {
 		return nil, err
 	}
-	tableDef := tblInfo.tableDefs[0]
-	objRef := tblInfo.objRef[0]
-	// if tblInfo.haveConstraint {
-	// 	return nil, moerr.NewNotSupported(ctx.GetContext(), "table '%v' have contraint, can not use load statement", tblName)
-	// }
 
-	tableDef.Name2ColIndex = map[string]int32{}
-	node1 := &plan.Node{}
-	node1.NodeType = plan.Node_EXTERNAL_SCAN
-	node1.Stats = &plan.Stats{}
-
-	node2 := &plan.Node{}
-	node2.NodeType = plan.Node_PROJECT
-	node2.Stats = &plan.Stats{}
-	node2.NodeId = 1
-	node2.Children = []int32{0}
-
-	node3 := &plan.Node{}
-	node3.NodeType = plan.Node_INSERT
-	node3.Stats = &plan.Stats{}
-	node3.NodeId = 2
-	node3.Children = []int32{1}
-
-	for i := 0; i < len(tableDef.Cols); i++ {
-		tableDef.Name2ColIndex[tableDef.Cols[i].Name] = int32(i)
-		tmp := &plan.Expr{
-			Typ: tableDef.Cols[i].Typ,
-			Expr: &plan.Expr_Col{
-				Col: &plan.ColRef{
-					ColPos: int32(i),
-					Name:   tblName + "." + tableDef.Cols[i].Name,
-				},
-			},
-		}
-		node1.ProjectList = append(node1.ProjectList, tmp)
-		// node3.ProjectList = append(node3.ProjectList, tmp)
-	}
-	if err := GetProjectNode(stmt, ctx, node2, tableDef.Name2ColIndex); err != nil {
-		return nil, err
-	}
 	if err := checkNullMap(stmt, tableDef.Cols, ctx); err != nil {
 		return nil, err
 	}
 
-	// node3.TableDef = tableDef
-	// node3.ObjRef = objRef
-	node3.InsertCtx = &plan.InsertCtx{
-		Ref:      objRef,
-		TableDef: tableDef,
-		// ParentIdx:    map[string]int32{},
+	noCompress := getCompressType(stmt.Param, fileName) == tree.NOCOMPRESS
+	var offset int64 = 0
+	if stmt.Param.Tail.IgnoredLines > 0 && stmt.Param.Parallel && noCompress && !stmt.Param.Local {
+		offset, err = IgnoredLines(stmt.Param, ctx)
+		if err != nil {
+			return nil, err
+		}
+		stmt.Param.FileStartOff = offset
+	}
+
+	if stmt.Param.FileSize-offset < int64(LoadParallelMinSize) {
+		stmt.Param.Parallel = false
 	}
 
 	stmt.Param.Tail.ColumnList = nil
-	stmt.Param.LoadFile = true
+	if stmt.Param.ScanType != tree.INLINE {
+		json_byte, err := json.Marshal(stmt.Param)
+		if err != nil {
+			return nil, err
+		}
+		tableDef.Createsql = string(json_byte)
+	}
 
-	json_byte, err := json.Marshal(stmt.Param)
+	builder := NewQueryBuilder(plan.Query_SELECT, ctx, isPrepareStmt, false)
+	bindCtx := NewBindContext(builder, nil)
+	terminated := ","
+	enclosedBy := []byte("\"")
+	escapedBy := []byte{0}
+	if stmt.Param.Tail.Fields != nil {
+		if stmt.Param.Tail.Fields.EnclosedBy != nil {
+			if stmt.Param.Tail.Fields.EnclosedBy.Value != 0 {
+				enclosedBy = []byte{stmt.Param.Tail.Fields.EnclosedBy.Value}
+			}
+		}
+		if stmt.Param.Tail.Fields.EscapedBy != nil {
+			if stmt.Param.Tail.Fields.EscapedBy.Value != 0 {
+				escapedBy = []byte{stmt.Param.Tail.Fields.EscapedBy.Value}
+			}
+		}
+		if stmt.Param.Tail.Fields.Terminated != nil {
+			terminated = stmt.Param.Tail.Fields.Terminated.Value
+		}
+	}
+
+	externalScanNode := &plan.Node{
+		NodeType:    plan.Node_EXTERNAL_SCAN,
+		Stats:       &plan.Stats{},
+		ProjectList: externalProject,
+		ObjRef:      objRef,
+		TableDef:    tableDef,
+		ExternScan: &plan.ExternScan{
+			Type:           int32(plan.ExternType_LOAD),
+			LoadType:       int32(stmt.Param.ScanType),
+			Data:           stmt.Param.Data,
+			Format:         stmt.Param.Format,
+			IgnoredLines:   uint64(stmt.Param.Tail.IgnoredLines),
+			EnclosedBy:     enclosedBy,
+			Terminated:     terminated,
+			EscapedBy:      escapedBy,
+			JsonType:       stmt.Param.JsonData,
+			TbColToDataCol: tbColToDataCol,
+		},
+	}
+	lastNodeId := builder.appendNode(externalScanNode, bindCtx)
+
+	projectNode := &plan.Node{
+		Children: []int32{lastNodeId},
+		NodeType: plan.Node_PROJECT,
+		Stats:    &plan.Stats{},
+	}
+
+	ifExistAutoPkCol, err := getProjectNode(stmt, ctx, projectNode, originTableDef, colToIndex)
+
 	if err != nil {
 		return nil, err
 	}
 
-	tableDef.Createsql = string(json_byte)
-	node1.TableDef = tableDef
-	node1.ObjRef = objRef
-	node3.TableDef = tableDef
-	node3.ObjRef = objRef
+	inlineDataSize := strings.Count(stmt.Param.Data, "")
+	builder.qry.LoadWriteS3 = true
 
-	nodes := make([]*plan.Node, 3)
-	nodes[0] = node1
-	nodes[1] = node2
-	nodes[2] = node3
-	query := &plan.Query{
-		StmtType: plan.Query_INSERT,
-		Steps:    []int32{2},
-		Nodes:    nodes,
+	if noCompress && ((stmt.Param.ScanType == tree.INLINE && inlineDataSize < LoadWriteS3MinSize) || (stmt.Param.ScanType != tree.INLINE && stmt.Param.FileSize-offset < int64(LoadWriteS3MinSize))) {
+		builder.qry.LoadWriteS3 = false
 	}
+
+	if stmt.Param.Parallel && (!noCompress || stmt.Local) {
+		projectNode.ProjectList = makeCastExpr(stmt, fileName, originTableDef, projectNode)
+	}
+	lastNodeId = builder.appendNode(projectNode, bindCtx)
+	builder.qry.LoadTag = true
+
+	//append lock node
+	if lockNodeId, ok := appendLockNode(
+		builder,
+		bindCtx,
+		lastNodeId,
+		originTableDef,
+		true,
+		false,
+		false,
+	); ok {
+		lastNodeId = lockNodeId
+	}
+
+	// append hidden column to tableDef
+	newTableDef := DeepCopyTableDef(originTableDef, true)
+	err = buildInsertPlans(ctx, builder, bindCtx, nil, objRef, newTableDef, lastNodeId, ifExistAutoPkCol, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	// use shuffle for load if parallel and no compress
+	if stmt.Param.Parallel && (getCompressType(stmt.Param, fileName) == tree.NOCOMPRESS) {
+		for i := range builder.qry.Nodes {
+			node := builder.qry.Nodes[i]
+			if node.NodeType == plan.Node_INSERT {
+				if node.Stats.HashmapStats == nil {
+					node.Stats.HashmapStats = &plan.HashMapStats{}
+				}
+				node.Stats.HashmapStats.Shuffle = true
+			}
+		}
+	}
+
+	query := builder.qry
+	sqls, err := genSqlsForCheckFKSelfRefer(ctx.GetContext(),
+		objRef.SchemaName, newTableDef.Name, newTableDef.Cols, newTableDef.Fkeys)
+	if err != nil {
+		return nil, err
+	}
+	query.DetectSqls = sqls
+	reduceSinkSinkScanNodes(query)
+	builder.tempOptimizeForDML()
+	query.StmtType = plan.Query_INSERT
+
 	pn := &Plan{
 		Plan: &plan.Plan_Query{
 			Query: query,
 		},
 	}
-	pn.GetQuery().LoadTag = true
 	return pn, nil
 }
 
-func checkFileExist(param *tree.ExternParam, ctx CompilerContext) error {
-	if param.Local {
-		return nil
+func checkFileExist(param *tree.ExternParam, ctx CompilerContext) (string, error) {
+	if param.ScanType == tree.INLINE {
+		return "", nil
 	}
-	param.Ctx = ctx.GetContext()
+
 	if param.ScanType == tree.S3 {
 		if err := InitS3Param(param); err != nil {
-			return err
+			return "", err
 		}
 	} else {
-		if err := InitInfileParam(param); err != nil {
-			return err
+		if err := InitInfileOrStageParam(param, ctx.GetProcess()); err != nil {
+			return "", err
 		}
 	}
+	if param.Local {
+		return param.Filepath, nil
+	}
+	if len(param.Filepath) == 0 {
+		return "", nil
+	}
 
-	fileList, _, err := ReadDir(param)
-	if err != nil {
-		return err
-	}
-	if len(fileList) == 0 {
-		return moerr.NewInvalidInput(param.Ctx, "the file does not exist in load flow")
-	}
-	param.Ctx = nil
-	return nil
-}
-
-func GetProjectNode(stmt *tree.Load, ctx CompilerContext, node *plan.Node, Name2ColIndex map[string]int32) error {
-	tblName := string(stmt.Table.ObjectName)
-	dbName := string(stmt.Table.SchemaName)
-	_, tableDef := ctx.Resolve(dbName, tblName)
-	if tableDef == nil {
-		return moerr.NewInternalError(ctx.GetContext(), "invalid table name: %s", string(stmt.Table.ObjectName))
-	}
-	if len(stmt.Param.Tail.ColumnList) > len(tableDef.Cols) {
-		return moerr.NewInternalError(ctx.GetContext(), "the load data column list is larger than table column")
-	}
-	colToIndex := make(map[int32]string, 0)
-	if len(stmt.Param.Tail.ColumnList) == 0 {
-		for i := 0; i < len(tableDef.Cols); i++ {
-			colToIndex[int32(i)] = tableDef.Cols[i].Name
-		}
-	} else {
-		for i, col := range stmt.Param.Tail.ColumnList {
-			switch realCol := col.(type) {
-			case *tree.UnresolvedName:
-				if _, ok := Name2ColIndex[realCol.Parts[0]]; !ok {
-					return moerr.NewInternalError(ctx.GetContext(), "column '%s' does not exist", realCol.Parts[0])
-				}
-				colToIndex[int32(i)] = realCol.Parts[0]
-			case *tree.VarExpr:
-				//NOTE:variable like '@abc' will be passed by.
-			default:
-				return moerr.NewInternalError(ctx.GetContext(), "unsupported column type %v", realCol)
+	param.Ctx = ctx.GetContext()
+	if err := StatFile(param); err != nil {
+		if moerror, ok := err.(*moerr.Error); ok {
+			if moerror.ErrorCode() == moerr.ErrFileNotFound {
+				return "", moerr.NewInvalidInput(ctx.GetContext(), "the file does not exist in load flow")
+			} else {
+				return "", moerror
 			}
 		}
+		return "", moerr.NewInternalError(ctx.GetContext(), err.Error())
 	}
+	return param.Filepath, nil
+}
+
+func getProjectNode(stmt *tree.Load, ctx CompilerContext, node *plan.Node, tableDef *TableDef, colToIndex map[string]int32) (bool, error) {
+	tblName := string(stmt.Table.ObjectName)
+	ifExistAutoPkCol := false
 	node.ProjectList = make([]*plan.Expr, len(tableDef.Cols))
-	projectVec := make([]*plan.Expr, len(tableDef.Cols))
-	for i := 0; i < len(tableDef.Cols); i++ {
-		tmp := &plan.Expr{
-			Typ: tableDef.Cols[i].Typ,
-			Expr: &plan.Expr_Col{
-				Col: &plan.ColRef{
-					ColPos: int32(i),
-					Name:   tblName + "." + tableDef.Cols[i].Name,
-				},
-			},
-		}
-		projectVec[i] = tmp
-	}
-	for i := 0; i < len(tableDef.Cols); i++ {
-		if v, ok := colToIndex[int32(i)]; ok {
-			node.ProjectList[Name2ColIndex[v]] = projectVec[i]
-		}
-	}
 	var tmp *plan.Expr
-	//var err error
+
 	for i := 0; i < len(tableDef.Cols); i++ {
-		if node.ProjectList[i] != nil {
+		if colListId, ok := colToIndex[tableDef.Cols[i].Name]; ok {
+			tmp = &plan.Expr{
+				Typ: tableDef.Cols[i].Typ,
+				Expr: &plan.Expr_Col{
+					Col: &plan.ColRef{
+						ColPos: int32(colListId),
+						Name:   tblName + "." + tableDef.Cols[i].Name,
+					},
+				},
+			}
+			node.ProjectList[i] = tmp
 			continue
 		}
 
-		if tableDef.Cols[i].Default.Expr == nil || tableDef.Cols[i].Default.NullAbility {
-			tmp = makePlan2NullConstExprWithType()
-		} else {
-			tmp = &plan.Expr{
-				Typ:  tableDef.Cols[i].Default.Expr.Typ,
-				Expr: tableDef.Cols[i].Default.Expr.Expr,
-			}
+		defExpr, err := getDefaultExpr(ctx.GetContext(), tableDef.Cols[i])
+		if err != nil {
+			return false, err
 		}
-		node.ProjectList[i] = tmp
+
+		node.ProjectList[i] = defExpr
+		if tableDef.Cols[i].Typ.AutoIncr && tableDef.Cols[i].Name == tableDef.Pkey.PkeyColName {
+			ifExistAutoPkCol = true
+		}
 	}
-	return nil
+
+	return ifExistAutoPkCol, nil
 }
 
 func InitNullMap(param *tree.ExternParam, ctx CompilerContext) error {
@@ -237,7 +470,7 @@ func InitNullMap(param *tree.ExternParam, ctx CompilerContext) error {
 		}
 
 		expr2, ok := expr.Func.FunctionReference.(*tree.UnresolvedName)
-		if !ok || expr2.Parts[0] != "nullif" {
+		if !ok || expr2.ColName() != "nullif" {
 			param.Tail.Assignments[i].Expr = nil
 			return nil
 		}
@@ -251,12 +484,13 @@ func InitNullMap(param *tree.ExternParam, ctx CompilerContext) error {
 		if !ok {
 			return moerr.NewInvalidInput(ctx.GetContext(), "the nullif func second param is not NumVal form")
 		}
-		for j := 0; j < len(param.Tail.Assignments[i].Names); j++ {
-			col := param.Tail.Assignments[i].Names[j].Parts[0]
-			if col != expr3.Parts[0] {
+
+		for _, name := range param.Tail.Assignments[i].Names {
+			col := name.ColName()
+			if col != expr3.ColName() {
 				return moerr.NewInvalidInput(ctx.GetContext(), "the nullif func first param must equal to colName")
 			}
-			param.NullMap[col] = append(param.NullMap[col], strings.ToLower(expr4.String()))
+			param.NullMap[col] = append(param.NullMap[col], expr4.String())
 		}
 		param.Tail.Assignments[i].Expr = nil
 	}
@@ -272,8 +506,49 @@ func checkNullMap(stmt *tree.Load, Cols []*ColDef, ctx CompilerContext) error {
 			}
 		}
 		if !find {
-			return moerr.NewInvalidInput(ctx.GetContext(), "wrong col name '%s' in nullif function", k)
+			return moerr.NewInvalidInputf(ctx.GetContext(), "wrong col name '%s' in nullif function", k)
 		}
 	}
 	return nil
+}
+
+func getCompressType(param *tree.ExternParam, filepath string) string {
+	if param.CompressType != "" && param.CompressType != tree.AUTO {
+		return param.CompressType
+	}
+	index := strings.LastIndex(filepath, ".")
+	if index == -1 {
+		return tree.NOCOMPRESS
+	}
+	tail := string([]byte(filepath)[index+1:])
+	switch tail {
+	case "gz", "gzip":
+		return tree.GZIP
+	case "bz2", "bzip2":
+		return tree.BZIP2
+	case "lz4":
+		return tree.LZ4
+	default:
+		return tree.NOCOMPRESS
+	}
+}
+
+func makeCastExpr(stmt *tree.Load, fileName string, tableDef *TableDef, node *plan.Node) []*plan.Expr {
+	ret := make([]*plan.Expr, 0)
+	stringTyp := &plan.Type{
+		Id: int32(types.T_varchar),
+	}
+	for i := 0; i < len(tableDef.Cols); i++ {
+		typ := node.ProjectList[i].Typ
+		expr := node.ProjectList[i].Expr
+		planExpr := &plan.Expr{
+			Typ:  *stringTyp,
+			Expr: expr,
+		}
+
+		planExpr, _ = makePlan2CastExpr(stmt.Param.Ctx, planExpr, typ)
+		ret = append(ret, planExpr)
+	}
+
+	return ret
 }

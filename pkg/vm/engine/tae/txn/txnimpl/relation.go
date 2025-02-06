@@ -15,19 +15,22 @@
 package txnimpl
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
-	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
 
-	pkgcatalog "github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/handle"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 )
 
@@ -80,12 +83,12 @@ func (it *txnRelationIt) Next() {
 		entry.RLock()
 		// SystemDB can hold table created by different tenant, filter needed.
 		// while the 3 shared tables are not affected
-		if it.txnDB.entry.IsSystemDB() && !isSysTable(entry.GetSchema().Name) &&
-			entry.GetSchema().AcInfo.TenantID != txn.GetTenantID() {
+		if it.txnDB.entry.IsSystemDB() && !isSysTable(entry.GetLastestSchemaLocked(false).Name) &&
+			entry.GetLastestSchemaLocked(false).AcInfo.TenantID != txn.GetTenantID() {
 			entry.RUnlock()
 			continue
 		}
-		valid, err = entry.IsVisible(it.txnDB.store.txn.GetStartTS(), entry.RWMutex)
+		valid, err = entry.IsVisibleWithLock(it.txnDB.store.txn, entry.RWMutex)
 		entry.RUnlock()
 		if err != nil {
 			it.err = err
@@ -129,104 +132,112 @@ func (h *txnRelation) SimplePPString(level common.PPLevel) string {
 	if level < common.PPL1 {
 		return s
 	}
-	it := h.MakeBlockIt()
-	for it.Valid() {
-		block := it.GetBlock()
-		s = fmt.Sprintf("%s\n%s", s, block.String())
-		it.Next()
+	it := h.MakeObjectIt(false)
+	for it.Next() {
+		object := it.GetObject()
+		defer object.Close()
+		s = fmt.Sprintf("%s\n%s", s, object.String())
+	}
+	s = fmt.Sprintf("%s\n--Data End--\n", s)
+	it = h.MakeObjectIt(true)
+	for it.Next() {
+		object := it.GetObject()
+		defer object.Close()
+		s = fmt.Sprintf("%s\n%s", s, object.String())
 	}
 	return s
 }
 
 func (h *txnRelation) Close() error { return nil }
 func (h *txnRelation) GetMeta() any { return h.table.entry }
-func (h *txnRelation) Schema() any  { return h.table.entry.GetSchema() }
 
-func (h *txnRelation) Rows() int64 {
-	if h.table.entry.GetDB().IsSystemDB() && h.table.entry.IsVirtual() {
-		if h.table.entry.GetSchema().Name == pkgcatalog.MO_DATABASE {
-			return int64(h.table.entry.GetCatalog().CoarseDBCnt())
-		} else if h.table.entry.GetSchema().Name == pkgcatalog.MO_TABLES {
-			return int64(h.table.entry.GetCatalog().CoarseTableCnt())
-		} else if h.table.entry.GetSchema().Name == pkgcatalog.MO_COLUMNS {
-			return int64(h.table.entry.GetCatalog().CoarseColumnCnt())
-		}
-		panic("logic error")
-	}
-	return int64(h.table.entry.GetRows())
-}
-func (h *txnRelation) GetCardinality(attr string) int64 { return 0 }
+// Schema return schema in txnTable, not the lastest schema in TableEntry
+func (h *txnRelation) Schema(isTombstone bool) any { return h.table.GetLocalSchema(isTombstone) }
 
 func (h *txnRelation) BatchDedup(col containers.Vector) error {
 	return h.Txn.GetStore().BatchDedup(h.table.entry.GetDB().ID, h.table.entry.GetID(), col)
 }
 
-func (h *txnRelation) Append(data *containers.Batch) error {
-	return h.Txn.GetStore().Append(h.table.entry.GetDB().ID, h.table.entry.GetID(), data)
+func (h *txnRelation) Append(ctx context.Context, data *containers.Batch) error {
+	if !h.table.GetLocalSchema(false).IsSameColumns(h.table.GetMeta().GetLastestSchemaLocked(false)) {
+		return moerr.NewInternalErrorNoCtx("schema changed, please rollback and retry")
+	}
+	return h.Txn.GetStore().Append(ctx, h.table.entry.GetDB().ID, h.table.entry.GetID(), data)
 }
 
-func (h *txnRelation) AddBlksWithMetaLoc(
-	zm []dataio.Index,
-	metaLocs []string) error {
-	return h.Txn.GetStore().AddBlksWithMetaLoc(
+func (h *txnRelation) AddDataFiles(ctx context.Context, stats containers.Vector) error {
+	return h.Txn.GetStore().AddDataFiles(
+		ctx,
 		h.table.entry.GetDB().ID,
 		h.table.entry.GetID(),
-		zm,
-		metaLocs,
+		stats,
 	)
 }
 
-func (h *txnRelation) GetSegment(id types.Uuid) (seg handle.Segment, err error) {
+func (h *txnRelation) GetObject(id *types.Objectid, isTombstone bool) (obj handle.Object, err error) {
 	fp := h.table.entry.AsCommonID()
-	fp.SegmentID = id
-	return h.Txn.GetStore().GetSegment(h.table.entry.GetDB().ID, fp)
+	fp.SetObjectID(id)
+	return h.Txn.GetStore().GetObject(fp, isTombstone)
 }
 
-func (h *txnRelation) CreateSegment(is1PC bool) (seg handle.Segment, err error) {
-	return h.Txn.GetStore().CreateSegment(h.table.entry.GetDB().ID, h.table.entry.GetID(), is1PC)
+func (h *txnRelation) CreateObject(isTombstone bool) (obj handle.Object, err error) {
+	return h.Txn.GetStore().CreateObject(h.table.entry.GetDB().ID, h.table.entry.GetID(), isTombstone)
 }
 
-func (h *txnRelation) CreateNonAppendableSegment(is1PC bool) (seg handle.Segment, err error) {
-	return h.Txn.GetStore().CreateNonAppendableSegment(h.table.entry.GetDB().ID, h.table.entry.GetID(), is1PC)
+func (h *txnRelation) CreateNonAppendableObject(isTombstone bool, opt *objectio.CreateObjOpt) (obj handle.Object, err error) {
+	if opt == nil {
+		opt = &objectio.CreateObjOpt{
+			Stats: objectio.NewObjectStatsWithObjectID(objectio.NewObjectid(), false, false, false),
+		}
+	}
+	return h.Txn.GetStore().CreateNonAppendableObject(h.table.entry.GetDB().ID, h.table.entry.GetID(), isTombstone, opt)
 }
 
-func (h *txnRelation) SoftDeleteSegment(id types.Uuid) (err error) {
+func (h *txnRelation) SoftDeleteObject(id *types.Objectid, isTombstone bool) (err error) {
 	fp := h.table.entry.AsCommonID()
-	fp.SegmentID = id
-	return h.Txn.GetStore().SoftDeleteSegment(h.table.entry.GetDB().ID, fp)
+	fp.SetObjectID(id)
+	return h.Txn.GetStore().SoftDeleteObject(isTombstone, fp)
 }
 
-func (h *txnRelation) MakeSegmentItOnSnap() handle.SegmentIt {
-	return newSegmentItOnSnap(h.table)
+func (h *txnRelation) MakeObjectItOnSnap(isTombstone bool) handle.ObjectIt {
+	return newObjectItOnSnap(h.table, isTombstone)
 }
 
-func (h *txnRelation) MakeSegmentIt() handle.SegmentIt {
-	return newSegmentIt(h.table)
+func (h *txnRelation) MakeObjectIt(isTombstone bool) handle.ObjectIt {
+	return newObjectIt(h.table, isTombstone)
 }
 
-func (h *txnRelation) MakeBlockIt() handle.BlockIt {
-	return newRelationBlockIt(h)
+func (h *txnRelation) GetByFilter(
+	ctx context.Context, filter *handle.Filter,
+) (*common.ID, uint32, error) {
+	return h.Txn.GetStore().GetByFilter(ctx, h.table.entry.GetDB().ID, h.table.entry.GetID(), filter)
 }
 
-func (h *txnRelation) GetByFilter(filter *handle.Filter) (*common.ID, uint32, error) {
-	return h.Txn.GetStore().GetByFilter(h.table.entry.GetDB().ID, h.table.entry.GetID(), filter)
-}
-
-func (h *txnRelation) GetValueByFilter(filter *handle.Filter, col int) (v any, err error) {
-	id, row, err := h.GetByFilter(filter)
+func (h *txnRelation) GetValueByFilter(
+	ctx context.Context, filter *handle.Filter, col int,
+) (v any, isNull bool, err error) {
+	id, row, err := h.GetByFilter(ctx, filter)
 	if err != nil {
 		return
 	}
-	v, err = h.GetValue(id, row, uint16(col))
+	v, isNull, err = h.GetValue(id, row, uint16(col), false)
 	return
 }
 
-func (h *txnRelation) UpdateByFilter(filter *handle.Filter, col uint16, v any) (err error) {
-	id, row, err := h.table.GetByFilter(filter)
+func (h *txnRelation) UpdateByFilter(ctx context.Context, filter *handle.Filter, col uint16, v any, isNull bool) (err error) {
+	id, row, err := h.table.GetByFilter(ctx, filter)
 	if err != nil {
 		return
 	}
-	schema := h.table.entry.GetSchema()
+	schema := h.table.GetLocalSchema(false)
+	pkDef := schema.GetPrimaryKey()
+	pkVec := makeWorkspaceVector(pkDef.Type)
+	defer pkVec.Close()
+	pkVal, _, err := h.table.GetValue(ctx, id, row, uint16(pkDef.Idx), true)
+	if err != nil {
+		return err
+	}
+	pkVec.Append(pkVal, false)
 	bat := containers.NewBatch()
 	defer bat.Close()
 	for _, def := range schema.ColDefs {
@@ -234,84 +245,112 @@ func (h *txnRelation) UpdateByFilter(filter *handle.Filter, col uint16, v any) (
 			continue
 		}
 		var colVal any
+		var colValIsNull bool
 		if int(col) == def.Idx {
 			colVal = v
+			colValIsNull = isNull
 		} else {
-			colVal, err = h.table.GetValue(id, row, uint16(def.Idx))
+			colVal, colValIsNull, err = h.table.GetValue(ctx, id, row, uint16(def.Idx), true)
 			if err != nil {
 				return err
 			}
 		}
-		vec := containers.MakeVector(def.Type, def.Nullable())
-		vec.Append(colVal)
+		vec := makeWorkspaceVector(def.Type)
+		vec.Append(colVal, colValIsNull)
 		bat.AddVector(def.Name, vec)
 	}
-	if err = h.table.RangeDelete(id, row, row, handle.DT_Normal); err != nil {
+	if err = h.table.RangeDelete(id, row, row, pkVec, handle.DT_Normal); err != nil {
 		return
 	}
-	err = h.Append(bat)
+	err = h.Append(ctx, bat)
 	// FIXME!: We need to revert previous delete if append fails.
 	return
 }
 
-func (h *txnRelation) DeleteByFilter(filter *handle.Filter) (err error) {
-	id, row, err := h.GetByFilter(filter)
+func (h *txnRelation) DeleteByFilter(ctx context.Context, filter *handle.Filter) (err error) {
+	id, row, err := h.GetByFilter(ctx, filter)
 	if err != nil {
 		return
 	}
 	return h.RangeDelete(id, row, row, handle.DT_Normal)
 }
 
-func (h *txnRelation) DeleteByPhyAddrKeys(keys containers.Vector) (err error) {
-	id := &common.ID{
-		TableID: h.table.entry.ID,
-	}
-	var row uint32
-	dbId := h.table.entry.GetDB().ID
-	err = keys.ForeachShallow(func(key any, _ bool, _ int) (err error) {
-		id.SegmentID, id.BlockID, row = model.DecodePhyAddrKeyFromValue(key)
-		err = h.Txn.GetStore().RangeDelete(dbId, id, row, row, handle.DT_Normal)
-		return
-	}, nil)
-	return
+func (h *txnRelation) DeleteByPhyAddrKeys(keys containers.Vector, pkVec containers.Vector, dt handle.DeleteType) (err error) {
+	id := h.table.entry.AsCommonID()
+	return h.Txn.GetStore().DeleteByPhyAddrKeys(
+		id,
+		keys,
+		pkVec,
+		dt,
+	)
 }
 
+// Only used by test.
 func (h *txnRelation) DeleteByPhyAddrKey(key any) error {
-	sid, bid, row := model.DecodePhyAddrKeyFromValue(key)
-	id := &common.ID{
-		TableID:   h.table.entry.ID,
-		SegmentID: sid,
-		BlockID:   bid,
+	rid := key.(types.Rowid)
+	bid, row := rid.Decode()
+	id := h.table.entry.AsCommonID()
+	id.BlockID = *bid
+	schema := h.table.GetLocalSchema(false)
+	pkDef := schema.GetPrimaryKey()
+	pkVec := makeWorkspaceVector(pkDef.Type)
+	defer pkVec.Close()
+	val, _, err := h.table.GetValue(h.table.store.ctx, id, row, uint16(pkDef.Idx), true)
+	if err != nil {
+		return err
 	}
-	return h.Txn.GetStore().RangeDelete(h.table.entry.GetDB().ID, id, row, row, handle.DT_Normal)
+	pkVec.Append(val, false)
+	return h.Txn.GetStore().RangeDelete(id, row, row, pkVec, handle.DT_Normal)
 }
 
 func (h *txnRelation) RangeDelete(id *common.ID, start, end uint32, dt handle.DeleteType) error {
-	return h.Txn.GetStore().RangeDelete(h.table.entry.GetDB().ID, id, start, end, dt)
-}
-
-func (h *txnRelation) GetValueByPhyAddrKey(key any, col int) (any, error) {
-	sid, bid, row := model.DecodePhyAddrKeyFromValue(key)
-	id := &common.ID{
-		TableID:   h.table.entry.ID,
-		SegmentID: sid,
-		BlockID:   bid,
+	schema := h.table.GetLocalSchema(false)
+	pkDef := schema.GetPrimaryKey()
+	pkVec := h.table.store.rt.VectorPool.Small.GetVector(&pkDef.Type)
+	defer pkVec.Close()
+	for row := start; row <= end; row++ {
+		pkVal, _, err := h.table.GetValue(h.table.store.GetContext(), id, row, uint16(pkDef.Idx), true)
+		if err != nil {
+			return err
+		}
+		pkVec.Append(pkVal, false)
 	}
-	return h.Txn.GetStore().GetValue(h.table.entry.GetDB().ID, id, row, uint16(col))
+	return h.Txn.GetStore().RangeDelete(id, start, end, pkVec, dt)
 }
 
-func (h *txnRelation) GetValue(id *common.ID, row uint32, col uint16) (any, error) {
-	return h.Txn.GetStore().GetValue(h.table.entry.GetDB().ID, id, row, col)
+//func (h *txnRelation) TryDeleteByDeltaloc(id *common.ID, deltaloc objectio.Location) (ok bool, err error) {
+//	return h.Txn.GetStore().TryDeleteByDeltaloc(id, deltaloc)
+//}
+
+func (h *txnRelation) AddPersistedTombstoneFile(id *common.ID, stats objectio.ObjectStats) (ok bool, err error) {
+	return h.Txn.GetStore().AddPersistedTombstoneFile(id, stats)
 }
 
-func (h *txnRelation) LogTxnEntry(entry txnif.TxnEntry, readed []*common.ID) (err error) {
-	return h.Txn.GetStore().LogTxnEntry(h.table.entry.GetDB().ID, h.table.entry.GetID(), entry, readed)
+// Only used by test.
+func (h *txnRelation) GetValueByPhyAddrKey(key any, col int) (any, bool, error) {
+	rid := key.(types.Rowid)
+	bid, row := rid.Decode()
+	id := h.table.entry.AsCommonID()
+	id.BlockID = *bid
+	return h.Txn.GetStore().GetValue(id, row, uint16(col), false)
+}
+
+func (h *txnRelation) GetValue(id *common.ID, row uint32, col uint16, skipCheckDelete bool) (any, bool, error) {
+	return h.Txn.GetStore().GetValue(id, row, col, skipCheckDelete)
+}
+
+func (h *txnRelation) LogTxnEntry(entry txnif.TxnEntry, readedObject, readedTombstone []*common.ID) (err error) {
+	return h.Txn.GetStore().LogTxnEntry(h.table.entry.GetDB().ID, h.table.entry.GetID(), entry, readedObject, readedTombstone)
 }
 
 func (h *txnRelation) GetDB() (handle.Database, error) {
 	return h.Txn.GetStore().GetDatabase(h.GetMeta().(*catalog.TableEntry).GetDB().GetName())
 }
 
-func (h *txnRelation) UpdateConstraint(cstr []byte) (err error) {
-	return h.table.UpdateConstraint(cstr)
+func (h *txnRelation) AlterTable(ctx context.Context, req *apipb.AlterTableReq) (err error) {
+	return h.table.AlterTable(ctx, req)
+}
+
+func (h *txnRelation) FillInWorkspaceDeletes(blkID types.Blockid, view **nulls.Nulls, deleteStartOffset uint64) error {
+	return h.table.FillInWorkspaceDeletes(blkID, view, deleteStartOffset)
 }

@@ -15,15 +15,13 @@
 package hakeeper
 
 import (
-	"context"
-
 	"github.com/matrixorigin/matrixone/pkg/hakeeper/checkers/util"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper/operator"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
-	"github.com/matrixorigin/matrixone/pkg/pb/task"
 )
 
 type IDAllocator interface {
-	// Next returns a new ID that can be used as the replica ID of a DN shard or
+	// Next returns a new ID that can be used as the replica ID of a TN shard or
 	// Log shard. When the return boolean value is false, it means no more ID
 	// can be allocated at this time.
 	Next() (uint64, bool)
@@ -39,24 +37,53 @@ type Checker interface {
 	// Check is periodically called by the HAKeeper for checking the cluster
 	// health status, a list of Operator instances will be returned describing
 	// actions required to ensure the high availability of the cluster.
-	Check(alloc util.IDAllocator, state pb.CheckerState) []pb.ScheduleCommand
+	Check(alloc util.IDAllocator, state pb.CheckerState, standbyEnabled bool) []pb.ScheduleCommand
+}
+
+type CheckerCommonFields struct {
+	ServiceID   string
+	Cfg         Config
+	Alloc       util.IDAllocator
+	Cluster     pb.ClusterInfo
+	User        pb.TaskTableUser
+	CurrentTick uint64
+}
+
+func NewCheckerCommonFields(
+	sid string,
+	cfg Config,
+	alloc util.IDAllocator,
+	cluster pb.ClusterInfo,
+	user pb.TaskTableUser,
+	currentTick uint64,
+) CheckerCommonFields {
+	return CheckerCommonFields{
+		ServiceID:   sid,
+		Cfg:         cfg,
+		Alloc:       alloc,
+		Cluster:     cluster,
+		User:        user,
+		CurrentTick: currentTick,
+	}
+}
+
+// ModuleChecker is the interface implemented by all modules that need to check
+// their status and return operators.
+type ModuleChecker interface {
+	// Check checks the status of the module and return operators.
+	Check() []*operator.Operator
 }
 
 // BootstrapManager is the interface suppose to be implemented by HAKeeper's
 // bootstrap manager.
 type BootstrapManager interface {
-	Bootstrap(util.IDAllocator, pb.DNState, pb.LogState) ([]pb.ScheduleCommand, error)
+	Bootstrap(util.IDAllocator, pb.TNState, pb.LogState) ([]pb.ScheduleCommand, error)
 
 	CheckBootstrap(pb.LogState) bool
 }
 
 type TaskScheduler interface {
 	Schedule(cnState pb.CNState, currentTick uint64)
-
-	// Create an asynchronous task that executes a single time, this method is idempotent, the
-	// same task is not created repeatedly based on multiple calls.
-	Create(context.Context, []task.TaskMetadata) error
-
 	// StartScheduleCronTask start schedule cron tasks. A timer will be started to pull the latest CronTask
 	// from the TaskStore at regular intervals, and a timer will be maintained in memory for all Cron's to be
 	// triggered at regular intervals.

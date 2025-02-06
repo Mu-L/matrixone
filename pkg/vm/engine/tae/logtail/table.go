@@ -22,27 +22,135 @@ import (
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"go.uber.org/zap"
 )
 
 type RowT = *txnRow
 type BlockT = *txnBlock
 
+type smallTxn struct {
+	memo      *txnif.TxnMemo
+	startTS   types.TS
+	prepareTS types.TS
+	state     txnif.TxnState
+	lsn       uint64
+}
+
+func (txn *smallTxn) GetMemo() *txnif.TxnMemo {
+	return txn.memo
+}
+
+func (txn *smallTxn) GetTxnState(_ bool) txnif.TxnState {
+	return txn.state
+}
+
+func (txn *smallTxn) GetStartTS() types.TS {
+	return txn.startTS
+}
+
+func (txn *smallTxn) GetPrepareTS() types.TS {
+	return txn.prepareTS
+}
+
+func (txn *smallTxn) GetCommitTS() types.TS {
+	return txn.prepareTS
+}
+
+func (txn *smallTxn) GetLSN() uint64 {
+	return txn.lsn
+}
+
 type summary struct {
 	hasCatalogChanges bool
+	tids              map[uint64]struct{}
 	// TODO
-	// table ids
 	// maxLsn
 }
 
 type txnRow struct {
-	txnif.AsyncTxn
+	source atomic.Pointer[txnbase.Txn]
+	packed atomic.Pointer[smallTxn]
+}
+
+func (row *txnRow) GetLSN() uint64 {
+	if txn := row.source.Load(); txn != nil {
+		return txn.GetLSN()
+	}
+	txn := row.packed.Load()
+	return txn.GetLSN()
+}
+
+func (row *txnRow) GetMemo() *txnif.TxnMemo {
+	if txn := row.source.Load(); txn != nil {
+		return txn.GetMemo()
+	}
+	txn := row.packed.Load()
+	return txn.GetMemo()
+}
+
+func (row *txnRow) GetTxnState(waitIfcommitting bool) txnif.TxnState {
+	if txn := row.source.Load(); txn != nil {
+		return txn.GetTxnState(waitIfcommitting)
+	}
+	txn := row.packed.Load()
+	return txn.GetTxnState(waitIfcommitting)
+}
+
+func (row *txnRow) GetStartTS() types.TS {
+	if txn := row.source.Load(); txn != nil {
+		return txn.GetStartTS()
+	}
+	txn := row.packed.Load()
+	return txn.GetStartTS()
+}
+
+func (row *txnRow) GetPrepareTS() types.TS {
+	if txn := row.source.Load(); txn != nil {
+		return txn.GetPrepareTS()
+	}
+	txn := row.packed.Load()
+	return txn.GetPrepareTS()
+}
+
+func (row *txnRow) GetCommitTS() types.TS {
+	if txn := row.source.Load(); txn != nil {
+		return txn.GetCommitTS()
+	}
+	txn := row.packed.Load()
+	return txn.GetCommitTS()
 }
 
 func (row *txnRow) Length() int             { return 1 }
 func (row *txnRow) Window(_, _ int) *txnRow { return nil }
+
+func (row *txnRow) IsCompacted() bool {
+	return row.packed.Load() != nil
+}
+
+func (row *txnRow) TryCompact() (compacted, changed bool) {
+	if txn := row.source.Load(); txn == nil {
+		return true, false
+	} else {
+		state := txn.GetTxnState(false)
+		if state == txnif.TxnStateCommitted || state == txnif.TxnStateRollbacked {
+			packed := &smallTxn{
+				memo:      txn.GetMemo(),
+				startTS:   txn.GetStartTS(),
+				prepareTS: txn.GetPrepareTS(),
+				state:     state,
+				lsn:       txn.GetLSN(),
+			}
+			row.packed.Store(packed)
+			row.source.Store(nil)
+			return true, true
+		}
+	}
+	return false, false
+}
 
 type txnBlock struct {
 	sync.RWMutex
@@ -55,6 +163,28 @@ func (blk *txnBlock) Length() int {
 	blk.RLock()
 	defer blk.RUnlock()
 	return len(blk.rows)
+}
+
+func (blk *txnBlock) TryCompact() (all bool, changed bool) {
+	blk.RLock()
+	defer blk.RUnlock()
+	if len(blk.rows) < cap(blk.rows) {
+		return false, false
+	}
+	if blk.rows[len(blk.rows)-1].IsCompacted() {
+		return true, false
+	}
+	all = true
+	for _, row := range blk.rows {
+		if compacted, _ := row.TryCompact(); !compacted {
+			all = false
+			break
+		}
+	}
+	if all {
+		changed = true
+	}
+	return
 }
 
 func (blk *txnBlock) IsAppendable() bool {
@@ -77,10 +207,14 @@ func (blk *txnBlock) Close() {
 
 func (blk *txnBlock) trySumary() {
 	summary := new(summary)
+	summary.tids = make(map[uint64]struct{}, 8)
 	for _, row := range blk.rows {
-		if row.GetMemo().HasCatalogChanges() {
+		memo := row.GetMemo()
+		if !summary.hasCatalogChanges && memo.HasCatalogChanges() {
 			summary.hasCatalogChanges = true
-			break
+		}
+		for k := range memo.Tree.Tables {
+			summary.tids[k] = struct{}{}
 		}
 	}
 	blk.summary.CompareAndSwap(nil, summary)
@@ -105,11 +239,11 @@ func (blk *txnBlock) ForeachRowInBetween(
 	for _, row := range rows {
 		readRows += 1
 		ts := row.GetPrepareTS()
-		if ts.IsEmpty() || ts.Greater(to) {
+		if ts.IsEmpty() || ts.GT(&to) {
 			outOfRange = true
 			return
 		}
-		if ts.Less(from) {
+		if ts.LT(&from) {
 			continue
 		}
 
@@ -133,21 +267,21 @@ type TxnTable struct {
 	*model.AOT[BlockT, RowT]
 }
 
-func blockCompareFn(a, b BlockT) bool {
-	return a.bornTS.Less(b.bornTS)
+func (blk *txnBlock) Less(b BlockT) bool {
+	return blk.bornTS.LT(&b.bornTS)
 }
 
 func timeBasedTruncateFactory(ts types.TS) func(b BlockT) bool {
 	return func(b BlockT) bool {
-		return b.bornTS.GreaterEq(ts)
+		return b.bornTS.GE(&ts)
 	}
 }
 
-func NewTxnTable(blockSize int, now func() types.TS) *TxnTable {
+func NewTxnTable(blockSize int, nowClock func() types.TS) *TxnTable {
 	factory := func(row RowT) BlockT {
 		ts := row.GetPrepareTS()
 		if ts == txnif.UncommitTS {
-			ts = now()
+			ts = nowClock()
 		}
 		return &txnBlock{
 			bornTS: ts,
@@ -158,15 +292,29 @@ func NewTxnTable(blockSize int, now func() types.TS) *TxnTable {
 		AOT: model.NewAOT(
 			blockSize,
 			factory,
-			blockCompareFn,
+			(*txnBlock).Less,
 		),
 	}
 }
 
+func (table *TxnTable) TryCompact(from types.TS, rt *dbutils.Runtime) (to types.TS) {
+	snapshot := table.Snapshot()
+	snapshot.Ascend(
+		&txnBlock{bornTS: from},
+		func(blk BlockT) bool {
+			allCompacted, changed := blk.TryCompact()
+			if changed {
+				rt.Logtail.CompactStats.Add(1)
+			}
+			to = blk.bornTS
+			return allCompacted
+		})
+	return
+}
+
 func (table *TxnTable) AddTxn(txn txnif.AsyncTxn) (err error) {
-	row := &txnRow{
-		AsyncTxn: txn,
-	}
+	row := &txnRow{}
+	row.source.Store(txn.GetBase().(*txnbase.Txn))
 	err = table.Append(row)
 	return
 }
@@ -191,21 +339,23 @@ func (table *TxnTable) ForeachRowInBetween(
 	})
 
 	// from is smaller than the very first block and it is not special like 0-0, 0-1, 1-0
-	if outOfLeft && from.Greater(types.BuildTS(1, 1)) {
+	ts := types.BuildTS(1, 1)
+	if outOfLeft && from.GT(&ts) {
 		minTs := types.TS{}
 		snapshot.Ascend(&txnBlock{}, func(blk *txnBlock) bool {
 			minTs = blk.bornTS
 			return false
 		})
-		logutil.Warn("[logtail] fetch with too small ts", zap.String("ts", from.ToString()), zap.String("minTs", minTs.ToString()))
+		logutil.Info("[logtail] fetch with too small ts", zap.String("ts", from.ToString()), zap.String("minTs", minTs.ToString()))
 	}
 	snapshot.Ascend(pivot, func(blk BlockT) bool {
-		if blk.bornTS.Greater(to) {
+		if blk.bornTS.GT(&to) {
 			return false
 		}
 
 		if skipBlkOp != nil && skipBlkOp(blk) {
-			return blk.rows[len(blk.rows)-1].GetPrepareTS().LessEq(to)
+			prepareTS := blk.rows[len(blk.rows)-1].GetPrepareTS()
+			return prepareTS.LE(&to)
 		}
 		outOfRange, cnt := blk.ForeachRowInBetween(
 			from,

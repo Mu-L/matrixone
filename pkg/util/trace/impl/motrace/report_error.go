@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -37,6 +38,19 @@ type MOErrorHolder struct {
 	Timestamp time.Time `json:"timestamp"`
 }
 
+var errorPool = sync.Pool{
+	New: func() any {
+		return &MOErrorHolder{}
+	},
+}
+
+func newMOErrorHolder(err error, t time.Time) *MOErrorHolder {
+	h := errorPool.Get().(*MOErrorHolder)
+	h.Error = err
+	h.Timestamp = t
+	return h
+}
+
 func (h *MOErrorHolder) GetName() string {
 	return errorView.OriginTable.GetName()
 }
@@ -46,27 +60,28 @@ func (h *MOErrorHolder) Size() int64 {
 }
 func (h *MOErrorHolder) Free() {
 	h.Error = nil
+	errorPool.Put(h)
 }
 
 func (h *MOErrorHolder) GetTable() *table.Table { return errorView.OriginTable }
 
 func (h *MOErrorHolder) FillRow(ctx context.Context, row *table.Row) {
 	row.Reset()
-	row.SetColumnVal(rawItemCol, errorView.Table)
-	row.SetColumnVal(timestampCol, h.Timestamp)
-	row.SetColumnVal(nodeUUIDCol, GetNodeResource().NodeUuid)
-	row.SetColumnVal(nodeTypeCol, GetNodeResource().NodeType)
-	row.SetColumnVal(errorCol, h.Error.Error())
-	row.SetColumnVal(stackCol, fmt.Sprintf(errorFormatter.Load().(string), h.Error))
+	row.SetColumnVal(rawItemCol, table.StringField(errorView.Table))
+	row.SetColumnVal(timestampCol, table.TimeField(h.Timestamp))
+	row.SetColumnVal(nodeUUIDCol, table.StringField(GetNodeResource().NodeUuid))
+	row.SetColumnVal(nodeTypeCol, table.StringField(GetNodeResource().NodeType))
+	row.SetColumnVal(errorCol, table.StringField(h.Error.Error()))
+	row.SetColumnVal(stackCol, table.StringField(fmt.Sprintf(errorFormatter.Load().(string), h.Error)))
 	var moError *moerr.Error
 	if errors.As(h.Error, &moError) {
-		row.SetColumnVal(errCodeCol, fmt.Sprintf("%d", moError.ErrorCode()))
+		row.SetColumnVal(errCodeCol, table.StringField(fmt.Sprintf("%d", moError.ErrorCode())))
 	}
 	if ct := errutil.GetContextTracer(h.Error); ct != nil && ct.Context() != nil {
 		span := trace.SpanFromContext(ct.Context())
-		row.SetColumnVal(traceIDCol, span.SpanContext().TraceID.String())
-		row.SetColumnVal(spanIDCol, span.SpanContext().SpanID.String())
-		row.SetColumnVal(spanKindCol, span.SpanContext().Kind.String())
+		row.SetColumnVal(traceIDCol, table.StringField(span.SpanContext().TraceID.String()))
+		row.SetColumnVal(spanIDCol, table.StringField(span.SpanContext().SpanID.String()))
+		row.SetColumnVal(spanKindCol, table.StringField(span.SpanContext().Kind.String()))
 	}
 }
 
@@ -103,6 +118,6 @@ func ReportError(ctx context.Context, err error, depth int) {
 	if ctx == nil {
 		ctx = DefaultContext()
 	}
-	e := &MOErrorHolder{Error: err, Timestamp: time.Now()}
+	e := newMOErrorHolder(err, time.Now())
 	GetGlobalBatchProcessor().Collect(ctx, e)
 }

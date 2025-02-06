@@ -15,151 +15,339 @@
 package tables
 
 import (
-	"strings"
+	"context"
 
-	"github.com/RoaringBitmap/roaring"
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables/indexwrapper"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/index"
 )
 
 var _ NodeT = (*persistedNode)(nil)
 
 type persistedNode struct {
 	common.RefHelper
-	block *baseBlock
-	//ZM and BF index for primary key column.
-	pkIndex indexwrapper.Index
-	//ZM and BF index for all columns.
-	indexes map[int]indexwrapper.Index
+	object *baseObject
 }
 
-func newPersistedNode(block *baseBlock) *persistedNode {
+func newPersistedNode(object *baseObject) *persistedNode {
 	node := &persistedNode{
-		block: block,
+		object: object,
 	}
 	node.OnZeroCB = node.close
-	if block.meta.HasPersistedData() {
-		node.init()
-	}
 	return node
 }
 
-func (node *persistedNode) close() {
-	for i, index := range node.indexes {
-		index.Close()
-		node.indexes[i] = nil
-	}
-	node.indexes = nil
+func (node *persistedNode) close() {}
+
+func (node *persistedNode) Rows() (uint32, error) {
+	return node.object.meta.Load().GetObjectStats().Rows(), nil
 }
 
-func (node *persistedNode) init() {
-	node.indexes = make(map[int]indexwrapper.Index)
-	schema := node.block.meta.GetSchema()
-	pkIdx := -1
-	if schema.HasPK() {
-		pkIdx = schema.GetSingleSortKeyIdx()
-	}
-	metaloc := node.block.meta.GetMetaLoc()
-	info := strings.Split(metaloc, ":")
-	if len(info) < 2 {
-		logutil.Infof("%s bad metaloc %q: %s", node.block.meta.ID.String(), metaloc, node.block.meta.String())
-	}
-	for i := range schema.ColDefs {
-		index := indexwrapper.NewImmutableIndex()
-		if err := index.ReadFrom(
-			node.block.fs,
-			node.block.meta.AsCommonID(),
-			node.block.meta.GetMetaLoc(),
-			schema.ColDefs[i]); err != nil {
-			panic(err)
-		}
-		node.indexes[i] = index
-		if i == pkIdx {
-			node.pkIndex = index
-		}
-	}
-}
-
-func (node *persistedNode) Rows() uint32 {
-	location := node.block.meta.GetMetaLoc()
-	return uint32(ReadPersistedBlockRow(location))
-}
-
-func (node *persistedNode) BatchDedup(
+func (node *persistedNode) Contains(
+	ctx context.Context,
 	keys containers.Vector,
-	skipFn func(row uint32) error) (sels *roaring.Bitmap, err error) {
-	return node.pkIndex.BatchDedup(keys, skipFn)
+	keysZM index.ZM,
+	txn txnif.TxnReader,
+	mp *mpool.MPool,
+) (err error) {
+	panic("should not be called")
 }
-
-func (node *persistedNode) ContainsKey(key any) (ok bool, err error) {
-	if err = node.pkIndex.Dedup(key, nil); err == nil {
-		return
-	}
-	if !moerr.IsMoErrCode(err, moerr.OkExpectedPossibleDup) {
-		return
-	}
-	ok = true
-	err = nil
-	return
-}
-
-func (node *persistedNode) GetColumnDataWindow(
-	from uint32,
-	to uint32,
-	colIdx int,
-) (vec containers.Vector, err error) {
-	var data containers.Vector
-	if data, err = node.block.LoadPersistedColumnData(
-		colIdx,
-	); err != nil {
-		return
-	}
-	if to-from == uint32(data.Length()) {
-		vec = data
-	} else {
-		vec = data.CloneWindow(int(from), int(to-from), common.DefaultAllocator)
-		data.Close()
-	}
-	return
+func (node *persistedNode) GetDuplicatedRows(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	getRowOffset func() (min, max int32, err error),
+	keys containers.Vector,
+	keysZM index.ZM,
+	rowIDs containers.Vector,
+	mp *mpool.MPool,
+) (err error) {
+	panic("should not be balled")
 }
 
 func (node *persistedNode) GetDataWindow(
-	from, to uint32) (bat *containers.Batch, err error) {
-	data, err := node.block.LoadPersistedData()
-	if err != nil {
-		return
-	}
-
-	if to-from == uint32(data.Length()) {
-		bat = data
-	} else {
-		bat = data.CloneWindow(int(from), int(to-from), common.DefaultAllocator)
-		data.Close()
-	}
-	return
+	readSchema *catalog.Schema, colIdxes []int, from, to uint32, mp *mpool.MPool,
+) (bat *containers.Batch, err error) {
+	panic("to be implemented")
 }
 
 func (node *persistedNode) IsPersisted() bool { return true }
 
-func (node *persistedNode) PrepareAppend(rows uint32) (n uint32, err error) {
-	panic(moerr.NewInternalErrorNoCtx("not supported"))
+func (node *persistedNode) Scan(
+	ctx context.Context,
+	bat **containers.Batch,
+	txn txnif.TxnReader,
+	readSchema *catalog.Schema,
+	blkID uint16,
+	colIdxes []int,
+	mp *mpool.MPool,
+) (err error) {
+	id := node.object.meta.Load().AsCommonID()
+	id.SetBlockOffset(uint16(blkID))
+	location, err := node.object.buildMetalocation(uint16(blkID))
+	if err != nil {
+		return err
+	}
+	var tsForAppendable *types.TS
+	if node.object.meta.Load().IsAppendable() {
+		ts := txn.GetStartTS()
+		tsForAppendable = &ts
+	}
+	vecs, deletes, err := LoadPersistedColumnDatas(
+		ctx, readSchema, node.object.rt, id, colIdxes, location, mp, tsForAppendable,
+	)
+	if err != nil {
+		return err
+	}
+	// TODO: check visibility
+	if *bat == nil {
+		*bat = containers.NewBatch()
+		(*bat).Deletes = deletes
+		for i, idx := range colIdxes {
+			var attr string
+			if idx == objectio.SEQNUM_COMMITTS {
+				attr = objectio.TombstoneAttr_CommitTs_Attr
+				if vecs[i].GetType().Oid != types.T_TS {
+					vecs[i].Close()
+					vecs[i] = node.object.rt.VectorPool.Transient.GetVector(&objectio.TSType)
+					createTS := node.object.meta.Load().GetCreatedAt()
+					vector.AppendMultiFixed(vecs[i].GetDownstreamVector(), createTS, false, vecs[0].Length(), mp)
+				}
+			} else {
+				attr = readSchema.ColDefs[idx].Name
+			}
+			(*bat).AddVector(attr, vecs[i])
+		}
+	} else {
+		if (*bat).Deletes == nil {
+			(*bat).Deletes = nulls.NewWithSize(1024)
+		}
+		len := (*bat).Length()
+		deletes.Foreach(func(i uint64) bool {
+			(*bat).Deletes.Add(i + uint64(len))
+			return true
+		})
+		for i, idx := range colIdxes {
+			var attr string
+			if idx == objectio.SEQNUM_COMMITTS {
+				attr = objectio.TombstoneAttr_CommitTs_Attr
+				if vecs[i].GetType().Oid != types.T_TS {
+					vecs[i].Close()
+					vecs[i] = node.object.rt.VectorPool.Transient.GetVector(&objectio.TSType)
+					createTS := node.object.meta.Load().GetCreatedAt()
+					vector.AppendMultiFixed(vecs[i].GetDownstreamVector(), createTS, false, vecs[0].Length(), mp)
+				}
+			} else {
+				attr = readSchema.ColDefs[idx].Name
+			}
+			(*bat).GetVectorByName(attr).Extend(vecs[i])
+		}
+	}
+	return
 }
 
-func (node *persistedNode) ApplyAppend(
-	_ *containers.Batch,
-	_ txnif.AsyncTxn,
-) (from int, err error) {
-	panic(moerr.NewInternalErrorNoCtx("not supported"))
+func (node *persistedNode) CollectObjectTombstoneInRange(
+	ctx context.Context,
+	start, end types.TS,
+	objID *types.Objectid,
+	bat **containers.Batch,
+	mp *mpool.MPool,
+	vpool *containers.VectorPool,
+) (err error) {
+	if !node.object.meta.Load().IsTombstone {
+		panic("not support")
+	}
+	colIdxes := objectio.TombstoneColumns_TN_Created
+	readSchema := node.object.meta.Load().GetTable().GetLastestSchema(true)
+	var startTS types.TS
+	if !node.object.meta.Load().IsAppendable() {
+		startTS = node.object.meta.Load().GetCreatedAt()
+		if startTS.LT(&start) || startTS.GT(&end) {
+			return
+		}
+	} else {
+		createAt := node.object.meta.Load().GetCreatedAt()
+		deleteAt := node.object.meta.Load().GetDeleteAt()
+		if deleteAt.LT(&start) || createAt.GT(&end) {
+			return
+		}
+	}
+	id := node.object.meta.Load().AsCommonID()
+
+	var bf objectio.BloomFilter
+	if bf, err = objectio.FastLoadBF(
+		ctx,
+		node.object.meta.Load().GetLocation(),
+		false,
+		node.object.rt.Fs.Service,
+	); err != nil {
+		return
+	}
+	objLocation := node.object.meta.Load().GetLocation()
+	objDataMeta, err := objectio.FastLoadObjectMeta(ctx, &objLocation, false, node.object.GetFs().Service)
+	if err != nil {
+		return err
+	}
+	colCount := objDataMeta.MustGetMeta(objectio.SchemaData).GetBlockMeta(0).GetColumnCount()
+	persistedByCN := colCount == 2
+	for blkID := 0; blkID < node.object.meta.Load().BlockCnt(); blkID++ {
+		buf := bf.GetBloomFilter(uint32(blkID))
+		bfIndex := index.NewEmptyBloomFilterWithType(index.HBF)
+		if err = index.DecodeBloomFilter(bfIndex, buf); err != nil {
+			return
+		}
+		containes, err := bfIndex.PrefixMayContainsKey(objID[:], index.PrefixFnID_Object, 1)
+		if err != nil {
+			return err
+		}
+		if !containes {
+			continue
+		}
+		id.SetBlockOffset(uint16(blkID))
+		location, err := node.object.buildMetalocation(uint16(blkID))
+		if err != nil {
+			return err
+		}
+		vecs, _, err := LoadPersistedColumnDatas(
+			ctx, readSchema, node.object.rt, id, colIdxes, location, mp, nil,
+		)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			for i := range vecs {
+				vecs[i].Close()
+			}
+		}()
+		var commitTSs []types.TS
+		if !persistedByCN {
+			commitTSs = vector.MustFixedColWithTypeCheck[types.TS](vecs[2].GetDownstreamVector())
+			rowIDs := vector.MustFixedColWithTypeCheck[types.Rowid](vecs[0].GetDownstreamVector())
+			for i := 0; i < len(commitTSs); i++ {
+				commitTS := commitTSs[i]
+				if commitTS.GE(&start) && commitTS.LE(&end) &&
+					types.PrefixCompare(rowIDs[i][:], objID[:]) == 0 { // TODO
+					if *bat == nil {
+						pkIdx := readSchema.GetColIdx(objectio.TombstoneAttr_PK_Attr)
+						pkType := readSchema.ColDefs[pkIdx].GetType()
+						*bat = catalog.NewTombstoneBatchByPKType(pkType, mp)
+					}
+					(*bat).GetVectorByName(objectio.TombstoneAttr_Rowid_Attr).Append(rowIDs[i], false)
+					(*bat).GetVectorByName(objectio.TombstoneAttr_PK_Attr).Append(vecs[1].Get(i), false)
+					(*bat).GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr).Append(commitTS, false)
+				}
+			}
+		} else {
+			rowIDs := vector.MustFixedColWithTypeCheck[types.Rowid](vecs[0].GetDownstreamVector())
+			for i := 0; i < len(rowIDs); i++ {
+				if types.PrefixCompare(rowIDs[i][:], objID[:]) == 0 { // TODO
+					if *bat == nil {
+						pkIdx := readSchema.GetColIdx(objectio.TombstoneAttr_PK_Attr)
+						pkType := readSchema.ColDefs[pkIdx].GetType()
+						*bat = catalog.NewTombstoneBatchByPKType(pkType, mp)
+					}
+					(*bat).GetVectorByName(objectio.TombstoneAttr_Rowid_Attr).Append(rowIDs[i], false)
+					(*bat).GetVectorByName(objectio.TombstoneAttr_PK_Attr).Append(vecs[1].Get(i), false)
+					(*bat).GetVectorByName(objectio.TombstoneAttr_CommitTs_Attr).Append(startTS, false)
+				}
+			}
+		}
+	}
+	return
 }
 
-func (node *persistedNode) GetValueByRow(row, col int) (v any) {
-	panic(moerr.NewInternalErrorNoCtx("todo"))
-}
-
-func (node *persistedNode) GetRowsByKey(key any) ([]uint32, error) {
-	panic(moerr.NewInternalErrorNoCtx("todo"))
+func (node *persistedNode) FillBlockTombstones(
+	ctx context.Context,
+	txn txnif.TxnReader,
+	blkID *objectio.Blockid,
+	deletes **nulls.Nulls,
+	deleteStartOffset uint64,
+	mp *mpool.MPool) error {
+	startTS := txn.GetStartTS()
+	if !node.object.meta.Load().IsAppendable() {
+		node.object.RLock()
+		createAt := node.object.meta.Load().GetCreatedAt()
+		node.object.RUnlock()
+		if createAt.GT(&startTS) {
+			return nil
+		}
+	}
+	id := node.object.meta.Load().AsCommonID()
+	readSchema := node.object.meta.Load().GetTable().GetLastestSchema(true)
+	var bf objectio.BloomFilter
+	var err error
+	if bf, err = objectio.FastLoadBF(
+		ctx,
+		node.object.meta.Load().GetLocation(),
+		false,
+		node.object.rt.Fs.Service,
+	); err != nil {
+		return err
+	}
+	for tombstoneBlkID := 0; tombstoneBlkID < node.object.meta.Load().BlockCnt(); tombstoneBlkID++ {
+		buf := bf.GetBloomFilter(uint32(tombstoneBlkID))
+		bfIndex := index.NewEmptyBloomFilterWithType(index.HBF)
+		if err := index.DecodeBloomFilter(bfIndex, buf); err != nil {
+			return err
+		}
+		containes, err := bfIndex.PrefixMayContainsKey(blkID[:], index.PrefixFnID_Block, 2)
+		if err != nil {
+			return err
+		}
+		if !containes {
+			continue
+		}
+		id.SetBlockOffset(uint16(tombstoneBlkID))
+		location, err := node.object.buildMetalocation(uint16(tombstoneBlkID))
+		if err != nil {
+			return err
+		}
+		vecs, _, err := LoadPersistedColumnDatas(
+			ctx, readSchema, node.object.rt, id, []int{0}, location, mp, nil,
+		)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			for i := range vecs {
+				vecs[i].Close()
+			}
+		}()
+		var commitTSs []types.TS
+		var commitTSVec containers.Vector
+		if node.object.meta.Load().IsAppendable() {
+			commitTSVec, err = node.object.LoadPersistedCommitTS(uint16(tombstoneBlkID))
+			if err != nil {
+				return err
+			}
+			commitTSs = vector.MustFixedColWithTypeCheck[types.TS](commitTSVec.GetDownstreamVector())
+		}
+		if commitTSVec != nil {
+			defer commitTSVec.Close()
+		}
+		rowIDs := vector.MustFixedColWithTypeCheck[types.Rowid](vecs[0].GetDownstreamVector())
+		// TODO: biselect, check visibility
+		for i := 0; i < len(rowIDs); i++ {
+			if node.object.meta.Load().IsAppendable() {
+				if commitTSs[i].GT(&startTS) {
+					continue
+				}
+			}
+			rowID := rowIDs[i]
+			if types.PrefixCompare(rowID[:], blkID[:]) == 0 {
+				if *deletes == nil {
+					*deletes = &nulls.Nulls{}
+				}
+				offset := rowID.GetRowOffset()
+				(*deletes).Add(uint64(offset) + deleteStartOffset)
+			}
+		}
+	}
+	return nil
 }

@@ -91,7 +91,10 @@ func Test_NoopSpan_End(t *testing.T) {
 		name string
 		args args
 	}{
-		// TODO: Add test cases.
+		{
+			name: "normal",
+			args: args{in0: []SpanEndOption{}},
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -177,7 +180,7 @@ func Test_NoopTracer_Start(t1 *testing.T) {
 	type args struct {
 		ctx   context.Context
 		name  string
-		in2   []SpanOption
+		in2   []SpanStartOption
 		endIn []SpanEndOption
 	}
 	tests := []struct {
@@ -191,10 +194,21 @@ func Test_NoopTracer_Start(t1 *testing.T) {
 			args: args{
 				ctx:   context.Background(),
 				name:  "NoopTracer_Start",
-				in2:   []SpanOption{WithNewRoot(true)},
+				in2:   []SpanStartOption{WithNewRoot(true)},
 				endIn: []SpanEndOption{},
 			},
 			want:  ContextWithSpan(context.Background(), NoopSpan{}),
+			want1: NoopSpan{},
+		},
+		{
+			name: "empty",
+			args: args{
+				ctx:   context.Background(),
+				name:  "NoopTracer_Start",
+				in2:   []SpanStartOption{},
+				endIn: []SpanEndOption{},
+			},
+			want:  context.Background(),
 			want1: NoopSpan{},
 		},
 		{
@@ -202,7 +216,7 @@ func Test_NoopTracer_Start(t1 *testing.T) {
 			args: args{
 				ctx:   ContextWithSpan(context.Background(), &NonRecordingSpan{}),
 				name:  "NoopTracer_Start",
-				in2:   []SpanOption{WithNewRoot(true)},
+				in2:   []SpanStartOption{WithNewRoot(true)},
 				endIn: []SpanEndOption{},
 			},
 			want:  ContextWithSpan(ContextWithSpan(context.Background(), &NonRecordingSpan{}), NoopSpan{}),

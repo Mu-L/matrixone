@@ -23,13 +23,13 @@ import (
 )
 
 var (
-	Int64BatchHash     = wyhashInt64Batch
-	Int64CellBatchHash = wyhashInt64CellBatch
-
-	BytesBatchGenHashStates  = wyhashBytesBatch
-	Int192BatchGenHashStates = wyhashInt192Batch
-	Int256BatchGenHashStates = wyhashInt256Batch
-	Int320BatchGenHashStates = wyhashInt320Batch
+	Int64BatchHash                  = wyhashInt64Batch
+	Int64HashWithFixedSeed          = wyhash64WithFixedSeed
+	BytesBatchGenHashStates         = wyhashBytesBatch
+	BytesBatchGenHashStatesWithSeed = wyhashBytesBatchWithSeed
+	Int192BatchGenHashStates        = wyhashInt192Batch
+	Int256BatchGenHashStates        = wyhashInt256Batch
+	Int320BatchGenHashStates        = wyhashInt320Batch
 )
 
 // Hashing algorithm inspired by
@@ -100,6 +100,10 @@ func wyhash(p unsafe.Pointer, seed, s uint64) uint64 {
 	return mix(m5^s, mix(a^m2, b^seed))
 }
 
+func wyhash64WithFixedSeed(x uint64) uint64 {
+	return mix(m5^8, mix(x^m2, x^m3^m4^m1))
+}
+
 func wyhash64(x, seed uint64) uint64 {
 	return mix(m5^8, mix(x^m2, x^seed^hashkey[0]^m1))
 }
@@ -126,14 +130,6 @@ func wyhashInt64Batch(data unsafe.Pointer, hashes *uint64, length int) {
 	}
 }
 
-func wyhashInt64CellBatch(data unsafe.Pointer, hashes *uint64, length int) {
-	dataSlice := unsafe.Slice((*Int64HashMapCell)(data), length)
-	hashSlice := unsafe.Slice(hashes, length)
-	for i := 0; i < length; i++ {
-		hashSlice[i] = wyhash64(dataSlice[i].Key, randseed)
-	}
-}
-
 func wyhashBytesBatch(data *[]byte, states *[3]uint64, length int) {
 	dataSlice := unsafe.Slice((*[]byte)(data), length)
 	hashSlice := unsafe.Slice((*[3]uint64)(states), length)
@@ -141,6 +137,16 @@ func wyhashBytesBatch(data *[]byte, states *[3]uint64, length int) {
 		hashSlice[i][0] = wyhash(unsafe.Pointer(&dataSlice[i][0]), randseed, uint64(len(dataSlice[i])))
 		hashSlice[i][1] = wyhash(unsafe.Pointer(&dataSlice[i][0]), randseed<<32, uint64(len(dataSlice[i])))
 		hashSlice[i][2] = wyhash(unsafe.Pointer(&dataSlice[i][0]), randseed>>32, uint64(len(dataSlice[i])))
+	}
+}
+
+func wyhashBytesBatchWithSeed(data *[]byte, states *[3]uint64, length int, seed uint64) {
+	dataSlice := unsafe.Slice((*[]byte)(data), length)
+	hashSlice := unsafe.Slice((*[3]uint64)(states), length)
+	for i := 0; i < length; i++ {
+		hashSlice[i][0] = wyhash(unsafe.Pointer(&dataSlice[i][0]), seed, uint64(len(dataSlice[i])))
+		hashSlice[i][1] = wyhash(unsafe.Pointer(&dataSlice[i][0]), seed<<32, uint64(len(dataSlice[i])))
+		hashSlice[i][2] = wyhash(unsafe.Pointer(&dataSlice[i][0]), seed>>32, uint64(len(dataSlice[i])))
 	}
 }
 

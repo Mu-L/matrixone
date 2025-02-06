@@ -16,13 +16,13 @@ package util
 
 import (
 	"strconv"
-
-	"github.com/matrixorigin/matrixone/pkg/sql/plan/function/builtin/multi"
+	"strings"
 
 	"github.com/fagongzi/util/format"
 	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
@@ -56,6 +56,14 @@ func SplitCompositeClusterByColumnName(s string) []string {
 	}
 
 	return names
+}
+
+func GetClusterByFirstColumn(cbName string) string {
+	if !JudgeIsCompositeClusterByColumn(cbName) {
+		return cbName
+	} else {
+		return SplitCompositeClusterByColumnName(cbName)[0]
+	}
 }
 
 func GetClusterByColumnOrder(cbName, colName string) int {
@@ -94,7 +102,7 @@ func FillCompositeKeyBatch(bat *batch.Batch, ckeyName string, keyParts []string,
 	cCBVectorMap := make(map[string]*vector.Vector)
 	for num, attrName := range bat.Attrs {
 		for _, elem := range keyParts {
-			if attrName == elem {
+			if strings.EqualFold(attrName, elem) {
 				cCBVectorMap[elem] = bat.Vecs[num]
 			}
 		}
@@ -104,7 +112,7 @@ func FillCompositeKeyBatch(bat *batch.Batch, ckeyName string, keyParts []string,
 		v := cCBVectorMap[elem]
 		vs = append(vs, v)
 	}
-	vec, err := multi.Serial(vs, proc)
+	vec, err := function.RunFunctionDirectly(proc, function.SerialFunctionEncodeID, vs, bat.RowCount())
 	if err != nil {
 		return err
 	}

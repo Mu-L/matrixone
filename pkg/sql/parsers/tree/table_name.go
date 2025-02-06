@@ -17,6 +17,7 @@ package tree
 type TableName struct {
 	TableExpr
 	objName
+	AtTsExpr *AtTimeStamp
 }
 
 func (tn TableName) Format(ctx *FmtCtx) {
@@ -29,6 +30,9 @@ func (tn TableName) Format(ctx *FmtCtx) {
 		ctx.WriteByte('.')
 	}
 	ctx.WriteString(string(tn.ObjectName))
+	if tn.AtTsExpr != nil {
+		tn.AtTsExpr.Format(ctx)
+	}
 }
 
 func (tn *TableName) Name() Identifier {
@@ -57,11 +61,56 @@ func (node *TableNames) Format(ctx *FmtCtx) {
 	}
 }
 
-func NewTableName(name Identifier, prefix ObjectNamePrefix) *TableName {
+func NewTableName(name Identifier, prefix ObjectNamePrefix, AtTsExpr *AtTimeStamp) *TableName {
 	return &TableName{
 		objName: objName{
 			ObjectName:       name,
 			ObjectNamePrefix: prefix,
 		},
+		AtTsExpr: AtTsExpr,
 	}
+}
+
+type AtTimeStamp struct {
+	Type         ATTimeStampType
+	SnapshotName string
+	Expr         Expr
+}
+
+func (node *AtTimeStamp) Format(ctx *FmtCtx) {
+	ctx.WriteString("{")
+	ctx.WriteString(node.Type.String())
+	if node.Type != ASOFTIMESTAMP {
+		ctx.WriteString(" = ")
+	} else {
+		ctx.WriteString(" ")
+	}
+	node.Expr.Format(ctx)
+	ctx.WriteString("}")
+}
+
+type ATTimeStampType int
+
+const (
+	ATTIMESTAMPNONE ATTimeStampType = iota
+	ATTIMESTAMPTIME
+	ATTIMESTAMPSNAPSHOT
+	ATMOTIMESTAMP
+	ASOFTIMESTAMP
+)
+
+func (a ATTimeStampType) String() string {
+	switch a {
+	case ATTIMESTAMPNONE: // none
+		return "none"
+	case ATTIMESTAMPTIME: // format: {timestamp = expr}
+		return "timestamp"
+	case ATTIMESTAMPSNAPSHOT: // format: {snapshot = expr}
+		return "snapshot"
+	case ATMOTIMESTAMP: // format: {mo-timestamp = expr}
+		return "mo-timestamp"
+	case ASOFTIMESTAMP: // format: {as of timestamp = expr}
+		return "as of timestamp"
+	}
+	return "unknown"
 }

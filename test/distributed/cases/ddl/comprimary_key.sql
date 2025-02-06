@@ -15,13 +15,14 @@ drop table if exists cpk_table_10;
 drop table if exists cpk_table_11;
 drop table if exists cpk_table_42;
 drop table if exists cpk_table_43;
-create external table ex_table_cpk(clo1 tinyint,clo2 smallint,clo3 int,clo4 bigint,clo5 tinyint unsigned,clo6 smallint unsigned,clo7 int unsigned,clo8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255))infile{"filepath"='$resources/external_table_file/cpk_table_1.csv'} ;
+create external table ex_table_cpk(clo1 tinyint,clo2 smallint,clo3 int,clo4 bigint,clo5 tinyint unsigned,clo6 smallint unsigned,clo7 int unsigned,clo8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255))infile{"filepath"='$resources/external_table_file/cpk_table_1.csv'} fields terminated by ',';
 
 -- 复合主键int+varchar
 create table cpk_table_1(col1 tinyint,col2 smallint,col3 int,col4 bigint,col5 tinyint unsigned,col6 smallint unsigned,col7 int unsigned,col8 bigint unsigned,col9 float,col10 double,col11 varchar(255),col12 Date,col13 DateTime,col14 timestamp,col15 bool,col16 decimal(5,2),col17 text,col18 varchar(255),col19 varchar(255),col20 varchar(255),primary key(col3, col18));
 insert into cpk_table_1 select * from ex_table_cpk;
 select col3,col18 from cpk_table_1;
 -- 唯一性验证
+-- @pattern
 insert into cpk_table_1 select * from ex_table_cpk;
 
 -- 复合主键tinyint+datetime+int
@@ -29,6 +30,7 @@ create  table  cpk_table_2(col1 tinyint,col2 smallint,col3 int,col4 bigint,col5 
 insert into cpk_table_2 select * from ex_table_cpk;
 select col1,col12,col3 from cpk_table_2;
 -- 唯一性验证
+-- @pattern
 insert into cpk_table_2 select * from ex_table_cpk;
 
 -- 复合主键smallint+float+timestamp+varchar
@@ -124,3 +126,15 @@ CREATE external TABLE rawlog_withnull (
 infile{"filepath"='$resources/external_table_file/rawlog_withnull.csv'} fields terminated by ',' enclosed by '\"' lines terminated by '\n';
 select raw_item,node_uuid,node_type,span_id,statement_id,logger_name,timestamp from rawlog_withnull order by 1 limit 1;
 drop table if exists rawlog_withnull;
+-- 包含uuid的复合主键测试
+drop table if exists test;
+CREATE TABLE test (
+    account_id BIGINT UNSIGNED NOT NULL,
+    task_id UUID NOT NULL,
+    task_name VARCHAR(1000) NOT NULL,
+    PRIMARY KEY (account_id, task_id)
+);
+insert into test values(3,"019126ce-64a8-78cf-1234-be2626281abd","task3");
+insert into test values(3,"019126ce-64a8-78cf-5678-be2626281abd","task4");
+-- @pattern
+insert into test values(3,"019126ce-64a8-78cf-5678-be2626281abd","task4");

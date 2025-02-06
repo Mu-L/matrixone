@@ -20,39 +20,38 @@
 # make
 #
 # To re-build MO -
-#	
+#
 #	make clean
-#	make config
 #	make build
 #
 # To re-build MO in debug mode also with race detector enabled -
 #
 # make clean
-# make config
 # make debug
 #
-# To run static checks - 
-# 
+# To run static checks -
+#
 # make install-static-check-tools
 # make static-check
 #
-# To construct a directory named vendor in the main module’s root directory that contains copies of all packages needed to support builds and tests of packages in the main module. 
+# To construct a directory named vendor in the main module’s root directory that contains copies of all packages needed to support builds and tests of packages in the main module.
 # make vendor
 #
 
 # where am I
 ROOT_DIR = $(shell dirname $(realpath $(lastword $(MAKEFILE_LIST))))
-GOBIN := go
 BIN_NAME := mo-service
-MO_DUMP := mo-dump
-BUILD_CFG := gen_config
 UNAME_S := $(shell uname -s)
 GOPATH := $(shell go env GOPATH)
 GO_VERSION=$(shell go version)
 BRANCH_NAME=$(shell git rev-parse --abbrev-ref HEAD)
-LAST_COMMIT_ID=$(shell git rev-parse HEAD)
-BUILD_TIME=$(shell date)
-MO_VERSION=$(shell git describe --always --tags $(shell git rev-list --tags --max-count=1))
+LAST_COMMIT_ID=$(shell git rev-parse --short HEAD)
+BUILD_TIME=$(shell date +%s)
+MO_VERSION=$(shell git symbolic-ref -q --short HEAD || git describe --tags --exact-match)
+GO_MODULE=$(shell go list -m)
+MUSL_DIR=$(ROOT_DIR)/musl
+MUSL_CC=$(MUSL_DIR)/bin/musl-gcc
+MUSL_VERSION:=1.2.5
 
 # cross compilation has been disabled for now
 ifneq ($(GOARCH)$(TARGET_ARCH)$(GOOS)$(TARGET_OS),)
@@ -62,20 +61,17 @@ endif
 ###############################################################################
 # default target
 ###############################################################################
+
 all: build
 
-
 ###############################################################################
-# build vendor directory 
+# build vendor directory
 ###############################################################################
 
-VENDOR_DIRECTORY := ./vendor
 .PHONY: vendor-build
-vendor-build: 
+vendor-build:
 	$(info [go mod vendor])
 	@go mod vendor
-
-
 
 ###############################################################################
 # code generation
@@ -93,33 +89,63 @@ generate-pb:
 # Generate protobuf files
 .PHONY: pb
 pb: vendor-build generate-pb fmt
-	$(info all protos are generated) 
+	$(info all protos are generated)
 
 ###############################################################################
 # build mo-service
 ###############################################################################
 
-RACE_OPT := 
-DEBUG_OPT := 
+RACE_OPT :=
+DEBUG_OPT :=
 CGO_DEBUG_OPT :=
-CGO_OPTS=CGO_CFLAGS="-I$(ROOT_DIR)/cgo" CGO_LDFLAGS="-L$(ROOT_DIR)/cgo -lmo -lm"
-GO=$(CGO_OPTS) $(GOBIN)
-GOLDFLAGS=-ldflags="-X 'main.GoVersion=$(GO_VERSION)' -X 'main.BranchName=$(BRANCH_NAME)' -X 'main.CommitID=$(LAST_COMMIT_ID)' -X 'main.BuildTime=$(BUILD_TIME)' -X 'main.Version=$(MO_VERSION)'"
+CGO_OPTS :=
+GOLDFLAGS=-ldflags="-X '$(GO_MODULE)/pkg/version.GoVersion=$(GO_VERSION)' -X '$(GO_MODULE)/pkg/version.BranchName=$(BRANCH_NAME)' -X '$(GO_MODULE)/pkg/version.CommitID=$(LAST_COMMIT_ID)' -X '$(GO_MODULE)/pkg/version.BuildTime=$(BUILD_TIME)' -X '$(GO_MODULE)/pkg/version.Version=$(MO_VERSION)'"
+TAGS :=
+
+ifeq ($(GOBUILD_OPT),)
+	GOBUILD_OPT :=
+endif
 
 .PHONY: cgo
 cgo:
-	@(cd cgo; make ${CGO_DEBUG_OPT})
+	@(cd cgo; ${MAKE} ${CGO_DEBUG_OPT})
 
-BUILD_NAME=binary
 # build mo-service binary
 .PHONY: build
-build: config cgo cmd/mo-service/$(wildcard *.go)
-	$(info [Build $(BUILD_NAME)])
-	$(GO) build $(RACE_OPT) $(GOLDFLAGS) -o $(BIN_NAME) ./cmd/mo-service
+build: config
+	$(info [Build binary])
+	$(CGO_OPTS) go build $(TAGS) $(RACE_OPT) $(GOLDFLAGS) $(DEBUG_OPT) $(GOBUILD_OPT) -o $(BIN_NAME) ./cmd/mo-service
 
-.PHONY: modump
-modump:
-	$(GO) build $(RACE_OPT) $(GOLDFLAGS) -o $(MO_DUMP) ./cmd/mo-dump
+.PHONY: musl-install
+musl-install:
+ifeq ("$(UNAME_S)","Linux")
+ ifeq ("$(wildcard $(MUSL_CC))","")
+	@rm -rf /tmp/musl-$(MUSL_VERSION) musl-$(MUSL_VERSION).tar.gz
+	@curl -SfL "https://musl.libc.org/releases/musl-$(MUSL_VERSION).tar.gz" -o /tmp/musl-$(MUSL_VERSION).tar.gz
+	@tar -zxf /tmp/musl-$(MUSL_VERSION).tar.gz -C $(ROOT_DIR)
+	@cd musl-$(MUSL_VERSION) && ./configure --prefix=$(MUSL_DIR) --syslibdir=$(MUSL_DIR)/syslib && $(MAKE) && $(MAKE) install
+	@rm -rf musl-$(MUSL_VERSION) /tmp/musl-$(MUSL_VERSION).tar.gz
+ endif
+endif
+
+.PHONY: musl-cgo
+musl-cgo: musl-install
+	@(cd $(ROOT_DIR)/cgo; CC=$(MUSL_CC) ${MAKE} ${CGO_DEBUG_OPT})
+
+.PHONY: musl
+musl: override CGO_OPTS += CC=$(MUSL_CC)
+musl: override GOLDFLAGS:=-ldflags="--linkmode 'external' --extldflags '-static' -X '$(GO_MODULE)/pkg/version.GoVersion=$(GO_VERSION)' -X '$(GO_MODULE)/pkg/version.BranchName=$(BRANCH_NAME)' -X '$(GO_MODULE)/pkg/version.CommitID=$(LAST_COMMIT_ID)' -X '$(GO_MODULE)/pkg/version.BuildTime=$(BUILD_TIME)' -X '$(GO_MODULE)/pkg/version.Version=$(MO_VERSION)'"
+musl: override TAGS := -tags musl
+musl: musl-install musl-cgo config
+musl:
+	$(info [Build binary(musl)])
+	$(CGO_OPTS) go build $(TAGS) $(RACE_OPT) $(GOLDFLAGS) $(DEBUG_OPT) $(GOBUILD_OPT) -o $(BIN_NAME) ./cmd/mo-service
+
+# build mo-tool
+.PHONY: mo-tool
+mo-tool: config
+	$(info [Build mo-tool tool])
+	$(CGO_OPTS) go build -o mo-tool ./cmd/mo-tool
 
 # build mo-service binary for debugging with go's race detector enabled
 # produced executable is 10x slower and consumes much more memory
@@ -135,8 +161,8 @@ debug: build
 ###############################################################################
 # Excluding frontend test cases temporarily
 # Argument SKIP_TEST to skip a specific go test
-.PHONY: ut 
-ut: config cgo
+.PHONY: ut
+ut: config
 	$(info [Unit testing])
 ifeq ($(UNAME_S),Darwin)
 	@cd optools && ./run_ut.sh UT $(SKIP_TEST)
@@ -150,7 +176,7 @@ endif
 UT_PARALLEL ?= 1
 ENABLE_UT ?= "false"
 GOPROXY ?= "https://proxy.golang.com.cn,direct"
-LAUNCH ?= "launch-tae-CN-tae-DN"
+LAUNCH ?= "launch"
 
 .PHONY: ci
 ci:
@@ -168,6 +194,26 @@ ci-clean:
 	@docker rmi matrixorigin/matrixone:local-ci
 	@docker image prune -f
 
+
+###############################################################################
+# docker compose bvt test
+###############################################################################
+
+COMPOSE_LAUNCH := "launch"
+
+.PHONY: compose
+compose:
+	@cd optools/compose_bvt && ./compose_bvt.sh $(ROOT_DIR) $(COMPOSE_LAUNCH)
+
+.PHONY: compose-clean
+compose-clean:
+	@docker compose -f etc/launch-tae-compose/compose.yaml --profile $(COMPOSE_LAUNCH) down --remove-orphans
+	@docker volume rm -f launch-tae-compose_minio_storage
+	@docker image prune -f
+	@cd $(ROOT_DIR) && rm -rf docker-compose-log && rm -rf test/distributed/resources/json/export*
+	@cd $(ROOT_DIR) && rm -rf test/distributed/resources/into_outfile/*.csv
+	@cd $(ROOT_DIR) && rm -rf test/distributed/resources/into_outfile_2/*.csv
+
 ###############################################################################
 # clean
 ###############################################################################
@@ -177,8 +223,10 @@ clean:
 	$(info [Clean up])
 	$(info Clean go test cache)
 	@go clean -testcache
-	rm -f $(BIN_NAME) $(BUILD_CFG)
-	rm -rf $(VENDOR_DIRECTORY)
+	rm -f $(BIN_NAME)
+	rm -rf $(ROOT_DIR)/vendor
+	rm -rf $(MUSL_DIR)
+	rm -rf /tmp/musl-$(MUSL_VERSION).tar.gz
 	$(MAKE) -C cgo clean
 
 ###############################################################################
@@ -191,14 +239,13 @@ fmt:
 
 .PHONY: install-static-check-tools
 install-static-check-tools:
-	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | bash -s -- -b $(GOPATH)/bin v1.48.0
+	@curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/master/install.sh | bash -s -- -b $(GOPATH)/bin v1.60.2
 	@go install github.com/matrixorigin/linter/cmd/molint@latest
 	@go install github.com/apache/skywalking-eyes/cmd/license-eye@v0.4.0
 
-
 .PHONY: static-check
-static-check: config cgo err-check
-	$(CGO_OPTS) go vet -vettool=`which molint` $(shell go list ./... | grep -v github.com/matrixorigin/matrixone/cmd/mo-dump)
+static-check: config err-check
+	$(CGO_OPTS) go vet -vettool=`which molint` ./...
 	$(CGO_OPTS) license-eye -c .licenserc.yml header check
 	$(CGO_OPTS) license-eye -c .licenserc.yml dep check
 	$(CGO_OPTS) golangci-lint run -c .golangci.yml ./...
@@ -207,6 +254,11 @@ fmtErrs := $(shell grep -onr 'fmt.Errorf' pkg/ --exclude-dir=.git --exclude-dir=
 				--exclude=*.pb.go --exclude=system_vars.go --exclude=Makefile)
 errNews := $(shell grep -onr 'errors.New' pkg/ --exclude-dir=.git --exclude-dir=vendor \
 				--exclude=*.pb.go --exclude=system_vars.go --exclude=Makefile)
+withTimeout := $(shell grep -onr 'context.WithTimeout' pkg/ --exclude-dir=.git --exclude-dir=vendor \
+				--exclude=*.pb.go --exclude=*_test.go --exclude=system_vars.go --exclude=Makefile)
+withDeadline := $(shell grep -onr 'context.WithDeadline' pkg/ --exclude-dir=.git --exclude-dir=vendor \
+				--exclude=*.pb.go --exclude=*_test.go --exclude=system_vars.go --exclude=Makefile)
+
 
 .PHONY: err-check
 err-check:
@@ -219,8 +271,15 @@ ifneq ("$(strip $(fmtErrs))$(strip $(errNews))", "")
 		$(warning 'errors.New()' is found.)
 		$(warning One of 'errors.New()' is called at: $(shell printf "%s\n" $(errNews) | head -1))
  endif
-
+ ifneq ("$(strip $(withTimeout))", "")
+ 		$(warning 'context.WithTimeout' is found.)
+ 		$(warning One of 'context.WithTimeout' is called at: $(shell printf "%s\n" $(errNews) | head -1))
+ endif
+ ifneq ("$(strip $(withDeadline))", "")
+ 		$(warning 'context.WithDeadline' is found.)
+ 		$(warning One of 'context.WithDeadline' is called at: $(shell printf "%s\n" $(errNews) | head -1))
+ endif
 	$(error Use moerr instead.)
 else
-	$(info Neither 'fmt.Errorf()' nor 'errors.New()' is found)
+	$(info Does not find 'fmt.Errorf()', 'errors.New()','context.WithTimeout' and 'context.WithDeadline')
 endif

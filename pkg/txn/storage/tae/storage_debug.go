@@ -16,13 +16,14 @@ package taestorage
 
 import (
 	"context"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/cmd_util"
 
 	"github.com/fagongzi/util/protoc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/pb/ctl"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db"
+	"github.com/matrixorigin/matrixone/pkg/sql/plan/function/ctl"
 )
 
 func (s *taeStorage) Debug(ctx context.Context,
@@ -30,59 +31,140 @@ func (s *taeStorage) Debug(ctx context.Context,
 	opCode uint32,
 	data []byte) ([]byte, error) {
 	switch opCode {
-	case uint32(ctl.CmdMethod_Ping):
+	case uint32(api.OpCode_OpPing):
 		return s.handlePing(data), nil
-	case uint32(ctl.CmdMethod_Flush):
-		_, err := handleRead(
-			ctx, s,
-			txnMeta, data,
-			s.taeHandler.HandleFlushTable,
-		)
+	case uint32(api.OpCode_OpFlush):
+		_, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleFlushTable)
 		if err != nil {
-			resp := protoc.MustMarshal(&ctl.DNStringResponse{
+			resp := protoc.MustMarshal(&api.TNStringResponse{
 				ReturnStr: "Failed",
 			})
 			return resp, err
 		}
-		resp := protoc.MustMarshal(&ctl.DNStringResponse{
+		resp := protoc.MustMarshal(&api.TNStringResponse{
 			ReturnStr: "OK",
 		})
 		return resp, err
-	case uint32(ctl.CmdMethod_Checkpoint):
-		_, err := handleRead(
-			ctx, s, txnMeta, data, s.taeHandler.HandleForceCheckpoint,
-		)
+	case uint32(api.OpCode_OpCheckpoint):
+		_, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleForceCheckpoint)
 		if err != nil {
-			resp := protoc.MustMarshal(&ctl.DNStringResponse{
+			resp := protoc.MustMarshal(&api.TNStringResponse{
 				ReturnStr: "Failed",
 			})
 			return resp, err
 		}
-		resp := protoc.MustMarshal(&ctl.DNStringResponse{
+		resp := protoc.MustMarshal(&api.TNStringResponse{
+			ReturnStr: "OK",
+		})
+		return resp, err
+	case uint32(api.OpCode_OpGlobalCheckpoint):
+		_, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleForceGlobalCheckpoint)
+		if err != nil {
+			resp := protoc.MustMarshal(&api.TNStringResponse{
+				ReturnStr: "Failed",
+			})
+			return resp, err
+		}
+		resp := protoc.MustMarshal(&api.TNStringResponse{
 			ReturnStr: "OK",
 		})
 		return resp, err
 
-	case uint32(ctl.CmdMethod_Inspect):
-		resp, err := handleRead(
-			ctx, s, txnMeta, data, s.taeHandler.HandleInspectDN,
-		)
+	case uint32(api.OpCode_OpInspect):
+		resp, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleInspectTN)
 		if err != nil {
-			return types.Encode(&db.InspectResp{
+			return types.Encode(&cmd_util.InspectResp{
 				Message: "Failed",
 			})
 		}
 		return resp.Read()
+	case uint32(api.OpCode_OpAddFaultPoint):
+		_, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleAddFaultPoint)
+		if err != nil {
+			resp := protoc.MustMarshal(&api.TNStringResponse{
+				ReturnStr: "Failed",
+			})
+			return resp, err
+		}
+		resp := protoc.MustMarshal(&api.TNStringResponse{
+			ReturnStr: "OK",
+		})
+		return resp, err
+	case uint32(api.OpCode_OpBackup):
+		resp, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleBackup)
+		if err != nil {
+			return types.Encode(&api.SyncLogTailResp{
+				CkpLocation: "Failed",
+			})
+		}
+		return resp.Read()
+	case uint32(api.OpCode_OpTraceSpan):
+		req := cmd_util.TraceSpan{}
+		if err := req.Unmarshal(data); err != nil {
+			return nil, err
+		}
+		ret := ctl.UpdateCurrentCNTraceSpan(req.Cmd, req.Spans, req.Threshold)
+		return []byte(ret), nil
+
+	case uint32(api.OpCode_OpStorageUsage):
+		resp, _ := handleRead(ctx, txnMeta, data, s.taeHandler.HandleStorageUsage)
+		return resp.Read()
+	case uint32(api.OpCode_OpSnapshotRead):
+		resp, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleSnapshotRead)
+		if err != nil {
+			return types.Encode(&cmd_util.SnapshotReadResp{
+				Succeed: false,
+			})
+		}
+		return resp.Read()
+	case uint32(api.OpCode_OpInterceptCommit):
+		resp, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleInterceptCommit)
+		if err != nil {
+			return types.Encode(&api.SyncLogTailResp{
+				CkpLocation: "Failed",
+			})
+		}
+		return resp.Read()
+	case uint32(api.OpCode_OpDiskDiskCleaner):
+		_, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleDiskCleaner)
+		if err != nil {
+			resp := protoc.MustMarshal(&api.TNStringResponse{
+				ReturnStr: "Failed!" + err.Error(),
+			})
+			return resp, err
+		}
+		resp := protoc.MustMarshal(&api.TNStringResponse{
+			ReturnStr: "OK",
+		})
+		return resp, nil
+	case uint32(api.OpCode_OpGetLatestCheckpoint):
+		resp, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleGetLatestCheckpoint)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Read()
+	case uint32(api.OpCode_OpGetChangedTableList):
+		resp, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleGetChangedTableList)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Read()
+	case uint32(api.OpCode_OpFaultInject):
+		resp, err := handleRead(ctx, txnMeta, data, s.taeHandler.HandleFaultInject)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Read()
 	default:
-		return nil, moerr.NewNotSupportedNoCtx("TAEStorage not support ctl method %d", opCode)
+		return nil, moerr.NewNotSupportedNoCtxf("TAEStorage not support ctl method %d", opCode)
 	}
 }
 
 func (s *taeStorage) handlePing(data []byte) []byte {
-	req := ctl.DNPingRequest{}
+	req := api.TNPingRequest{}
 	protoc.MustUnmarshal(&req, data)
 
-	return protoc.MustMarshal(&ctl.DNPingResponse{
+	return protoc.MustMarshal(&api.TNPingResponse{
 		ShardID:        s.shard.ShardID,
 		ReplicaID:      s.shard.ReplicaID,
 		LogShardID:     s.shard.LogShardID,

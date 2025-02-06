@@ -15,9 +15,13 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
 	"flag"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net/http"
 	_ "net/http/pprof"
 	"os"
@@ -26,20 +30,31 @@ import (
 	"runtime/pprof"
 	"sort"
 	"strings"
+	"time"
 	"unsafe"
 
+	"github.com/felixge/fgprof"
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/cnservice"
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/util/profile"
+	"github.com/matrixorigin/matrixone/pkg/util/status"
 )
 
 var (
-	cpuProfilePathFlag         = flag.String("cpu-profile", "", "write cpu profile to the specified file")
-	allocsProfilePathFlag      = flag.String("allocs-profile", "", "write allocs profile to the specified file")
-	fileServiceProfilePathFlag = flag.String("file-service-profile", "", "write file service profile to the specified file")
-	httpListenAddr             = flag.String("debug-http", "", "http server listen address")
-
-	globalCounterSet = new(perfcounter.CounterSet)
+	cpuProfilePathFlag    = flag.String("cpu-profile", "", "write cpu profile to the specified file")
+	allocsProfilePathFlag = flag.String("allocs-profile", "", "write allocs profile to the specified file")
+	heapProfilePathFlag   = flag.String("heap-profile", "", "write heap profile to the specified file")
+	httpListenAddr        = flag.String("debug-http", "", "http server listen address")
+	profileInterval       = flag.Duration("profile-interval", 0, "profile interval")
+	statusServer          = status.NewServer()
 )
 
 func startCPUProfile() func() {
@@ -82,21 +97,24 @@ func writeAllocsProfile() {
 	logutil.Infof("Allocs profile written to %s", profilePath)
 }
 
-func startFileServiceProfile() func() {
-	filePath := *fileServiceProfilePathFlag
-	if filePath == "" {
-		filePath = "file-service-profile"
+func writeHeapProfile() {
+	profile := pprof.Lookup("heap")
+	if profile == nil {
+		return
 	}
-	f, err := os.Create(filePath)
+	profilePath := *heapProfilePathFlag
+	if profilePath == "" {
+		profilePath = "heap-profile"
+	}
+	f, err := os.Create(profilePath)
 	if err != nil {
 		panic(err)
 	}
-	stop := fileservice.FSProfileHandler.StartProfile(f)
-	logutil.Infof("File service profiling enabled, writing to %s", filePath)
-	return func() {
-		stop()
-		f.Close()
+	defer f.Close()
+	if err := profile.WriteTo(f, 0); err != nil {
+		panic(err)
 	}
+	logutil.Infof("Heap profile written to %s", profilePath)
 }
 
 func init() {
@@ -262,11 +280,17 @@ func init() {
 
 	})
 
-	// file service profile
-	http.Handle("/debug/fs/", fileservice.FSProfileHandler)
-
 	// global performance counter
-	http.Handle("/debug/perfcounter", globalCounterSet)
+	v, ok := perfcounter.Named.Load(perfcounter.NameForGlobal)
+	if ok {
+		http.Handle("/debug/perfcounter/", v.(*perfcounter.CounterSet))
+	}
+
+	// fgprof
+	http.Handle("/debug/fgprof/", fgprof.Handler())
+
+	// status server
+	http.Handle("/debug/status/", statusServer)
 
 }
 
@@ -363,4 +387,108 @@ func _formatBytes(n int64, unitIndex int) string {
 		str = fmt.Sprintf(" %d%s", rem, units[unitIndex])
 	}
 	return _formatBytes(next, unitIndex+1) + str
+}
+
+// saveProfilesLoop save profiles again and again until the
+// mo is terminated.
+func saveProfilesLoop(sigs chan os.Signal) {
+	if *profileInterval == 0 {
+		return
+	}
+
+	if *profileInterval < time.Second*10 {
+		*profileInterval = time.Second * 10
+	}
+
+	cpuProfileInterval := *profileInterval / 2
+
+	quit := false
+	tk := time.NewTicker(*profileInterval)
+	logutil.GetGlobalLogger().Info("save profiles loop started", zap.Duration("profile-interval", *profileInterval), zap.Duration("cpuProfileInterval", cpuProfileInterval))
+	for {
+		select {
+		case <-tk.C:
+			logutil.GetGlobalLogger().Info("save profiles start")
+			saveProfiles()
+			saveCpuProfile(cpuProfileInterval)
+			logutil.GetGlobalLogger().Info("save profiles end")
+		case <-sigs:
+			quit = true
+		}
+		if quit {
+			break
+		}
+	}
+}
+
+func saveProfiles() {
+	//dump heap profile before stopping services
+	saveProfile(profile.HEAP)
+	//dump goroutine before stopping services
+	saveProfile(profile.GOROUTINE)
+	// dump malloc profile
+	saveMallocProfile()
+	// dump http connections profile
+	saveHTTPConnectionsProfile()
+}
+
+func saveProfile(typ string) string {
+	name, _ := uuid.NewV7()
+	profilePath := catalog.BuildProfilePath(globalServiceType, globalNodeId, typ, name.String()) + ".gz"
+	logutil.GetGlobalLogger().Info("save profiles ", zap.String("path", profilePath))
+	cnservice.SaveProfile(profilePath, typ, globalEtlFS)
+	return profilePath
+}
+
+func saveCpuProfile(cpuProfileInterval time.Duration) {
+	genCpuProfile := func(writer io.Writer) error {
+		err := pprof.StartCPUProfile(writer)
+		if err != nil {
+			return err
+		}
+		time.Sleep(cpuProfileInterval)
+		pprof.StopCPUProfile()
+		return err
+	}
+	saveProfileWithType("cpu", genCpuProfile)
+}
+
+func saveMallocProfile() {
+	saveProfileWithType("malloc", malloc.WriteProfileData)
+}
+
+func saveHTTPConnectionsProfile() {
+	saveProfileWithType("http-conns", fileservice.WriteHTTPConnsProfile)
+}
+
+func saveProfileWithType(typ string, genData func(writer io.Writer) error) {
+	buf := bytes.Buffer{}
+	w := gzip.NewWriter(&buf)
+
+	if err := genData(w); err != nil {
+		logutil.GetGlobalLogger().Error(fmt.Sprintf("failed to generate %s profile", typ), zap.Error(err))
+		return
+	}
+	if err := w.Close(); err != nil {
+		return
+	}
+
+	name, _ := uuid.NewV7()
+	profilePath := catalog.BuildProfilePath(globalServiceType, globalNodeId, typ, name.String()) + ".gz"
+	writeVec := fileservice.IOVector{
+		FilePath: profilePath,
+		Entries: []fileservice.IOEntry{
+			{
+				Offset: 0,
+				Data:   buf.Bytes(),
+				Size:   int64(len(buf.Bytes())),
+			},
+		},
+	}
+	ctx, cancel := context.WithTimeoutCause(context.TODO(), time.Minute*3, moerr.CauseSaveMallocProfileTimeout)
+	defer cancel()
+	if err := globalEtlFS.Write(ctx, writeVec); err != nil {
+		err = moerr.AttachCause(ctx, err)
+		logutil.GetGlobalLogger().Error(fmt.Sprintf("failed to write %s profile", typ), zap.Error(err))
+	}
 }

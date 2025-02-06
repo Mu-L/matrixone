@@ -18,10 +18,15 @@
  package task; 
  option go_package = "github.com/matrixorigin/matrixone/pkg/pb/task";
  
- import "github.com/gogo/protobuf/gogoproto/gogo.proto";
- 
- option (gogoproto.goproto_enum_prefix_all) = true;
- 
+import "github.com/gogo/protobuf/gogoproto/gogo.proto";
+import "google/protobuf/timestamp.proto";
+import "metadata.proto";
+
+option (gogoproto.goproto_enum_prefix_all) = true;
+option (gogoproto.sizer_all) = false;
+option (gogoproto.protosizer_all) = true;
+
+
  // TaskStatus task status
  enum TaskStatus {
      // Create is the state of waiting to be scheduled.
@@ -30,6 +35,24 @@
      Running   = 1;
      // Completed the task has been completed.
      Completed = 2;
+     // Paused is the state that the task has been paused by user.
+     Paused = 3;
+     // Error is the state that the task encounters some kind of error.
+     Error = 4;
+     // Canceled is the state that the task is canceled by user.
+     Canceled = 5;
+     // ResumeRequested is the state that resume request has been proposed to
+     // the task and has not been resume.
+     ResumeRequested = 6;
+     // PauseRequested is the state that pause request has been proposed to
+     // the task and has not been paused.
+     PauseRequested = 7;
+     // CancelRequested is the state that cancel request has been proposed to
+     // the task and has not been canceled.
+     CancelRequested = 8;
+     // RestartRequested is the state that restart request has been proposed to
+     // the task and has not been restart.
+     RestartRequested = 9;
  }
 
  // TaskCode task code
@@ -42,6 +65,16 @@
    MetricLogMerge = 2;
    // MetricStorageUsage handle metric server_storage_usage collection
    MetricStorageUsage = 3;
+   // ConnectorKafkaSink is for the streaming connector task.
+   ConnectorKafkaSink = 4;
+   // MergeObject is for the merge object task.
+   MergeObject = 5;
+   // Retention is for table retention
+   Retention = 6;
+   // Init cdc task
+   InitCdc = 7;
+   // MO Table Stats Task
+   MOTableStats = 8;
  }
  
  // TaskMetadata is a task metadata abstraction that can be scheduled for execution at any CN node.
@@ -67,6 +100,18 @@
      int64  DelayDuration = 3;
      // Concurrency is the max number of a task running at the same time. 0 means no limits.
      uint32 Concurrency   = 4;
+     // Labels indicates that the task should run on the CNs with the Labels.
+     map<string, string> Labels = 5;
+     // Resource required by the task
+     Resource Resource = 6;
+ }
+
+ // Resource task resource
+ message Resource {
+   // CPU cpu resource
+   uint64 CPU = 1;
+   // Memory memory resource
+   uint64 Memory = 2;
  }
  
  // ResultCode result code
@@ -86,7 +131,7 @@
  }
  
  // Task task execute info.
- message Task {
+ message AsyncTask {
      uint64        ID            = 1;
      // TaskMetadata task metadata
      TaskMetadata  Metadata      = 2 [(gogoproto.nullable) = false];
@@ -124,4 +169,66 @@
      int64         CreateAt      = 6;
      // CreateAt time of the cron task created. Unix timestamp in ms
      int64         UpdateAt      = 7;
+ }
+
+enum TaskType {
+  Unknown = 0 [(gogoproto.enumvalue_customname) = "TypeUnknown"];
+  KafkaSinkConnector = 1 [(gogoproto.enumvalue_customname) = "TypeKafkaSinkConnector"];
+  RetentionType = 2 [(gogoproto.enumvalue_customname) = "TypeRetention"];
+  CreateCdc = 3 [(gogoproto.enumvalue_customname) = "CreateCdc"];
+}
+
+message ConnectorDetails {
+  string TableName = 1;
+  map<string, string> Options = 2;
+}
+
+message Account {
+   uint64 Id = 1;
+   string Name = 2;
+}
+
+message CreateCdcDetails {
+  //cdc task uuid
+  string TaskId = 1;
+  //cdc task name in CreateCdc
+  string TaskName = 2;
+  //cdc source account
+  repeated Account Accounts = 3;
+}
+
+message RetentionDetails {}
+
+message Details {
+  string Description = 1;
+  uint32 AccountID = 2;
+  string Account = 3;
+  string Username = 4;
+  string Error = 5;
+  oneof Details {
+    ConnectorDetails Connector = 10;
+    RetentionDetails Retention = 11;
+    CreateCdcDetails CreateCdc = 12;
+  }
+}
+
+ message DaemonTask {
+   uint64 ID = 1;
+   TaskMetadata Metadata = 2 [(gogoproto.nullable) = false];
+   uint32 AccountID = 3;
+   string Account = 4;
+   TaskType TaskType = 5;
+   string TaskRunner = 6;
+   TaskStatus TaskStatus = 7;
+   google.protobuf.Timestamp LastHeartbeat = 8
+     [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+   Details Details = 9;
+   google.protobuf.Timestamp CreateAt = 10
+     [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+   google.protobuf.Timestamp UpdateAt = 11
+     [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+   google.protobuf.Timestamp EndAt = 12
+     [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
+   google.protobuf.Timestamp LastRun = 13
+     [ (gogoproto.nullable) = false, (gogoproto.stdtime) = true ];
  }

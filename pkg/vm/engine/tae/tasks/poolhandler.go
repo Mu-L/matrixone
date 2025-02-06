@@ -15,6 +15,7 @@
 package tasks
 
 import (
+	"context"
 	"sync"
 
 	"github.com/matrixorigin/matrixone/pkg/logutil"
@@ -34,13 +35,13 @@ type poolHandler struct {
 	wg     *sync.WaitGroup
 }
 
-func NewPoolHandler(num int) *poolHandler {
+func NewPoolHandler(ctx context.Context, num int) *poolHandler {
 	pool, err := ants.NewPool(num)
 	if err != nil {
 		panic(err)
 	}
 	h := &poolHandler{
-		BaseTaskHandler: *NewBaseEventHandler(poolHandlerName),
+		BaseTaskHandler: *NewBaseEventHandler(ctx, poolHandlerName),
 		pool:            pool,
 		wg:              &sync.WaitGroup{},
 	}
@@ -56,8 +57,8 @@ func (h *poolHandler) Execute(task Task) {
 func (h *poolHandler) doHandle(op iops.IOp) {
 	closure := func(o iops.IOp, wg *sync.WaitGroup) func() {
 		return func() {
+			defer wg.Done()
 			h.opExec(o)
-			wg.Done()
 		}
 	}
 	h.wg.Add(1)

@@ -14,19 +14,28 @@
 
 package hashtable
 
-import "unsafe"
+import (
+	"unsafe"
+)
 
 const (
 	kInitialCellCntBits = 10
 	kInitialCellCnt     = 1 << kInitialCellCntBits
-
-	kLoadFactorNumerator   = 1
-	kLoadFactorDenominator = 2
-
-	//kTwoLevelBucketCntBits = 8
-	//kTwoLevelBucketCnt     = 1 << kTwoLevelBucketCntBits
-	//kMaxTwoLevelBucketCnt  = kTwoLevelBucketCnt - 1
+	maxBlockSize        = 256 * (1 << 20)
+	MB                  = 1 << 20
 )
+
+func maxElemCnt(cellCnt, cellSize uint64) uint64 {
+	totalSize := cellCnt * cellSize
+	if totalSize < 64*MB {
+		return cellCnt / 2
+	} else if totalSize < 128*MB {
+		return cellCnt * 2 / 3
+	} else if totalSize < 256*MB {
+		return cellCnt * 3 / 4
+	}
+	return cellCnt * 4 / 5
+}
 
 type Aggregator interface {
 	StateSize() uint8

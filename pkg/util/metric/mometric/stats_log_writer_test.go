@@ -16,18 +16,22 @@ package mometric
 
 import (
 	"context"
+	"fmt"
+	"math/rand"
+	"sync"
+	"testing"
+	"time"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/util/metric/stats"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
-	"sync"
-	"testing"
-	"time"
 )
 
 // MockService for testing stats Registry
@@ -87,7 +91,7 @@ func TestStatsLogWriter(t *testing.T) {
 	stats.Register("MockServiceStats", stats.WithLogExporter(serviceLogExporter))
 
 	//2.1 Setup a Runtime
-	runtime.SetupProcessLevelRuntime(runtime.NewRuntime(metadata.ServiceType_CN, "test", logutil.GetGlobalLogger()))
+	runtime.SetupServiceBasedRuntime("", runtime.NewRuntime(metadata.ServiceType_CN, "test", logutil.GetGlobalLogger()))
 
 	//2.2 Create custom Hook logger
 	type threadSafeWrittenLog struct {
@@ -97,7 +101,7 @@ func TestStatsLogWriter(t *testing.T) {
 	}
 
 	writtenLogs := threadSafeWrittenLog{}
-	customLogger := runtime.ProcessLevelRuntime().Logger().WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
+	customLogger := runtime.ServiceRuntime("").Logger().WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
 		writtenLogs.Lock()
 		defer writtenLogs.Unlock()
 		writtenLogs.content = append(writtenLogs.content, entry)
@@ -105,8 +109,8 @@ func TestStatsLogWriter(t *testing.T) {
 	}))
 
 	// 2.3 Start the LogWriter
-	c := newStatsLogWriter(&stats.DefaultRegistry, customLogger, 100*time.Millisecond)
-	serviceCtx := context.Background()
+	c := newStatsLogWriter(stats.DefaultRegistry, customLogger, 100*time.Millisecond)
+	serviceCtx := context.WithValue(context.Background(), ServiceTypeKey, "DN")
 	assert.True(t, c.Start(serviceCtx))
 
 	// 3. Perform operations on Dev Stats
@@ -131,7 +135,7 @@ func TestStatsLogWriter(t *testing.T) {
 	defer writtenLogs.Unlock()
 	assert.True(t, len(writtenLogs.content) >= 10)
 	for _, log := range writtenLogs.content {
-		assert.Contains(t, log.Message, "stats ")
+		assert.Contains(t, log.Message, "Stats")
 	}
 
 	// 7. (Optional) Read from the console and validate the log. Example log:
@@ -156,4 +160,43 @@ func waitUtil(timeout, checkInterval time.Duration, check func() bool) error {
 			time.Sleep(checkInterval)
 		}
 	}
+}
+
+func TestWriteBlkReadStats(t *testing.T) {
+	h1, t1 := rand.Int(), rand.Int()+1
+	objectio.BlkReadStats.BlksByReaderStats.Record(h1, t1)
+
+	h2, t2 := rand.Int(), rand.Int()+1
+	objectio.BlkReadStats.EntryCacheHitStats.Record(h2, t2)
+
+	h3, t3 := rand.Int(), rand.Int()+1
+	objectio.BlkReadStats.BlkCacheHitStats.Record(h3, t3)
+
+	s := new(StatsLogWriter)
+	type threadSafeWrittenLog struct {
+		content []zapcore.Entry
+		// This is because, BusyLoop and StatsLogger read (ie len) and write (content) to the same field.
+		sync.Mutex
+	}
+
+	writtenLogs := threadSafeWrittenLog{}
+	runtime.SetupServiceBasedRuntime("", runtime.NewRuntime(metadata.ServiceType_CN, "test", logutil.GetGlobalLogger()))
+	s.logger = runtime.ServiceRuntime("").Logger().WithOptions(zap.Hooks(func(entry zapcore.Entry) error {
+		writtenLogs.Lock()
+		defer writtenLogs.Unlock()
+		writtenLogs.content = append(writtenLogs.content, entry)
+		return nil
+	}))
+	s.writeBlkReadStats()
+
+	expected := fmt.Sprintf("duration: %d, "+
+		"blk hit rate: %d/%d=%.4f, entry hit rate: %d/%d=%.4f, (average) blks in each reader: %d/%d=%.4f",
+		s.gatherInterval,
+		h3, t3, float32(h3)/float32(t3),
+		h2, t2, float32(h2)/float32(t2),
+		t1, h1, float32(t1)/float32(h1),
+	)
+
+	require.Equal(t, writtenLogs.content[0].Level, zapcore.InfoLevel)
+	require.Equal(t, writtenLogs.content[0].Message, expected)
 }

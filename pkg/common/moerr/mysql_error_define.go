@@ -106,7 +106,7 @@ const (
 	ER_TOO_MANY_KEYS             uint16 = 1069
 	ER_TOO_MANY_KEY_PARTS        uint16 = 1070
 	ER_TOO_LONG_KEY              uint16 = 1071
-	ER_KEY_COLUMN_DOES_NOT_EXITS uint16 = 1072
+	ER_KEY_COLUMN_DOES_NOT_EXIST uint16 = 1072
 	ER_BLOB_USED_AS_KEY          uint16 = 1073
 	ER_TOO_BIG_FIELDLENGTH       uint16 = 1074
 	ER_WRONG_AUTO_KEY            uint16 = 1075
@@ -210,7 +210,7 @@ const (
 	ER_REQUIRES_PRIMARY_KEY    uint16 = 1173
 	//OBSOLETE_ER_NO_RAID_COMPILED uint16 = 1174
 	ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE    uint16 = 1175
-	ER_KEY_DOES_NOT_EXITS                 uint16 = 1176
+	ER_KEY_DOES_NOT_EXIST                 uint16 = 1176
 	ER_CHECK_NO_SUCH_TABLE                uint16 = 1177
 	ER_CHECK_NOT_IMPLEMENTED              uint16 = 1178
 	ER_CANT_DO_THIS_DURING_AN_TRANSACTION uint16 = 1179
@@ -5514,7 +5514,7 @@ var MysqlErrorMsgRefer = map[uint16]errorMsgItem{
 	ER_TOO_MANY_KEYS:             {1069, []string{"42000", "S1009"}, "Too many keys specified; max %d keys allowed"},
 	ER_TOO_MANY_KEY_PARTS:        {1070, []string{"42000", "S1009"}, "Too many key parts specified; max %d parts allowed"},
 	ER_TOO_LONG_KEY:              {1071, []string{"42000", "S1009"}, "Specified key was too long; max key length is %d bytes"},
-	ER_KEY_COLUMN_DOES_NOT_EXITS: {1072, []string{"42000", "S1009"}, "Key column '%-.192s' doesn't exist in table"},
+	ER_KEY_COLUMN_DOES_NOT_EXIST: {1072, []string{"42000", "S1009"}, "Key column '%-.192s' doesn't exist in table"},
 	ER_BLOB_USED_AS_KEY:          {1073, []string{"42000", "S1009"}, "BLOB column '%-.192s' can't be used in key specification with the used table type"},
 	ER_TOO_BIG_FIELDLENGTH:       {1074, []string{"42000", "S1009"}, "Column length too big for column '%-.192s' (max = %lu); use BLOB or TEXT instead"},
 	ER_WRONG_AUTO_KEY:            {1075, []string{"42000", "S1009"}, "Incorrect table definition; there can be only one auto column and it must be defined as a key"},
@@ -5618,7 +5618,7 @@ var MysqlErrorMsgRefer = map[uint16]errorMsgItem{
 	ER_REQUIRES_PRIMARY_KEY:    {1173, []string{"42000"}, "This table type requires a primary key"},
 	//OBSOLETE_ER_NO_RAID_COMPILED : {0000,[]string{""},"This version of MySQL is not compiled with RAID support"},
 	ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE:    {1175, []string{"HY000"}, "You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column. %s"},
-	ER_KEY_DOES_NOT_EXITS:                 {1176, []string{"42000", "S1009"}, "Key '%-.192s' doesn't exist in table '%-.192s'"},
+	ER_KEY_DOES_NOT_EXIST:                 {1176, []string{"42000", "S1009"}, "Key '%-.192s' doesn't exist in table '%-.192s'"},
 	ER_CHECK_NO_SUCH_TABLE:                {1177, []string{"42000"}, "Can't open table"},
 	ER_CHECK_NOT_IMPLEMENTED:              {1178, []string{"42000"}, "The storage engine for the table doesn't support %s"},
 	ER_CANT_DO_THIS_DURING_AN_TRANSACTION: {1179, []string{"25000"}, "You are not allowed to execute this command in a transaction"},
@@ -8852,7 +8852,7 @@ var MysqlErrorMsgRefer = map[uint16]errorMsgItem{
 	ER_LDAP_AUTH_INFO_FOR_USER:                                    {11756, []string{"HY000"}, "User is authenticated as: %s external user: %s"},
 	ER_LDAP_AUTH_USER_GROUP_SEARCH_INFO:                           {11757, []string{"HY000"}, "Group search information base DN: %s scope: %d filter: %s attribute: %s"},
 	ER_LDAP_AUTH_GRP_SEARCH_SPECIAL_HDL:                           {11758, []string{"HY000"}, "Special handling for group search, {GA} found"},
-	ER_LDAP_AUTH_GRP_IS_FULL_DN:                                   {11759, []string{"HY000"}, "Group search special handling, group full DN found. "},
+	ER_LDAP_AUTH_GRP_IS_FULL_DN:                                   {11759, []string{"HY000"}, "Group search special handling, group full TN found. "},
 	ER_LDAP_AUTH_USER_NOT_FOUND_IN_ANY_GRP:                        {11760, []string{"HY000"}, "User %s is not member of any group."},
 	ER_LDAP_AUTH_USER_FOUND_IN_MANY_GRPS:                          {11761, []string{"HY000"}, "User %s is member of more than one group"},
 	ER_LDAP_AUTH_USER_HAS_MULTIPLE_GRP_NAMES:                      {11762, []string{"HY000"}, "For user %s has multiple user group names. Please check if group attribute name is correct"},
@@ -10429,7 +10429,7 @@ var MysqlErrorMsgRefer = map[uint16]errorMsgItem{
 	ER_LDAP_AUTH_GRP_INFO_FOUND_IN_MANY_OBJECTS:                  {13334, []string{"HY000"}, "Group information found in multiple user objects. Search filter configuration is incorrect."},
 	ER_LDAP_AUTH_GRP_INCORRECT_ATTRIBUTE:                         {13335, []string{"HY000"}, "User group retrieval: no group attribute found. Incorrect group search attribute. "},
 	ER_LDAP_AUTH_GRP_NULL_ATTRIBUTE_VALUE:                        {13336, []string{"HY000"}, "User group retrieval: Group attribute values is NULL. "},
-	ER_LDAP_AUTH_GRP_DN_PARSING_FAILED:                           {13337, []string{"HY000"}, "User group retrieval: parsing DN failed. "},
+	ER_LDAP_AUTH_GRP_DN_PARSING_FAILED:                           {13337, []string{"HY000"}, "User group retrieval: parsing TN failed. "},
 	ER_LDAP_AUTH_GRP_OBJECT_HAS_USER_INFO:                        {13338, []string{"HY000"}, "User group retrieval: Group object has user information"},
 	ER_LDAP_AUTH_LDAPS:                                           {13339, []string{"HY000"}, "Reserved port for ldaps using ldaps"},
 	ER_LDAP_MAPPING_GET_USER_PROXY:                               {13340, []string{"HY000"}, "Get user proxy"},
@@ -10539,7 +10539,7 @@ var MysqlErrorMsgRefer = map[uint16]errorMsgItem{
 	//OBSOLETE_ER_FUNCTIONAL_INDEX_DATA_IS_TOO_LONG : {3907,[]string{"22001"},"DataSource too long for functional index '%-.64s'"},
 	//OBSOLETE_ER_INVALID_JSON_VALUE_FOR_FUNC_INDEX : {3903,[]string{"22018"},"Invalid JSON value for CAST for functional index '%-.64s'"},
 	//OBSOLETE_ER_JSON_VALUE_OUT_OF_RANGE_FOR_FUNC_INDEX : {3904,[]string{"22003"},"Out of range JSON value for CAST for functional index '%-.64s'"},
-	ER_LDAP_EMPTY_USERDN_PASSWORD:                           {13447, []string{"HY000"}, "Empty user dn or password is not allowed, not attempting LDAP bind."},
+	ER_LDAP_EMPTY_USERDN_PASSWORD:                           {13447, []string{"HY000"}, "Empty user tn or password is not allowed, not attempting LDAP bind."},
 	ER_ACL_WRONG_OR_MISSING_ACL_TABLES_LOG:                  {13449, []string{"HY000"}, "The current layout of the ACL tables does not conform to the server's expected layout. They're either altered, missing or not upgraded from a previous version. However a best effort attempt to read data from these tables will still be made."},
 	ER_LOCK_ORDER_FAILED_WRITE_FILE:                         {13450, []string{"HY000"}, "LOCK_ORDER: Failed to write to file <%s>."},
 	ER_LOCK_ORDER_FAILED_READ_FILE:                          {13451, []string{"HY000"}, "LOCK_ORDER: Failed to read from file <%s>."},

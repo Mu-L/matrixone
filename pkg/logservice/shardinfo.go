@@ -20,12 +20,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/util/trace"
 	"go.uber.org/zap"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
 
 type ShardInfo struct {
@@ -38,14 +38,27 @@ type ShardInfo struct {
 // GetShardInfo is to be invoked when querying ShardInfo on a Log Service node.
 // address is usually the reverse proxy that randomly redirect the request to
 // a known Log Service node.
-func GetShardInfo(address string, shardID uint64) (ShardInfo, bool, error) {
+func GetShardInfo(
+	sid string,
+	address string,
+	shardID uint64,
+) (ShardInfo, bool, error) {
 	respPool := &sync.Pool{}
 	respPool.New = func() interface{} {
 		return &RPCResponse{pool: respPool}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second, moerr.CauseGetShardInfo)
 	defer cancel()
-	cc, err := getRPCClient(ctx, address, respPool, defaultMaxMessageSize, false, "GetShardInfo")
+	cc, err := getRPCClient(
+		ctx,
+		sid,
+		address,
+		respPool,
+		defaultMaxMessageSize,
+		false,
+		0,
+		"GetShardInfo",
+	)
 	if err != nil {
 		return ShardInfo{}, false, err
 	}
@@ -67,7 +80,7 @@ func GetShardInfo(address string, shardID uint64) (ShardInfo, bool, error) {
 	}
 	future, err := cc.Send(ctx, address, rpcReq)
 	if err != nil {
-		return ShardInfo{}, false, err
+		return ShardInfo{}, false, moerr.AttachCause(ctx, err)
 	}
 	defer future.Close()
 	msg, err := future.Get()

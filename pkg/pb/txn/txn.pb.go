@@ -90,26 +90,26 @@ const (
 	// Active is the state of transaction creation, in this state, can execute the
 	// transaction Read/Write/Commit/Rollback.
 	TxnStatus_Active TxnStatus = 0
-	// Prepared for distributed transactions across DNs, a 2pc commit is performed,
-	// and the prepared status means that the transaction on a DN was executed
+	// Prepared for distributed transactions across TNs, a 2pc commit is performed,
+	// and the prepared status means that the transaction on a TN was executed
 	// successfully in the first phase.
 	//
 	// Note that this status needs to be saved to the LogService. Once the first
 	// phase of a transaction is successful, data cannot be lost.
 	TxnStatus_Prepared TxnStatus = 1
-	// Committing for distributed transactions across DNs, once all DNs have completed
+	// Committing for distributed transactions across TNs, once all TNs have completed
 	// the first phase, the transaction enters the Committing state and initiates an
 	// asynchronous process to handle the commit of temporary data.
 	//
-	// Note that when all DNs involved are in the prepared state, the distributed
+	// Note that when all TNs involved are in the prepared state, the distributed
 	// transaction can be considered committed because all data has been written
 	// successfully. The subsequent Committing process just explicitly converts these
 	// writes into committed data.
 	//
 	// Note that the state exists only in memory and is not persisted to the LogService.
-	// It can be restored through the Prepared state, if all(DN).Status == Prepared.
+	// It can be restored through the Prepared state, if all(TN).Status == Prepared.
 	TxnStatus_Committing TxnStatus = 2
-	// Committed after the Committing phase has transformed all DN data involved into
+	// Committed after the Committing phase has transformed all TN data involved into
 	// committed data, the status of the distributed transaction is explicitly recorded
 	// as Committed.
 	//
@@ -120,9 +120,9 @@ const (
 	// asynchronous task to clean up the temporary data written by the transaction.
 	//
 	// Note that the state exists only in memory and is not persisted to the LogService.
-	// It can be restored through the Prepared state, if Any(DN).Status != Prepared.
+	// It can be restored through the Prepared state, if Any(TN).Status != Prepared.
 	TxnStatus_Aborting TxnStatus = 4
-	// Aborted after the Aborting phase, all data involved in the DN is cleaned up and
+	// Aborted after the Aborting phase, all data involved in the TN is cleaned up and
 	// the transaction status is explicitly recorded as Aborted.
 	//
 	// Note that this status needs to be saved to the LogService
@@ -167,32 +167,32 @@ const (
 	TxnMethod_Commit TxnMethod = 2
 	// Rollback rollback transaction
 	TxnMethod_Rollback TxnMethod = 3
-	// Prepare when DN(Coordinator) receives a commit request from CN, it sends a prepare to
-	// each DN(DNShard)
+	// Prepare when TN(Coordinator) receives a commit request from CN, it sends a prepare to
+	// each TN(TNShard)
 	TxnMethod_Prepare TxnMethod = 4
-	// GetStatus query the status of a transaction on a DN. When a DN encounters a transaction
-	// in the Prepared state, it needs to go to the DN(Coordinator) to query the status of the
-	// current transaction. When a DN encounters a transaction in the Prepared state during the
-	// recover, it needs to query the status of the transaction on each DN(DNShard) to determine
+	// GetStatus query the status of a transaction on a TN. When a TN encounters a transaction
+	// in the Prepared state, it needs to go to the TN(Coordinator) to query the status of the
+	// current transaction. When a TN encounters a transaction in the Prepared state during the
+	// recover, it needs to query the status of the transaction on each TN(TNShard) to determine
 	// if the transaction is committed.
 	TxnMethod_GetStatus TxnMethod = 5
-	// CommitDNShard after the 2pc transaction is committed, the temporary data on each DN needs
+	// CommitTNShard after the 2pc transaction is committed, the temporary data on each TN needs
 	// to be explicitly converted to committed data.
-	TxnMethod_CommitDNShard TxnMethod = 6
-	// RollbackDNShard after the 2pc transaction is aborted, the temporary data on each DN needs
+	TxnMethod_CommitTNShard TxnMethod = 6
+	// RollbackTNShard after the 2pc transaction is aborted, the temporary data on each TN needs
 	// to cleanup.
-	TxnMethod_RollbackDNShard TxnMethod = 7
-	// RemoveMedata Remove metadata for transactions on DNShard. For a 2pc distributed transaction,
-	// after all participating DNShards have Prepared successfully, the asynchronous commit process
-	// starts, sending CommitDNShard requests to all participating DNShards in parallel. After each
-	// DNShard has processed the CommitDNShard, the metadata of the transaction cannot be deleted
+	TxnMethod_RollbackTNShard TxnMethod = 7
+	// RemoveMedata Remove metadata for transactions on TNShard. For a 2pc distributed transaction,
+	// after all participating TNShards have Prepared successfully, the asynchronous commit process
+	// starts, sending CommitTNShard requests to all participating TNShards in parallel. After each
+	// TNShard has processed the CommitTNShard, the metadata of the transaction cannot be deleted
 	// immediately, otherwise when the transaction coordinator node is down and restarted, the commit
 	// status of the transaction cannot be determined in the recovery process, as it is possible that
-	// some participating DNShards cannot find the transaction information.
+	// some participating TNShards cannot find the transaction information.
 	//
 	// TODO: needs to work with TAE's log compaction, not currently supported.
 	TxnMethod_RemoveMedata TxnMethod = 8
-	// DEBUG used to send debug request from cn to dn, and received response from dn to cn
+	// DEBUG used to send debug request from cn to tn, and received response from tn to cn
 	TxnMethod_DEBUG TxnMethod = 9
 )
 
@@ -203,8 +203,8 @@ var TxnMethod_name = map[int32]string{
 	3: "Rollback",
 	4: "Prepare",
 	5: "GetStatus",
-	6: "CommitDNShard",
-	7: "RollbackDNShard",
+	6: "CommitTNShard",
+	7: "RollbackTNShard",
 	8: "RemoveMedata",
 	9: "DEBUG",
 }
@@ -216,8 +216,8 @@ var TxnMethod_value = map[string]int32{
 	"Rollback":        3,
 	"Prepare":         4,
 	"GetStatus":       5,
-	"CommitDNShard":   6,
-	"RollbackDNShard": 7,
+	"CommitTNShard":   6,
+	"RollbackTNShard": 7,
 	"RemoveMedata":    8,
 	"DEBUG":           9,
 }
@@ -245,21 +245,25 @@ type TxnMeta struct {
 	PreparedTS timestamp.Timestamp `protobuf:"bytes,4,opt,name=PreparedTS,proto3" json:"PreparedTS"`
 	// CommitTS transaction commit timestamp. For a 2pc transaction, commitTS = max(preparedTS).
 	CommitTS timestamp.Timestamp `protobuf:"bytes,5,opt,name=CommitTS,proto3" json:"CommitTS"`
-	// DNShards all DNShards that have written data. The first DN is the coordinator of the
+	// TNShards all TNShards that have written data. The first TN is the coordinator of the
 	// transaction
-	DNShards []metadata.DNShard `protobuf:"bytes,6,rep,name=DNShards,proto3" json:"DNShards"`
+	TNShards []metadata.TNShard `protobuf:"bytes,6,rep,name=TNShards,proto3" json:"TNShards"`
 	// LockTables For pessimistic transactions, LockTables record the bind metadata of the
 	// LockTable corresponding to the successful locking of the current transaction. This data
-	// is committed to the DN at Commit time, and the DN will check once if these bindings have
+	// is committed to the TN at Commit time, and the TN will check once if these bindings have
 	// changed, and if they have, the transaction will be rolled back.
 	LockTables []lock.LockTable `protobuf:"bytes,7,rep,name=LockTables,proto3" json:"LockTables"`
 	// TxnMode txn mode
 	Mode TxnMode `protobuf:"varint,8,opt,name=Mode,proto3,enum=txn.TxnMode" json:"Mode,omitempty"`
 	// TxnIsolation isolation
-	Isolation            TxnIsolation `protobuf:"varint,9,opt,name=Isolation,proto3,enum=txn.TxnIsolation" json:"Isolation,omitempty"`
-	XXX_NoUnkeyedLiteral struct{}     `json:"-"`
-	XXX_unrecognized     []byte       `json:"-"`
-	XXX_sizecache        int32        `json:"-"`
+	Isolation TxnIsolation `protobuf:"varint,9,opt,name=Isolation,proto3,enum=txn.TxnIsolation" json:"Isolation,omitempty"`
+	// Mirror is mirror is true, means the current txn is not created on current node.
+	Mirror bool `protobuf:"varint,10,opt,name=Mirror,proto3" json:"Mirror,omitempty"`
+	// LockService lock service's service address. Empty if is not pessimistic txn.
+	LockService          string   `protobuf:"bytes,11,opt,name=LockService,proto3" json:"LockService,omitempty"`
+	XXX_NoUnkeyedLiteral struct{} `json:"-"`
+	XXX_unrecognized     []byte   `json:"-"`
+	XXX_sizecache        int32    `json:"-"`
 }
 
 func (m *TxnMeta) Reset()         { *m = TxnMeta{} }
@@ -287,7 +291,7 @@ func (m *TxnMeta) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnMeta.Merge(m, src)
 }
 func (m *TxnMeta) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnMeta) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnMeta.DiscardUnknown(m)
@@ -330,9 +334,9 @@ func (m *TxnMeta) GetCommitTS() timestamp.Timestamp {
 	return timestamp.Timestamp{}
 }
 
-func (m *TxnMeta) GetDNShards() []metadata.DNShard {
+func (m *TxnMeta) GetTNShards() []metadata.TNShard {
 	if m != nil {
-		return m.DNShards
+		return m.TNShards
 	}
 	return nil
 }
@@ -358,17 +362,33 @@ func (m *TxnMeta) GetIsolation() TxnIsolation {
 	return TxnIsolation_SI
 }
 
+func (m *TxnMeta) GetMirror() bool {
+	if m != nil {
+		return m.Mirror
+	}
+	return false
+}
+
+func (m *TxnMeta) GetLockService() string {
+	if m != nil {
+		return m.LockService
+	}
+	return ""
+}
+
 // CNTxnSnapshot snapshot of the cn txn operation.
 type CNTxnSnapshot struct {
 	// ID txn id
 	Txn TxnMeta `protobuf:"bytes,1,opt,name=Txn,proto3" json:"Txn"`
-	// ReadyOnly txn options
+	// Deprecated: use TxnOptions
 	ReadyOnly bool `protobuf:"varint,2,opt,name=ReadyOnly,proto3" json:"ReadyOnly,omitempty"`
-	// EnableCacheWrite txn options
+	// Deprecated: use TxnOptions
 	EnableCacheWrite bool `protobuf:"varint,3,opt,name=EnableCacheWrite,proto3" json:"EnableCacheWrite,omitempty"`
-	// Disable1PCOpt txn options
+	// Deprecated: use TxnOptions
 	Disable1PCOpt        bool             `protobuf:"varint,4,opt,name=Disable1PCOpt,proto3" json:"Disable1PCOpt,omitempty"`
 	LockTables           []lock.LockTable `protobuf:"bytes,5,rep,name=LockTables,proto3" json:"LockTables"`
+	Options              TxnOptions       `protobuf:"bytes,6,opt,name=Options,proto3" json:"Options"`
+	Flag                 uint32           `protobuf:"varint,7,opt,name=Flag,proto3" json:"Flag,omitempty"`
 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
 	XXX_unrecognized     []byte           `json:"-"`
 	XXX_sizecache        int32            `json:"-"`
@@ -399,7 +419,7 @@ func (m *CNTxnSnapshot) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_CNTxnSnapshot.Merge(m, src)
 }
 func (m *CNTxnSnapshot) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *CNTxnSnapshot) XXX_DiscardUnknown() {
 	xxx_messageInfo_CNTxnSnapshot.DiscardUnknown(m)
@@ -442,7 +462,21 @@ func (m *CNTxnSnapshot) GetLockTables() []lock.LockTable {
 	return nil
 }
 
-// CNOpRequest cn read/write request, CN -> DN. If data is written to more than one DN (>1) in a
+func (m *CNTxnSnapshot) GetOptions() TxnOptions {
+	if m != nil {
+		return m.Options
+	}
+	return TxnOptions{}
+}
+
+func (m *CNTxnSnapshot) GetFlag() uint32 {
+	if m != nil {
+		return m.Flag
+	}
+	return 0
+}
+
+// CNOpRequest cn read/write request, CN -> TN. If data is written to more than one TN (>1) in a
 // single transaction, then the transaction becomes a 2pc transaction.
 type CNOpRequest struct {
 	// OpCode request operation type
@@ -451,7 +485,7 @@ type CNOpRequest struct {
 	// format and content
 	Payload []byte `protobuf:"bytes,2,opt,name=Payload,proto3" json:"Payload,omitempty"`
 	// Target target to which the request was sent
-	Target               metadata.DNShard `protobuf:"bytes,3,opt,name=Target,proto3" json:"Target"`
+	Target               metadata.TNShard `protobuf:"bytes,3,opt,name=Target,proto3" json:"Target"`
 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
 	XXX_unrecognized     []byte           `json:"-"`
 	XXX_sizecache        int32            `json:"-"`
@@ -482,7 +516,7 @@ func (m *CNOpRequest) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_CNOpRequest.Merge(m, src)
 }
 func (m *CNOpRequest) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *CNOpRequest) XXX_DiscardUnknown() {
 	xxx_messageInfo_CNOpRequest.DiscardUnknown(m)
@@ -504,14 +538,14 @@ func (m *CNOpRequest) GetPayload() []byte {
 	return nil
 }
 
-func (m *CNOpRequest) GetTarget() metadata.DNShard {
+func (m *CNOpRequest) GetTarget() metadata.TNShard {
 	if m != nil {
 		return m.Target
 	}
-	return metadata.DNShard{}
+	return metadata.TNShard{}
 }
 
-// CNOpResponse cn read/write response, DN -> CN. A request corresponds to a response.
+// CNOpResponse cn read/write response, TN -> CN. A request corresponds to a response.
 type CNOpResponse struct {
 	// Payload response payload
 	Payload              []byte   `protobuf:"bytes,1,opt,name=Payload,proto3" json:"Payload,omitempty"`
@@ -545,7 +579,7 @@ func (m *CNOpResponse) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_CNOpResponse.Merge(m, src)
 }
 func (m *CNOpResponse) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *CNOpResponse) XXX_DiscardUnknown() {
 	xxx_messageInfo_CNOpResponse.DiscardUnknown(m)
@@ -565,8 +599,8 @@ func (m *CNOpResponse) GetPayload() []byte {
 // to TxnMethod.
 //
 // Request flow of TxnRequest as below:
-//  1. CN -> DN (TxnMethod.Read, TxnMethod.Write, TxnMethod.Commit, TxnMethod.Rollback)
-//  2. DN -> DN (TxnMethod.Prepare, TxnMethod.GetStatus, TxnMethod.CommitDNShard, TxnMethod.RollbackDNShard,
+//  1. CN -> TN (TxnMethod.Read, TxnMethod.Write, TxnMethod.Commit, TxnMethod.Rollback)
+//  2. TN -> TN (TxnMethod.Prepare, TxnMethod.GetStatus, TxnMethod.CommitTNShard, TxnMethod.RollbackTNShard,
 //     TxnMethod.RemoveMetadata)
 type TxnRequest struct {
 	// RequestID request id
@@ -587,10 +621,10 @@ type TxnRequest struct {
 	PrepareRequest *TxnPrepareRequest `protobuf:"bytes,8,opt,name=PrepareRequest,proto3" json:"PrepareRequest,omitempty"`
 	// TxnGetStatusRequest corresponds to TxnMethod.GetStatus
 	GetStatusRequest *TxnGetStatusRequest `protobuf:"bytes,9,opt,name=GetStatusRequest,proto3" json:"GetStatusRequest,omitempty"`
-	// TxnCommitDNShardRequest corresponds to TxnMethod.CommitDNShard
-	CommitDNShardRequest *TxnCommitDNShardRequest `protobuf:"bytes,10,opt,name=CommitDNShardRequest,proto3" json:"CommitDNShardRequest,omitempty"`
-	// TxnRollbackDNShardRequest corresponds to TxnMethod.RollbackDNShard
-	RollbackDNShardRequest *TxnRollbackDNShardRequest `protobuf:"bytes,11,opt,name=RollbackDNShardRequest,proto3" json:"RollbackDNShardRequest,omitempty"`
+	// TxnCommitTNShardRequest corresponds to TxnMethod.CommitTNShard
+	CommitTNShardRequest *TxnCommitTNShardRequest `protobuf:"bytes,10,opt,name=CommitTNShardRequest,proto3" json:"CommitTNShardRequest,omitempty"`
+	// TxnRollbackTNShardRequest corresponds to TxnMethod.RollbackTNShard
+	RollbackTNShardRequest *TxnRollbackTNShardRequest `protobuf:"bytes,11,opt,name=RollbackTNShardRequest,proto3" json:"RollbackTNShardRequest,omitempty"`
 	// TxnRemoveMetadataRequest  corresponds to TxnMethod.RemoveMetadata
 	RemoveMetadata *TxnRemoveMetadataRequest `protobuf:"bytes,12,opt,name=RemoveMetadata,proto3" json:"RemoveMetadata,omitempty"`
 	// TxnRequestOptions request options
@@ -625,7 +659,7 @@ func (m *TxnRequest) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnRequest.Merge(m, src)
 }
 func (m *TxnRequest) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnRequest) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnRequest.DiscardUnknown(m)
@@ -696,16 +730,16 @@ func (m *TxnRequest) GetGetStatusRequest() *TxnGetStatusRequest {
 	return nil
 }
 
-func (m *TxnRequest) GetCommitDNShardRequest() *TxnCommitDNShardRequest {
+func (m *TxnRequest) GetCommitTNShardRequest() *TxnCommitTNShardRequest {
 	if m != nil {
-		return m.CommitDNShardRequest
+		return m.CommitTNShardRequest
 	}
 	return nil
 }
 
-func (m *TxnRequest) GetRollbackDNShardRequest() *TxnRollbackDNShardRequest {
+func (m *TxnRequest) GetRollbackTNShardRequest() *TxnRollbackTNShardRequest {
 	if m != nil {
-		return m.RollbackDNShardRequest
+		return m.RollbackTNShardRequest
 	}
 	return nil
 }
@@ -726,7 +760,7 @@ func (m *TxnRequest) GetOptions() *TxnRequestOptions {
 
 // TxnRequestOptions txn options
 type TxnRequestOptions struct {
-	// RetryCodes when DN processes TxnRequest and encounters the specified error, it needs to retry
+	// RetryCodes when TN processes TxnRequest and encounters the specified error, it needs to retry
 	// on the server side. Only read and write can retry.
 	RetryCodes []int32 `protobuf:"varint,1,rep,packed,name=RetryCodes,proto3" json:"RetryCodes,omitempty"`
 	// RetryInterval retry interval, default is 100ms.
@@ -761,7 +795,7 @@ func (m *TxnRequestOptions) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnRequestOptions.Merge(m, src)
 }
 func (m *TxnRequestOptions) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnRequestOptions) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnRequestOptions.DiscardUnknown(m)
@@ -808,10 +842,10 @@ type TxnResponse struct {
 	PrepareResponse *TxnPrepareResponse `protobuf:"bytes,9,opt,name=PrepareResponse,proto3" json:"PrepareResponse,omitempty"`
 	// TxnGetStatusResponse corresponds to TxnMethod.GetStatus response
 	GetStatusResponse *TxnGetStatusResponse `protobuf:"bytes,10,opt,name=GetStatusResponse,proto3" json:"GetStatusResponse,omitempty"`
-	// TxnCommitDNShardResponse corresponds to TxnMethod.CommitDNShard response
-	CommitDNShardResponse *TxnCommitDNShardResponse `protobuf:"bytes,11,opt,name=CommitDNShardResponse,proto3" json:"CommitDNShardResponse,omitempty"`
-	// TxnRollbackDNShardResponse corresponds to TxnMethod.RollbackDNShard response
-	RollbackDNShardResponse *TxnRollbackDNShardResponse `protobuf:"bytes,12,opt,name=RollbackDNShardResponse,proto3" json:"RollbackDNShardResponse,omitempty"`
+	// TxnCommitTNShardResponse corresponds to TxnMethod.CommitTNShard response
+	CommitTNShardResponse *TxnCommitTNShardResponse `protobuf:"bytes,11,opt,name=CommitTNShardResponse,proto3" json:"CommitTNShardResponse,omitempty"`
+	// TxnRollbackTNShardResponse corresponds to TxnMethod.RollbackTNShard response
+	RollbackTNShardResponse *TxnRollbackTNShardResponse `protobuf:"bytes,12,opt,name=RollbackTNShardResponse,proto3" json:"RollbackTNShardResponse,omitempty"`
 	// TxnRemoveMetadataResponse  corresponds to TxnMethod.RemoveMetadata
 	RemoveMetadata       *TxnRemoveMetadataResponse `protobuf:"bytes,13,opt,name=RemoveMetadata,proto3" json:"RemoveMetadata,omitempty"`
 	XXX_NoUnkeyedLiteral struct{}                   `json:"-"`
@@ -844,7 +878,7 @@ func (m *TxnResponse) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnResponse.Merge(m, src)
 }
 func (m *TxnResponse) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnResponse) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnResponse.DiscardUnknown(m)
@@ -922,16 +956,16 @@ func (m *TxnResponse) GetGetStatusResponse() *TxnGetStatusResponse {
 	return nil
 }
 
-func (m *TxnResponse) GetCommitDNShardResponse() *TxnCommitDNShardResponse {
+func (m *TxnResponse) GetCommitTNShardResponse() *TxnCommitTNShardResponse {
 	if m != nil {
-		return m.CommitDNShardResponse
+		return m.CommitTNShardResponse
 	}
 	return nil
 }
 
-func (m *TxnResponse) GetRollbackDNShardResponse() *TxnRollbackDNShardResponse {
+func (m *TxnResponse) GetRollbackTNShardResponse() *TxnRollbackTNShardResponse {
 	if m != nil {
-		return m.RollbackDNShardResponse
+		return m.RollbackTNShardResponse
 	}
 	return nil
 }
@@ -943,12 +977,13 @@ func (m *TxnResponse) GetRemoveMetadata() *TxnRemoveMetadataResponse {
 	return nil
 }
 
-// TxnCommitRequest CN sent the commit request to coordinator DN.
+// TxnCommitRequest CN sent the commit request to coordinator TN.
 type TxnCommitRequest struct {
-	Disable1PCOpt        bool     `protobuf:"varint,2,opt,name=Disable1PCOpt,proto3" json:"Disable1PCOpt,omitempty"`
-	XXX_NoUnkeyedLiteral struct{} `json:"-"`
-	XXX_unrecognized     []byte   `json:"-"`
-	XXX_sizecache        int32    `json:"-"`
+	Payload              []*TxnRequest `protobuf:"bytes,1,rep,name=Payload,proto3" json:"Payload,omitempty"`
+	Disable1PCOpt        bool          `protobuf:"varint,2,opt,name=Disable1PCOpt,proto3" json:"Disable1PCOpt,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}      `json:"-"`
+	XXX_unrecognized     []byte        `json:"-"`
+	XXX_sizecache        int32         `json:"-"`
 }
 
 func (m *TxnCommitRequest) Reset()         { *m = TxnCommitRequest{} }
@@ -976,13 +1011,20 @@ func (m *TxnCommitRequest) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnCommitRequest.Merge(m, src)
 }
 func (m *TxnCommitRequest) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnCommitRequest) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnCommitRequest.DiscardUnknown(m)
 }
 
 var xxx_messageInfo_TxnCommitRequest proto.InternalMessageInfo
+
+func (m *TxnCommitRequest) GetPayload() []*TxnRequest {
+	if m != nil {
+		return m.Payload
+	}
+	return nil
+}
 
 func (m *TxnCommitRequest) GetDisable1PCOpt() bool {
 	if m != nil {
@@ -993,6 +1035,7 @@ func (m *TxnCommitRequest) GetDisable1PCOpt() bool {
 
 // TxnCommitResponse response of TxnCommitRequest.
 type TxnCommitResponse struct {
+	InvalidLockTables    []uint64 `protobuf:"varint,1,rep,packed,name=InvalidLockTables,proto3" json:"InvalidLockTables,omitempty"`
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
@@ -1023,7 +1066,7 @@ func (m *TxnCommitResponse) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnCommitResponse.Merge(m, src)
 }
 func (m *TxnCommitResponse) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnCommitResponse) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnCommitResponse.DiscardUnknown(m)
@@ -1031,7 +1074,14 @@ func (m *TxnCommitResponse) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TxnCommitResponse proto.InternalMessageInfo
 
-// TxnCommitRequest CN sent the rollback request to coordinator DN.
+func (m *TxnCommitResponse) GetInvalidLockTables() []uint64 {
+	if m != nil {
+		return m.InvalidLockTables
+	}
+	return nil
+}
+
+// TxnCommitRequest CN sent the rollback request to coordinator TN.
 type TxnRollbackRequest struct {
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
@@ -1063,7 +1113,7 @@ func (m *TxnRollbackRequest) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnRollbackRequest.Merge(m, src)
 }
 func (m *TxnRollbackRequest) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnRollbackRequest) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnRollbackRequest.DiscardUnknown(m)
@@ -1103,7 +1153,7 @@ func (m *TxnRollbackResponse) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnRollbackResponse.Merge(m, src)
 }
 func (m *TxnRollbackResponse) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnRollbackResponse) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnRollbackResponse.DiscardUnknown(m)
@@ -1111,12 +1161,12 @@ func (m *TxnRollbackResponse) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TxnRollbackResponse proto.InternalMessageInfo
 
-// TxnPrepareRequest when a DN(coordinator) receives a Commit request from a CN, if
-// more than one DN is involved, the 2PC commit process is enabled and the first phase
-// is to send prepare requests to all DNs.
+// TxnPrepareRequest when a TN(coordinator) receives a Commit request from a CN, if
+// more than one TN is involved, the 2PC commit process is enabled and the first phase
+// is to send prepare requests to all TNs.
 type TxnPrepareRequest struct {
-	// DNShard prepare DN
-	DNShard              metadata.DNShard `protobuf:"bytes,1,opt,name=DNShard,proto3" json:"DNShard"`
+	// TNShard prepare TN
+	TNShard              metadata.TNShard `protobuf:"bytes,1,opt,name=TNShard,proto3" json:"TNShard"`
 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
 	XXX_unrecognized     []byte           `json:"-"`
 	XXX_sizecache        int32            `json:"-"`
@@ -1147,7 +1197,7 @@ func (m *TxnPrepareRequest) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnPrepareRequest.Merge(m, src)
 }
 func (m *TxnPrepareRequest) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnPrepareRequest) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnPrepareRequest.DiscardUnknown(m)
@@ -1155,11 +1205,11 @@ func (m *TxnPrepareRequest) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TxnPrepareRequest proto.InternalMessageInfo
 
-func (m *TxnPrepareRequest) GetDNShard() metadata.DNShard {
+func (m *TxnPrepareRequest) GetTNShard() metadata.TNShard {
 	if m != nil {
-		return m.DNShard
+		return m.TNShard
 	}
-	return metadata.DNShard{}
+	return metadata.TNShard{}
 }
 
 // TxnPrepareResponse response of TxnPrepareRequest
@@ -1194,7 +1244,7 @@ func (m *TxnPrepareResponse) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnPrepareResponse.Merge(m, src)
 }
 func (m *TxnPrepareResponse) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnPrepareResponse) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnPrepareResponse.DiscardUnknown(m)
@@ -1202,10 +1252,10 @@ func (m *TxnPrepareResponse) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TxnPrepareResponse proto.InternalMessageInfo
 
-// TxnGetStatusRequest query the status of a transaction on DN
+// TxnGetStatusRequest query the status of a transaction on TN
 type TxnGetStatusRequest struct {
-	// DNShard target DN
-	DNShard              metadata.DNShard `protobuf:"bytes,1,opt,name=DNShard,proto3" json:"DNShard"`
+	// TNShard target TN
+	TNShard              metadata.TNShard `protobuf:"bytes,1,opt,name=TNShard,proto3" json:"TNShard"`
 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
 	XXX_unrecognized     []byte           `json:"-"`
 	XXX_sizecache        int32            `json:"-"`
@@ -1236,7 +1286,7 @@ func (m *TxnGetStatusRequest) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnGetStatusRequest.Merge(m, src)
 }
 func (m *TxnGetStatusRequest) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnGetStatusRequest) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnGetStatusRequest.DiscardUnknown(m)
@@ -1244,11 +1294,11 @@ func (m *TxnGetStatusRequest) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TxnGetStatusRequest proto.InternalMessageInfo
 
-func (m *TxnGetStatusRequest) GetDNShard() metadata.DNShard {
+func (m *TxnGetStatusRequest) GetTNShard() metadata.TNShard {
 	if m != nil {
-		return m.DNShard
+		return m.TNShard
 	}
-	return metadata.DNShard{}
+	return metadata.TNShard{}
 }
 
 // TxnGetStatusResponse response of TxnGetStatusRequest
@@ -1283,7 +1333,7 @@ func (m *TxnGetStatusResponse) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnGetStatusResponse.Merge(m, src)
 }
 func (m *TxnGetStatusResponse) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnGetStatusResponse) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnGetStatusResponse.DiscardUnknown(m)
@@ -1291,28 +1341,28 @@ func (m *TxnGetStatusResponse) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TxnGetStatusResponse proto.InternalMessageInfo
 
-// TxnCommitDNShardRequest commit txn on DNShard. Data needs to be written to the
+// TxnCommitTNShardRequest commit txn on TNShard. Data needs to be written to the
 // LogService.
-type TxnCommitDNShardRequest struct {
-	// DNShard target DN
-	DNShard              metadata.DNShard `protobuf:"bytes,1,opt,name=DNShard,proto3" json:"DNShard"`
+type TxnCommitTNShardRequest struct {
+	// TNShard target TN
+	TNShard              metadata.TNShard `protobuf:"bytes,1,opt,name=TNShard,proto3" json:"TNShard"`
 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
 	XXX_unrecognized     []byte           `json:"-"`
 	XXX_sizecache        int32            `json:"-"`
 }
 
-func (m *TxnCommitDNShardRequest) Reset()         { *m = TxnCommitDNShardRequest{} }
-func (m *TxnCommitDNShardRequest) String() string { return proto.CompactTextString(m) }
-func (*TxnCommitDNShardRequest) ProtoMessage()    {}
-func (*TxnCommitDNShardRequest) Descriptor() ([]byte, []int) {
+func (m *TxnCommitTNShardRequest) Reset()         { *m = TxnCommitTNShardRequest{} }
+func (m *TxnCommitTNShardRequest) String() string { return proto.CompactTextString(m) }
+func (*TxnCommitTNShardRequest) ProtoMessage()    {}
+func (*TxnCommitTNShardRequest) Descriptor() ([]byte, []int) {
 	return fileDescriptor_4f782e76b37adb9a, []int{15}
 }
-func (m *TxnCommitDNShardRequest) XXX_Unmarshal(b []byte) error {
+func (m *TxnCommitTNShardRequest) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *TxnCommitDNShardRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TxnCommitTNShardRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_TxnCommitDNShardRequest.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TxnCommitTNShardRequest.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -1322,44 +1372,44 @@ func (m *TxnCommitDNShardRequest) XXX_Marshal(b []byte, deterministic bool) ([]b
 		return b[:n], nil
 	}
 }
-func (m *TxnCommitDNShardRequest) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_TxnCommitDNShardRequest.Merge(m, src)
+func (m *TxnCommitTNShardRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TxnCommitTNShardRequest.Merge(m, src)
 }
-func (m *TxnCommitDNShardRequest) XXX_Size() int {
-	return m.Size()
+func (m *TxnCommitTNShardRequest) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *TxnCommitDNShardRequest) XXX_DiscardUnknown() {
-	xxx_messageInfo_TxnCommitDNShardRequest.DiscardUnknown(m)
+func (m *TxnCommitTNShardRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_TxnCommitTNShardRequest.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_TxnCommitDNShardRequest proto.InternalMessageInfo
+var xxx_messageInfo_TxnCommitTNShardRequest proto.InternalMessageInfo
 
-func (m *TxnCommitDNShardRequest) GetDNShard() metadata.DNShard {
+func (m *TxnCommitTNShardRequest) GetTNShard() metadata.TNShard {
 	if m != nil {
-		return m.DNShard
+		return m.TNShard
 	}
-	return metadata.DNShard{}
+	return metadata.TNShard{}
 }
 
-// TxnCommitDNShardResponse response of TxnCommitDNShardRequest
-type TxnCommitDNShardResponse struct {
+// TxnCommitTNShardResponse response of TxnCommitTNShardRequest
+type TxnCommitTNShardResponse struct {
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *TxnCommitDNShardResponse) Reset()         { *m = TxnCommitDNShardResponse{} }
-func (m *TxnCommitDNShardResponse) String() string { return proto.CompactTextString(m) }
-func (*TxnCommitDNShardResponse) ProtoMessage()    {}
-func (*TxnCommitDNShardResponse) Descriptor() ([]byte, []int) {
+func (m *TxnCommitTNShardResponse) Reset()         { *m = TxnCommitTNShardResponse{} }
+func (m *TxnCommitTNShardResponse) String() string { return proto.CompactTextString(m) }
+func (*TxnCommitTNShardResponse) ProtoMessage()    {}
+func (*TxnCommitTNShardResponse) Descriptor() ([]byte, []int) {
 	return fileDescriptor_4f782e76b37adb9a, []int{16}
 }
-func (m *TxnCommitDNShardResponse) XXX_Unmarshal(b []byte) error {
+func (m *TxnCommitTNShardResponse) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *TxnCommitDNShardResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TxnCommitTNShardResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_TxnCommitDNShardResponse.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TxnCommitTNShardResponse.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -1369,39 +1419,39 @@ func (m *TxnCommitDNShardResponse) XXX_Marshal(b []byte, deterministic bool) ([]
 		return b[:n], nil
 	}
 }
-func (m *TxnCommitDNShardResponse) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_TxnCommitDNShardResponse.Merge(m, src)
+func (m *TxnCommitTNShardResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TxnCommitTNShardResponse.Merge(m, src)
 }
-func (m *TxnCommitDNShardResponse) XXX_Size() int {
-	return m.Size()
+func (m *TxnCommitTNShardResponse) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *TxnCommitDNShardResponse) XXX_DiscardUnknown() {
-	xxx_messageInfo_TxnCommitDNShardResponse.DiscardUnknown(m)
+func (m *TxnCommitTNShardResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_TxnCommitTNShardResponse.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_TxnCommitDNShardResponse proto.InternalMessageInfo
+var xxx_messageInfo_TxnCommitTNShardResponse proto.InternalMessageInfo
 
-// TxnRollbackDNShardRequest rollback txn on DNShard
-type TxnRollbackDNShardRequest struct {
-	// DNShard target DN
-	DNShard              metadata.DNShard `protobuf:"bytes,1,opt,name=DNShard,proto3" json:"DNShard"`
+// TxnRollbackTNShardRequest rollback txn on TNShard
+type TxnRollbackTNShardRequest struct {
+	// TNShard target TN
+	TNShard              metadata.TNShard `protobuf:"bytes,1,opt,name=TNShard,proto3" json:"TNShard"`
 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
 	XXX_unrecognized     []byte           `json:"-"`
 	XXX_sizecache        int32            `json:"-"`
 }
 
-func (m *TxnRollbackDNShardRequest) Reset()         { *m = TxnRollbackDNShardRequest{} }
-func (m *TxnRollbackDNShardRequest) String() string { return proto.CompactTextString(m) }
-func (*TxnRollbackDNShardRequest) ProtoMessage()    {}
-func (*TxnRollbackDNShardRequest) Descriptor() ([]byte, []int) {
+func (m *TxnRollbackTNShardRequest) Reset()         { *m = TxnRollbackTNShardRequest{} }
+func (m *TxnRollbackTNShardRequest) String() string { return proto.CompactTextString(m) }
+func (*TxnRollbackTNShardRequest) ProtoMessage()    {}
+func (*TxnRollbackTNShardRequest) Descriptor() ([]byte, []int) {
 	return fileDescriptor_4f782e76b37adb9a, []int{17}
 }
-func (m *TxnRollbackDNShardRequest) XXX_Unmarshal(b []byte) error {
+func (m *TxnRollbackTNShardRequest) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *TxnRollbackDNShardRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TxnRollbackTNShardRequest) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_TxnRollbackDNShardRequest.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TxnRollbackTNShardRequest.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -1411,44 +1461,44 @@ func (m *TxnRollbackDNShardRequest) XXX_Marshal(b []byte, deterministic bool) ([
 		return b[:n], nil
 	}
 }
-func (m *TxnRollbackDNShardRequest) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_TxnRollbackDNShardRequest.Merge(m, src)
+func (m *TxnRollbackTNShardRequest) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TxnRollbackTNShardRequest.Merge(m, src)
 }
-func (m *TxnRollbackDNShardRequest) XXX_Size() int {
-	return m.Size()
+func (m *TxnRollbackTNShardRequest) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *TxnRollbackDNShardRequest) XXX_DiscardUnknown() {
-	xxx_messageInfo_TxnRollbackDNShardRequest.DiscardUnknown(m)
+func (m *TxnRollbackTNShardRequest) XXX_DiscardUnknown() {
+	xxx_messageInfo_TxnRollbackTNShardRequest.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_TxnRollbackDNShardRequest proto.InternalMessageInfo
+var xxx_messageInfo_TxnRollbackTNShardRequest proto.InternalMessageInfo
 
-func (m *TxnRollbackDNShardRequest) GetDNShard() metadata.DNShard {
+func (m *TxnRollbackTNShardRequest) GetTNShard() metadata.TNShard {
 	if m != nil {
-		return m.DNShard
+		return m.TNShard
 	}
-	return metadata.DNShard{}
+	return metadata.TNShard{}
 }
 
-// TxnRollbackDNShardResponse response of TxnRollbackDNShardRequest
-type TxnRollbackDNShardResponse struct {
+// TxnRollbackTNShardResponse response of TxnRollbackTNShardRequest
+type TxnRollbackTNShardResponse struct {
 	XXX_NoUnkeyedLiteral struct{} `json:"-"`
 	XXX_unrecognized     []byte   `json:"-"`
 	XXX_sizecache        int32    `json:"-"`
 }
 
-func (m *TxnRollbackDNShardResponse) Reset()         { *m = TxnRollbackDNShardResponse{} }
-func (m *TxnRollbackDNShardResponse) String() string { return proto.CompactTextString(m) }
-func (*TxnRollbackDNShardResponse) ProtoMessage()    {}
-func (*TxnRollbackDNShardResponse) Descriptor() ([]byte, []int) {
+func (m *TxnRollbackTNShardResponse) Reset()         { *m = TxnRollbackTNShardResponse{} }
+func (m *TxnRollbackTNShardResponse) String() string { return proto.CompactTextString(m) }
+func (*TxnRollbackTNShardResponse) ProtoMessage()    {}
+func (*TxnRollbackTNShardResponse) Descriptor() ([]byte, []int) {
 	return fileDescriptor_4f782e76b37adb9a, []int{18}
 }
-func (m *TxnRollbackDNShardResponse) XXX_Unmarshal(b []byte) error {
+func (m *TxnRollbackTNShardResponse) XXX_Unmarshal(b []byte) error {
 	return m.Unmarshal(b)
 }
-func (m *TxnRollbackDNShardResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+func (m *TxnRollbackTNShardResponse) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
 	if deterministic {
-		return xxx_messageInfo_TxnRollbackDNShardResponse.Marshal(b, m, deterministic)
+		return xxx_messageInfo_TxnRollbackTNShardResponse.Marshal(b, m, deterministic)
 	} else {
 		b = b[:cap(b)]
 		n, err := m.MarshalToSizedBuffer(b)
@@ -1458,22 +1508,22 @@ func (m *TxnRollbackDNShardResponse) XXX_Marshal(b []byte, deterministic bool) (
 		return b[:n], nil
 	}
 }
-func (m *TxnRollbackDNShardResponse) XXX_Merge(src proto.Message) {
-	xxx_messageInfo_TxnRollbackDNShardResponse.Merge(m, src)
+func (m *TxnRollbackTNShardResponse) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TxnRollbackTNShardResponse.Merge(m, src)
 }
-func (m *TxnRollbackDNShardResponse) XXX_Size() int {
-	return m.Size()
+func (m *TxnRollbackTNShardResponse) XXX_Size() int {
+	return m.ProtoSize()
 }
-func (m *TxnRollbackDNShardResponse) XXX_DiscardUnknown() {
-	xxx_messageInfo_TxnRollbackDNShardResponse.DiscardUnknown(m)
+func (m *TxnRollbackTNShardResponse) XXX_DiscardUnknown() {
+	xxx_messageInfo_TxnRollbackTNShardResponse.DiscardUnknown(m)
 }
 
-var xxx_messageInfo_TxnRollbackDNShardResponse proto.InternalMessageInfo
+var xxx_messageInfo_TxnRollbackTNShardResponse proto.InternalMessageInfo
 
-// TxnRemoveMetadataRequest remove txn metadata on DNShard
+// TxnRemoveMetadataRequest remove txn metadata on TNShard
 type TxnRemoveMetadataRequest struct {
-	// DNShard target DN
-	DNShard              metadata.DNShard `protobuf:"bytes,1,opt,name=DNShard,proto3" json:"DNShard"`
+	// TNShard target TN
+	TNShard              metadata.TNShard `protobuf:"bytes,1,opt,name=TNShard,proto3" json:"TNShard"`
 	XXX_NoUnkeyedLiteral struct{}         `json:"-"`
 	XXX_unrecognized     []byte           `json:"-"`
 	XXX_sizecache        int32            `json:"-"`
@@ -1504,7 +1554,7 @@ func (m *TxnRemoveMetadataRequest) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnRemoveMetadataRequest.Merge(m, src)
 }
 func (m *TxnRemoveMetadataRequest) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnRemoveMetadataRequest) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnRemoveMetadataRequest.DiscardUnknown(m)
@@ -1512,11 +1562,11 @@ func (m *TxnRemoveMetadataRequest) XXX_DiscardUnknown() {
 
 var xxx_messageInfo_TxnRemoveMetadataRequest proto.InternalMessageInfo
 
-func (m *TxnRemoveMetadataRequest) GetDNShard() metadata.DNShard {
+func (m *TxnRemoveMetadataRequest) GetTNShard() metadata.TNShard {
 	if m != nil {
-		return m.DNShard
+		return m.TNShard
 	}
-	return metadata.DNShard{}
+	return metadata.TNShard{}
 }
 
 // TxnRemoveMetadataResponse response of TxnRemoveMetadataRequest
@@ -1551,7 +1601,7 @@ func (m *TxnRemoveMetadataResponse) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnRemoveMetadataResponse.Merge(m, src)
 }
 func (m *TxnRemoveMetadataResponse) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnRemoveMetadataResponse) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnRemoveMetadataResponse.DiscardUnknown(m)
@@ -1563,7 +1613,7 @@ var xxx_messageInfo_TxnRemoveMetadataResponse proto.InternalMessageInfo
 type TxnError struct {
 	// Code moerr code, used to special error handle without unmarshal moerr
 	Code uint32 `protobuf:"varint,1,opt,name=Code,proto3" json:"Code,omitempty"`
-	// Error we use this field to send moerr from dn to cn. Set with
+	// Error we use this field to send moerr from tn to cn. Set with
 	// moerr.MarshalBinary, and use moerr.UnmarshalBinary to restore
 	// moerr.
 	Error []byte `protobuf:"bytes,2,opt,name=Error,proto3" json:"Error,omitempty"`
@@ -1604,7 +1654,7 @@ func (m *TxnError) XXX_Merge(src proto.Message) {
 	xxx_messageInfo_TxnError.Merge(m, src)
 }
 func (m *TxnError) XXX_Size() int {
-	return m.Size()
+	return m.ProtoSize()
 }
 func (m *TxnError) XXX_DiscardUnknown() {
 	xxx_messageInfo_TxnError.DiscardUnknown(m)
@@ -1633,6 +1683,181 @@ func (m *TxnError) GetTxnErrCode() uint32 {
 	return 0
 }
 
+type TxnOptions struct {
+	Features             uint32          `protobuf:"varint,1,opt,name=Features,proto3" json:"Features,omitempty"`
+	CN                   string          `protobuf:"bytes,2,opt,name=CN,proto3" json:"CN,omitempty"`
+	SessionID            string          `protobuf:"bytes,3,opt,name=SessionID,proto3" json:"SessionID,omitempty"`
+	AccountID            uint32          `protobuf:"varint,4,opt,name=AccountID,proto3" json:"AccountID,omitempty"`
+	ConnectionID         uint32          `protobuf:"varint,5,opt,name=ConnectionID,proto3" json:"ConnectionID,omitempty"`
+	UserName             string          `protobuf:"bytes,6,opt,name=UserName,proto3" json:"UserName,omitempty"`
+	SkipLockTables       []uint64        `protobuf:"varint,7,rep,packed,name=SkipLockTables,proto3" json:"SkipLockTables,omitempty"`
+	SkipLockTableModes   []lock.LockMode `protobuf:"varint,8,rep,packed,name=SkipLockTableModes,proto3,enum=lock.LockMode" json:"SkipLockTableModes,omitempty"`
+	Counter              string          `protobuf:"bytes,9,opt,name=counter,proto3" json:"counter,omitempty"`
+	SessionInfo          string          `protobuf:"bytes,10,opt,name=sessionInfo,proto3" json:"sessionInfo,omitempty"`
+	InRunSql             bool            `protobuf:"varint,11,opt,name=inRunSql,proto3" json:"inRunSql,omitempty"`
+	InCommit             bool            `protobuf:"varint,12,opt,name=inCommit,proto3" json:"inCommit,omitempty"`
+	InRollback           bool            `protobuf:"varint,13,opt,name=inRollback,proto3" json:"inRollback,omitempty"`
+	ByBegin              bool            `protobuf:"varint,14,opt,name=byBegin,proto3" json:"byBegin,omitempty"`
+	Autocommit           bool            `protobuf:"varint,15,opt,name=autocommit,proto3" json:"autocommit,omitempty"`
+	InIncrStmt           bool            `protobuf:"varint,16,opt,name=inIncrStmt,proto3" json:"inIncrStmt,omitempty"`
+	InRollbackStmt       bool            `protobuf:"varint,17,opt,name=inRollbackStmt,proto3" json:"inRollbackStmt,omitempty"`
+	XXX_NoUnkeyedLiteral struct{}        `json:"-"`
+	XXX_unrecognized     []byte          `json:"-"`
+	XXX_sizecache        int32           `json:"-"`
+}
+
+func (m *TxnOptions) Reset()         { *m = TxnOptions{} }
+func (m *TxnOptions) String() string { return proto.CompactTextString(m) }
+func (*TxnOptions) ProtoMessage()    {}
+func (*TxnOptions) Descriptor() ([]byte, []int) {
+	return fileDescriptor_4f782e76b37adb9a, []int{22}
+}
+func (m *TxnOptions) XXX_Unmarshal(b []byte) error {
+	return m.Unmarshal(b)
+}
+func (m *TxnOptions) XXX_Marshal(b []byte, deterministic bool) ([]byte, error) {
+	if deterministic {
+		return xxx_messageInfo_TxnOptions.Marshal(b, m, deterministic)
+	} else {
+		b = b[:cap(b)]
+		n, err := m.MarshalToSizedBuffer(b)
+		if err != nil {
+			return nil, err
+		}
+		return b[:n], nil
+	}
+}
+func (m *TxnOptions) XXX_Merge(src proto.Message) {
+	xxx_messageInfo_TxnOptions.Merge(m, src)
+}
+func (m *TxnOptions) XXX_Size() int {
+	return m.ProtoSize()
+}
+func (m *TxnOptions) XXX_DiscardUnknown() {
+	xxx_messageInfo_TxnOptions.DiscardUnknown(m)
+}
+
+var xxx_messageInfo_TxnOptions proto.InternalMessageInfo
+
+func (m *TxnOptions) GetFeatures() uint32 {
+	if m != nil {
+		return m.Features
+	}
+	return 0
+}
+
+func (m *TxnOptions) GetCN() string {
+	if m != nil {
+		return m.CN
+	}
+	return ""
+}
+
+func (m *TxnOptions) GetSessionID() string {
+	if m != nil {
+		return m.SessionID
+	}
+	return ""
+}
+
+func (m *TxnOptions) GetAccountID() uint32 {
+	if m != nil {
+		return m.AccountID
+	}
+	return 0
+}
+
+func (m *TxnOptions) GetConnectionID() uint32 {
+	if m != nil {
+		return m.ConnectionID
+	}
+	return 0
+}
+
+func (m *TxnOptions) GetUserName() string {
+	if m != nil {
+		return m.UserName
+	}
+	return ""
+}
+
+func (m *TxnOptions) GetSkipLockTables() []uint64 {
+	if m != nil {
+		return m.SkipLockTables
+	}
+	return nil
+}
+
+func (m *TxnOptions) GetSkipLockTableModes() []lock.LockMode {
+	if m != nil {
+		return m.SkipLockTableModes
+	}
+	return nil
+}
+
+func (m *TxnOptions) GetCounter() string {
+	if m != nil {
+		return m.Counter
+	}
+	return ""
+}
+
+func (m *TxnOptions) GetSessionInfo() string {
+	if m != nil {
+		return m.SessionInfo
+	}
+	return ""
+}
+
+func (m *TxnOptions) GetInRunSql() bool {
+	if m != nil {
+		return m.InRunSql
+	}
+	return false
+}
+
+func (m *TxnOptions) GetInCommit() bool {
+	if m != nil {
+		return m.InCommit
+	}
+	return false
+}
+
+func (m *TxnOptions) GetInRollback() bool {
+	if m != nil {
+		return m.InRollback
+	}
+	return false
+}
+
+func (m *TxnOptions) GetByBegin() bool {
+	if m != nil {
+		return m.ByBegin
+	}
+	return false
+}
+
+func (m *TxnOptions) GetAutocommit() bool {
+	if m != nil {
+		return m.Autocommit
+	}
+	return false
+}
+
+func (m *TxnOptions) GetInIncrStmt() bool {
+	if m != nil {
+		return m.InIncrStmt
+	}
+	return false
+}
+
+func (m *TxnOptions) GetInRollbackStmt() bool {
+	if m != nil {
+		return m.InRollbackStmt
+	}
+	return false
+}
+
 func init() {
 	proto.RegisterEnum("txn.TxnIsolation", TxnIsolation_name, TxnIsolation_value)
 	proto.RegisterEnum("txn.TxnMode", TxnMode_name, TxnMode_value)
@@ -1653,103 +1878,123 @@ func init() {
 	proto.RegisterType((*TxnPrepareResponse)(nil), "txn.TxnPrepareResponse")
 	proto.RegisterType((*TxnGetStatusRequest)(nil), "txn.TxnGetStatusRequest")
 	proto.RegisterType((*TxnGetStatusResponse)(nil), "txn.TxnGetStatusResponse")
-	proto.RegisterType((*TxnCommitDNShardRequest)(nil), "txn.TxnCommitDNShardRequest")
-	proto.RegisterType((*TxnCommitDNShardResponse)(nil), "txn.TxnCommitDNShardResponse")
-	proto.RegisterType((*TxnRollbackDNShardRequest)(nil), "txn.TxnRollbackDNShardRequest")
-	proto.RegisterType((*TxnRollbackDNShardResponse)(nil), "txn.TxnRollbackDNShardResponse")
+	proto.RegisterType((*TxnCommitTNShardRequest)(nil), "txn.TxnCommitTNShardRequest")
+	proto.RegisterType((*TxnCommitTNShardResponse)(nil), "txn.TxnCommitTNShardResponse")
+	proto.RegisterType((*TxnRollbackTNShardRequest)(nil), "txn.TxnRollbackTNShardRequest")
+	proto.RegisterType((*TxnRollbackTNShardResponse)(nil), "txn.TxnRollbackTNShardResponse")
 	proto.RegisterType((*TxnRemoveMetadataRequest)(nil), "txn.TxnRemoveMetadataRequest")
 	proto.RegisterType((*TxnRemoveMetadataResponse)(nil), "txn.TxnRemoveMetadataResponse")
 	proto.RegisterType((*TxnError)(nil), "txn.TxnError")
+	proto.RegisterType((*TxnOptions)(nil), "txn.TxnOptions")
 }
 
 func init() { proto.RegisterFile("txn.proto", fileDescriptor_4f782e76b37adb9a) }
 
 var fileDescriptor_4f782e76b37adb9a = []byte{
-	// 1268 bytes of a gzipped FileDescriptorProto
-	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x57, 0xeb, 0x6e, 0xe2, 0x46,
-	0x14, 0x8e, 0xb9, 0x9a, 0xc3, 0x25, 0xc3, 0xe4, 0xe6, 0x4d, 0x53, 0x16, 0x59, 0xab, 0x15, 0x45,
-	0x2d, 0x74, 0xb3, 0xda, 0xaa, 0x6a, 0xa5, 0x48, 0x09, 0x24, 0x69, 0xa4, 0xcd, 0x45, 0x03, 0x6d,
-	0xb5, 0xfd, 0x53, 0x19, 0x98, 0x12, 0x2b, 0x60, 0xbb, 0xf6, 0x24, 0x22, 0xcf, 0xd2, 0x97, 0xe8,
-	0x63, 0xec, 0xcf, 0x7d, 0x80, 0xaa, 0x6a, 0x23, 0xf5, 0x09, 0xfa, 0x02, 0xd5, 0x8c, 0x67, 0x00,
-	0x1b, 0xd8, 0xad, 0xb2, 0xbf, 0x98, 0x39, 0x97, 0xef, 0x8c, 0xcf, 0x39, 0xdf, 0x99, 0x01, 0x72,
-	0x6c, 0xe2, 0x34, 0x3c, 0xdf, 0x65, 0x2e, 0x4e, 0xb2, 0x89, 0xb3, 0xfb, 0xc5, 0xd0, 0x66, 0xd7,
-	0xb7, 0xbd, 0x46, 0xdf, 0x1d, 0x37, 0x87, 0xee, 0xd0, 0x6d, 0x0a, 0x5d, 0xef, 0xf6, 0x17, 0xb1,
-	0x13, 0x1b, 0xb1, 0x0a, 0x7d, 0x76, 0xd7, 0x99, 0x3d, 0xa6, 0x01, 0xb3, 0xc6, 0x9e, 0x14, 0x94,
-	0xc6, 0x94, 0x59, 0x03, 0x8b, 0x59, 0x72, 0x0f, 0x23, 0xb7, 0x7f, 0x13, 0xae, 0xcd, 0xdf, 0x93,
-	0x90, 0xed, 0x4e, 0x9c, 0x73, 0xca, 0x2c, 0x5c, 0x82, 0xc4, 0x59, 0xdb, 0xd0, 0xaa, 0x5a, 0xad,
-	0x40, 0x12, 0x67, 0x6d, 0xfc, 0x1c, 0x32, 0x1d, 0x66, 0xb1, 0xdb, 0xc0, 0x48, 0x54, 0xb5, 0x5a,
-	0x69, 0xbf, 0xd4, 0xe0, 0x07, 0xeb, 0x4e, 0x9c, 0x50, 0x4a, 0xa4, 0x16, 0x7f, 0x03, 0xd0, 0x71,
-	0x2c, 0x2f, 0xb8, 0x76, 0x59, 0xb7, 0x63, 0x24, 0xab, 0x5a, 0x2d, 0xbf, 0xbf, 0xd9, 0x98, 0x9d,
-	0xa2, 0xab, 0x56, 0x47, 0xa9, 0xb7, 0x7f, 0x3e, 0x5d, 0x23, 0x73, 0xd6, 0xdc, 0xf7, 0xca, 0xa7,
-	0x9e, 0xe5, 0xd3, 0x41, 0xb7, 0x63, 0xa4, 0x3e, 0xec, 0x3b, 0xb3, 0xc6, 0x5f, 0x81, 0xde, 0x72,
-	0xc7, 0x63, 0x9b, 0x47, 0x4d, 0x7f, 0xd0, 0x73, 0x6a, 0x8b, 0x5f, 0x82, 0xde, 0xbe, 0xe8, 0x5c,
-	0x5b, 0xfe, 0x20, 0x30, 0x32, 0xd5, 0x64, 0x2d, 0xbf, 0x5f, 0x6e, 0x4c, 0x53, 0x24, 0x35, 0xca,
-	0x49, 0x19, 0xe2, 0x57, 0x00, 0xaf, 0xdd, 0xfe, 0x4d, 0xd7, 0xea, 0x8d, 0x68, 0x60, 0x64, 0x85,
-	0xdb, 0x7a, 0x43, 0x64, 0x72, 0x2a, 0x57, 0x67, 0x9c, 0x19, 0xe2, 0x2a, 0xa4, 0xce, 0xdd, 0x01,
-	0x35, 0x74, 0x91, 0xc1, 0x82, 0xca, 0x20, 0x97, 0x11, 0xa1, 0xc1, 0x4d, 0xc8, 0x9d, 0x05, 0xee,
-	0xc8, 0x62, 0xb6, 0xeb, 0x18, 0x39, 0x61, 0x56, 0x56, 0x66, 0x53, 0x05, 0x99, 0xd9, 0x98, 0x7f,
-	0x68, 0x50, 0x6c, 0x5d, 0xf0, 0x32, 0xc8, 0x34, 0xe2, 0x67, 0x90, 0xec, 0x4e, 0x1c, 0x51, 0xb9,
-	0xfc, 0x5c, 0x0c, 0xca, 0x2c, 0x79, 0x22, 0xae, 0xc6, 0x7b, 0x90, 0x23, 0xd4, 0x1a, 0xdc, 0x5f,
-	0x3a, 0xa3, 0x7b, 0x51, 0x51, 0x9d, 0xcc, 0x04, 0xb8, 0x0e, 0xe8, 0xd8, 0xe1, 0x67, 0x6e, 0x59,
-	0xfd, 0x6b, 0xfa, 0xa3, 0x6f, 0x33, 0x2a, 0x4a, 0xa9, 0x93, 0x05, 0x39, 0x7e, 0x06, 0xc5, 0xb6,
-	0x1d, 0x70, 0xe1, 0x8b, 0xab, 0xd6, 0xa5, 0xc7, 0x44, 0xdd, 0x74, 0x12, 0x15, 0xc6, 0x32, 0x96,
-	0xfe, 0x9f, 0x19, 0x33, 0x3d, 0xc8, 0xb7, 0x2e, 0x2e, 0x3d, 0x42, 0x7f, 0xbd, 0xa5, 0x01, 0xc3,
-	0xdb, 0x90, 0xb9, 0xf4, 0x5a, 0x3c, 0x85, 0xfc, 0xf3, 0x8a, 0x44, 0xee, 0xb0, 0x01, 0xd9, 0x2b,
-	0xeb, 0x7e, 0xe4, 0x5a, 0x03, 0xf1, 0x2d, 0x05, 0xa2, 0xb6, 0xb8, 0x09, 0x99, 0xae, 0xe5, 0x0f,
-	0x29, 0x93, 0xad, 0xb8, 0xb2, 0xb8, 0xd2, 0xcc, 0xac, 0x41, 0x21, 0x8c, 0x18, 0x78, 0xae, 0x13,
-	0x44, 0xa0, 0xb5, 0x08, 0xb4, 0xf9, 0x4f, 0x1a, 0xa0, 0x3b, 0x71, 0xd4, 0xd9, 0x44, 0x46, 0xc5,
-	0x52, 0xf2, 0x26, 0x45, 0x66, 0x02, 0x55, 0x95, 0xc4, 0xfb, 0xab, 0xf2, 0x1c, 0x32, 0xe7, 0x94,
-	0x5d, 0xbb, 0x03, 0x71, 0xda, 0x39, 0x92, 0x85, 0x52, 0x22, 0xb5, 0x18, 0x43, 0xea, 0x64, 0x64,
-	0x0d, 0x45, 0xaa, 0x8b, 0x44, 0xac, 0x71, 0x03, 0x72, 0xad, 0x0b, 0x19, 0x50, 0x32, 0x00, 0x09,
-	0xf7, 0xb9, 0x04, 0x92, 0x99, 0x09, 0xfe, 0x16, 0x8a, 0x21, 0x09, 0x94, 0x4f, 0x46, 0xf8, 0x6c,
-	0xa9, 0x90, 0x11, 0x25, 0x89, 0xda, 0xe2, 0x43, 0x58, 0x27, 0xee, 0x68, 0xd4, 0xb3, 0xfa, 0x37,
-	0xca, 0x3d, 0x2b, 0xdc, 0x77, 0x94, 0x7b, 0x4c, 0x4d, 0xe2, 0xf6, 0xf8, 0x00, 0x4a, 0x92, 0xbe,
-	0x0a, 0x41, 0x17, 0x08, 0xdb, 0x0a, 0x21, 0xaa, 0x25, 0x31, 0x6b, 0xdc, 0x06, 0x74, 0x4a, 0x99,
-	0x9c, 0x3e, 0x12, 0x21, 0x27, 0x10, 0x0c, 0x85, 0x10, 0xd7, 0x93, 0x05, 0x0f, 0x7c, 0x05, 0x9b,
-	0xe1, 0x97, 0xc9, 0x6e, 0x50, 0x48, 0x20, 0x90, 0xf6, 0xa2, 0xc9, 0x88, 0xda, 0x90, 0xa5, 0x9e,
-	0xf8, 0x07, 0xd8, 0x56, 0x9f, 0x1a, 0xc3, 0xcc, 0x0b, 0xcc, 0x4a, 0x3c, 0x43, 0x31, 0xd4, 0x15,
-	0xde, 0xf8, 0x18, 0x4a, 0x84, 0x8e, 0xdd, 0x3b, 0x7a, 0x2e, 0x1b, 0xd8, 0x28, 0x08, 0xbc, 0x4f,
-	0xa7, 0x78, 0x11, 0xed, 0x34, 0x6d, 0x51, 0x31, 0xfe, 0x12, 0xb2, 0x97, 0x1e, 0x1f, 0x1d, 0x81,
-	0x51, 0x8c, 0xe6, 0x5b, 0x7a, 0x48, 0x2d, 0x51, 0x66, 0xe6, 0x1b, 0x28, 0x2f, 0x68, 0x71, 0x05,
-	0x80, 0x50, 0xe6, 0xdf, 0x73, 0xfa, 0x05, 0x86, 0x56, 0x4d, 0xd6, 0xd2, 0x64, 0x4e, 0xc2, 0xa7,
-	0x82, 0xd8, 0x9d, 0x39, 0x8c, 0xfa, 0x77, 0xd6, 0x48, 0x74, 0x7e, 0x92, 0x44, 0x85, 0xe6, 0xbf,
-	0x69, 0xc8, 0x0b, 0x6c, 0x49, 0xb6, 0xf7, 0x73, 0xa8, 0xb2, 0x92, 0x43, 0x1f, 0xcf, 0x9e, 0xcf,
-	0x40, 0xef, 0x4e, 0x9c, 0x63, 0xdf, 0x77, 0x7d, 0x49, 0x9e, 0xa2, 0xf2, 0x16, 0x42, 0x32, 0x55,
-	0xe3, 0x57, 0xd1, 0x09, 0x21, 0x79, 0x53, 0x9e, 0xe3, 0x5a, 0xa8, 0x20, 0xd1, 0x41, 0x72, 0x00,
-	0x25, 0xc5, 0x21, 0xe9, 0x98, 0x8d, 0xe6, 0x3f, 0xaa, 0x25, 0x31, 0x6b, 0xde, 0xef, 0x33, 0x0a,
-	0x49, 0x04, 0x3d, 0xda, 0xef, 0x71, 0x3d, 0x59, 0xf0, 0xe0, 0xc4, 0x9d, 0xf2, 0x48, 0x82, 0xe4,
-	0xa2, 0xc4, 0x8d, 0xa9, 0x49, 0xdc, 0x1e, 0x9f, 0x42, 0x79, 0x8e, 0x46, 0x12, 0x24, 0xe4, 0xcb,
-	0x93, 0x25, 0xcc, 0x93, 0x30, 0x8b, 0x3e, 0xb8, 0x03, 0x5b, 0x31, 0x06, 0x49, 0xb0, 0x7c, 0xb4,
-	0xb1, 0x97, 0x1a, 0x91, 0xe5, 0xbe, 0xf8, 0x0d, 0xec, 0x2c, 0x10, 0x48, 0xc2, 0x86, 0x7c, 0x79,
-	0xba, 0x92, 0x7f, 0x12, 0x78, 0x95, 0x3f, 0x3e, 0x59, 0x60, 0x60, 0x31, 0xc6, 0xe8, 0x18, 0x03,
-	0x55, 0x25, 0xa3, 0x72, 0xf3, 0x6b, 0x40, 0xf1, 0xf9, 0xba, 0x78, 0x8b, 0x26, 0x96, 0xdc, 0xa2,
-	0xe6, 0x86, 0xa0, 0x62, 0xb4, 0x31, 0xcc, 0x4d, 0xc0, 0x8b, 0xf3, 0xd6, 0xdc, 0x82, 0x8d, 0x25,
-	0x1d, 0x61, 0x9e, 0x08, 0x84, 0xd8, 0x28, 0x7d, 0x01, 0x59, 0xf9, 0xad, 0xf2, 0xd9, 0xb0, 0xf2,
-	0x96, 0x54, 0x76, 0x32, 0x68, 0xac, 0x35, 0xcc, 0xef, 0x44, 0xd0, 0x85, 0x21, 0xfb, 0x08, 0xfc,
-	0x6d, 0xd8, 0x5c, 0xd6, 0x46, 0xe6, 0x6b, 0xd8, 0x59, 0x31, 0x8e, 0x1f, 0x13, 0x65, 0x17, 0x8c,
-	0x55, 0xfd, 0x65, 0x5e, 0xc0, 0x93, 0x95, 0x43, 0xfa, 0x31, 0xb1, 0xf6, 0x60, 0x77, 0x75, 0xd3,
-	0x99, 0xe7, 0xe2, 0x24, 0x4b, 0x47, 0xf8, 0x63, 0x82, 0x7d, 0x12, 0x1e, 0x7e, 0x69, 0x3f, 0x9a,
-	0xdd, 0xd9, 0xac, 0xe3, 0xb3, 0x70, 0xee, 0x3d, 0x25, 0xd6, 0x78, 0x13, 0xd2, 0xe1, 0x20, 0x0c,
-	0xdf, 0x52, 0xe1, 0x86, 0x4f, 0xfc, 0xd0, 0x4b, 0xd8, 0x27, 0x85, 0xfd, 0x9c, 0xa4, 0x5e, 0x81,
-	0xc2, 0xfc, 0x23, 0x15, 0x67, 0x20, 0xd1, 0x39, 0x43, 0x6b, 0xfc, 0x97, 0xb4, 0x90, 0x56, 0xaf,
-	0x87, 0xff, 0x2d, 0x78, 0x80, 0x12, 0x00, 0xbf, 0x47, 0xc6, 0x76, 0xc0, 0xec, 0x3e, 0x5a, 0xc3,
-	0xeb, 0x90, 0xbf, 0xa2, 0x41, 0xa0, 0x04, 0x5a, 0xfd, 0x67, 0xc8, 0x4d, 0xff, 0x59, 0x60, 0x80,
-	0xcc, 0x61, 0x9f, 0xd9, 0x77, 0x14, 0xad, 0xe1, 0x02, 0xe8, 0xea, 0xcd, 0x8f, 0x34, 0x8e, 0x13,
-	0xd6, 0x8e, 0xd9, 0xce, 0x10, 0x25, 0x70, 0x11, 0x72, 0x72, 0x4f, 0x07, 0x28, 0xc9, 0x8d, 0x0f,
-	0x7b, 0xae, 0x2f, 0x94, 0x29, 0x9c, 0x87, 0xac, 0xd8, 0xd1, 0x01, 0x4a, 0xd7, 0x7f, 0xd3, 0x44,
-	0x04, 0x79, 0x21, 0xe8, 0x90, 0xe2, 0x6f, 0x5f, 0xb4, 0x86, 0x73, 0x90, 0x16, 0xaf, 0x5a, 0xa4,
-	0xf1, 0xb0, 0x21, 0x18, 0x4a, 0x70, 0x24, 0x55, 0x38, 0x94, 0xe4, 0x48, 0xf2, 0x10, 0x28, 0xc5,
-	0x63, 0x4e, 0xbb, 0x14, 0xa5, 0x71, 0x59, 0xbd, 0xaa, 0x64, 0x25, 0x50, 0x06, 0x6f, 0xcc, 0xde,
-	0x4a, 0x4a, 0x98, 0xc5, 0x08, 0x0a, 0xaa, 0x3a, 0xbc, 0x36, 0x48, 0xe7, 0xa1, 0xdb, 0xc7, 0x47,
-	0xdf, 0x9f, 0xa2, 0xdc, 0xd1, 0xc1, 0xbb, 0xbf, 0x2b, 0xda, 0xdb, 0x87, 0x8a, 0xf6, 0xee, 0xa1,
-	0xa2, 0xfd, 0xf5, 0x50, 0xd1, 0x7e, 0xfa, 0x7c, 0xee, 0x5f, 0xdf, 0xd8, 0x62, 0xbe, 0x3d, 0x71,
-	0x7d, 0x7b, 0x68, 0x3b, 0x6a, 0xe3, 0xd0, 0xa6, 0x77, 0x33, 0x6c, 0x7a, 0xbd, 0x26, 0x9b, 0x38,
-	0xbd, 0x8c, 0xf8, 0x3b, 0xf7, 0xf2, 0xbf, 0x00, 0x00, 0x00, 0xff, 0xff, 0x37, 0x40, 0x8b, 0x72,
-	0x3c, 0x0e, 0x00, 0x00,
+	// 1577 bytes of a gzipped FileDescriptorProto
+	0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xa4, 0x58, 0xcb, 0x6e, 0xdb, 0x46,
+	0x17, 0x36, 0x75, 0x25, 0x8f, 0x2e, 0xa6, 0x26, 0x8e, 0xc3, 0xf8, 0xcf, 0xaf, 0x08, 0x44, 0x10,
+	0x28, 0x46, 0x7e, 0xeb, 0x4f, 0x82, 0x74, 0xd1, 0x02, 0x01, 0x6c, 0xd9, 0x4e, 0x05, 0x44, 0xb2,
+	0x31, 0x52, 0x5a, 0xa4, 0x9b, 0x82, 0x92, 0x26, 0x32, 0x61, 0x89, 0x54, 0xc8, 0x91, 0x21, 0x3f,
+	0x4b, 0x37, 0xed, 0x2b, 0xf4, 0x29, 0xb2, 0xcc, 0x13, 0x14, 0x6d, 0x8a, 0x6e, 0xba, 0xed, 0x0b,
+	0x14, 0x33, 0x9c, 0xe1, 0x4d, 0x52, 0x52, 0xb8, 0x2b, 0xf1, 0xdc, 0xbe, 0x33, 0x3c, 0x73, 0xbe,
+	0x33, 0x1c, 0x81, 0x46, 0x97, 0xce, 0xc1, 0xdc, 0x73, 0xa9, 0x8b, 0xb2, 0x74, 0xe9, 0xec, 0xfd,
+	0x6f, 0x62, 0xd3, 0x8b, 0xc5, 0xf0, 0x60, 0xe4, 0xce, 0x5a, 0x13, 0x77, 0xe2, 0xb6, 0xb8, 0x6d,
+	0xb8, 0x78, 0xcb, 0x25, 0x2e, 0xf0, 0xa7, 0x20, 0x66, 0x6f, 0x9b, 0xda, 0x33, 0xe2, 0x53, 0x6b,
+	0x36, 0x17, 0x8a, 0xea, 0x8c, 0x50, 0x6b, 0x6c, 0x51, 0x4b, 0xc8, 0x30, 0x75, 0x47, 0x97, 0xc1,
+	0xb3, 0xf9, 0x67, 0x16, 0x8a, 0x83, 0xa5, 0xd3, 0x25, 0xd4, 0x42, 0x55, 0xc8, 0x74, 0x8e, 0x0d,
+	0xa5, 0xa1, 0x34, 0xcb, 0x38, 0xd3, 0x39, 0x46, 0x0f, 0xa1, 0xd0, 0xa7, 0x16, 0x5d, 0xf8, 0x46,
+	0xa6, 0xa1, 0x34, 0xab, 0x4f, 0xab, 0x07, 0x6c, 0x61, 0x83, 0xa5, 0x13, 0x68, 0xb1, 0xb0, 0xa2,
+	0x2f, 0x01, 0xfa, 0x8e, 0x35, 0xf7, 0x2f, 0x5c, 0x3a, 0xe8, 0x1b, 0xd9, 0x86, 0xd2, 0x2c, 0x3d,
+	0xdd, 0x39, 0x88, 0x56, 0x31, 0x90, 0x4f, 0x47, 0xb9, 0xf7, 0xbf, 0xdc, 0xdf, 0xc2, 0x31, 0x6f,
+	0x16, 0x7b, 0xee, 0x91, 0xb9, 0xe5, 0x91, 0xf1, 0xa0, 0x6f, 0xe4, 0x3e, 0x1f, 0x1b, 0x79, 0xa3,
+	0x2f, 0x40, 0x6d, 0xbb, 0xb3, 0x99, 0xcd, 0xb2, 0xe6, 0x3f, 0x1b, 0x19, 0xfa, 0xa2, 0x67, 0xa0,
+	0x0e, 0x7a, 0xfd, 0x0b, 0xcb, 0x1b, 0xfb, 0x46, 0xa1, 0x91, 0x6d, 0x96, 0x9e, 0xd6, 0x0e, 0xc2,
+	0x12, 0x09, 0x8b, 0x0c, 0x92, 0x8e, 0xe8, 0x39, 0xc0, 0x2b, 0x77, 0x74, 0x39, 0xb0, 0x86, 0x53,
+	0xe2, 0x1b, 0x45, 0x1e, 0xb6, 0x7d, 0xc0, 0x2b, 0x19, 0xea, 0xe5, 0x1a, 0x23, 0x47, 0xd4, 0x80,
+	0x5c, 0xd7, 0x1d, 0x13, 0x43, 0xe5, 0x15, 0x2c, 0xcb, 0x0a, 0x32, 0x1d, 0xe6, 0x16, 0xd4, 0x02,
+	0xad, 0xe3, 0xbb, 0x53, 0x8b, 0xda, 0xae, 0x63, 0x68, 0xdc, 0xad, 0x26, 0xdd, 0x42, 0x03, 0x8e,
+	0x7c, 0xd0, 0x2e, 0x14, 0xba, 0xb6, 0xe7, 0xb9, 0x9e, 0x01, 0x0d, 0xa5, 0xa9, 0x62, 0x21, 0xa1,
+	0x06, 0x94, 0x58, 0xe2, 0x3e, 0xf1, 0xae, 0xec, 0x11, 0x31, 0x4a, 0x0d, 0xa5, 0xa9, 0xe1, 0xb8,
+	0xca, 0xfc, 0x29, 0x03, 0x95, 0x76, 0x8f, 0x6d, 0xa0, 0xd8, 0x00, 0xf4, 0x00, 0xb2, 0x83, 0xa5,
+	0xc3, 0xf7, 0xbc, 0x14, 0x5b, 0x1d, 0xa1, 0x96, 0x78, 0x17, 0x66, 0x46, 0xf7, 0x40, 0xc3, 0xc4,
+	0x1a, 0x5f, 0x9f, 0x39, 0xd3, 0x6b, 0xde, 0x0b, 0x2a, 0x8e, 0x14, 0x68, 0x1f, 0xf4, 0x13, 0x87,
+	0xbd, 0x6d, 0xdb, 0x1a, 0x5d, 0x90, 0x6f, 0x3d, 0x9b, 0x12, 0xde, 0x04, 0x2a, 0x5e, 0xd1, 0xa3,
+	0x07, 0x50, 0x39, 0xb6, 0x7d, 0xa6, 0x7c, 0x72, 0xde, 0x3e, 0x9b, 0x53, 0xbe, 0xe3, 0x2a, 0x4e,
+	0x2a, 0x53, 0xb5, 0xce, 0xff, 0xd3, 0x5a, 0xb7, 0xa0, 0x78, 0x36, 0x67, 0x25, 0x62, 0xdb, 0xaa,
+	0xf0, 0x18, 0xf1, 0x42, 0x42, 0x2d, 0x62, 0xa4, 0x17, 0x42, 0x90, 0x3b, 0x9d, 0x5a, 0x13, 0xa3,
+	0xd8, 0x50, 0x9a, 0x15, 0xcc, 0x9f, 0xcd, 0x39, 0x94, 0xda, 0xbd, 0xb3, 0x39, 0x26, 0xef, 0x16,
+	0xc4, 0xa7, 0xac, 0xd8, 0x67, 0xf3, 0x36, 0xdb, 0x41, 0x85, 0x3b, 0x09, 0x09, 0x19, 0x50, 0x3c,
+	0xb7, 0xae, 0xa7, 0xae, 0x35, 0xe6, 0x05, 0x29, 0x63, 0x29, 0xa2, 0x16, 0x14, 0x06, 0x96, 0x37,
+	0x21, 0x54, 0x30, 0x61, 0x63, 0x6f, 0x09, 0x37, 0xb3, 0x09, 0xe5, 0x20, 0xa3, 0x3f, 0x77, 0x1d,
+	0x3f, 0x01, 0xad, 0x24, 0xa0, 0xcd, 0x3f, 0xf2, 0x00, 0x83, 0xa5, 0x23, 0xd7, 0xc6, 0xb7, 0x85,
+	0x3f, 0x0a, 0xda, 0xe6, 0x70, 0xa4, 0x90, 0x5b, 0x9b, 0xf9, 0xf4, 0xd6, 0x3e, 0x84, 0x42, 0x97,
+	0xd0, 0x0b, 0x77, 0xcc, 0x57, 0x1b, 0xe3, 0x78, 0xa0, 0xc5, 0xc2, 0x1a, 0x96, 0x2a, 0x17, 0x95,
+	0x0a, 0x1d, 0x80, 0xd6, 0xee, 0x89, 0x84, 0x82, 0x80, 0x3a, 0x0f, 0x8f, 0x15, 0x10, 0x47, 0x2e,
+	0xe8, 0x2b, 0xa8, 0x04, 0x1c, 0x94, 0x31, 0xc1, 0x2e, 0xdd, 0x96, 0x29, 0x13, 0x46, 0x9c, 0xf4,
+	0x45, 0x87, 0xb0, 0x8d, 0xdd, 0xe9, 0x74, 0x68, 0x8d, 0x2e, 0x65, 0x78, 0x91, 0x87, 0xdf, 0x91,
+	0xe1, 0x29, 0x33, 0x4e, 0xfb, 0xa3, 0x17, 0x50, 0x15, 0xd3, 0x43, 0x22, 0xa8, 0x1c, 0x61, 0x57,
+	0x22, 0x24, 0xad, 0x38, 0xe5, 0x8d, 0x8e, 0x41, 0x7f, 0x49, 0xa8, 0x18, 0x7e, 0x02, 0x41, 0xe3,
+	0x08, 0x86, 0x44, 0x48, 0xdb, 0xf1, 0x4a, 0x04, 0x3a, 0x87, 0x1d, 0x31, 0x89, 0x82, 0x6e, 0x90,
+	0x48, 0xc0, 0x91, 0xee, 0x25, 0x8b, 0x91, 0xf4, 0xc1, 0x6b, 0x23, 0xd1, 0x37, 0xb0, 0x2b, 0x5f,
+	0x35, 0x85, 0x59, 0xe2, 0x98, 0xf5, 0x74, 0x85, 0x52, 0xa8, 0x1b, 0xa2, 0xd1, 0x09, 0x54, 0x31,
+	0x99, 0xb9, 0x57, 0xa4, 0x2b, 0x1a, 0xd8, 0x28, 0x73, 0xbc, 0xff, 0x86, 0x78, 0x09, 0x6b, 0x58,
+	0xb6, 0xa4, 0x1a, 0xfd, 0x3f, 0xa2, 0x65, 0x25, 0x59, 0x6f, 0x11, 0x21, 0xac, 0x21, 0x2f, 0xcd,
+	0x37, 0x50, 0x5b, 0xb1, 0xa2, 0x3a, 0x00, 0x26, 0xd4, 0xbb, 0x66, 0xf4, 0xf3, 0x0d, 0xa5, 0x91,
+	0x6d, 0xe6, 0x71, 0x4c, 0xc3, 0x46, 0x0b, 0x97, 0x3a, 0x0e, 0x25, 0xde, 0x95, 0x35, 0xe5, 0x9d,
+	0x9f, 0xc5, 0x49, 0xa5, 0xf9, 0x57, 0x1e, 0x4a, 0x1c, 0x5b, 0x90, 0xed, 0xd3, 0x1c, 0xaa, 0x6f,
+	0xe4, 0xd0, 0xbf, 0x67, 0xcf, 0x23, 0x50, 0x07, 0x4b, 0xe7, 0x84, 0x0f, 0xf2, 0x80, 0x3c, 0x15,
+	0x19, 0xcd, 0x95, 0x38, 0x34, 0xa3, 0xe7, 0xc9, 0x09, 0x21, 0x78, 0x53, 0x8b, 0x71, 0x2d, 0x30,
+	0xe0, 0xe4, 0x20, 0x79, 0x01, 0x55, 0xc9, 0x21, 0x11, 0x58, 0x4c, 0xd6, 0x3f, 0x69, 0xc5, 0x29,
+	0x6f, 0xd6, 0xef, 0x11, 0x85, 0x04, 0x82, 0x9a, 0xec, 0xf7, 0xb4, 0x1d, 0xaf, 0x44, 0x30, 0xe2,
+	0x86, 0x3c, 0x12, 0x20, 0x5a, 0x92, 0xb8, 0x29, 0x33, 0x4e, 0xfb, 0xa3, 0x97, 0x50, 0x8b, 0xd1,
+	0x48, 0x80, 0x04, 0x7c, 0xb9, 0xbb, 0x86, 0x79, 0x02, 0x66, 0x35, 0x06, 0xf5, 0xe1, 0x76, 0x8a,
+	0x41, 0x02, 0xac, 0x94, 0x6c, 0xec, 0xb5, 0x4e, 0x78, 0x7d, 0x2c, 0x7a, 0x03, 0x77, 0x56, 0x08,
+	0x24, 0x60, 0x03, 0xbe, 0xdc, 0xdf, 0xc8, 0x3f, 0x01, 0xbc, 0x29, 0x1e, 0x9d, 0xae, 0x30, 0xb0,
+	0x92, 0x62, 0x74, 0x8a, 0x81, 0x72, 0x27, 0x93, 0x7a, 0x73, 0x04, 0x7a, 0x7a, 0xbe, 0xa2, 0x47,
+	0xf1, 0x63, 0x26, 0x1b, 0x3f, 0x2d, 0x25, 0x91, 0xc3, 0x23, 0x6d, 0xe5, 0xd4, 0xce, 0xac, 0x39,
+	0xb5, 0xcd, 0x43, 0xce, 0xda, 0x54, 0x0f, 0x3d, 0x86, 0x5a, 0xc7, 0xb9, 0xb2, 0xa6, 0xf6, 0x38,
+	0x76, 0xa2, 0xb3, 0x7c, 0x39, 0xbc, 0x6a, 0x30, 0x77, 0x00, 0xad, 0x0e, 0x72, 0xf3, 0x36, 0xdc,
+	0x5a, 0xd3, 0x6a, 0xe6, 0x29, 0xcf, 0x97, 0x9a, 0xd1, 0x4f, 0xa0, 0x28, 0x8a, 0x28, 0x3e, 0x6a,
+	0x36, 0x1e, 0xbf, 0xd2, 0x4f, 0x24, 0x4d, 0xf5, 0x9c, 0xf9, 0x35, 0x4f, 0xba, 0x32, 0xbd, 0x6f,
+	0x80, 0xbf, 0x0b, 0x3b, 0xeb, 0xfa, 0xd3, 0x7c, 0x05, 0x77, 0x36, 0xcc, 0xf9, 0x9b, 0x64, 0xd9,
+	0x03, 0x63, 0x53, 0xe3, 0x9a, 0x3d, 0xb8, 0xbb, 0x71, 0xfa, 0xdf, 0x24, 0xd7, 0x3d, 0xd8, 0xdb,
+	0xdc, 0xcd, 0x66, 0x97, 0xaf, 0x64, 0xed, 0xd9, 0x70, 0x93, 0x64, 0xff, 0x09, 0x16, 0xbf, 0xb6,
+	0xd1, 0xcd, 0x41, 0x34, 0x44, 0xd9, 0x90, 0x8d, 0x7d, 0xa8, 0xf1, 0x67, 0xb4, 0x03, 0xf9, 0x60,
+	0xc2, 0x06, 0x1f, 0x69, 0x81, 0xc0, 0x8e, 0x92, 0x20, 0x8a, 0xfb, 0x67, 0xb9, 0x7f, 0x4c, 0x63,
+	0xfe, 0x9c, 0xe3, 0x0e, 0xf2, 0xe4, 0xd9, 0x03, 0xf5, 0x94, 0x58, 0x74, 0xe1, 0xf1, 0xd6, 0x65,
+	0xce, 0xa1, 0xcc, 0xee, 0x4c, 0xed, 0x1e, 0x47, 0xd7, 0x70, 0xa6, 0xdd, 0x63, 0xe7, 0x49, 0x9f,
+	0xf8, 0xbe, 0xed, 0x3a, 0x9d, 0x63, 0x8e, 0xac, 0xe1, 0x48, 0xc1, 0xac, 0x87, 0xa3, 0x91, 0xbb,
+	0x70, 0xd8, 0x69, 0x13, 0x1c, 0x06, 0x91, 0x02, 0x99, 0x50, 0x6e, 0xbb, 0x8e, 0x43, 0x46, 0x34,
+	0x08, 0xcf, 0x73, 0x87, 0x84, 0x8e, 0xad, 0xe5, 0xb5, 0x4f, 0xbc, 0x9e, 0x35, 0x0b, 0x8e, 0x01,
+	0x0d, 0x87, 0x32, 0x7a, 0x08, 0xd5, 0xfe, 0xa5, 0x3d, 0x4f, 0x5d, 0x53, 0x72, 0x38, 0xa5, 0x45,
+	0x2f, 0x00, 0x25, 0x34, 0x5d, 0x7e, 0xa2, 0xaa, 0x8d, 0x2c, 0x3f, 0xc1, 0xc2, 0xcf, 0x6c, 0x7e,
+	0x47, 0x59, 0xe3, 0xc9, 0x3e, 0x50, 0xf9, 0x92, 0x89, 0xc7, 0x27, 0xb9, 0x86, 0xa5, 0xc8, 0xae,
+	0x20, 0xbe, 0x78, 0x59, 0xe7, 0xad, 0xcb, 0x47, 0xb4, 0x86, 0xe3, 0x2a, 0xb6, 0x7e, 0xdb, 0xc1,
+	0x0b, 0xa7, 0xff, 0x6e, 0xca, 0x87, 0xae, 0x8a, 0x43, 0x39, 0xb0, 0x05, 0x1d, 0xcc, 0x27, 0x27,
+	0xb7, 0x05, 0x32, 0xdb, 0x32, 0x3b, 0xec, 0x38, 0x3e, 0x05, 0x55, 0x1c, 0xd3, 0xb0, 0x35, 0x0d,
+	0xaf, 0x8f, 0xc8, 0xc4, 0x76, 0x8c, 0x2a, 0x37, 0x4a, 0x91, 0x45, 0x5a, 0x0b, 0xea, 0x8e, 0x02,
+	0xdc, 0xed, 0x20, 0x32, 0xd2, 0x04, 0xc8, 0x1d, 0x67, 0xe4, 0xf5, 0xe9, 0x8c, 0x1a, 0xba, 0x44,
+	0x96, 0x1a, 0x56, 0xd5, 0x28, 0x0f, 0xf7, 0xa9, 0x71, 0x9f, 0x94, 0x76, 0xbf, 0x0e, 0xe5, 0xf8,
+	0x8d, 0x0d, 0x15, 0x20, 0xd3, 0xef, 0xe8, 0x5b, 0xec, 0x17, 0xb7, 0x75, 0x65, 0x7f, 0x3f, 0xb8,
+	0x68, 0xb3, 0xae, 0xac, 0x02, 0xb0, 0xde, 0x9a, 0xd9, 0x3e, 0xb5, 0x47, 0xfa, 0x16, 0xda, 0x86,
+	0xd2, 0x39, 0xab, 0x91, 0x50, 0x28, 0xfb, 0xdf, 0x83, 0x16, 0x5e, 0xb3, 0x11, 0x40, 0xe1, 0x70,
+	0x44, 0xed, 0x2b, 0xa2, 0x6f, 0xa1, 0x32, 0xa8, 0xf2, 0x02, 0xac, 0x2b, 0x0c, 0x27, 0x28, 0x0f,
+	0xb5, 0x9d, 0x89, 0x9e, 0x41, 0x15, 0xd0, 0x84, 0x4c, 0xc6, 0x7a, 0x96, 0x39, 0x1f, 0x0e, 0x5d,
+	0x8f, 0x1b, 0x73, 0xa8, 0x04, 0x45, 0x2e, 0x91, 0xb1, 0x9e, 0xdf, 0xff, 0x41, 0xe1, 0x19, 0xc4,
+	0xe7, 0x89, 0x0a, 0x39, 0x76, 0x9d, 0xd3, 0xb7, 0x90, 0x06, 0x79, 0x7e, 0x51, 0xd3, 0x15, 0x96,
+	0x36, 0x00, 0xd3, 0x33, 0x0c, 0x49, 0xbe, 0xab, 0x9e, 0x65, 0x48, 0x62, 0x11, 0x7a, 0x8e, 0xe5,
+	0x0c, 0x47, 0x9b, 0x9e, 0x47, 0x35, 0xf9, 0x8d, 0x2f, 0xe8, 0xab, 0x17, 0xd0, 0xad, 0xe8, 0xcb,
+	0x5d, 0x2a, 0x8b, 0x48, 0x87, 0xb2, 0xa4, 0x34, 0x23, 0xb4, 0xae, 0xb2, 0xd4, 0xc7, 0x27, 0x47,
+	0xaf, 0x5f, 0xea, 0xda, 0xd1, 0xd1, 0x87, 0xdf, 0xea, 0xca, 0xfb, 0x8f, 0x75, 0xe5, 0xc3, 0xc7,
+	0xba, 0xf2, 0xeb, 0xc7, 0xfa, 0xd6, 0x8f, 0xbf, 0xd7, 0x95, 0xef, 0x1e, 0xc7, 0xfe, 0x06, 0x99,
+	0x59, 0xd4, 0xb3, 0x97, 0xae, 0x67, 0x4f, 0x6c, 0x47, 0x0a, 0x0e, 0x69, 0xcd, 0x2f, 0x27, 0xad,
+	0xf9, 0xb0, 0x45, 0x97, 0xce, 0xb0, 0xc0, 0xff, 0xdf, 0x78, 0xf6, 0x77, 0x00, 0x00, 0x00, 0xff,
+	0xff, 0x28, 0x6b, 0x1e, 0x0e, 0x4d, 0x11, 0x00, 0x00,
 }
 
 func (m *TxnMeta) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -1759,7 +2004,7 @@ func (m *TxnMeta) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnMeta) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -1771,6 +2016,23 @@ func (m *TxnMeta) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	if m.XXX_unrecognized != nil {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if len(m.LockService) > 0 {
+		i -= len(m.LockService)
+		copy(dAtA[i:], m.LockService)
+		i = encodeVarintTxn(dAtA, i, uint64(len(m.LockService)))
+		i--
+		dAtA[i] = 0x5a
+	}
+	if m.Mirror {
+		i--
+		if m.Mirror {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x50
 	}
 	if m.Isolation != 0 {
 		i = encodeVarintTxn(dAtA, i, uint64(m.Isolation))
@@ -1796,10 +2058,10 @@ func (m *TxnMeta) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 			dAtA[i] = 0x3a
 		}
 	}
-	if len(m.DNShards) > 0 {
-		for iNdEx := len(m.DNShards) - 1; iNdEx >= 0; iNdEx-- {
+	if len(m.TNShards) > 0 {
+		for iNdEx := len(m.TNShards) - 1; iNdEx >= 0; iNdEx-- {
 			{
-				size, err := m.DNShards[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				size, err := m.TNShards[iNdEx].MarshalToSizedBuffer(dAtA[:i])
 				if err != nil {
 					return 0, err
 				}
@@ -1856,7 +2118,7 @@ func (m *TxnMeta) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *CNTxnSnapshot) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -1866,7 +2128,7 @@ func (m *CNTxnSnapshot) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *CNTxnSnapshot) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -1879,6 +2141,21 @@ func (m *CNTxnSnapshot) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
+	if m.Flag != 0 {
+		i = encodeVarintTxn(dAtA, i, uint64(m.Flag))
+		i--
+		dAtA[i] = 0x38
+	}
+	{
+		size, err := m.Options.MarshalToSizedBuffer(dAtA[:i])
+		if err != nil {
+			return 0, err
+		}
+		i -= size
+		i = encodeVarintTxn(dAtA, i, uint64(size))
+	}
+	i--
+	dAtA[i] = 0x32
 	if len(m.LockTables) > 0 {
 		for iNdEx := len(m.LockTables) - 1; iNdEx >= 0; iNdEx-- {
 			{
@@ -1937,7 +2214,7 @@ func (m *CNTxnSnapshot) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *CNOpRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -1947,7 +2224,7 @@ func (m *CNOpRequest) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *CNOpRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -1986,7 +2263,7 @@ func (m *CNOpRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *CNOpResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -1996,7 +2273,7 @@ func (m *CNOpResponse) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *CNOpResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2020,7 +2297,7 @@ func (m *CNOpResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2030,7 +2307,7 @@ func (m *TxnRequest) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2067,9 +2344,9 @@ func (m *TxnRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x62
 	}
-	if m.RollbackDNShardRequest != nil {
+	if m.RollbackTNShardRequest != nil {
 		{
-			size, err := m.RollbackDNShardRequest.MarshalToSizedBuffer(dAtA[:i])
+			size, err := m.RollbackTNShardRequest.MarshalToSizedBuffer(dAtA[:i])
 			if err != nil {
 				return 0, err
 			}
@@ -2079,9 +2356,9 @@ func (m *TxnRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x5a
 	}
-	if m.CommitDNShardRequest != nil {
+	if m.CommitTNShardRequest != nil {
 		{
-			size, err := m.CommitDNShardRequest.MarshalToSizedBuffer(dAtA[:i])
+			size, err := m.CommitTNShardRequest.MarshalToSizedBuffer(dAtA[:i])
 			if err != nil {
 				return 0, err
 			}
@@ -2180,7 +2457,7 @@ func (m *TxnRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnRequestOptions) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2190,7 +2467,7 @@ func (m *TxnRequestOptions) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnRequestOptions) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2209,21 +2486,21 @@ func (m *TxnRequestOptions) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		dAtA[i] = 0x10
 	}
 	if len(m.RetryCodes) > 0 {
-		dAtA17 := make([]byte, len(m.RetryCodes)*10)
-		var j16 int
+		dAtA18 := make([]byte, len(m.RetryCodes)*10)
+		var j17 int
 		for _, num1 := range m.RetryCodes {
 			num := uint64(num1)
 			for num >= 1<<7 {
-				dAtA17[j16] = uint8(uint64(num)&0x7f | 0x80)
+				dAtA18[j17] = uint8(uint64(num)&0x7f | 0x80)
 				num >>= 7
-				j16++
+				j17++
 			}
-			dAtA17[j16] = uint8(num)
-			j16++
+			dAtA18[j17] = uint8(num)
+			j17++
 		}
-		i -= j16
-		copy(dAtA[i:], dAtA17[:j16])
-		i = encodeVarintTxn(dAtA, i, uint64(j16))
+		i -= j17
+		copy(dAtA[i:], dAtA18[:j17])
+		i = encodeVarintTxn(dAtA, i, uint64(j17))
 		i--
 		dAtA[i] = 0xa
 	}
@@ -2231,7 +2508,7 @@ func (m *TxnRequestOptions) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2241,7 +2518,7 @@ func (m *TxnResponse) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2266,9 +2543,9 @@ func (m *TxnResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x6a
 	}
-	if m.RollbackDNShardResponse != nil {
+	if m.RollbackTNShardResponse != nil {
 		{
-			size, err := m.RollbackDNShardResponse.MarshalToSizedBuffer(dAtA[:i])
+			size, err := m.RollbackTNShardResponse.MarshalToSizedBuffer(dAtA[:i])
 			if err != nil {
 				return 0, err
 			}
@@ -2278,9 +2555,9 @@ func (m *TxnResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x62
 	}
-	if m.CommitDNShardResponse != nil {
+	if m.CommitTNShardResponse != nil {
 		{
-			size, err := m.CommitDNShardResponse.MarshalToSizedBuffer(dAtA[:i])
+			size, err := m.CommitTNShardResponse.MarshalToSizedBuffer(dAtA[:i])
 			if err != nil {
 				return 0, err
 			}
@@ -2393,7 +2670,7 @@ func (m *TxnResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnCommitRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2403,7 +2680,7 @@ func (m *TxnCommitRequest) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnCommitRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2426,11 +2703,25 @@ func (m *TxnCommitRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i--
 		dAtA[i] = 0x10
 	}
+	if len(m.Payload) > 0 {
+		for iNdEx := len(m.Payload) - 1; iNdEx >= 0; iNdEx-- {
+			{
+				size, err := m.Payload[iNdEx].MarshalToSizedBuffer(dAtA[:i])
+				if err != nil {
+					return 0, err
+				}
+				i -= size
+				i = encodeVarintTxn(dAtA, i, uint64(size))
+			}
+			i--
+			dAtA[i] = 0xa
+		}
+	}
 	return len(dAtA) - i, nil
 }
 
 func (m *TxnCommitResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2440,7 +2731,7 @@ func (m *TxnCommitResponse) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnCommitResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2453,11 +2744,29 @@ func (m *TxnCommitResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		i -= len(m.XXX_unrecognized)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
+	if len(m.InvalidLockTables) > 0 {
+		dAtA30 := make([]byte, len(m.InvalidLockTables)*10)
+		var j29 int
+		for _, num := range m.InvalidLockTables {
+			for num >= 1<<7 {
+				dAtA30[j29] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j29++
+			}
+			dAtA30[j29] = uint8(num)
+			j29++
+		}
+		i -= j29
+		copy(dAtA[i:], dAtA30[:j29])
+		i = encodeVarintTxn(dAtA, i, uint64(j29))
+		i--
+		dAtA[i] = 0xa
+	}
 	return len(dAtA) - i, nil
 }
 
 func (m *TxnRollbackRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2467,7 +2776,7 @@ func (m *TxnRollbackRequest) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnRollbackRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2484,7 +2793,7 @@ func (m *TxnRollbackRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnRollbackResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2494,7 +2803,7 @@ func (m *TxnRollbackResponse) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnRollbackResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2511,7 +2820,7 @@ func (m *TxnRollbackResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnPrepareRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2521,7 +2830,7 @@ func (m *TxnPrepareRequest) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnPrepareRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2535,7 +2844,7 @@ func (m *TxnPrepareRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
 	{
-		size, err := m.DNShard.MarshalToSizedBuffer(dAtA[:i])
+		size, err := m.TNShard.MarshalToSizedBuffer(dAtA[:i])
 		if err != nil {
 			return 0, err
 		}
@@ -2548,7 +2857,7 @@ func (m *TxnPrepareRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnPrepareResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2558,7 +2867,7 @@ func (m *TxnPrepareResponse) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnPrepareResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2575,7 +2884,7 @@ func (m *TxnPrepareResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnGetStatusRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2585,7 +2894,7 @@ func (m *TxnGetStatusRequest) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnGetStatusRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2599,7 +2908,7 @@ func (m *TxnGetStatusRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
 	{
-		size, err := m.DNShard.MarshalToSizedBuffer(dAtA[:i])
+		size, err := m.TNShard.MarshalToSizedBuffer(dAtA[:i])
 		if err != nil {
 			return 0, err
 		}
@@ -2612,7 +2921,7 @@ func (m *TxnGetStatusRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 }
 
 func (m *TxnGetStatusResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2622,7 +2931,7 @@ func (m *TxnGetStatusResponse) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnGetStatusResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2638,8 +2947,8 @@ func (m *TxnGetStatusResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
-func (m *TxnCommitDNShardRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TxnCommitTNShardRequest) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2648,12 +2957,12 @@ func (m *TxnCommitDNShardRequest) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *TxnCommitDNShardRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TxnCommitTNShardRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *TxnCommitDNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TxnCommitTNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -2663,7 +2972,7 @@ func (m *TxnCommitDNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, error)
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
 	{
-		size, err := m.DNShard.MarshalToSizedBuffer(dAtA[:i])
+		size, err := m.TNShard.MarshalToSizedBuffer(dAtA[:i])
 		if err != nil {
 			return 0, err
 		}
@@ -2675,8 +2984,8 @@ func (m *TxnCommitDNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, error)
 	return len(dAtA) - i, nil
 }
 
-func (m *TxnCommitDNShardResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TxnCommitTNShardResponse) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2685,12 +2994,12 @@ func (m *TxnCommitDNShardResponse) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *TxnCommitDNShardResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TxnCommitTNShardResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *TxnCommitDNShardResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TxnCommitTNShardResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -2702,8 +3011,8 @@ func (m *TxnCommitDNShardResponse) MarshalToSizedBuffer(dAtA []byte) (int, error
 	return len(dAtA) - i, nil
 }
 
-func (m *TxnRollbackDNShardRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TxnRollbackTNShardRequest) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2712,12 +3021,12 @@ func (m *TxnRollbackDNShardRequest) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *TxnRollbackDNShardRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TxnRollbackTNShardRequest) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *TxnRollbackDNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TxnRollbackTNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -2727,7 +3036,7 @@ func (m *TxnRollbackDNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, erro
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
 	{
-		size, err := m.DNShard.MarshalToSizedBuffer(dAtA[:i])
+		size, err := m.TNShard.MarshalToSizedBuffer(dAtA[:i])
 		if err != nil {
 			return 0, err
 		}
@@ -2739,8 +3048,8 @@ func (m *TxnRollbackDNShardRequest) MarshalToSizedBuffer(dAtA []byte) (int, erro
 	return len(dAtA) - i, nil
 }
 
-func (m *TxnRollbackDNShardResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+func (m *TxnRollbackTNShardResponse) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2749,12 +3058,12 @@ func (m *TxnRollbackDNShardResponse) Marshal() (dAtA []byte, err error) {
 	return dAtA[:n], nil
 }
 
-func (m *TxnRollbackDNShardResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+func (m *TxnRollbackTNShardResponse) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
-func (m *TxnRollbackDNShardResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+func (m *TxnRollbackTNShardResponse) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	i := len(dAtA)
 	_ = i
 	var l int
@@ -2767,7 +3076,7 @@ func (m *TxnRollbackDNShardResponse) MarshalToSizedBuffer(dAtA []byte) (int, err
 }
 
 func (m *TxnRemoveMetadataRequest) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2777,7 +3086,7 @@ func (m *TxnRemoveMetadataRequest) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnRemoveMetadataRequest) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2791,7 +3100,7 @@ func (m *TxnRemoveMetadataRequest) MarshalToSizedBuffer(dAtA []byte) (int, error
 		copy(dAtA[i:], m.XXX_unrecognized)
 	}
 	{
-		size, err := m.DNShard.MarshalToSizedBuffer(dAtA[:i])
+		size, err := m.TNShard.MarshalToSizedBuffer(dAtA[:i])
 		if err != nil {
 			return 0, err
 		}
@@ -2804,7 +3113,7 @@ func (m *TxnRemoveMetadataRequest) MarshalToSizedBuffer(dAtA []byte) (int, error
 }
 
 func (m *TxnRemoveMetadataResponse) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2814,7 +3123,7 @@ func (m *TxnRemoveMetadataResponse) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnRemoveMetadataResponse) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2831,7 +3140,7 @@ func (m *TxnRemoveMetadataResponse) MarshalToSizedBuffer(dAtA []byte) (int, erro
 }
 
 func (m *TxnError) Marshal() (dAtA []byte, err error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	dAtA = make([]byte, size)
 	n, err := m.MarshalToSizedBuffer(dAtA[:size])
 	if err != nil {
@@ -2841,7 +3150,7 @@ func (m *TxnError) Marshal() (dAtA []byte, err error) {
 }
 
 func (m *TxnError) MarshalTo(dAtA []byte) (int, error) {
-	size := m.Size()
+	size := m.ProtoSize()
 	return m.MarshalToSizedBuffer(dAtA[:size])
 }
 
@@ -2874,6 +3183,193 @@ func (m *TxnError) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	return len(dAtA) - i, nil
 }
 
+func (m *TxnOptions) Marshal() (dAtA []byte, err error) {
+	size := m.ProtoSize()
+	dAtA = make([]byte, size)
+	n, err := m.MarshalToSizedBuffer(dAtA[:size])
+	if err != nil {
+		return nil, err
+	}
+	return dAtA[:n], nil
+}
+
+func (m *TxnOptions) MarshalTo(dAtA []byte) (int, error) {
+	size := m.ProtoSize()
+	return m.MarshalToSizedBuffer(dAtA[:size])
+}
+
+func (m *TxnOptions) MarshalToSizedBuffer(dAtA []byte) (int, error) {
+	i := len(dAtA)
+	_ = i
+	var l int
+	_ = l
+	if m.XXX_unrecognized != nil {
+		i -= len(m.XXX_unrecognized)
+		copy(dAtA[i:], m.XXX_unrecognized)
+	}
+	if m.InRollbackStmt {
+		i--
+		if m.InRollbackStmt {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0x88
+	}
+	if m.InIncrStmt {
+		i--
+		if m.InIncrStmt {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x1
+		i--
+		dAtA[i] = 0x80
+	}
+	if m.Autocommit {
+		i--
+		if m.Autocommit {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x78
+	}
+	if m.ByBegin {
+		i--
+		if m.ByBegin {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x70
+	}
+	if m.InRollback {
+		i--
+		if m.InRollback {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x68
+	}
+	if m.InCommit {
+		i--
+		if m.InCommit {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x60
+	}
+	if m.InRunSql {
+		i--
+		if m.InRunSql {
+			dAtA[i] = 1
+		} else {
+			dAtA[i] = 0
+		}
+		i--
+		dAtA[i] = 0x58
+	}
+	if len(m.SessionInfo) > 0 {
+		i -= len(m.SessionInfo)
+		copy(dAtA[i:], m.SessionInfo)
+		i = encodeVarintTxn(dAtA, i, uint64(len(m.SessionInfo)))
+		i--
+		dAtA[i] = 0x52
+	}
+	if len(m.Counter) > 0 {
+		i -= len(m.Counter)
+		copy(dAtA[i:], m.Counter)
+		i = encodeVarintTxn(dAtA, i, uint64(len(m.Counter)))
+		i--
+		dAtA[i] = 0x4a
+	}
+	if len(m.SkipLockTableModes) > 0 {
+		dAtA37 := make([]byte, len(m.SkipLockTableModes)*10)
+		var j36 int
+		for _, num := range m.SkipLockTableModes {
+			for num >= 1<<7 {
+				dAtA37[j36] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j36++
+			}
+			dAtA37[j36] = uint8(num)
+			j36++
+		}
+		i -= j36
+		copy(dAtA[i:], dAtA37[:j36])
+		i = encodeVarintTxn(dAtA, i, uint64(j36))
+		i--
+		dAtA[i] = 0x42
+	}
+	if len(m.SkipLockTables) > 0 {
+		dAtA39 := make([]byte, len(m.SkipLockTables)*10)
+		var j38 int
+		for _, num := range m.SkipLockTables {
+			for num >= 1<<7 {
+				dAtA39[j38] = uint8(uint64(num)&0x7f | 0x80)
+				num >>= 7
+				j38++
+			}
+			dAtA39[j38] = uint8(num)
+			j38++
+		}
+		i -= j38
+		copy(dAtA[i:], dAtA39[:j38])
+		i = encodeVarintTxn(dAtA, i, uint64(j38))
+		i--
+		dAtA[i] = 0x3a
+	}
+	if len(m.UserName) > 0 {
+		i -= len(m.UserName)
+		copy(dAtA[i:], m.UserName)
+		i = encodeVarintTxn(dAtA, i, uint64(len(m.UserName)))
+		i--
+		dAtA[i] = 0x32
+	}
+	if m.ConnectionID != 0 {
+		i = encodeVarintTxn(dAtA, i, uint64(m.ConnectionID))
+		i--
+		dAtA[i] = 0x28
+	}
+	if m.AccountID != 0 {
+		i = encodeVarintTxn(dAtA, i, uint64(m.AccountID))
+		i--
+		dAtA[i] = 0x20
+	}
+	if len(m.SessionID) > 0 {
+		i -= len(m.SessionID)
+		copy(dAtA[i:], m.SessionID)
+		i = encodeVarintTxn(dAtA, i, uint64(len(m.SessionID)))
+		i--
+		dAtA[i] = 0x1a
+	}
+	if len(m.CN) > 0 {
+		i -= len(m.CN)
+		copy(dAtA[i:], m.CN)
+		i = encodeVarintTxn(dAtA, i, uint64(len(m.CN)))
+		i--
+		dAtA[i] = 0x12
+	}
+	if m.Features != 0 {
+		i = encodeVarintTxn(dAtA, i, uint64(m.Features))
+		i--
+		dAtA[i] = 0x8
+	}
+	return len(dAtA) - i, nil
+}
+
 func encodeVarintTxn(dAtA []byte, offset int, v uint64) int {
 	offset -= sovTxn(v)
 	base := offset
@@ -2885,7 +3381,7 @@ func encodeVarintTxn(dAtA []byte, offset int, v uint64) int {
 	dAtA[offset] = uint8(v)
 	return base
 }
-func (m *TxnMeta) Size() (n int) {
+func (m *TxnMeta) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -2898,21 +3394,21 @@ func (m *TxnMeta) Size() (n int) {
 	if m.Status != 0 {
 		n += 1 + sovTxn(uint64(m.Status))
 	}
-	l = m.SnapshotTS.Size()
+	l = m.SnapshotTS.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
-	l = m.PreparedTS.Size()
+	l = m.PreparedTS.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
-	l = m.CommitTS.Size()
+	l = m.CommitTS.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
-	if len(m.DNShards) > 0 {
-		for _, e := range m.DNShards {
-			l = e.Size()
+	if len(m.TNShards) > 0 {
+		for _, e := range m.TNShards {
+			l = e.ProtoSize()
 			n += 1 + l + sovTxn(uint64(l))
 		}
 	}
 	if len(m.LockTables) > 0 {
 		for _, e := range m.LockTables {
-			l = e.Size()
+			l = e.ProtoSize()
 			n += 1 + l + sovTxn(uint64(l))
 		}
 	}
@@ -2922,19 +3418,26 @@ func (m *TxnMeta) Size() (n int) {
 	if m.Isolation != 0 {
 		n += 1 + sovTxn(uint64(m.Isolation))
 	}
+	if m.Mirror {
+		n += 2
+	}
+	l = len(m.LockService)
+	if l > 0 {
+		n += 1 + l + sovTxn(uint64(l))
+	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
 	}
 	return n
 }
 
-func (m *CNTxnSnapshot) Size() (n int) {
+func (m *CNTxnSnapshot) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	l = m.Txn.Size()
+	l = m.Txn.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.ReadyOnly {
 		n += 2
@@ -2947,9 +3450,14 @@ func (m *CNTxnSnapshot) Size() (n int) {
 	}
 	if len(m.LockTables) > 0 {
 		for _, e := range m.LockTables {
-			l = e.Size()
+			l = e.ProtoSize()
 			n += 1 + l + sovTxn(uint64(l))
 		}
+	}
+	l = m.Options.ProtoSize()
+	n += 1 + l + sovTxn(uint64(l))
+	if m.Flag != 0 {
+		n += 1 + sovTxn(uint64(m.Flag))
 	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -2957,7 +3465,7 @@ func (m *CNTxnSnapshot) Size() (n int) {
 	return n
 }
 
-func (m *CNOpRequest) Size() (n int) {
+func (m *CNOpRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -2970,7 +3478,7 @@ func (m *CNOpRequest) Size() (n int) {
 	if l > 0 {
 		n += 1 + l + sovTxn(uint64(l))
 	}
-	l = m.Target.Size()
+	l = m.Target.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -2978,7 +3486,7 @@ func (m *CNOpRequest) Size() (n int) {
 	return n
 }
 
-func (m *CNOpResponse) Size() (n int) {
+func (m *CNOpResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -2994,7 +3502,7 @@ func (m *CNOpResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnRequest) Size() (n int) {
+func (m *TxnRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3003,7 +3511,7 @@ func (m *TxnRequest) Size() (n int) {
 	if m.RequestID != 0 {
 		n += 1 + sovTxn(uint64(m.RequestID))
 	}
-	l = m.Txn.Size()
+	l = m.Txn.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.Method != 0 {
 		n += 1 + sovTxn(uint64(m.Method))
@@ -3012,39 +3520,39 @@ func (m *TxnRequest) Size() (n int) {
 		n += 1 + sovTxn(uint64(m.Flag))
 	}
 	if m.CNRequest != nil {
-		l = m.CNRequest.Size()
+		l = m.CNRequest.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.CommitRequest != nil {
-		l = m.CommitRequest.Size()
+		l = m.CommitRequest.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.RollbackRequest != nil {
-		l = m.RollbackRequest.Size()
+		l = m.RollbackRequest.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.PrepareRequest != nil {
-		l = m.PrepareRequest.Size()
+		l = m.PrepareRequest.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.GetStatusRequest != nil {
-		l = m.GetStatusRequest.Size()
+		l = m.GetStatusRequest.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
-	if m.CommitDNShardRequest != nil {
-		l = m.CommitDNShardRequest.Size()
+	if m.CommitTNShardRequest != nil {
+		l = m.CommitTNShardRequest.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
-	if m.RollbackDNShardRequest != nil {
-		l = m.RollbackDNShardRequest.Size()
+	if m.RollbackTNShardRequest != nil {
+		l = m.RollbackTNShardRequest.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.RemoveMetadata != nil {
-		l = m.RemoveMetadata.Size()
+		l = m.RemoveMetadata.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.Options != nil {
-		l = m.Options.Size()
+		l = m.Options.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.XXX_unrecognized != nil {
@@ -3053,7 +3561,7 @@ func (m *TxnRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnRequestOptions) Size() (n int) {
+func (m *TxnRequestOptions) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3075,7 +3583,7 @@ func (m *TxnRequestOptions) Size() (n int) {
 	return n
 }
 
-func (m *TxnResponse) Size() (n int) {
+func (m *TxnResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3085,7 +3593,7 @@ func (m *TxnResponse) Size() (n int) {
 		n += 1 + sovTxn(uint64(m.RequestID))
 	}
 	if m.Txn != nil {
-		l = m.Txn.Size()
+		l = m.Txn.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.Method != 0 {
@@ -3095,39 +3603,39 @@ func (m *TxnResponse) Size() (n int) {
 		n += 1 + sovTxn(uint64(m.Flag))
 	}
 	if m.TxnError != nil {
-		l = m.TxnError.Size()
+		l = m.TxnError.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.CNOpResponse != nil {
-		l = m.CNOpResponse.Size()
+		l = m.CNOpResponse.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.CommitResponse != nil {
-		l = m.CommitResponse.Size()
+		l = m.CommitResponse.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.RollbackResponse != nil {
-		l = m.RollbackResponse.Size()
+		l = m.RollbackResponse.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.PrepareResponse != nil {
-		l = m.PrepareResponse.Size()
+		l = m.PrepareResponse.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.GetStatusResponse != nil {
-		l = m.GetStatusResponse.Size()
+		l = m.GetStatusResponse.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
-	if m.CommitDNShardResponse != nil {
-		l = m.CommitDNShardResponse.Size()
+	if m.CommitTNShardResponse != nil {
+		l = m.CommitTNShardResponse.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
-	if m.RollbackDNShardResponse != nil {
-		l = m.RollbackDNShardResponse.Size()
+	if m.RollbackTNShardResponse != nil {
+		l = m.RollbackTNShardResponse.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.RemoveMetadata != nil {
-		l = m.RemoveMetadata.Size()
+		l = m.RemoveMetadata.ProtoSize()
 		n += 1 + l + sovTxn(uint64(l))
 	}
 	if m.XXX_unrecognized != nil {
@@ -3136,12 +3644,18 @@ func (m *TxnResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnCommitRequest) Size() (n int) {
+func (m *TxnCommitRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
+	if len(m.Payload) > 0 {
+		for _, e := range m.Payload {
+			l = e.ProtoSize()
+			n += 1 + l + sovTxn(uint64(l))
+		}
+	}
 	if m.Disable1PCOpt {
 		n += 2
 	}
@@ -3151,7 +3665,26 @@ func (m *TxnCommitRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnCommitResponse) Size() (n int) {
+func (m *TxnCommitResponse) ProtoSize() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if len(m.InvalidLockTables) > 0 {
+		l = 0
+		for _, e := range m.InvalidLockTables {
+			l += sovTxn(uint64(e))
+		}
+		n += 1 + sovTxn(uint64(l)) + l
+	}
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
+	}
+	return n
+}
+
+func (m *TxnRollbackRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3163,7 +3696,7 @@ func (m *TxnCommitResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnRollbackRequest) Size() (n int) {
+func (m *TxnRollbackResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3175,25 +3708,13 @@ func (m *TxnRollbackRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnRollbackResponse) Size() (n int) {
+func (m *TxnPrepareRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	if m.XXX_unrecognized != nil {
-		n += len(m.XXX_unrecognized)
-	}
-	return n
-}
-
-func (m *TxnPrepareRequest) Size() (n int) {
-	if m == nil {
-		return 0
-	}
-	var l int
-	_ = l
-	l = m.DNShard.Size()
+	l = m.TNShard.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -3201,7 +3722,7 @@ func (m *TxnPrepareRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnPrepareResponse) Size() (n int) {
+func (m *TxnPrepareResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3213,13 +3734,13 @@ func (m *TxnPrepareResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnGetStatusRequest) Size() (n int) {
+func (m *TxnGetStatusRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	l = m.DNShard.Size()
+	l = m.TNShard.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -3227,7 +3748,7 @@ func (m *TxnGetStatusRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnGetStatusResponse) Size() (n int) {
+func (m *TxnGetStatusResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3239,13 +3760,13 @@ func (m *TxnGetStatusResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnCommitDNShardRequest) Size() (n int) {
+func (m *TxnCommitTNShardRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	l = m.DNShard.Size()
+	l = m.TNShard.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -3253,7 +3774,7 @@ func (m *TxnCommitDNShardRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnCommitDNShardResponse) Size() (n int) {
+func (m *TxnCommitTNShardResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3265,13 +3786,13 @@ func (m *TxnCommitDNShardResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnRollbackDNShardRequest) Size() (n int) {
+func (m *TxnRollbackTNShardRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	l = m.DNShard.Size()
+	l = m.TNShard.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -3279,7 +3800,7 @@ func (m *TxnRollbackDNShardRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnRollbackDNShardResponse) Size() (n int) {
+func (m *TxnRollbackTNShardResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3291,13 +3812,13 @@ func (m *TxnRollbackDNShardResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnRemoveMetadataRequest) Size() (n int) {
+func (m *TxnRemoveMetadataRequest) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
 	var l int
 	_ = l
-	l = m.DNShard.Size()
+	l = m.TNShard.ProtoSize()
 	n += 1 + l + sovTxn(uint64(l))
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -3305,7 +3826,7 @@ func (m *TxnRemoveMetadataRequest) Size() (n int) {
 	return n
 }
 
-func (m *TxnRemoveMetadataResponse) Size() (n int) {
+func (m *TxnRemoveMetadataResponse) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3317,7 +3838,7 @@ func (m *TxnRemoveMetadataResponse) Size() (n int) {
 	return n
 }
 
-func (m *TxnError) Size() (n int) {
+func (m *TxnError) ProtoSize() (n int) {
 	if m == nil {
 		return 0
 	}
@@ -3332,6 +3853,82 @@ func (m *TxnError) Size() (n int) {
 	}
 	if m.TxnErrCode != 0 {
 		n += 1 + sovTxn(uint64(m.TxnErrCode))
+	}
+	if m.XXX_unrecognized != nil {
+		n += len(m.XXX_unrecognized)
+	}
+	return n
+}
+
+func (m *TxnOptions) ProtoSize() (n int) {
+	if m == nil {
+		return 0
+	}
+	var l int
+	_ = l
+	if m.Features != 0 {
+		n += 1 + sovTxn(uint64(m.Features))
+	}
+	l = len(m.CN)
+	if l > 0 {
+		n += 1 + l + sovTxn(uint64(l))
+	}
+	l = len(m.SessionID)
+	if l > 0 {
+		n += 1 + l + sovTxn(uint64(l))
+	}
+	if m.AccountID != 0 {
+		n += 1 + sovTxn(uint64(m.AccountID))
+	}
+	if m.ConnectionID != 0 {
+		n += 1 + sovTxn(uint64(m.ConnectionID))
+	}
+	l = len(m.UserName)
+	if l > 0 {
+		n += 1 + l + sovTxn(uint64(l))
+	}
+	if len(m.SkipLockTables) > 0 {
+		l = 0
+		for _, e := range m.SkipLockTables {
+			l += sovTxn(uint64(e))
+		}
+		n += 1 + sovTxn(uint64(l)) + l
+	}
+	if len(m.SkipLockTableModes) > 0 {
+		l = 0
+		for _, e := range m.SkipLockTableModes {
+			l += sovTxn(uint64(e))
+		}
+		n += 1 + sovTxn(uint64(l)) + l
+	}
+	l = len(m.Counter)
+	if l > 0 {
+		n += 1 + l + sovTxn(uint64(l))
+	}
+	l = len(m.SessionInfo)
+	if l > 0 {
+		n += 1 + l + sovTxn(uint64(l))
+	}
+	if m.InRunSql {
+		n += 2
+	}
+	if m.InCommit {
+		n += 2
+	}
+	if m.InRollback {
+		n += 2
+	}
+	if m.ByBegin {
+		n += 2
+	}
+	if m.Autocommit {
+		n += 2
+	}
+	if m.InIncrStmt {
+		n += 3
+	}
+	if m.InRollbackStmt {
+		n += 3
 	}
 	if m.XXX_unrecognized != nil {
 		n += len(m.XXX_unrecognized)
@@ -3528,7 +4125,7 @@ func (m *TxnMeta) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 6:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DNShards", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TNShards", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -3555,8 +4152,8 @@ func (m *TxnMeta) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			m.DNShards = append(m.DNShards, metadata.DNShard{})
-			if err := m.DNShards[len(m.DNShards)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			m.TNShards = append(m.TNShards, metadata.TNShard{})
+			if err := m.TNShards[len(m.TNShards)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -3632,6 +4229,58 @@ func (m *TxnMeta) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		case 10:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Mirror", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Mirror = bool(v != 0)
+		case 11:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field LockService", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.LockService = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
 			skippy, err := skipTxn(dAtA[iNdEx:])
@@ -3810,6 +4459,58 @@ func (m *CNTxnSnapshot) Unmarshal(dAtA []byte) error {
 				return err
 			}
 			iNdEx = postIndex
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Options", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			if err := m.Options.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
+		case 7:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Flag", wireType)
+			}
+			m.Flag = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Flag |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipTxn(dAtA[iNdEx:])
@@ -4355,7 +5056,7 @@ func (m *TxnRequest) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 10:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field CommitDNShardRequest", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field CommitTNShardRequest", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4382,16 +5083,16 @@ func (m *TxnRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.CommitDNShardRequest == nil {
-				m.CommitDNShardRequest = &TxnCommitDNShardRequest{}
+			if m.CommitTNShardRequest == nil {
+				m.CommitTNShardRequest = &TxnCommitTNShardRequest{}
 			}
-			if err := m.CommitDNShardRequest.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.CommitTNShardRequest.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 11:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RollbackDNShardRequest", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RollbackTNShardRequest", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -4418,10 +5119,10 @@ func (m *TxnRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.RollbackDNShardRequest == nil {
-				m.RollbackDNShardRequest = &TxnRollbackDNShardRequest{}
+			if m.RollbackTNShardRequest == nil {
+				m.RollbackTNShardRequest = &TxnRollbackTNShardRequest{}
 			}
-			if err := m.RollbackDNShardRequest.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.RollbackTNShardRequest.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5005,7 +5706,7 @@ func (m *TxnResponse) Unmarshal(dAtA []byte) error {
 			iNdEx = postIndex
 		case 11:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field CommitDNShardResponse", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field CommitTNShardResponse", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5032,16 +5733,16 @@ func (m *TxnResponse) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.CommitDNShardResponse == nil {
-				m.CommitDNShardResponse = &TxnCommitDNShardResponse{}
+			if m.CommitTNShardResponse == nil {
+				m.CommitTNShardResponse = &TxnCommitTNShardResponse{}
 			}
-			if err := m.CommitDNShardResponse.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.CommitTNShardResponse.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
 		case 12:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field RollbackDNShardResponse", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field RollbackTNShardResponse", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5068,10 +5769,10 @@ func (m *TxnResponse) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if m.RollbackDNShardResponse == nil {
-				m.RollbackDNShardResponse = &TxnRollbackDNShardResponse{}
+			if m.RollbackTNShardResponse == nil {
+				m.RollbackTNShardResponse = &TxnRollbackTNShardResponse{}
 			}
-			if err := m.RollbackDNShardResponse.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.RollbackTNShardResponse.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5162,6 +5863,40 @@ func (m *TxnCommitRequest) Unmarshal(dAtA []byte) error {
 			return fmt.Errorf("proto: TxnCommitRequest: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
+		case 1:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Payload", wireType)
+			}
+			var msglen int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				msglen |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			if msglen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + msglen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Payload = append(m.Payload, &TxnRequest{})
+			if err := m.Payload[len(m.Payload)-1].Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+				return err
+			}
+			iNdEx = postIndex
 		case 2:
 			if wireType != 0 {
 				return fmt.Errorf("proto: wrong wireType = %d for field Disable1PCOpt", wireType)
@@ -5233,6 +5968,82 @@ func (m *TxnCommitResponse) Unmarshal(dAtA []byte) error {
 			return fmt.Errorf("proto: TxnCommitResponse: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
+		case 1:
+			if wireType == 0 {
+				var v uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowTxn
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= uint64(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.InvalidLockTables = append(m.InvalidLockTables, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowTxn
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthTxn
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthTxn
+				}
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA[iNdEx:postIndex] {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.InvalidLockTables) == 0 {
+					m.InvalidLockTables = make([]uint64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowTxn
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.InvalidLockTables = append(m.InvalidLockTables, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field InvalidLockTables", wireType)
+			}
 		default:
 			iNdEx = preIndex
 			skippy, err := skipTxn(dAtA[iNdEx:])
@@ -5388,7 +6199,7 @@ func (m *TxnPrepareRequest) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DNShard", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TNShard", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5415,7 +6226,7 @@ func (m *TxnPrepareRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.DNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.TNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5523,7 +6334,7 @@ func (m *TxnGetStatusRequest) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DNShard", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TNShard", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5550,7 +6361,7 @@ func (m *TxnGetStatusRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.DNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.TNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5627,7 +6438,7 @@ func (m *TxnGetStatusResponse) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *TxnCommitDNShardRequest) Unmarshal(dAtA []byte) error {
+func (m *TxnCommitTNShardRequest) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -5650,15 +6461,15 @@ func (m *TxnCommitDNShardRequest) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TxnCommitDNShardRequest: wiretype end group for non-group")
+			return fmt.Errorf("proto: TxnCommitTNShardRequest: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TxnCommitDNShardRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TxnCommitTNShardRequest: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DNShard", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TNShard", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5685,7 +6496,7 @@ func (m *TxnCommitDNShardRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.DNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.TNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5711,7 +6522,7 @@ func (m *TxnCommitDNShardRequest) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *TxnCommitDNShardResponse) Unmarshal(dAtA []byte) error {
+func (m *TxnCommitTNShardResponse) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -5734,10 +6545,10 @@ func (m *TxnCommitDNShardResponse) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TxnCommitDNShardResponse: wiretype end group for non-group")
+			return fmt.Errorf("proto: TxnCommitTNShardResponse: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TxnCommitDNShardResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TxnCommitTNShardResponse: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		default:
@@ -5762,7 +6573,7 @@ func (m *TxnCommitDNShardResponse) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *TxnRollbackDNShardRequest) Unmarshal(dAtA []byte) error {
+func (m *TxnRollbackTNShardRequest) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -5785,15 +6596,15 @@ func (m *TxnRollbackDNShardRequest) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TxnRollbackDNShardRequest: wiretype end group for non-group")
+			return fmt.Errorf("proto: TxnRollbackTNShardRequest: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TxnRollbackDNShardRequest: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TxnRollbackTNShardRequest: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DNShard", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TNShard", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5820,7 +6631,7 @@ func (m *TxnRollbackDNShardRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.DNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.TNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -5846,7 +6657,7 @@ func (m *TxnRollbackDNShardRequest) Unmarshal(dAtA []byte) error {
 	}
 	return nil
 }
-func (m *TxnRollbackDNShardResponse) Unmarshal(dAtA []byte) error {
+func (m *TxnRollbackTNShardResponse) Unmarshal(dAtA []byte) error {
 	l := len(dAtA)
 	iNdEx := 0
 	for iNdEx < l {
@@ -5869,10 +6680,10 @@ func (m *TxnRollbackDNShardResponse) Unmarshal(dAtA []byte) error {
 		fieldNum := int32(wire >> 3)
 		wireType := int(wire & 0x7)
 		if wireType == 4 {
-			return fmt.Errorf("proto: TxnRollbackDNShardResponse: wiretype end group for non-group")
+			return fmt.Errorf("proto: TxnRollbackTNShardResponse: wiretype end group for non-group")
 		}
 		if fieldNum <= 0 {
-			return fmt.Errorf("proto: TxnRollbackDNShardResponse: illegal tag %d (wire type %d)", fieldNum, wire)
+			return fmt.Errorf("proto: TxnRollbackTNShardResponse: illegal tag %d (wire type %d)", fieldNum, wire)
 		}
 		switch fieldNum {
 		default:
@@ -5928,7 +6739,7 @@ func (m *TxnRemoveMetadataRequest) Unmarshal(dAtA []byte) error {
 		switch fieldNum {
 		case 1:
 			if wireType != 2 {
-				return fmt.Errorf("proto: wrong wireType = %d for field DNShard", wireType)
+				return fmt.Errorf("proto: wrong wireType = %d for field TNShard", wireType)
 			}
 			var msglen int
 			for shift := uint(0); ; shift += 7 {
@@ -5955,7 +6766,7 @@ func (m *TxnRemoveMetadataRequest) Unmarshal(dAtA []byte) error {
 			if postIndex > l {
 				return io.ErrUnexpectedEOF
 			}
-			if err := m.DNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
+			if err := m.TNShard.Unmarshal(dAtA[iNdEx:postIndex]); err != nil {
 				return err
 			}
 			iNdEx = postIndex
@@ -6133,6 +6944,559 @@ func (m *TxnError) Unmarshal(dAtA []byte) error {
 					break
 				}
 			}
+		default:
+			iNdEx = preIndex
+			skippy, err := skipTxn(dAtA[iNdEx:])
+			if err != nil {
+				return err
+			}
+			if (skippy < 0) || (iNdEx+skippy) < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if (iNdEx + skippy) > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.XXX_unrecognized = append(m.XXX_unrecognized, dAtA[iNdEx:iNdEx+skippy]...)
+			iNdEx += skippy
+		}
+	}
+
+	if iNdEx > l {
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+func (m *TxnOptions) Unmarshal(dAtA []byte) error {
+	l := len(dAtA)
+	iNdEx := 0
+	for iNdEx < l {
+		preIndex := iNdEx
+		var wire uint64
+		for shift := uint(0); ; shift += 7 {
+			if shift >= 64 {
+				return ErrIntOverflowTxn
+			}
+			if iNdEx >= l {
+				return io.ErrUnexpectedEOF
+			}
+			b := dAtA[iNdEx]
+			iNdEx++
+			wire |= uint64(b&0x7F) << shift
+			if b < 0x80 {
+				break
+			}
+		}
+		fieldNum := int32(wire >> 3)
+		wireType := int(wire & 0x7)
+		if wireType == 4 {
+			return fmt.Errorf("proto: TxnOptions: wiretype end group for non-group")
+		}
+		if fieldNum <= 0 {
+			return fmt.Errorf("proto: TxnOptions: illegal tag %d (wire type %d)", fieldNum, wire)
+		}
+		switch fieldNum {
+		case 1:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Features", wireType)
+			}
+			m.Features = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.Features |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 2:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field CN", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.CN = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 3:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SessionID", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.SessionID = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 4:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AccountID", wireType)
+			}
+			m.AccountID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.AccountID |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 5:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ConnectionID", wireType)
+			}
+			m.ConnectionID = 0
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				m.ConnectionID |= uint32(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+		case 6:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field UserName", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.UserName = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 7:
+			if wireType == 0 {
+				var v uint64
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowTxn
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= uint64(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.SkipLockTables = append(m.SkipLockTables, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowTxn
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthTxn
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthTxn
+				}
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				var count int
+				for _, integer := range dAtA[iNdEx:postIndex] {
+					if integer < 128 {
+						count++
+					}
+				}
+				elementCount = count
+				if elementCount != 0 && len(m.SkipLockTables) == 0 {
+					m.SkipLockTables = make([]uint64, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v uint64
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowTxn
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= uint64(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.SkipLockTables = append(m.SkipLockTables, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field SkipLockTables", wireType)
+			}
+		case 8:
+			if wireType == 0 {
+				var v lock.LockMode
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowTxn
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					v |= lock.LockMode(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				m.SkipLockTableModes = append(m.SkipLockTableModes, v)
+			} else if wireType == 2 {
+				var packedLen int
+				for shift := uint(0); ; shift += 7 {
+					if shift >= 64 {
+						return ErrIntOverflowTxn
+					}
+					if iNdEx >= l {
+						return io.ErrUnexpectedEOF
+					}
+					b := dAtA[iNdEx]
+					iNdEx++
+					packedLen |= int(b&0x7F) << shift
+					if b < 0x80 {
+						break
+					}
+				}
+				if packedLen < 0 {
+					return ErrInvalidLengthTxn
+				}
+				postIndex := iNdEx + packedLen
+				if postIndex < 0 {
+					return ErrInvalidLengthTxn
+				}
+				if postIndex > l {
+					return io.ErrUnexpectedEOF
+				}
+				var elementCount int
+				if elementCount != 0 && len(m.SkipLockTableModes) == 0 {
+					m.SkipLockTableModes = make([]lock.LockMode, 0, elementCount)
+				}
+				for iNdEx < postIndex {
+					var v lock.LockMode
+					for shift := uint(0); ; shift += 7 {
+						if shift >= 64 {
+							return ErrIntOverflowTxn
+						}
+						if iNdEx >= l {
+							return io.ErrUnexpectedEOF
+						}
+						b := dAtA[iNdEx]
+						iNdEx++
+						v |= lock.LockMode(b&0x7F) << shift
+						if b < 0x80 {
+							break
+						}
+					}
+					m.SkipLockTableModes = append(m.SkipLockTableModes, v)
+				}
+			} else {
+				return fmt.Errorf("proto: wrong wireType = %d for field SkipLockTableModes", wireType)
+			}
+		case 9:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Counter", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.Counter = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 10:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field SessionInfo", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthTxn
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthTxn
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.SessionInfo = string(dAtA[iNdEx:postIndex])
+			iNdEx = postIndex
+		case 11:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InRunSql", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.InRunSql = bool(v != 0)
+		case 12:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InCommit", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.InCommit = bool(v != 0)
+		case 13:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InRollback", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.InRollback = bool(v != 0)
+		case 14:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field ByBegin", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.ByBegin = bool(v != 0)
+		case 15:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field Autocommit", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.Autocommit = bool(v != 0)
+		case 16:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InIncrStmt", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.InIncrStmt = bool(v != 0)
+		case 17:
+			if wireType != 0 {
+				return fmt.Errorf("proto: wrong wireType = %d for field InRollbackStmt", wireType)
+			}
+			var v int
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowTxn
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				v |= int(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			m.InRollbackStmt = bool(v != 0)
 		default:
 			iNdEx = preIndex
 			skippy, err := skipTxn(dAtA[iNdEx:])

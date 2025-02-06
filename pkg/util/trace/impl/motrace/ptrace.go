@@ -32,11 +32,12 @@ type MOTracerProvider struct {
 func defaultMOTracerProvider() *MOTracerProvider {
 	pTracer := &MOTracerProvider{
 		tracerProviderConfig{
-			enable:           false,
-			resource:         trace.NewResource(),
-			idGenerator:      &moIDGenerator{},
-			batchProcessMode: FileService,
-			batchProcessor:   NoopBatchProcessor{},
+			enable:         false,
+			resource:       trace.NewResource(),
+			idGenerator:    &moIDGenerator{},
+			batchProcessor: NoopBatchProcessor{},
+			// default: 10K
+			MaxStatementSize: 10240,
 		},
 	}
 	WithNode("node_uuid", trace.NodeTypeStandalone).apply(&pTracer.tracerProviderConfig)
@@ -60,6 +61,8 @@ func (p *MOTracerProvider) Tracer(instrumentationName string, opts ...trace.Trac
 	tracer := &MOTracer{
 		TracerConfig: trace.TracerConfig{Name: instrumentationName},
 		provider:     p,
+		// init mapper
+		profileBackOff: make(map[string]BackOff, 8),
 	}
 	for _, opt := range opts {
 		opt.Apply(&tracer.TracerConfig)

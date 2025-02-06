@@ -15,13 +15,18 @@
 package txn
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/lni/goutils/leaktest"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/tests/service"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
 	"github.com/stretchr/testify/require"
 )
 
@@ -37,12 +42,13 @@ func TestBasicSingleShard(t *testing.T) {
 		t.Skip("skipping in short mode.")
 		return
 	}
+	ctx := context.Background()
 
 	// this case will start a mo cluster with 1 CNService, 1 DNService and 3 LogService.
 	// A Txn read and write will success.
 	for name, options := range testOptionsSet {
 		t.Run(name, func(t *testing.T) {
-			c, err := NewCluster(t,
+			c, err := NewCluster(ctx, t,
 				getBasicClusterOptions(options...))
 			require.NoError(t, err)
 			defer c.Stop()
@@ -66,6 +72,7 @@ func TestBasicSingleShardCannotReadUncommittedValue(t *testing.T) {
 		t.Skip("skipping in short mode.")
 		return
 	}
+	ctx := context.Background()
 
 	// this case will start a mo cluster with 1 CNService, 1 DNService and 3 LogService.
 	// 1. start t1
@@ -74,7 +81,7 @@ func TestBasicSingleShardCannotReadUncommittedValue(t *testing.T) {
 	// 4. t2 can not read t1's write
 	for name, options := range testOptionsSet {
 		t.Run(name, func(t *testing.T) {
-			c, err := NewCluster(t,
+			c, err := NewCluster(ctx, t,
 				getBasicClusterOptions(options...))
 			require.NoError(t, err)
 			defer c.Stop()
@@ -111,9 +118,11 @@ func TestWriteSkewIsAllowed(t *testing.T) {
 		t.Skip("skipping in short mode.")
 		return
 	}
+	ctx := context.Background()
+
 	for name, options := range testOptionsSet {
 		t.Run(name, func(t *testing.T) {
-			c, err := NewCluster(t,
+			c, err := NewCluster(ctx, t,
 				getBasicClusterOptions(options...))
 			require.NoError(t, err)
 			defer c.Stop()
@@ -149,14 +158,76 @@ func TestWriteSkewIsAllowed(t *testing.T) {
 	}
 }
 
+func TestBasicSingleShardWithInternalSQLExecutor(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode.")
+		return
+	}
+	ctx := context.Background()
+
+	// this case will start a mo cluster with 1 CNService, 1 DNService and 3 LogService.
+	// A Txn read and write will success.
+	for name, options := range testOptionsSet {
+		t.Run(name, func(t *testing.T) {
+			c, err := NewCluster(ctx, t,
+				getBasicClusterOptions(options...))
+			require.NoError(t, err)
+			defer c.Stop()
+			c.Start()
+
+			s, err := c.Env().GetCNServiceIndexed(0)
+			require.NoError(t, err)
+			v, ok := runtime.ServiceRuntime(s.ID()).GetGlobalVariables(runtime.InternalSQLExecutor)
+			if !ok {
+				panic("missing internal sql executor")
+			}
+			exec := v.(executor.SQLExecutor)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+			defer cancel()
+			exec.ExecTxn(
+				ctx,
+				func(te executor.TxnExecutor) error {
+					res, err := te.Exec("create database zx", executor.StatementOption{})
+					require.NoError(t, err)
+					res.Close()
+
+					res, err = te.Exec("create table t1 (id int primary key, name varchar(255))", executor.StatementOption{})
+					require.NoError(t, err)
+					res.Close()
+
+					res, err = te.Exec("insert into t1 values (1, 'a'),(2, 'b'),(3, 'c')", executor.StatementOption{})
+					require.NoError(t, err)
+					require.Equal(t, uint64(3), res.AffectedRows)
+					res.Close()
+
+					res, err = te.Exec("select id,name from t1 order by id", executor.StatementOption{})
+					require.NoError(t, err)
+					var ids []int32
+					var names []string
+					res.ReadRows(func(_ int, cols []*vector.Vector) bool {
+						ids = append(ids, executor.GetFixedRows[int32](cols[0])...)
+						names = append(names, executor.GetStringRows(cols[1])...)
+						return true
+					})
+					require.Equal(t, []int32{1, 2, 3}, ids)
+					require.Equal(t, []string{"a", "b", "c"}, names)
+					res.Close()
+					return nil
+				},
+				executor.Options{}.WithDatabase("zx"))
+		})
+	}
+}
+
 func TestSingleShardWithCreateTable(t *testing.T) {
 	defer leaktest.AfterTest(t)()
 	if testing.Short() {
 		t.Skip("skipping in short mode.")
 		return
 	}
+	ctx := context.Background()
 
-	c, err := NewCluster(t,
+	c, err := NewCluster(ctx, t,
 		getBasicClusterOptions(useTAEStorage, useDistributedTAEEngine))
 	require.NoError(t, err)
 	defer c.Stop()
@@ -188,8 +259,9 @@ func TestAggTable(t *testing.T) {
 		t.Skip("skipping in short mode.")
 		return
 	}
+	ctx := context.Background()
 
-	c, err := NewCluster(t,
+	c, err := NewCluster(ctx, t,
 		getBasicClusterOptions(useTAEStorage, useDistributedTAEEngine))
 	require.NoError(t, err)
 	defer c.Stop()
@@ -241,10 +313,14 @@ func TestAggTable(t *testing.T) {
 			defer wg.Done()
 			rows, err := txnList[i].ExecSQLQuery(fmt.Sprintf("SELECT DISTINCT a, AVG( b) FROM %s GROUP BY a HAVING AVG( b) > 50;", tblList[i]))
 			defer mustCloseRows(t, rows)
+			defer func() {
+				err := rows.Err()
+				require.NoError(t, err)
+			}()
 			require.NoError(t, err)
 			var l avgline
 			if !rows.Next() {
-				rows.Close()
+				return
 			}
 			err = rows.Scan(&l.a, &l.b)
 			require.NoError(t, err)
@@ -283,9 +359,9 @@ func checkWrite(t *testing.T, txn Txn, key, value string, expectError error, com
 
 func getBasicClusterOptions(opts ...func(opts service.Options) service.Options) service.Options {
 	basic := service.DefaultOptions().
-		WithDNShardNum(1).
+		WithTNShardNum(1).
 		WithLogShardNum(1).
-		WithDNServiceNum(1).
+		WithTNServiceNum(1).
 		WithLogServiceNum(3).
 		WithCNShardNum(1).
 		WithCNServiceNum(1)
@@ -296,7 +372,7 @@ func getBasicClusterOptions(opts ...func(opts service.Options) service.Options) 
 }
 
 func useTAEStorage(opts service.Options) service.Options {
-	return opts.WithDNUseTAEStorage()
+	return opts.WithTNUseTAEStorage()
 }
 
 func useDistributedTAEEngine(opts service.Options) service.Options {

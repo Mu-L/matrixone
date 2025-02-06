@@ -15,13 +15,82 @@
 package projection
 
 import (
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
+	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-type Argument struct {
-	Es []*plan.Expr
+var _ vm.Operator = new(Projection)
+
+type Projection struct {
+	ctr         container
+	ProjectList []*plan.Expr
+	vm.OperatorBase
+
+	maxAllocSize int
 }
 
-func (arg *Argument) Free(proc *process.Process, pipelineFailed bool) {
+func (projection *Projection) GetOperatorBase() *vm.OperatorBase {
+	return &projection.OperatorBase
+}
+
+func init() {
+	reuse.CreatePool[Projection](
+		func() *Projection {
+			return &Projection{}
+		},
+		func(a *Projection) {
+			*a = Projection{}
+		},
+		reuse.DefaultOptions[Projection]().
+			WithEnableChecker(),
+	)
+}
+
+func (projection Projection) TypeName() string {
+	return opName
+}
+
+func NewArgument() *Projection {
+	return reuse.Alloc[Projection](nil)
+}
+
+func (projection *Projection) Release() {
+	if projection != nil {
+		reuse.Free[Projection](projection, nil)
+	}
+}
+
+type container struct {
+	buf           *batch.Batch
+	projExecutors []colexec.ExpressionExecutor
+}
+
+func (projection *Projection) Reset(proc *process.Process, pipelineFailed bool, err error) {
+	for i := range projection.ctr.projExecutors {
+		if projection.ctr.projExecutors[i] != nil {
+			projection.ctr.projExecutors[i].ResetForNextQuery()
+		}
+	}
+
+	if projection.OpAnalyzer != nil {
+		projection.OpAnalyzer.Alloc(int64(projection.maxAllocSize))
+	}
+	projection.maxAllocSize = 0
+}
+
+func (projection *Projection) Free(proc *process.Process, pipelineFailed bool, err error) {
+	for i := range projection.ctr.projExecutors {
+		if projection.ctr.projExecutors[i] != nil {
+			projection.ctr.projExecutors[i].Free()
+		}
+	}
+	projection.ctr.projExecutors = nil
+}
+
+func (projection *Projection) ExecProjection(proc *process.Process, input *batch.Batch) (*batch.Batch, error) {
+	return input, nil
 }

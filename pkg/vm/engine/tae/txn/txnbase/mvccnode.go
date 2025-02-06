@@ -15,23 +15,20 @@
 package txnbase
 
 import (
-	"encoding/binary"
 	"fmt"
 	"io"
 
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/containers"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/store"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
 )
 
 type TxnMVCCNode struct {
 	Start, Prepare, End types.TS
 	Txn                 txnif.TxnReader
 	Aborted             bool
-	is1PC               bool // for subTxn
-	LogIndex            *wal.Index
 }
 
 var (
@@ -43,42 +40,42 @@ var (
 	SnapshotAttr_LogIndex_Size = "log_index_size"
 )
 
-func NewTxnMVCCNodeWithTxn(txn txnif.TxnReader) *TxnMVCCNode {
+func NewTxnMVCCNodeWithTxn(txn txnif.TxnReader) TxnMVCCNode {
 	var ts types.TS
 	if txn != nil {
 		ts = txn.GetStartTS()
 	}
-	return &TxnMVCCNode{
+	return TxnMVCCNode{
 		Start:   ts,
 		Prepare: txnif.UncommitTS,
 		End:     txnif.UncommitTS,
 		Txn:     txn,
 	}
 }
-func NewTxnMVCCNodeWithTS(ts types.TS) *TxnMVCCNode {
-	return &TxnMVCCNode{
+func NewTxnMVCCNodeWithTS(ts types.TS) TxnMVCCNode {
+	return TxnMVCCNode{
 		Start:   ts,
 		Prepare: ts,
 		End:     ts,
 	}
 }
-
+func NewTxnMVCCNodeWithStartEnd(start, end types.TS) TxnMVCCNode {
+	return TxnMVCCNode{
+		Start:   start,
+		Prepare: end,
+		End:     end,
+	}
+}
 func (un *TxnMVCCNode) IsAborted() bool {
 	return un.Aborted
 }
-func (un *TxnMVCCNode) Is1PC() bool {
-	return un.is1PC
-}
-func (un *TxnMVCCNode) Set1PC() {
-	un.is1PC = true
-}
 
 // Check w-w confilct
-func (un *TxnMVCCNode) CheckConflict(ts types.TS) error {
+func (un *TxnMVCCNode) CheckConflict(txn txnif.TxnReader) error {
 	// If node is held by a active txn
 	if !un.IsCommitted() {
 		// No conflict if it is the same txn
-		if un.IsSameTxn(ts) {
+		if un.IsSameTxn(txn) {
 			return nil
 		}
 		return txnif.ErrTxnWWConflict
@@ -87,7 +84,8 @@ func (un *TxnMVCCNode) CheckConflict(ts types.TS) error {
 	// For a committed node, it is w-w conflict if ts is lt the node commit ts
 	// -------+-------------+-------------------->
 	//        ts         CommitTs            time
-	if un.End.Greater(ts) {
+	startTS := txn.GetStartTS()
+	if un.End.GT(&startTS) {
 		return txnif.ErrTxnWWConflict
 	}
 	return nil
@@ -95,9 +93,9 @@ func (un *TxnMVCCNode) CheckConflict(ts types.TS) error {
 
 // Check whether is mvcc node is visible to ts
 // Make sure all the relevant prepared txns should be committed|rollbacked
-func (un *TxnMVCCNode) IsVisible(ts types.TS) (visible bool) {
+func (un *TxnMVCCNode) IsVisible(txn txnif.TxnReader) (visible bool) {
 	// Node is always visible to its born txn
-	if un.IsSameTxn(ts) {
+	if un.IsSameTxn(txn) {
 		return true
 	}
 
@@ -107,7 +105,36 @@ func (un *TxnMVCCNode) IsVisible(ts types.TS) (visible bool) {
 	}
 
 	// Node is visible if the commit ts is le ts
-	if un.End.LessEq(ts) && !un.Aborted {
+	startTS := txn.GetStartTS()
+	if un.End.LE(&startTS) && !un.Aborted {
+		return true
+	}
+
+	// Node is not invisible if the commit ts is gt ts
+	return false
+
+}
+func (un *TxnMVCCNode) Reset() {
+	un.Start = types.TS{}
+	un.Prepare = types.TS{}
+	un.End = types.TS{}
+	un.Aborted = false
+	un.Txn = nil
+}
+func (un *TxnMVCCNode) IsEmpty() bool {
+	return un.Start.IsEmpty()
+}
+
+// Check whether is mvcc node is visible to ts
+// Make sure all the relevant prepared txns should be committed|rollbacked
+func (un *TxnMVCCNode) IsVisibleByTS(ts types.TS) (visible bool) {
+	// The born txn of this node has not been commited|rollbacked
+	if un.IsActive() || un.IsCommitting() {
+		return false
+	}
+
+	// Node is visible if the commit ts is le ts
+	if un.End.LE(&ts) && !un.Aborted {
 		return true
 	}
 
@@ -139,7 +166,7 @@ func (un *TxnMVCCNode) PreparedIn(minTS, maxTS types.TS) (in, before bool) {
 	// Created by other committed txn
 	// false: not prepared in range
 	// true: prepared before minTs
-	if un.Prepare.Less(minTS) {
+	if un.Prepare.LT(&minTS) {
 		return false, true
 	}
 
@@ -149,7 +176,7 @@ func (un *TxnMVCCNode) PreparedIn(minTS, maxTS types.TS) (in, before bool) {
 	// Created by other committed txn
 	// true: prepared in range
 	// false: not prepared before minTs
-	if un.Prepare.GreaterEq(minTS) && un.Prepare.LessEq(maxTS) {
+	if un.Prepare.GE(&minTS) && un.Prepare.LE(&maxTS) {
 		return true, false
 	}
 
@@ -183,7 +210,7 @@ func (un *TxnMVCCNode) CommittedIn(minTS, maxTS types.TS) (in, before bool) {
 	// Created by other committed txn
 	// false: not committed in range
 	// true: committed before minTs
-	if un.End.Less(minTS) {
+	if un.End.LT(&minTS) {
 		return false, true
 	}
 
@@ -193,7 +220,7 @@ func (un *TxnMVCCNode) CommittedIn(minTS, maxTS types.TS) (in, before bool) {
 	// Created by other committed txn
 	// true: committed in range
 	// false: not committed before minTs
-	if un.End.GreaterEq(minTS) && un.End.LessEq(maxTS) {
+	if un.End.GE(&minTS) && un.End.LE(&maxTS) {
 		return true, false
 	}
 
@@ -217,7 +244,8 @@ func (un *TxnMVCCNode) NeedWaitCommitting(ts types.TS) (bool, txnif.TxnReader) {
 	// --------+----------------+------------------------>
 	//         Ts           PrepareTs                Time
 	// If ts is before the prepare ts. not to wait
-	if un.Txn.GetPrepareTS().GreaterEq(ts) {
+	prepareTS := un.Txn.GetPrepareTS()
+	if prepareTS.GE(&ts) {
 		return false, nil
 	}
 
@@ -227,11 +255,15 @@ func (un *TxnMVCCNode) NeedWaitCommitting(ts types.TS) (bool, txnif.TxnReader) {
 	return true, un.Txn
 }
 
-func (un *TxnMVCCNode) IsSameTxn(ts types.TS) bool {
+func (un *TxnMVCCNode) IsSameTxn(txn txnif.TxnReader) bool {
 	if un.Txn == nil {
 		return false
 	}
-	return un.Txn.GetStartTS().Equal(ts)
+	// for appendnode test
+	if txn == nil {
+		return false
+	}
+	return un.Txn.GetID() == txn.GetID()
 }
 
 func (un *TxnMVCCNode) IsActive() bool {
@@ -265,41 +297,34 @@ func (un *TxnMVCCNode) GetTxn() txnif.TxnReader {
 }
 
 func (un *TxnMVCCNode) Compare(o *TxnMVCCNode) int {
-	if un.Start.Less(o.Start) {
+	if un.Start.LT(&o.Start) {
 		return -1
 	}
-	if un.Start.Equal(o.Start) {
+	if un.Start.Equal(&o.Start) {
 		return 0
 	}
 	return 1
 }
 
 func (un *TxnMVCCNode) Compare2(o *TxnMVCCNode) int {
-	if un.Prepare.Less(o.Prepare) {
+	if un.Prepare.LT(&o.Prepare) {
 		return -1
 	}
-	if un.Prepare.Equal(o.Prepare) {
+	if un.Prepare.Equal(&o.Prepare) {
 		return un.Compare(o)
 	}
 	return 1
 }
 
-func (un *TxnMVCCNode) SetLogIndex(idx *wal.Index) {
-	un.LogIndex = idx
-
-}
-func (un *TxnMVCCNode) GetLogIndex() *wal.Index {
-	return un.LogIndex
-}
-func (un *TxnMVCCNode) ApplyCommit(index *wal.Index) (ts types.TS, err error) {
-	if un.Is1PC() {
-		un.End = un.Txn.GetPrepareTS()
-	} else {
-		un.End = un.Txn.GetCommitTS()
+func (un *TxnMVCCNode) ApplyCommit(id string) (ts types.TS, err error) {
+	if un.Txn == nil {
+		err = moerr.NewTxnNotFoundNoCtx()
+		return
 	}
-	if index != nil {
-		un.SetLogIndex(index)
+	if un.Txn.GetID() != id {
+		err = moerr.NewMissingTxnNoCtx()
 	}
+	un.End = un.Txn.GetCommitTS()
 	un.Txn = nil
 	ts = un.End
 	return
@@ -310,81 +335,45 @@ func (un *TxnMVCCNode) PrepareRollback() (err error) {
 	return
 }
 
-func (un *TxnMVCCNode) ApplyRollback(index *wal.Index) (ts types.TS, err error) {
+func (un *TxnMVCCNode) ApplyRollback() (ts types.TS, err error) {
 	ts = un.Txn.GetCommitTS()
 	un.End = ts
 	un.Txn = nil
 	un.Aborted = true
-	if index != nil {
-		un.SetLogIndex(index)
-	}
 	return
 }
 
 func (un *TxnMVCCNode) WriteTo(w io.Writer) (n int64, err error) {
-	if err = binary.Write(w, binary.BigEndian, un.Start); err != nil {
+	var sn1 int
+	if sn1, err = w.Write(un.Start[:]); err != nil {
 		return
 	}
-	n += types.TxnTsSize
-	if err = binary.Write(w, binary.BigEndian, un.Prepare); err != nil {
+	n += int64(sn1)
+	if sn1, err = w.Write(un.Prepare[:]); err != nil {
 		return
 	}
-	n += types.TxnTsSize
-	if err = binary.Write(w, binary.BigEndian, un.End); err != nil {
+	n += int64(sn1)
+	if sn1, err = w.Write(un.End[:]); err != nil {
 		return
 	}
-	n += types.TxnTsSize
-	var sn int64
-	logIndex := un.LogIndex
-	if logIndex == nil {
-		logIndex = new(wal.Index)
-	}
-	sn, err = logIndex.WriteTo(w)
-	if err != nil {
-		return
-	}
-	n += sn
-	is1PC := uint8(0)
-	if un.is1PC {
-		is1PC = 1
-	}
-	if err = binary.Write(w, binary.BigEndian, is1PC); err != nil {
-		return
-	}
-	n += 1
+	n += int64(sn1)
 	return
 }
 
 func (un *TxnMVCCNode) ReadFrom(r io.Reader) (n int64, err error) {
-	if err = binary.Read(r, binary.BigEndian, &un.Start); err != nil {
+	var sn int
+	if sn, err = r.Read(un.Start[:]); err != nil {
 		return
 	}
-	n += types.TxnTsSize
-	if err = binary.Read(r, binary.BigEndian, &un.Prepare); err != nil {
+	n += int64(sn)
+	if sn, err = r.Read(un.Prepare[:]); err != nil {
 		return
 	}
-	n += types.TxnTsSize
-	if err = binary.Read(r, binary.BigEndian, &un.End); err != nil {
+	n += int64(sn)
+	if sn, err = r.Read(un.End[:]); err != nil {
 		return
 	}
-	n += types.TxnTsSize
-
-	var sn int64
-	un.LogIndex = &store.Index{}
-	sn, err = un.LogIndex.ReadFrom(r)
-	if err != nil {
-		return
-	}
-	n += sn
-
-	is1PC := uint8(0)
-	if err = binary.Read(r, binary.BigEndian, &is1PC); err != nil {
-		return
-	}
-	n += 1
-	if is1PC == 1 {
-		un.is1PC = true
-	}
+	n += int64(sn)
 	return
 }
 
@@ -393,75 +382,85 @@ func CompareTxnMVCCNode(e, o *TxnMVCCNode) int {
 }
 
 func (un *TxnMVCCNode) Update(o *TxnMVCCNode) {
-	if !un.Start.Equal(o.Start) {
+	if !un.Start.Equal(&o.Start) {
 		panic(fmt.Sprintf("logic err, expect %s, start at %s", un.Start.ToString(), o.Start.ToString()))
 	}
-	if !un.Prepare.Equal(o.Prepare) {
+	if !un.Prepare.Equal(&o.Prepare) {
 		panic(fmt.Sprintf("logic err expect %s, prepare at %s", un.Prepare.ToString(), o.Prepare.ToString()))
 	}
-	un.LogIndex = o.LogIndex
 }
 
-func (un *TxnMVCCNode) CloneAll() *TxnMVCCNode {
-	n := &TxnMVCCNode{}
+func (un *TxnMVCCNode) CloneAll() TxnMVCCNode {
+	n := TxnMVCCNode{}
 	n.Start = un.Start
 	n.Prepare = un.Prepare
 	n.End = un.End
-	n.LogIndex = un.LogIndex.Clone()
+	n.Txn = un.Txn
 	return n
 }
 
 func (un *TxnMVCCNode) String() string {
-	return fmt.Sprintf("[%s,%s,%s][%v]",
+	return fmt.Sprintf("[%s,%s][Committed(%v)]",
 		un.Start.ToString(),
-		un.Prepare.ToString(),
-		un.End.ToString(),
-		un.LogIndex)
+		un.End.ToString(), un.Txn == nil)
 }
 
 func (un *TxnMVCCNode) PrepareCommit() (ts types.TS, err error) {
+	if un.Txn == nil {
+		err = moerr.NewTxnNotFoundNoCtx()
+		return
+	}
 	un.Prepare = un.Txn.GetPrepareTS()
 	ts = un.Prepare
 	return
 }
 
 func (un *TxnMVCCNode) AppendTuple(bat *containers.Batch) {
-	bat.GetVectorByName(SnapshotAttr_StartTS).Append(un.Start)
-	bat.GetVectorByName(SnapshotAttr_PrepareTS).Append(un.Prepare)
-	bat.GetVectorByName(SnapshotAttr_CommitTS).Append(un.End)
-	if un.LogIndex != nil {
-		bat.GetVectorByName(SnapshotAttr_LogIndex_LSN).Append(un.LogIndex.LSN)
-		bat.GetVectorByName(SnapshotAttr_LogIndex_CSN).Append(un.LogIndex.CSN)
-		bat.GetVectorByName(SnapshotAttr_LogIndex_Size).Append(un.LogIndex.Size)
-	} else {
-		bat.GetVectorByName(SnapshotAttr_LogIndex_LSN).Append(uint64(0))
-		bat.GetVectorByName(SnapshotAttr_LogIndex_CSN).Append(uint32(0))
-		bat.GetVectorByName(SnapshotAttr_LogIndex_Size).Append(uint32(0))
-	}
+	startTSVec := bat.GetVectorByName(SnapshotAttr_StartTS)
+	vector.AppendFixed(
+		startTSVec.GetDownstreamVector(),
+		un.Start,
+		false,
+		startTSVec.GetAllocator(),
+	)
+	vector.AppendFixed(
+		bat.GetVectorByName(SnapshotAttr_PrepareTS).GetDownstreamVector(),
+		un.Prepare,
+		false,
+		startTSVec.GetAllocator(),
+	)
+	vector.AppendFixed(
+		bat.GetVectorByName(SnapshotAttr_CommitTS).GetDownstreamVector(),
+		un.End,
+		false,
+		startTSVec.GetAllocator(),
+	)
+}
+
+// In push model, logtail is prepared before committing txn,
+// un.End is txnif.Uncommit
+func (un *TxnMVCCNode) AppendTupleWithCommitTS(bat *containers.Batch, commitTS types.TS) {
+	startTSVec := bat.GetVectorByName(SnapshotAttr_StartTS)
+	vector.AppendFixed(
+		startTSVec.GetDownstreamVector(),
+		un.Start,
+		false,
+		startTSVec.GetAllocator(),
+	)
+	vector.AppendFixed(
+		bat.GetVectorByName(SnapshotAttr_PrepareTS).GetDownstreamVector(),
+		un.Prepare,
+		false,
+		startTSVec.GetAllocator(),
+	)
+	vector.AppendFixed(
+		bat.GetVectorByName(SnapshotAttr_CommitTS).GetDownstreamVector(),
+		commitTS,
+		false,
+		startTSVec.GetAllocator(),
+	)
 }
 
 func (un *TxnMVCCNode) ReadTuple(bat *containers.Batch, offset int) {
 	// TODO
-}
-
-func ReadTuple(bat *containers.Batch, row int) (un *TxnMVCCNode) {
-	end := bat.GetVectorByName(SnapshotAttr_CommitTS).Get(row).(types.TS)
-	start := bat.GetVectorByName(SnapshotAttr_StartTS).Get(row).(types.TS)
-	prepare := bat.GetVectorByName(SnapshotAttr_PrepareTS).Get(row).(types.TS)
-	lsn := bat.GetVectorByName(SnapshotAttr_LogIndex_LSN).Get(row).(uint64)
-	var logIndex *wal.Index
-	if lsn != 0 {
-		logIndex = &wal.Index{
-			LSN:  lsn,
-			CSN:  bat.GetVectorByName(SnapshotAttr_LogIndex_CSN).Get(row).(uint32),
-			Size: bat.GetVectorByName(SnapshotAttr_LogIndex_Size).Get(row).(uint32),
-		}
-	}
-	un = &TxnMVCCNode{
-		Start:    start,
-		Prepare:  prepare,
-		End:      end,
-		LogIndex: logIndex,
-	}
-	return
 }

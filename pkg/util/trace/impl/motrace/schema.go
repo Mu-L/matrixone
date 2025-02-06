@@ -16,7 +16,11 @@ package motrace
 
 import (
 	"context"
+	"fmt"
 	"time"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace/statistic"
 
 	"github.com/matrixorigin/matrixone/pkg/util/export/table"
 
@@ -32,12 +36,14 @@ const (
 const (
 	// statementInfoTbl is an EXTERNAL table
 	statementInfoTbl = "statement_info"
-	rawLogTbl        = "rawlog"
+	RawLogTbl        = "rawlog"
 
 	// spanInfoTbl is a view
 	spanInfoTbl  = "span_info"
 	logInfoTbl   = "log_info"
 	errorInfoTbl = "error_info"
+
+	SqlStatementHotspotTbl = "sql_statement_hotspot"
 )
 
 var (
@@ -59,17 +65,20 @@ var (
 	durationCol  = table.UInt64Column("duration", "exec time, unit: ns")
 	statusCol    = table.StringColumn("status", "sql statement running status, enum: Running, Success, Failed")
 	errorCol     = table.TextColumn("error", "error message")
-	execPlanCol  = table.JsonColumn("exec_plan", "statement execution plan")
+	execPlanCol  = table.TextDefaultColumn("exec_plan", `{}`, "statement execution plan")
 	rowsReadCol  = table.Int64Column("rows_read", "rows read total")
 	bytesScanCol = table.Int64Column("bytes_scan", "bytes scan total")
-	statsCol     = table.JsonColumn("stats", "global stats info in exec_plan")
+	statsCol     = table.TextDefaultColumn("stats", `[]`, "global stats info in exec_plan")
 	stmtTypeCol  = table.StringColumn("statement_type", "statement type, val in [Insert, Delete, Update, Drop Table, Drop User, ...]")
 	queryTypeCol = table.StringColumn("query_type", "query type, val in [DQL, DDL, DML, DCL, TCL]")
 	sqlTypeCol   = table.TextColumn("sql_source_type", "sql statement source type")
+	aggrCntCol   = table.Int64Column("aggr_count", "the number of statements aggregated")
 	resultCntCol = table.Int64Column("result_count", "the number of rows of sql execution results")
+	connIdCol    = table.Int64Column("connection_id", "connection id")
+	cuCol        = table.ValueColumnWithPrec("cu", "cu cost", 4)
 
 	SingleStatementTable = &table.Table{
-		Account:  table.AccountAll,
+		Account:  table.AccountSys,
 		Database: StatsDatabase,
 		Table:    statementInfoTbl,
 		Columns: []table.Column{
@@ -99,15 +108,25 @@ var (
 			queryTypeCol,
 			roleIdCol,
 			sqlTypeCol,
+			aggrCntCol,
 			resultCntCol,
+			// mo 2.0
+			connIdCol,
+			cuCol,
 		},
-		PrimaryKeyColumn: []table.Column{stmtIDCol},
-		Engine:           table.ExternalTableEngine,
-		Comment:          "record each statement and stats info",
-		PathBuilder:      table.NewAccountDatePathBuilder(),
-		AccountColumn:    &accountCol,
+		PrimaryKeyColumn: nil,
+		ClusterBy:        []table.Column{accountCol, reqAtCol},
+		// Engine
+		Engine:        table.NormalTableEngine,
+		Comment:       "record each statement and stats info" + catalog.MO_COMMENT_NO_DEL_HINT,
+		PathBuilder:   table.NewAccountDatePathBuilder(),
+		AccountColumn: &accountCol,
+		// TimestampColumn
+		TimestampColumn: &respAtCol,
 		// SupportUserAccess
 		SupportUserAccess: true,
+		// SupportConstAccess
+		SupportConstAccess: true,
 	}
 
 	rawItemCol      = table.StringColumn("raw_item", "raw log item")
@@ -116,22 +135,33 @@ var (
 	levelCol        = table.StringColumn("level", "log level, enum: debug, info, warn, error, panic, fatal")
 	callerCol       = table.StringColumn("caller", "where it log, like: package/file.go:123")
 	messageCol      = table.TextColumn("message", "log message")
-	extraCol        = table.JsonColumn("extra", "log dynamic fields")
+	extraCol        = table.TextDefaultColumn("extra", `{}`, "log dynamic fields")
 	errCodeCol      = table.StringDefaultColumn("err_code", `0`, "error code info")
-	stackCol        = table.StringWithScale("stack", 4096, "stack info")
+	stackCol        = table.StringWithScale("stack", 2048, "stack info")
 	traceIDCol      = table.UuidStringColumn("trace_id", "trace uniq id")
 	spanIDCol       = table.SpanIDStringColumn("span_id", "span uniq id")
+	sessionIDCol    = table.UuidStringColumn("session_id", "session id")
+	statementIDCol  = table.UuidStringColumn("statement_id", "statement id")
 	spanKindCol     = table.StringColumn("span_kind", "span kind, enum: internal, statement, remote")
 	parentSpanIDCol = table.SpanIDStringColumn("parent_span_id", "parent span uniq id")
 	spanNameCol     = table.StringColumn("span_name", "span name, for example: step name of execution plan, function name in code, ...")
 	startTimeCol    = table.DatetimeColumn("start_time", "start time")
 	endTimeCol      = table.DatetimeColumn("end_time", "end time")
-	resourceCol     = table.JsonColumn("resource", "static resource information")
+	resourceCol     = table.TextDefaultColumn("resource", `{}`, "static resource information")
+
+	UpgradeColumns = map[string]map[string][]table.Column{
+		"1.0": {
+			"ADD": {
+				statementIDCol,
+				sessionIDCol,
+			},
+		},
+	}
 
 	SingleRowLogTable = &table.Table{
-		Account:  table.AccountAll,
+		Account:  table.AccountSys,
 		Database: StatsDatabase,
-		Table:    rawLogTbl,
+		Table:    RawLogTbl,
 		Columns: []table.Column{
 			rawItemCol,
 			nodeUUIDCol,
@@ -154,14 +184,21 @@ var (
 			durationCol,
 			resourceCol,
 			spanKindCol,
+			statementIDCol,
+			sessionIDCol,
 		},
 		PrimaryKeyColumn: nil,
-		Engine:           table.ExternalTableEngine,
-		Comment:          "read merge data from log, error, span",
+		ClusterBy:        []table.Column{timestampCol},
+		Engine:           table.NormalTableEngine,
+		Comment:          "read merge data from log, error, span" + catalog.MO_COMMENT_NO_DEL_HINT,
 		PathBuilder:      table.NewAccountDatePathBuilder(),
 		AccountColumn:    nil,
+		// TimestampColumn
+		TimestampColumn: &timestampCol,
 		// SupportUserAccess
 		SupportUserAccess: false,
+		// SupportConstAccess
+		SupportConstAccess: true,
 	}
 
 	logView = &table.View{
@@ -181,6 +218,8 @@ var (
 			messageCol,
 			extraCol,
 			stackCol,
+			sessionIDCol,
+			statementIDCol,
 		},
 		Condition: &table.ViewSingleCondition{Column: rawItemCol, Table: logInfoTbl},
 	}
@@ -219,8 +258,38 @@ var (
 			endTimeCol,
 			durationCol,
 			resourceCol,
+			extraCol,
 		},
 		Condition: &table.ViewSingleCondition{Column: rawItemCol, Table: spanInfoTbl},
+	}
+
+	SqlStatementHotspotView = &table.View{
+		Database:    StatsDatabase,
+		Table:       SqlStatementHotspotTbl,
+		OriginTable: SingleStatementTable,
+		Columns: []table.Column{
+			table.StringColumn("statement_id", "the statement's uuid"),
+			table.StringColumn("statement", "query's statement"),
+			table.ValueColumn("timeconsumed", "query's exec time (unit: ms)"),
+			table.ValueColumn("memorysize", "query's consume mem size (unit: MiB)"),
+			table.DatetimeColumn("collecttime", "collected time, same as query's response time"),
+			table.StringColumn("node", "cn node uuid"),
+			table.StringColumn("account", "account id "),
+			table.StringColumn("user", "user name"),
+			table.StringColumn("type", "statement type, like: [Insert, Delete, Update, Select, ...]"),
+		},
+		CreateSql: table.ViewCreateSqlString(fmt.Sprintf(`CREATE VIEW IF NOT EXISTS system.sql_statement_hotspot AS
+select statement_id, statement, duration / 1e6 as timeconsumed,
+cast(json_unquote(json_extract(stats, '$[%d]')) / 1048576.00 as decimal(38,3)) as memorysize,
+response_at as collecttime,
+node_uuid as node,
+account,
+user,
+statement_type as type
+ from system.statement_info
+ where response_at > date_sub(now(), interval 10 minute) and response_at < now()
+and aggr_count = 0 order by duration desc limit 10;`, statistic.StatsArrayIndexMemorySize)),
+		SupportUserAccess: false,
 	}
 )
 
@@ -229,7 +298,7 @@ const (
 )
 
 var tables = []*table.Table{SingleStatementTable, SingleRowLogTable}
-var views = []*table.View{logView, errorView, spanView}
+var views = []*table.View{logView, errorView, spanView, SqlStatementHotspotView}
 
 // InitSchemaByInnerExecutor init schema, which can access db by io.InternalExecutor on any Node.
 func InitSchemaByInnerExecutor(ctx context.Context, ieFactory func() ie.InternalExecutor) error {
@@ -240,7 +309,7 @@ func InitSchemaByInnerExecutor(ctx context.Context, ieFactory func() ie.Internal
 	exec.ApplySessionOverride(ie.NewOptsBuilder().Database(StatsDatabase).Internal(true).Finish())
 	mustExec := func(sql string) error {
 		if err := exec.Exec(ctx, sql, ie.NewOptsBuilder().Finish()); err != nil {
-			return moerr.NewInternalError(ctx, "[Trace] init table error: %v, sql: %s", err, sql)
+			return moerr.NewInternalErrorf(ctx, "[Trace] init table error: %v, sql: %s", err, sql)
 		}
 		return nil
 	}
@@ -270,6 +339,13 @@ func InitSchemaByInnerExecutor(ctx context.Context, ieFactory func() ie.Internal
 	return nil
 }
 
+// GetAllTables
+//
+// Deprecated: use table.GetAllTables() instead.
+func GetAllTables() []*table.Table {
+	return tables
+}
+
 // GetSchemaForAccount return account's table, and view's schema
 func GetSchemaForAccount(ctx context.Context, account string) []string {
 	var sqls = make([]string, 0, 1)
@@ -281,7 +357,7 @@ func GetSchemaForAccount(ctx context.Context, account string) []string {
 		}
 	}
 	for _, v := range views {
-		if v.OriginTable.SupportUserAccess {
+		if v.SupportUserAccess && v.OriginTable.SupportUserAccess {
 			sqls = append(sqls, v.ToCreateSql(ctx, true))
 		}
 
@@ -293,7 +369,7 @@ func init() {
 	for _, tbl := range tables {
 		tbl.GetRow(context.Background()).Free()
 		if old := table.RegisterTableDefine(tbl); old != nil {
-			panic(moerr.NewInternalError(context.Background(), "table already registered: %s", old.GetIdentify()))
+			panic(moerr.NewInternalErrorf(context.Background(), "table already registered: %s", old.GetIdentify()))
 		}
 	}
 }

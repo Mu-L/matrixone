@@ -3,7 +3,7 @@ create table f2(b int, aa varchar primary key);
 create table c1 (a int, b int, foreign key f_a(a) references f1(c));
 internal error: column 'c' no exists in table 'f1'
 create table c1 (a int, b int, foreign key f_a(a) references f1(b));
-internal error: reference column 'b' is not unique constraint(Unique index or Primary Key)
+internal error: failed to add the foreign key constraint
 create table c1 (a int, b int, foreign key f_a(a) references f2(aa));
 internal error: type of reference column 'aa' is not match for column 'a'
 create table c1 (a int, b int, foreign key f_a(a) references f1(a));
@@ -320,6 +320,28 @@ drop table fk_04;
 drop table fk_03;
 drop table fk_02;
 drop table fk_01;
+create table f1(a int, b int, primary key (a,b));
+create table c1(id int primary key, aa int, bb int, CONSTRAINT `fk_aa` FOREIGN KEY(`aa`) REFERENCES `f1`(`a`));
+insert into f1 values (1,1);
+insert into c1 values (1,1,1);
+update f1 set a=a;
+update f1 set a=1;
+update f1 set a=a, b=2;
+update f1 set a=2;
+internal error: Cannot delete or update a parent row: a foreign key constraint fails
+drop table c1;
+drop table f1;
+create table f1(a int, b int, primary key (a,b));
+create table c1(id int primary key, aa int, bb int, CONSTRAINT `fk_aa` FOREIGN KEY(`aa`,`bb`) REFERENCES `f1`(`a`,`b`));
+insert into f1 values (1,1);
+insert into c1 values (1,1,1);
+update f1 set a=a;
+update f1 set a=a, b=1;
+update f1 set b=1, a=a;
+update f1 set a=a, b=2;
+internal error: Cannot delete or update a parent row: a foreign key constraint fails
+drop table c1;
+drop table f1;
 drop database if exists db1;
 create database db1;
 use db1;
@@ -347,3 +369,14 @@ show tables;
 Tables_in_db2
 drop database db2;
 drop account if exists acc1;
+drop database if exists db1;
+create database db1;
+use db1;
+create table t1(a int primary key);
+create table t2(a int primary key, b int);
+alter table t2 add constraint fk_t2_t1 foreign key(b) references t1(a), add constraint fk_t2_t1 foreign key(b) references t1(a);
+Duplicate foreign key constraint name 'fk_t2_t1'
+alter table t2 add constraint fk_t2_t1 foreign key(b) references t1(a);
+alter table t2 add constraint fk_t2_t1 foreign key(b) references t1(a);
+Duplicate foreign key constraint name 'fk_t2_t1'
+drop database db1;

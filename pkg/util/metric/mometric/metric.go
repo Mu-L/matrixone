@@ -15,28 +15,30 @@
 package mometric
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/util/metric"
-	"github.com/matrixorigin/matrixone/pkg/util/metric/stats"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/config"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
-	"github.com/matrixorigin/matrixone/pkg/util/export/table"
-	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
-	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace"
-
 	prom "github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	dto "github.com/prometheus/client_model/go"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/config"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/util/executor"
+	"github.com/matrixorigin/matrixone/pkg/util/export/table"
+	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
+	"github.com/matrixorigin/matrixone/pkg/util/metric"
+	"github.com/matrixorigin/matrixone/pkg/util/metric/stats"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
 const (
@@ -45,6 +47,11 @@ const (
 	SqlDropDBConst   = "drop database if exists " + MetricDBConst
 	ALL_IN_ONE_MODE  = "monolithic"
 )
+
+type CtxServiceType string
+
+const ServiceTypeKey CtxServiceType = "ServiceTypeKey"
+const LaunchMode = "ALL"
 
 type statusServer struct {
 	*http.Server
@@ -56,54 +63,69 @@ var moExporter metric.MetricExporter
 var moCollector MetricCollector
 var statsLogWriter *StatsLogWriter
 var statusSvr *statusServer
-var multiTable = false // need set before newMetricFSCollector and initTables
 
+// internalRegistry is the registry for metric.InternalCollectors, cooperated with internalExporter.
+var internalRegistry *prom.Registry
+var internalExporter metric.MetricExporter
+
+var enable bool
 var inited uint32
 
-func InitMetric(ctx context.Context, ieFactory func() ie.InternalExecutor, SV *config.ObservabilityParameters, nodeUUID, role string, opts ...InitOption) {
+func InitMetric(
+	ctx context.Context,
+	ieFactory func() ie.InternalExecutor,
+	SV *config.ObservabilityParameters,
+	nodeUUID, role string,
+	opts ...InitOption,
+) (act bool) {
 	// fix multi-init in standalone
 	if !atomic.CompareAndSwapUint32(&inited, 0, 1) {
-		return
+		return false
 	}
 	var initOpts InitOptions
 	opts = append(opts,
 		withExportInterval(SV.MetricExportInterval),
-		withUpdateInterval(SV.MetricUpdateStorageUsageInterval.Duration),
-		withMultiTable(SV.MetricMultiTable),
+		withUpdateInterval(SV.MetricStorageUsageUpdateInterval.Duration),
+		withCheckNewInterval(SV.MetricStorageUsageCheckNewInterval.Duration),
+		WithInternalGatherInterval(SV.MetricInternalGatherInterval.Duration),
 	)
 	for _, opt := range opts {
 		opt.ApplyTo(&initOpts)
 	}
 	// init global variables
-	initConfigByParamaterUnit(SV)
+	initConfigByParameterUnit(SV)
 	registry = prom.NewRegistry()
 	if initOpts.writerFactory != nil {
-		moCollector = newMetricFSCollector(initOpts.writerFactory, WithFlushInterval(initOpts.exportInterval), ExportMultiTable(initOpts.multiTable))
+		moCollector = newMetricFSCollector(initOpts.writerFactory, WithFlushInterval(initOpts.exportInterval))
 	} else {
 		moCollector = newMetricCollector(ieFactory, WithFlushInterval(initOpts.exportInterval))
 	}
-	moExporter = newMetricExporter(registry, moCollector, nodeUUID, role)
-	statsLogWriter = newStatsLogWriter(&stats.DefaultRegistry, runtime.ProcessLevelRuntime().Logger().Named("StatsLog"), metric.GetStatsGatherInterval())
+	moExporter = newMetricExporter(registry, moCollector, nodeUUID, role, WithGatherInterval(metric.GetGatherInterval()))
+	internalRegistry = prom.NewRegistry()
+	internalExporter = newMetricExporter(internalRegistry, moCollector, nodeUUID, role, WithGatherInterval(initOpts.internalGatherInterval))
+	statsLogWriter = newStatsLogWriter(stats.DefaultRegistry, runtime.ServiceRuntime(nodeUUID).Logger().Named("StatsLog"), metric.GetStatsGatherInterval())
 
 	// register metrics and create tables
 	registerAllMetrics()
-	multiTable = initOpts.multiTable
 	if initOpts.needInitTable {
-		initTables(ctx, ieFactory, SV.BatchProcessor)
+		initTables(ctx, ieFactory)
 	}
 
 	// start the data flow
-	serviceCtx := context.Background()
-	moCollector.Start(serviceCtx)
-	moExporter.Start(serviceCtx)
-	statsLogWriter.Start(serviceCtx)
-	metric.SetMetricExporter(moExporter)
+	if !SV.DisableMetric {
+		serviceCtx := context.WithValue(context.Background(), ServiceTypeKey, role)
+		moCollector.Start(serviceCtx)
+		moExporter.Start(serviceCtx)
+		internalExporter.Start(serviceCtx)
+		statsLogWriter.Start(serviceCtx)
+		metric.SetMetricExporter(moExporter)
+	}
 
-	if metric.GetExportToProm() {
+	if metric.EnableExportToProm() {
 		// http.HandleFunc("/query", makeDebugHandleFunc(ieFactory))
 		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.HandlerFor(prom.DefaultGatherer, promhttp.HandlerOpts{}))
-		addr := fmt.Sprintf("%s:%d", SV.Host, SV.StatusPort)
+		mux.Handle("/metrics", promhttp.HandlerFor(v2.GetPrometheusGatherer(), promhttp.HandlerOpts{}))
+		addr := fmt.Sprintf(":%d", SV.StatusPort)
 		statusSvr = &statusServer{Server: &http.Server{Addr: addr, Handler: mux}}
 		statusSvr.Add(1)
 		go func() {
@@ -112,12 +134,48 @@ func InitMetric(ctx context.Context, ieFactory func() ie.InternalExecutor, SV *c
 				panic(fmt.Sprintf("status server error: %v", err))
 			}
 		}()
-		logutil.Infof("[Metric] metrics scrape endpoint is ready at http://%s/metrics", addr)
+
+		startCrossServicesMetricsTask(ctx)
+
+		logutil.Debugf("[Metric] metrics scrape endpoint is ready at http://%s/metrics", addr)
 	}
 
-	metric.SetUpdateStorageUsageInterval(initOpts.updateInterval)
-	logutil.Infof("metric with ExportInterval: %v", initOpts.exportInterval)
-	logutil.Infof("metric with UpdateStorageUsageInterval: %v", initOpts.updateInterval)
+	enable = true
+	frontendServerStarted = initOpts.frontendServerStarted
+	SetUpdateStorageUsageInterval(initOpts.updateInterval)
+	SetStorageUsageCheckNewInterval(initOpts.checkNewInterval)
+	logutil.Debugf("metric with ExportInterval: %v", initOpts.exportInterval)
+	logutil.Debugf("metric with UpdateStorageUsageInterval: %v", initOpts.updateInterval)
+	return true
+}
+
+// this cron task can gather some service level metrics,
+func startCrossServicesMetricsTask(ctx context.Context) {
+	go func() {
+		logutil.Info("cross service metrics task started")
+		defer logutil.Info("cross service metrics task exiting")
+
+		timer := time.NewTicker(time.Second * 5)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-timer.C:
+				mpoolRelatedMetrics()
+			}
+		}
+	}()
+}
+
+func mpoolRelatedMetrics() {
+	v2.MemTotalCrossPoolFreeCounter.Add(float64(mpool.TotalCrossPoolFreeCounter()))
+
+	v2.MemGlobalStatsAllocatedGauge.Set(float64(mpool.GlobalStats().NumCurrBytes.Load()))
+	v2.MemGlobalStatsHighWaterMarkGauge.Set(float64(mpool.GlobalStats().HighWaterMark.Load()))
+}
+
+func IsEnable() bool {
+	return enable
 }
 
 func StopMetricSync() {
@@ -136,6 +194,12 @@ func StopMetricSync() {
 		}
 		moExporter = nil
 	}
+	if internalExporter != nil {
+		if ch, effect := internalExporter.Stop(true); effect {
+			<-ch
+		}
+		internalExporter = nil
+	}
 	if statsLogWriter != nil {
 		if ch, effect := statsLogWriter.Stop(true); effect {
 			<-ch
@@ -150,16 +214,16 @@ func StopMetricSync() {
 }
 
 func mustRegiterToProm(collector prom.Collector) {
-	if err := prom.Register(collector); err != nil {
+	if err := v2.GetPrometheusRegistry().Register(collector); err != nil {
 		// err is either registering a collector more than once or metrics have duplicate description.
 		// in any case, we respect the existing collectors in the prom registry
 		logutil.Debugf("[Metric] register to prom register: %v", err)
 	}
 }
 
-func mustRegister(collector metric.Collector) {
-	registry.MustRegister(collector)
-	if metric.GetExportToProm() {
+func mustRegister(reg *prom.Registry, collector metric.Collector) {
+	reg.MustRegister(collector)
+	if metric.EnableExportToProm() {
 		mustRegiterToProm(collector.CollectorToProm())
 	} else {
 		collector.CancelToProm()
@@ -169,22 +233,71 @@ func mustRegister(collector metric.Collector) {
 // register all defined collector here
 func registerAllMetrics() {
 	for _, c := range metric.InitCollectors {
-		mustRegister(c)
+		mustRegister(registry, c)
+	}
+	for _, c := range metric.InternalCollectors {
+		mustRegister(internalRegistry, c)
 	}
 }
 
-func initConfigByParamaterUnit(SV *config.ObservabilityParameters) {
+func initConfigByParameterUnit(SV *config.ObservabilityParameters) {
 	metric.SetExportToProm(SV.EnableMetricToProm)
 	metric.SetGatherInterval(time.Second * time.Duration(SV.MetricGatherInterval))
 }
 
-func InitSchema(ctx context.Context, ieFactory func() ie.InternalExecutor) error {
-	initTables(ctx, ieFactory, motrace.FileService)
+func InitSchema(ctx context.Context, txn executor.TxnExecutor) error {
+	if metric.GetForceInit() {
+		if _, err := txn.Exec(SqlDropDBConst, executor.StatementOption{}); err != nil {
+			return err
+		}
+	}
+
+	if _, err := txn.Exec(SqlCreateDBConst, executor.StatementOption{}); err != nil {
+		return err
+	}
+
+	var createCost time.Duration
+	defer func() {
+		logutil.Debugf("[Metric] init metrics tables: create cost %d ms", createCost.Milliseconds())
+	}()
+
+	instant := time.Now()
+	descChan := make(chan *prom.Desc, 10)
+	go func() {
+		for _, c := range metric.InitCollectors {
+			c.Describe(descChan)
+		}
+		for _, c := range metric.InternalCollectors {
+			c.Describe(descChan)
+		}
+		close(descChan)
+	}()
+
+	createSql := SingleMetricTable.ToCreateSql(ctx, true)
+	if _, err := txn.Exec(createSql, executor.StatementOption{}); err != nil {
+		//panic(fmt.Sprintf("[Metric] init metric tables error: %v, sql: %s", err, sql))
+		return moerr.NewInternalErrorf(ctx, "[Metric] init metric tables error: %v, sql: %s", err, createSql)
+	}
+
+	createSql = SqlStatementCUTable.ToCreateSql(ctx, true)
+	if _, err := txn.Exec(createSql, executor.StatementOption{}); err != nil {
+		//panic(fmt.Sprintf("[Metric] init metric tables error: %v, sql: %s", err, sql))
+		return moerr.NewInternalErrorf(ctx, "[Metric] init metric tables error: %v, sql: %s", err, createSql)
+	}
+
+	for desc := range descChan {
+		view := getView(ctx, desc)
+		sql := view.ToCreateSql(ctx, true)
+		if _, err := txn.Exec(sql, executor.StatementOption{}); err != nil {
+			return moerr.NewInternalErrorf(ctx, "[Metric] init metric tables error: %v, sql: %s", err, sql)
+		}
+	}
+	createCost = time.Since(instant)
 	return nil
 }
 
 // initTables gathers all metrics and extract metadata to format create table sql
-func initTables(ctx context.Context, ieFactory func() ie.InternalExecutor, batchProcessMode string) {
+func initTables(ctx context.Context, ieFactory func() ie.InternalExecutor) {
 	exec := ieFactory()
 	exec.ApplySessionOverride(ie.NewOptsBuilder().Database(MetricDBConst).Internal(true).Finish())
 	mustExec := func(sql string) {
@@ -210,49 +323,21 @@ func initTables(ctx context.Context, ieFactory func() ie.InternalExecutor, batch
 		for _, c := range metric.InitCollectors {
 			c.Describe(descChan)
 		}
+		for _, c := range metric.InternalCollectors {
+			c.Describe(descChan)
+		}
 		close(descChan)
 	}()
 
-	if !multiTable {
-		mustExec(SingleMetricTable.ToCreateSql(ctx, true))
-		for desc := range descChan {
-			view := getView(ctx, desc)
-			sql := view.ToCreateSql(ctx, true)
-			mustExec(sql)
-		}
-	} else {
-		optFactory := table.GetOptionFactory(ctx, table.ExternalTableEngine)
-		buf := new(bytes.Buffer)
-		for desc := range descChan {
-			sql := createTableSqlFromMetricFamily(desc, buf, optFactory)
-			mustExec(sql)
-		}
+	mustExec(SingleMetricTable.ToCreateSql(ctx, true))
+	mustExec(SqlStatementCUTable.ToCreateSql(ctx, true))
+	for desc := range descChan {
+		view := getView(ctx, desc)
+		sql := view.ToCreateSql(ctx, true)
+		mustExec(sql)
 	}
 
 	createCost = time.Since(instant)
-}
-
-type optionsFactory func(db, tbl, account string) table.TableOptions
-
-// instead MetricFamily, Desc is used to create tables because we don't want collect errors come into the picture.
-func createTableSqlFromMetricFamily(desc *prom.Desc, buf *bytes.Buffer, optionsFactory optionsFactory) string {
-	buf.Reset()
-	extra := newDescExtra(desc)
-	opts := optionsFactory(MetricDBConst, extra.fqName, table.AccountAll)
-	buf.WriteString("create ")
-	buf.WriteString(opts.GetCreateOptions())
-	buf.WriteString(fmt.Sprintf(
-		"table if not exists %s.%s (`%s` datetime(6), `%s` double, `%s` varchar(36), `%s` varchar(20)",
-		MetricDBConst, extra.fqName, metric.LblTimeConst, metric.LblValueConst, metric.LblNodeConst, metric.LblRoleConst,
-	))
-	for _, lbl := range extra.labels {
-		buf.WriteString(", `")
-		buf.WriteString(lbl.GetName())
-		buf.WriteString("` varchar(20)")
-	}
-	buf.WriteRune(')')
-	buf.WriteString(opts.GetTableOptions(nil))
-	return buf.String()
 }
 
 func getView(ctx context.Context, desc *prom.Desc) *table.View {
@@ -274,9 +359,9 @@ type descExtra struct {
 func newDescExtra(desc *prom.Desc) *descExtra {
 	str := desc.String()[14:] // strip Desc{fqName: "
 	fqName := str[:strings.Index(str, "\"")]
-	str = str[strings.Index(str, "variableLabels: [")+17:] // spot varlbl list
-	str = str[:strings.Index(str, "]")]
-	varLblCnt := len(strings.Split(str, " "))
+	str = str[strings.Index(str, "variableLabels: {")+17:] // spot varlbl list
+	str = str[:strings.Index(str, "}")]
+	varLblCnt := len(strings.Split(str, ","))
 	labels := prom.MakeLabelPairs(desc, make([]string, varLblCnt))
 	return &descExtra{orig: desc, fqName: fqName, labels: labels}
 }
@@ -284,14 +369,20 @@ func newDescExtra(desc *prom.Desc) *descExtra {
 type InitOptions struct {
 	writerFactory table.WriterFactory // see WithWriterFactory
 	// needInitTable control to do the initTables
+	// Deprecated: use InitSchema instead.
 	needInitTable bool // see WithInitAction
-	// initSingleTable
-	multiTable bool // see WithMultiTable
 	// exportInterval
 	exportInterval time.Duration // see withExportInterval
 	// updateInterval, update StorageUsage interval
 	// set by withUpdateInterval
 	updateInterval time.Duration
+	// checkNewAccountInterval, check new account Internal to collect new account for metric StorageUsage
+	// set by withCheckNewInterval
+	checkNewInterval time.Duration
+	// internalGatherInterval, handle metric.SubSystemMO gather interval
+	internalGatherInterval time.Duration
+	// frontendServerStarted, function return bool, represent server started or not
+	frontendServerStarted func(string) bool
 }
 
 type InitOption func(*InitOptions)
@@ -306,15 +397,10 @@ func WithWriterFactory(factory table.WriterFactory) InitOption {
 	})
 }
 
+// Deprecated: Use InitSchema instead.
 func WithInitAction(init bool) InitOption {
 	return InitOption(func(options *InitOptions) {
 		options.needInitTable = init
-	})
-}
-
-func withMultiTable(multi bool) InitOption {
-	return InitOption(func(options *InitOptions) {
-		options.multiTable = multi
 	})
 }
 
@@ -330,6 +416,24 @@ func withUpdateInterval(interval time.Duration) InitOption {
 	})
 }
 
+func withCheckNewInterval(interval time.Duration) InitOption {
+	return InitOption(func(opts *InitOptions) {
+		opts.checkNewInterval = interval
+	})
+}
+
+func WithInternalGatherInterval(interval time.Duration) InitOption {
+	return InitOption(func(options *InitOptions) {
+		options.internalGatherInterval = interval
+	})
+}
+
+func WithFrontendServerStarted(f func(string) bool) InitOption {
+	return InitOption(func(options *InitOptions) {
+		options.frontendServerStarted = f
+	})
+}
+
 var (
 	metricNameColumn        = table.StringDefaultColumn(`metric_name`, `sys`, `metric name, like: sql_statement_total, server_connections, process_cpu_percent, sys_memory_used, ...`)
 	metricCollectTimeColumn = table.DatetimeColumn(`collecttime`, `metric data collect time`)
@@ -338,20 +442,53 @@ var (
 	metricRoleColumn        = table.StringDefaultColumn(`role`, ALL_IN_ONE_MODE, `mo node role, like: CN, DN, LOG`)
 	metricAccountColumn     = table.StringDefaultColumn(`account`, `sys`, `account name`)
 	metricTypeColumn        = table.StringColumn(`type`, `sql type, like: insert, select, ...`)
+
+	sqlSourceTypeColumn = table.StringColumn(`sql_source_type`, `sql_source_type, val like: external_sql, cloud_nonuser_sql, cloud_user_sql, internal_sql, ...`)
 )
 
 var SingleMetricTable = &table.Table{
-	Account:          table.AccountAll,
+	Account:          table.AccountSys,
 	Database:         MetricDBConst,
 	Table:            `metric`,
 	Columns:          []table.Column{metricNameColumn, metricCollectTimeColumn, metricValueColumn, metricNodeColumn, metricRoleColumn, metricAccountColumn, metricTypeColumn},
 	PrimaryKeyColumn: []table.Column{},
-	Engine:           table.ExternalTableEngine,
+	ClusterBy:        []table.Column{metricAccountColumn, metricNameColumn, metricCollectTimeColumn},
+	Engine:           table.NormalTableEngine,
 	Comment:          `metric data`,
 	PathBuilder:      table.NewAccountDatePathBuilder(),
 	AccountColumn:    &metricAccountColumn,
+	// TimestampColumn
+	TimestampColumn: &metricCollectTimeColumn,
 	// SupportUserAccess
 	SupportUserAccess: true,
+	// SupportConstAccess
+	SupportConstAccess: true,
+}
+
+var SqlStatementCUTable = &table.Table{
+	Account:          table.AccountSys,
+	Database:         MetricDBConst,
+	Table:            catalog.MO_SQL_STMT_CU,
+	Columns:          []table.Column{metricAccountColumn, metricCollectTimeColumn, metricValueColumn, metricNodeColumn, metricRoleColumn, sqlSourceTypeColumn},
+	PrimaryKeyColumn: []table.Column{},
+	ClusterBy:        []table.Column{metricAccountColumn, metricCollectTimeColumn},
+	Engine:           table.NormalTableEngine,
+	Comment:          `sql_statement_cu metric data`,
+	PathBuilder:      table.NewAccountDatePathBuilder(),
+	AccountColumn:    &metricAccountColumn,
+	// TimestampColumn
+	TimestampColumn: &metricCollectTimeColumn,
+	// SupportUserAccess
+	SupportUserAccess: true,
+	// SupportConstAccess
+	SupportConstAccess: true,
+}
+
+// GetAllTables
+//
+// Deprecated: use table.GetAllTables() instead.
+func GetAllTables() []*table.Table {
+	return []*table.Table{SingleMetricTable, SqlStatementCUTable}
 }
 
 func NewMetricView(tbl string, opts ...table.ViewOption) *table.View {
@@ -379,7 +516,7 @@ func NewMetricViewWithLabels(ctx context.Context, tbl string, lbls []string) *ta
 		}
 	}
 	if subSystem == nil {
-		panic(moerr.NewNotSupported(ctx, "metric unknown SubSystem: %s", tbl))
+		panic(moerr.NewNotSupportedf(ctx, "metric unknown SubSystem: %s", tbl))
 	}
 	options = append(options, table.SupportUserAccess(subSystem.SupportUserAccess))
 	// construct columns
@@ -418,6 +555,9 @@ func GetSchemaForAccount(ctx context.Context, account string) []string {
 	tbl := SingleMetricTable.Clone()
 	tbl.Account = account
 	sqls = append(sqls, tbl.ToCreateSql(ctx, true))
+	tbl = SqlStatementCUTable.Clone()
+	tbl.Account = account
+	sqls = append(sqls, tbl.ToCreateSql(ctx, true))
 
 	descChan := make(chan *prom.Desc, 10)
 	go func() {
@@ -440,5 +580,8 @@ func GetSchemaForAccount(ctx context.Context, account string) []string {
 func init() {
 	if table.RegisterTableDefine(SingleMetricTable) != nil {
 		panic(moerr.NewInternalError(context.Background(), "metric table already registered"))
+	}
+	if table.RegisterTableDefine(SqlStatementCUTable) != nil {
+		panic(moerr.NewInternalError(context.Background(), "metric table 'sql_statement_cu' already registered"))
 	}
 }

@@ -19,37 +19,34 @@ import (
 	"testing"
 
 	"github.com/matrixorigin/matrixone/pkg/testutil"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/stretchr/testify/require"
 )
 
 func TestString(t *testing.T) {
-	arg := Argument{Name: "unnest"}
-	String(&arg, bytes.NewBuffer(nil))
-}
-
-func TestCall(t *testing.T) {
-	arg := Argument{Name: "unnest"}
-	end, err := Call(0, testutil.NewProc(), &arg, false, false)
-	require.NoError(t, err)
-	require.True(t, end)
-	arg.Name = "generate_series"
-	end, err = Call(0, testutil.NewProc(), &arg, false, false)
-	require.NoError(t, err)
-	require.True(t, end)
-	arg.Name = "not_exist"
-	end, err = Call(0, testutil.NewProc(), &arg, false, false)
-	require.Error(t, err)
-	require.True(t, end)
+	arg := TableFunction{FuncName: "unnest"}
+	arg.String(bytes.NewBuffer(nil))
 }
 
 func TestPrepare(t *testing.T) {
-	arg := Argument{Name: "unnest"}
-	err := Prepare(testutil.NewProc(), &arg)
+	arg := TableFunction{FuncName: "unnest",
+		OperatorBase: vm.OperatorBase{
+			OperatorInfo: vm.OperatorInfo{
+				Idx:     0,
+				IsFirst: false,
+				IsLast:  false,
+			},
+		},
+	}
+	err := arg.Prepare(testutil.NewProc())
 	require.Error(t, err)
-	arg.Name = "generate_series"
-	err = Prepare(testutil.NewProc(), &arg)
+	arg.FuncName = "generate_series"
+	err = arg.Prepare(testutil.NewProc())
 	require.NoError(t, err)
-	arg.Name = "not_exist"
-	err = Prepare(testutil.NewProc(), &arg)
+	arg.FuncName = "metadata_scan"
+	err = arg.Prepare(testutil.NewProc())
+	require.NoError(t, err)
+	arg.FuncName = "not_exist"
+	err = arg.Prepare(testutil.NewProc())
 	require.Error(t, err)
 }

@@ -26,20 +26,49 @@ const (
 	ClusterService = "cluster-service"
 	// ClusterService cluster service
 	LockService = "lock-service"
+	// InternalSQLExecutor attr name for internal sql executor
+	InternalSQLExecutor = "internal-sql-executor"
+	// AutoIncrementService attr name for AutoIncrementService
+	AutoIncrementService = "auto-increment-service"
+	// StatusServer is the global server of status of cluster.
+	StatusServer = "status-server"
+	// TxnTraceService txn trance service
+	TxnTraceService = "txn-trace-service"
+	// ShardService shard service
+	ShardService = "shard-service"
+	// ProcessCodecService process codec service
+	ProcessCodecService = "process-codec-service"
+	// PartitionService partition service
+	PartitionService = "partition-service"
+
 	// TxnOptions options used to create txn
 	TxnOptions = "txn-options"
 	// TxnMode runtime default txn mode
 	TxnMode = "txn-mode"
 	// TxnIsolation runtime default txn isolation
 	TxnIsolation = "txn-isolation"
+
+	// EnableCheckInvalidRCErrors enable check rc errors
+	EnableCheckInvalidRCErrors = "enable-check-rc-invalid-error"
+
+	// MOProtocolVersion is the protocol version of the MO services
+	MOProtocolVersion = "protocol-version"
+
+	// BackgroundCNSelector is the labels of the CN handing the background requests, including mo-logger, task-service.
+	BackgroundCNSelector = "background-cn-selector"
+
+	PipelineClient = "pipeline-client"
+
+	// TestingContextKey is the key of context for testing
+	TestingContextKey = "testing-context"
 )
 
 // Runtime contains the runtime environment for a MO service. Each CN/DN/LOG service
 // needs to receive a Runtime and will pass the Runtime to all components of the service.
-// These Runtimes may only be created in main or integration test framework.
+// These Runtime may only be created in main or integration test framework.
 //
 // Because most of our BVT tests and integration tests are run in a single mo-service
-// process, which runs multiple CN, DN and LOG services, the Runtime cannot be set as a
+// process, which runs multiple CN, TN and LOG services, the Runtime cannot be set as a
 // global variable, otherwise we would not be able to set a single Runtime for each service
 // and each component.
 //

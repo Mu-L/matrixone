@@ -15,86 +15,105 @@
 package containers
 
 import (
-	"bytes"
 	"io"
-	"unsafe"
 
 	"github.com/RoaringBitmap/roaring"
-	"github.com/RoaringBitmap/roaring/roaring64"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/stl"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/stl/containers"
+	cnVector "github.com/matrixorigin/matrixone/pkg/container/vector"
 )
 
-type Options = containers.Options
-type Bytes = stl.Bytes
-
-// var DefaultAllocator = alloc.NewAllocator(int(common.G) * 100)
-
-type ItOp = func(v any, isNull bool, row int) error
-
-type VectorView interface {
-	IsView() bool
-	Nullable() bool
-	IsNull(i int) bool
-	HasNull() bool
-	NullMask() *roaring64.Bitmap
-
-	Data() []byte
-	Bytes() *Bytes
-	Slice() any
-	SlicePtr() unsafe.Pointer
-	DataWindow(offset, length int) []byte
-	Get(i int) any
-	ShallowGet(i int) any
-
-	Length() int
-	Capacity() int
-	Allocated() int
-	GetAllocator() *mpool.MPool
-	GetType() types.Type
-	String() string
-	PPString(num int) string
-
-	Foreach(op ItOp, sels *roaring.Bitmap) error
-	ForeachWindow(offset, length int, op ItOp, sels *roaring.Bitmap) error
-	ForeachShallow(op ItOp, sels *roaring.Bitmap) error
-	ForeachWindowShallow(offset, length int, op ItOp, sels *roaring.Bitmap) error
-
-	WriteTo(w io.Writer) (int64, error)
+type Options struct {
+	Capacity  int
+	Allocator *mpool.MPool
 }
 
+type ItOp = func(v any, isNull bool, row int) error
+type ItOpT[T any] func(v T, isNull bool, row int) error
+
+// type ItBytesOp func(v []byte, isNull bool, row int) error
+
 type Vector interface {
-	VectorView
-	Reset()
-	ResetWithData(bs *Bytes, nulls *roaring64.Bitmap)
-	GetView() VectorView
-	Update(i int, v any)
-	Delete(i int)
+	GetType() *types.Type
+
+	IsConst() bool
+	IsConstNull() bool
+
+	// Deep copy ops
+	Get(i int) any
+	Append(v any, isNull bool)
+	CloneWindow(offset, length int, allocator ...*mpool.MPool) Vector
+	CloneWindowWithPool(offset, length int, pool *VectorPool) Vector
+	PreExtend(length int) error
+
+	WriteTo(w io.Writer) (int64, error)
+	WriteToV1(w io.Writer) (int64, error)
+	ReadFrom(r io.Reader) (int64, error)
+	ReadFromV1(r io.Reader) (int64, error)
+
+	// Shallow Ops
+	ShallowGet(i int) any
+	Window(offset, length int) Vector
+
+	// Deepcopy if const
+	TryConvertConst() Vector
+
+	GetDownstreamVector() *cnVector.Vector
+	setDownstreamVector(vec *cnVector.Vector)
+
+	Update(i int, v any, isNull bool)
 	Compact(*roaring.Bitmap)
-	Append(v any)
-	AppendMany(vs ...any)
-	AppendNoNulls(s any)
+	CompactByBitmap(*nulls.Bitmap)
+
 	Extend(o Vector)
 	ExtendWithOffset(src Vector, srcOff, srcLen int)
-	CloneWindow(offset, length int, allocator ...*mpool.MPool) Vector
+	ExtendVec(o *cnVector.Vector) error
 
-	Equals(o Vector) bool
-	Window(offset, length int) Vector
-	WriteTo(w io.Writer) (int64, error)
-	ReadFrom(r io.Reader) (int64, error)
+	Foreach(op ItOp, sels *nulls.Bitmap) error
+	ForeachWindow(offset, length int, op ItOp, sels *nulls.Bitmap) error
 
-	ReadFromFile(common.IVFile, *bytes.Buffer) error
+	Length() int
+	ApproxSize() int
+	Allocated() int
+	GetAllocator() *mpool.MPool
+
+	IsNull(i int) bool
+	HasNull() bool
+	NullMask() *nulls.Nulls
+	// NullCount will consider ConstNull and Const vector
+	NullCount() int
 
 	Close()
+
+	// Test functions
+	Equals(o Vector) bool
+	String() string
+	PPString(num int) string
+	AppendMany(vs []any, isNulls []bool)
+	Delete(i int)
 }
 
 type Batch struct {
 	Attrs   []string
 	Vecs    []Vector
-	Deletes *roaring.Bitmap
-	nameidx map[string]int
+	Deletes *nulls.Bitmap
+	Nameidx map[string]int
+	Pool    *VectorPool
 	// refidx  map[int]int
+}
+
+// BatchSplitter is used to split a batch into several batches
+// with the same size.
+type BatchSplitter struct {
+	internal  *Batch
+	sliceSize int
+	offset    int
+}
+
+type BatchWithVersion struct {
+	*Batch
+	Seqnums    []uint16
+	NextSeqnum uint16
+	Version    uint32
 }

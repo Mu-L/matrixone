@@ -262,7 +262,7 @@ func (kv *KVTxnStorage) Write(ctx context.Context, txnMeta txn.TxnMeta, op uint3
 	for idx, key := range req.Keys {
 		if t, ok := kv.uncommittedKeyTxnMap[string(key)]; ok {
 			if !bytes.Equal(t.ID, txnMeta.ID) {
-				return nil, moerr.NewTxnWriteConflictNoCtx("%s %s", t.ID, txnMeta.ID)
+				return nil, moerr.NewTxnWriteConflictNoCtxf("%s %s", t.ID, txnMeta.ID)
 			}
 		} else {
 			kv.uncommittedKeyTxnMap[string(key)] = &newTxn
@@ -302,7 +302,7 @@ func (kv *KVTxnStorage) Prepare(ctx context.Context, txnMeta txn.TxnMeta) (times
 
 	newTxn := kv.changeUncommittedTxnStatusLocked(txnMeta.ID, txn.TxnStatus_Prepared)
 	newTxn.PreparedTS = txnMeta.PreparedTS
-	newTxn.DNShards = txnMeta.DNShards
+	newTxn.TNShards = txnMeta.TNShards
 	kv.recoverFrom = lsn
 	kv.eventC <- Event{Txn: *newTxn, Type: PrepareType}
 	return txnMeta.PreparedTS, nil
@@ -330,7 +330,12 @@ func (kv *KVTxnStorage) Committing(ctx context.Context, txnMeta txn.TxnMeta) err
 	return nil
 }
 
-func (kv *KVTxnStorage) Commit(ctx context.Context, txnMeta txn.TxnMeta) (timestamp.Timestamp, error) {
+func (kv *KVTxnStorage) Commit(
+	ctx context.Context,
+	txnMeta txn.TxnMeta,
+	response *txn.TxnResponse,
+	commitRequests *txn.TxnCommitRequest,
+) (timestamp.Timestamp, error) {
 	kv.Lock()
 	defer kv.Unlock()
 
@@ -443,7 +448,7 @@ func (kv *KVTxnStorage) getWriteKeysLocked(txnMeta txn.TxnMeta) [][]byte {
 }
 
 func (kv *KVTxnStorage) saveLog(log *KVLog) (logservice.Lsn, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Minute, moerr.CauseSaveLog)
 	defer cancel()
 	data := log.MustMarshal()
 	record := kv.logClient.GetLogRecord(len(data))
@@ -452,7 +457,11 @@ func (kv *KVTxnStorage) saveLog(log *KVLog) (logservice.Lsn, error) {
 	} else {
 		copy(record.Data[len(record.Data)-len(data):], data)
 	}
-	return kv.logClient.Append(ctx, record)
+	lsn, err := kv.logClient.Append(ctx, record)
+	if err != nil {
+		return 0, moerr.AttachCause(ctx, err)
+	}
+	return lsn, nil
 }
 
 func (kv *KVTxnStorage) commitWithKVLogLocked(klog *KVLog) {

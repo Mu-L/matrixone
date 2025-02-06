@@ -15,77 +15,89 @@
 package model
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
 	"github.com/stretchr/testify/assert"
 )
 
 func TestTransferPage(t *testing.T) {
-	sid := common.NewSegmentid()
+	sid := objectio.NewSegmentid()
 	src := common.ID{
-		BlockID: common.NewBlockid(&sid, 1, 0),
+		BlockID: *objectio.NewBlockid(sid, 1, 0),
 	}
 	dest := common.ID{
-		BlockID: common.NewBlockid(&sid, 2, 0),
+		BlockID: *objectio.NewBlockid(sid, 2, 0),
 	}
-	prefix := dest.BlockID[:]
+	createdObjs := []*objectio.ObjectId{objectio.NewObjectidWithSegmentIDAndNum(sid, 2)}
 
-	memo1 := NewTransferHashPage(&src, time.Now())
+	memo1 := NewTransferHashPage(&src, time.Now(), false, objectio.TmpNewFileservice(context.Background(), "data"), ttl, diskTTL, createdObjs)
 	assert.Zero(t, memo1.RefCount())
 
+	transferMap := make(api.TransferMap)
 	for i := 0; i < 10; i++ {
-		rowID := EncodePhyAddrKeyWithPrefix(prefix, uint32(i))
-		memo1.Train(uint32(i), rowID)
+		transferMap[uint32(i)] = api.TransferDestPos{
+			BlkIdx: 0,
+			RowIdx: uint32(i),
+		}
 	}
+	memo1.Train(transferMap)
 
 	pinned := memo1.Pin()
 	assert.Equal(t, int64(1), memo1.RefCount())
 	pinned.Close()
 	assert.Zero(t, memo1.RefCount())
 
-	ttl := time.Millisecond * 10
 	now := time.Now()
-	memo2 := NewTransferHashPage(&src, now)
+	memo2 := NewTransferHashPage(&src, now, false, objectio.TmpNewFileservice(context.Background(), "data"), ttl, diskTTL, createdObjs)
 	defer memo2.Close()
 	assert.Zero(t, memo2.RefCount())
 
+	transferMap = make(api.TransferMap)
 	for i := 0; i < 10; i++ {
-		rowID := EncodePhyAddrKeyWithPrefix(prefix, uint32(i))
-		memo2.Train(uint32(i), rowID)
+		transferMap[uint32(i)] = api.TransferDestPos{
+			BlkIdx: 0,
+			RowIdx: uint32(i),
+		}
 	}
+	memo2.Train(transferMap)
 
-	assert.False(t, memo2.TTL(now.Add(ttl-time.Duration(1)), ttl))
-	assert.True(t, memo2.TTL(now.Add(ttl+time.Duration(1)), ttl))
+	assert.True(t, memo2.TTL() == 0)
 
 	for i := 0; i < 10; i++ {
 		rowID, ok := memo2.Transfer(uint32(i))
 		assert.True(t, ok)
-		_, blockId, offset := DecodePhyAddrKey(rowID)
-		assert.Equal(t, dest.BlockID, blockId)
+		blockId, offset := rowID.Decode()
+		assert.Equal(t, dest.BlockID, *blockId)
 		assert.Equal(t, uint32(i), offset)
 	}
 }
 
 func TestTransferTable(t *testing.T) {
-	ttl := time.Minute
-	table := NewTransferTable[*TransferHashPage](ttl)
+	ctx := context.Background()
+	table, _ := NewTransferTable[*TransferHashPage](ctx, objectio.TmpNewFileservice(ctx, "data"))
 	defer table.Close()
-	sid := common.NewSegmentid()
+	sid := objectio.NewSegmentid()
 
-	id1 := common.ID{BlockID: common.NewBlockid(&sid, 1, 0)}
-	id2 := common.ID{BlockID: common.NewBlockid(&sid, 2, 0)}
-
-	prefix := id2.BlockID[:]
+	id1 := common.ID{BlockID: *objectio.NewBlockid(sid, 1, 0)}
+	id2 := common.ID{BlockID: *objectio.NewBlockid(sid, 2, 0)}
+	createdObjs := []*objectio.ObjectId{objectio.NewObjectidWithSegmentIDAndNum(sid, 2)}
 
 	now := time.Now()
-	page1 := NewTransferHashPage(&id1, now)
+	page1 := NewTransferHashPage(&id1, now, false, objectio.TmpNewFileservice(context.Background(), "data"), ttl, 2*time.Second, createdObjs)
+	transferMap := make(api.TransferMap)
 	for i := 0; i < 10; i++ {
-		rowID := EncodePhyAddrKeyWithPrefix(prefix, uint32(i))
-		page1.Train(uint32(i), rowID)
+		transferMap[uint32(i)] = api.TransferDestPos{
+			BlkIdx: 0,
+			RowIdx: uint32(i),
+		}
 	}
+	page1.Train(transferMap)
 
 	assert.False(t, table.AddPage(page1))
 	assert.True(t, table.AddPage(page1))
@@ -98,9 +110,10 @@ func TestTransferTable(t *testing.T) {
 
 	assert.Equal(t, int64(2), pinned.Item().RefCount())
 
-	table.RunTTL(now.Add(ttl - time.Duration(1)))
+	table.RunTTL()
 	assert.Equal(t, 1, table.Len())
-	table.RunTTL(now.Add(ttl + time.Duration(1)))
+	time.Sleep(2 * time.Second)
+	table.RunTTL()
 	assert.Equal(t, 0, table.Len())
 
 	assert.Equal(t, int64(1), pinned.Item().RefCount())

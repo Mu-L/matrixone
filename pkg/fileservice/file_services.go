@@ -16,6 +16,7 @@ package fileservice
 
 import (
 	"context"
+	"iter"
 	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
@@ -52,6 +53,12 @@ func (f *FileServices) Delete(ctx context.Context, filePaths ...string) error {
 	return nil
 }
 
+func (f *FileServices) Close(ctx context.Context) {
+	for _, fs := range f.mappings {
+		fs.Close(ctx)
+	}
+}
+
 func (f *FileServices) deleteSingle(ctx context.Context, filePath string) error {
 	path, err := ParsePathAtService(filePath, "")
 	if err != nil {
@@ -67,34 +74,23 @@ func (f *FileServices) deleteSingle(ctx context.Context, filePath string) error 
 	return fs.Delete(ctx, filePath)
 }
 
-func (f *FileServices) List(ctx context.Context, dirPath string) ([]DirEntry, error) {
-	path, err := ParsePathAtService(dirPath, "")
-	if err != nil {
-		return nil, err
+func (f *FileServices) List(ctx context.Context, dirPath string) iter.Seq2[*DirEntry, error] {
+	return func(yield func(*DirEntry, error) bool) {
+		path, err := ParsePathAtService(dirPath, "")
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		if path.Service == "" {
+			path.Service = f.defaultName
+		}
+		fs, err := Get[FileService](f, path.Service)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		fs.List(ctx, dirPath)(yield)
 	}
-	if path.Service == "" {
-		path.Service = f.defaultName
-	}
-	fs, err := Get[FileService](f, path.Service)
-	if err != nil {
-		return nil, err
-	}
-	return fs.List(ctx, dirPath)
-}
-
-func (f *FileServices) Preload(ctx context.Context, dirPath string) error {
-	path, err := ParsePathAtService(dirPath, "")
-	if err != nil {
-		return err
-	}
-	if path.Service == "" {
-		path.Service = f.defaultName
-	}
-	fs, err := Get[FileService](f, path.Service)
-	if err != nil {
-		return err
-	}
-	return fs.Preload(ctx, dirPath)
 }
 
 func (f *FileServices) Name() string {
@@ -114,6 +110,21 @@ func (f *FileServices) Read(ctx context.Context, vector *IOVector) error {
 		return err
 	}
 	return fs.Read(ctx, vector)
+}
+
+func (f *FileServices) ReadCache(ctx context.Context, vector *IOVector) error {
+	path, err := ParsePathAtService(vector.FilePath, "")
+	if err != nil {
+		return err
+	}
+	if path.Service == "" {
+		path.Service = f.defaultName
+	}
+	fs, err := Get[FileService](f, path.Service)
+	if err != nil {
+		return err
+	}
+	return fs.ReadCache(ctx, vector)
 }
 
 func (f *FileServices) Write(ctx context.Context, vector IOVector) error {
@@ -144,4 +155,40 @@ func (f *FileServices) StatFile(ctx context.Context, filePath string) (*DirEntry
 		return nil, err
 	}
 	return fs.StatFile(ctx, filePath)
+}
+
+func (f *FileServices) PrefetchFile(ctx context.Context, filePath string) error {
+	path, err := ParsePathAtService(filePath, "")
+	if err != nil {
+		return err
+	}
+	if path.Service == "" {
+		path.Service = f.defaultName
+	}
+	fs, err := Get[FileService](f, path.Service)
+	if err != nil {
+		return err
+	}
+	return fs.PrefetchFile(ctx, filePath)
+}
+
+func (f *FileServices) Cost() *CostAttr {
+	attr := &CostAttr{
+		List: CostLow,
+	}
+	for _, fs := range f.mappings {
+		cost := fs.Cost()
+		attr = maxCost(attr, cost)
+	}
+	return attr
+}
+
+func maxCost(a, b *CostAttr) *CostAttr {
+	attr := &CostAttr{
+		List: a.List,
+	}
+	if attr.List < b.List {
+		attr.List = b.List
+	}
+	return attr
 }

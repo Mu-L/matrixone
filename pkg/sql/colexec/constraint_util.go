@@ -18,442 +18,135 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/nulls"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
-	"github.com/matrixorigin/matrixone/pkg/sql/util"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-type TableInfo struct {
-	HasAutoCol         bool
-	pkPos              int
-	updateNameToPos    map[string]int
-	hasCompositePkey   bool     // Whether the table contains composite primary key
-	compositePkeyParts []string // Part name of composite primary key
-	clusterBy          string
-	Attrs              []string
-	IdxList            []int32
-}
-
-func FilterAndDelByRowId(proc *process.Process, bat *batch.Batch, idxList []int32, rels []engine.Relation) (uint64, error) {
-	var affectedRows uint64
-	for i, idx := range idxList {
-		delBatch := filterRowIdForDel(proc, bat, int(idx))
-		affectedRows = affectedRows + uint64(delBatch.Length())
-		if delBatch.Length() > 0 {
-			err := rels[i].Delete(proc.Ctx, delBatch, catalog.Row_ID)
-			if err != nil {
-				delBatch.Clean(proc.Mp())
-				return 0, err
+func FilterRowIdForDel(proc *process.Process, retBat *batch.Batch, srcBat *batch.Batch,
+	idx int, primaryKeyIdx int) error {
+	sels := proc.Mp().GetSels()
+	defer proc.Mp().PutSels(sels)
+	rowidVec := retBat.Vecs[0]
+	primaryVec := retBat.Vecs[1]
+	rowIdMap := make(map[types.Rowid]bool)
+	nulls := srcBat.Vecs[idx].GetNulls()
+	for i, r := range vector.MustFixedColWithTypeCheck[types.Rowid](srcBat.Vecs[idx]) {
+		if !nulls.Contains(uint64(i)) {
+			if rowIdMap[r] {
+				continue
 			}
-		}
-		delBatch.Clean(proc.Mp())
-	}
-	return affectedRows, nil
-}
-
-func FilterAndUpdateByRowId(
-	eg engine.Engine,
-	proc *process.Process,
-	bat *batch.Batch,
-	idxList [][]int32,
-	rels []engine.Relation,
-	ref []*plan.ObjectRef,
-	tableDefs []*plan.TableDef,
-	updateCols []map[string]int32,
-	parentIdxs []map[string]int32,
-	uniqueRels [][]engine.Relation,
-) (uint64, error) {
-	var affectedRows uint64
-	var delBatch *batch.Batch
-	var updateBatch *batch.Batch
-	var err error
-	defer func() {
-		if delBatch != nil {
-			delBatch.Clean(proc.Mp())
-		}
-		if updateBatch != nil {
-			updateBatch.Clean(proc.Mp())
-		}
-	}()
-
-	for i, setIdxList := range idxList {
-		// get Attrs, HasAutoCol
-		tableDef := tableDefs[i]
-		updateCol := updateCols[i]
-		uniqueRel := uniqueRels[i]
-		var parentIdx map[string]int32 // nil means don't need check parent constraint
-		if len(parentIdxs) > 0 {
-			parentIdx = parentIdxs[i]
-		}
-		info := GetInfoForInsertAndUpdate(tableDef, updateCol)
-
-		delBatch, updateBatch, err = filterRowIdForUpdate(proc, bat, setIdxList, info.Attrs, parentIdx)
-		if err != nil {
-			return 0, err
-		}
-		if delBatch == nil && updateBatch == nil {
-			continue
-		}
-		affectedRows = affectedRows + uint64(delBatch.Length())
-		if delBatch.Length() > 0 {
-			// delete old rows
-			err = rels[i].Delete(proc.Ctx, delBatch, catalog.Row_ID)
-			if err != nil {
-				return 0, err
-			}
-
-			// fill auto incr column
-			if info.HasAutoCol {
-				if err = UpdateInsertBatch(eg, proc.Ctx, proc, tableDef.Cols, updateBatch, uint64(ref[i].Obj), ref[i].SchemaName, tableDef.Name); err != nil {
-					return 0, err
-				}
-			}
-
-			// check new rows not null
-			err := BatchDataNotNullCheck(updateBatch, tableDef, proc.Ctx)
-			if err != nil {
-				return 0, err
-			}
-
-			//  append hidden columns
-			//if info.compositePkey != "" {
-			//	util.FillCompositeClusterByBatch(updateBatch, info.compositePkey, proc)
-			//}
-
-			// append hidden columns
-			if info.hasCompositePkey {
-				err = util.FillCompositeKeyBatch(updateBatch, catalog.CPrimaryKeyColName, info.compositePkeyParts, proc)
-				if err != nil {
-					return 0, err
-				}
-			}
-
-			if info.clusterBy != "" && util.JudgeIsCompositeClusterByColumn(info.clusterBy) {
-				err = util.FillCompositeClusterByBatch(updateBatch, info.clusterBy, proc)
-				if err != nil {
-					return 0, err
-				}
-			}
-
-			// write unique key table
-			WriteUniqueTable(nil, proc, updateBatch, tableDef, info.updateNameToPos, info.pkPos, uniqueRel)
-
-			// write origin table
-			err = rels[i].Write(proc.Ctx, updateBatch)
-			if err != nil {
-				return 0, err
-			}
+			rowIdMap[r] = true
+			sels = append(sels, int64(i))
 		}
 	}
-	return affectedRows, nil
-}
-
-func WriteUniqueTable(s3Writer *S3Writer, proc *process.Process, updateBatch *batch.Batch,
-	tableDef *plan.TableDef, updateNameToPos map[string]int, pkPos int, rels []engine.Relation) error {
-	if tableDef.Indexes == nil {
-		return nil
-	}
-
-	var ukBatch *batch.Batch
-	defer func() {
-		if ukBatch != nil {
-			ukBatch.Clean(proc.Mp())
-		}
-	}()
-
-	uIdx := 0
-	for _, indexDef := range tableDef.Indexes {
-		if !indexDef.Unique {
-			continue
-		}
-
-		partsLength := len(indexDef.Parts)
-		uniqueColumnPos := make([]int, partsLength)
-		for p, column := range indexDef.Parts {
-			uniqueColumnPos[p] = updateNameToPos[column]
-		}
-
-		colCount := len(uniqueColumnPos)
-		if pkPos == -1 {
-			//have no pk
-			ukBatch = batch.New(true, []string{catalog.IndexTableIndexColName})
-		} else {
-			ukBatch = batch.New(true, []string{catalog.IndexTableIndexColName, catalog.IndexTablePrimaryColName})
-		}
-
-		var vec *vector.Vector
-		var bitMap *nulls.Nulls
-		if colCount == 1 {
-			idx := uniqueColumnPos[0]
-			vec, bitMap = util.CompactSingleIndexCol(updateBatch.Vecs[idx], proc)
-		} else {
-			vs := make([]*vector.Vector, colCount)
-			for vIdx, pIdx := range uniqueColumnPos {
-				vs[vIdx] = updateBatch.Vecs[pIdx]
-			}
-			vec, bitMap = util.SerialWithCompacted(vs, proc)
-		}
-		ukBatch.SetVector(0, vec)
-		ukBatch.SetZs(vec.Length(), proc.Mp())
-
-		if pkPos != -1 {
-			// have pk, append pk vector
-			vec = util.CompactPrimaryCol(updateBatch.Vecs[pkPos], bitMap, proc)
-			ukBatch.SetVector(1, vec)
-		}
-
-		if s3Writer == nil {
-			rel := rels[uIdx]
-			err := rel.Write(proc.Ctx, ukBatch)
-			if err != nil {
-				return err
-			}
-			uIdx++
-		} else {
-			uIdx++
-			err := s3Writer.WriteS3Batch(ukBatch, proc, uIdx)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	return nil
-}
-
-func filterRowIdForDel(proc *process.Process, bat *batch.Batch, idx int) *batch.Batch {
-	retVec := vector.NewVec(types.T_Rowid.ToType())
-	rowIdMap := make(map[types.Rowid]struct{})
-	for i, r := range vector.MustFixedCol[types.Rowid](bat.Vecs[idx]) {
-		if !bat.Vecs[idx].GetNulls().Contains(uint64(i)) {
-			rowIdMap[r] = struct{}{}
-		}
-	}
-	rowIdList := make([]types.Rowid, len(rowIdMap))
-	i := 0
-	for rowId := range rowIdMap {
-		rowIdList[i] = rowId
-		i++
-	}
-	vector.AppendFixedList(retVec, rowIdList, nil, proc.Mp())
-	retBatch := batch.New(true, []string{catalog.Row_ID})
-	retBatch.SetZs(retVec.Length(), proc.Mp())
-	retBatch.SetVector(0, retVec)
-	return retBatch
-}
-
-func filterRowIdForUpdate(proc *process.Process, bat *batch.Batch, idxList []int32, attrs []string, parentIdx map[string]int32) (*batch.Batch, *batch.Batch, error) {
-	rowIdMap := make(map[types.Rowid]struct{})
-	var rowSkip []bool
-	foundRowId := false
-	for i, idx := range idxList {
-		if bat.Vecs[idx].GetType().Oid == types.T_Rowid {
-			for j, r := range vector.MustFixedCol[types.Rowid](bat.Vecs[idx]) {
-				if _, exist := rowIdMap[r]; exist {
-					rowSkip = append(rowSkip, true)
-				} else if bat.Vecs[idx].GetNulls().Contains(uint64(j)) {
-					rowSkip = append(rowSkip, true)
-				} else {
-					rowIdMap[r] = struct{}{}
-					rowSkip = append(rowSkip, false)
-				}
-			}
-			foundRowId = true
-			idxList = append(idxList[:i], idxList[i+1:]...)
-			break
-		}
-	}
-	if !foundRowId {
-		return nil, nil, moerr.NewInternalError(proc.Ctx, "need rowid vector for update")
-	}
-	batLen := len(rowIdMap)
-	if batLen == 0 {
-		return nil, nil, nil
-	}
-
-	// get delete batch
-	delVec := vector.NewVec(types.T_Rowid.ToType())
-	rowIdList := make([]types.Rowid, len(rowIdMap))
-	i := 0
-	for rowId := range rowIdMap {
-		rowIdList[i] = rowId
-		i++
-	}
-	mp := proc.Mp()
-	vector.AppendFixedList(delVec, rowIdList, nil, mp)
-	delBatch := batch.New(true, []string{catalog.Row_ID})
-	delBatch.SetVector(0, delVec)
-	delBatch.SetZs(batLen, mp)
-
-	// get update batch
-	updateBatch, err := GetUpdateBatch(proc, bat, idxList, batLen, attrs, rowSkip, parentIdx)
+	err := rowidVec.Union(srcBat.Vecs[idx], sels, proc.Mp())
 	if err != nil {
-		delBatch.Clean(proc.Mp())
-		return nil, nil, err
+		return err
 	}
-
-	return delBatch, updateBatch, nil
+	err = primaryVec.Union(srcBat.Vecs[primaryKeyIdx], sels, proc.Mp())
+	if err != nil {
+		return err
+	}
+	retBat.SetRowCount(len(sels))
+	return nil
 }
 
-func GetUpdateBatch(proc *process.Process, bat *batch.Batch, idxList []int32, batLen int, attrs []string, rowSkip []bool, parentIdx map[string]int32) (*batch.Batch, error) {
-	updateBatch := batch.New(true, attrs)
-	var toVec *vector.Vector
+// FillPartitionBatchForDelete fills the data into the corresponding batch based on the different partitions to which the current `row_id` data belongs.
+func FillPartitionBatchForDelete(proc *process.Process, input *batch.Batch, buffer *batch.Batch, expect int32, rowIdIdx int, partitionIdx int, pkIdx int) error {
+	// Fill the data into the corresponding batch based on the different partitions to which the current `row_id` data
+	rid2pid := vector.MustFixedColWithTypeCheck[int32](input.Vecs[partitionIdx])
 	var err error
 
-	for i, idx := range idxList {
-		fromVec := bat.Vecs[idx]
-		colName := attrs[i]
-
-		// if update values is not null, but parent is null, throw error
-		if parentIdx != nil {
-			if pIdx, exists := parentIdx[colName]; exists {
-				parentVec := bat.Vecs[pIdx]
-				if fromVec.IsConst() {
-					if !fromVec.IsConstNull() {
-						if rowSkip == nil {
-							for j := 0; j < batLen; j++ {
-								if parentVec.GetNulls().Contains(uint64(j)) {
-									return nil, moerr.NewInternalError(proc.Ctx, "Cannot add or update a child row: a foreign key constraint fails")
-								}
-							}
-						} else {
-							for j := 0; j < batLen; j++ {
-								if !rowSkip[j] && parentVec.GetNulls().Contains(uint64(j)) {
-									return nil, moerr.NewInternalError(proc.Ctx, "Cannot add or update a child row: a foreign key constraint fails")
-								}
-							}
-						}
-					}
-				} else {
-					if rowSkip == nil {
-						for j := 0; j < fromVec.Length(); j++ {
-							if !fromVec.GetNulls().Contains(uint64(j)) && parentVec.GetNulls().Contains(uint64(j)) {
-								return nil, moerr.NewInternalError(proc.Ctx, "Cannot add or update a child row: a foreign key constraint fails")
-							}
-						}
-					} else {
-						for j := 0; j < fromVec.Length(); j++ {
-							if !rowSkip[j] && !fromVec.GetNulls().Contains(uint64(j)) && parentVec.GetNulls().Contains(uint64(j)) {
-								return nil, moerr.NewInternalError(proc.Ctx, "Cannot add or update a child row: a foreign key constraint fails")
-							}
-						}
-					}
+	for i, rowid := range vector.MustFixedColWithTypeCheck[types.Rowid](input.Vecs[rowIdIdx]) {
+		if !input.Vecs[rowIdIdx].GetNulls().Contains(uint64(i)) {
+			patition := rid2pid[i]
+			if patition == -1 {
+				return moerr.NewInvalidInput(proc.Ctx, "Table has no partition for value from column_list")
+			} else if patition == expect {
+				err = vector.AppendFixed(buffer.Vecs[0], rowid, false, proc.GetMPool())
+				if err != nil {
+					return err
+				}
+				err = buffer.Vecs[1].UnionOne(input.Vecs[pkIdx], int64(i), proc.Mp())
+				if err != nil {
+					return err
 				}
 			}
 		}
-
-		if fromVec.IsConst() {
-			toVec = vector.NewVec(*bat.Vecs[idx].GetType())
-			if fromVec.IsConstNull() {
-				for j := 0; j < batLen; j++ {
-					err := vector.AppendFixed(toVec, 0, true, proc.Mp())
-					if err != nil {
-						updateBatch.Clean(proc.Mp())
-						return nil, err
-					}
-				}
-			} else {
-				err = toVec.UnionMulti(fromVec, 0, batLen, proc.Mp())
-				if err != nil {
-					updateBatch.Clean(proc.Mp())
-					return nil, err
-				}
-			}
-		} else {
-			if rowSkip == nil {
-				toVec, err = fromVec.Dup(proc.Mp())
-				if err != nil {
-					return nil, err
-				}
-			} else {
-				toVec = vector.NewVec(*fromVec.GetType())
-				for j := 0; j < fromVec.Length(); j++ {
-					if !rowSkip[j] {
-						toVec.UnionOne(fromVec, int64(j), proc.Mp())
-					}
-				}
-			}
-		}
-		updateBatch.SetVector(int32(i), toVec)
 	}
-	updateBatch.SetZs(batLen, proc.Mp())
-	return updateBatch, nil
+
+	buffer.SetRowCount(buffer.Vecs[0].Length())
+	return nil
 }
 
-func GetInfoForInsertAndUpdate(tableDef *plan.TableDef, updateCol map[string]int32) *TableInfo {
-	info := &TableInfo{
-		HasAutoCol:         false,
-		pkPos:              -1,
-		updateNameToPos:    make(map[string]int),
-		hasCompositePkey:   false,
-		compositePkeyParts: make([]string, 0),
-		clusterBy:          "",
-		Attrs:              make([]string, 0, len(tableDef.Cols)),
-		IdxList:            make([]int32, 0, len(tableDef.Cols)),
-	}
-
-	// Check whether the composite primary key column is included
-	if tableDef.Pkey != nil && tableDef.Pkey.CompPkeyCol != nil {
-		info.hasCompositePkey = true
-		info.compositePkeyParts = tableDef.Pkey.Names
-	}
-
-	if tableDef.ClusterBy != nil {
-		info.clusterBy = tableDef.ClusterBy.Name
-	}
-	pos := 0
-	for j, col := range tableDef.Cols {
-		if col.Typ.AutoIncr {
-			if updateCol == nil { // update statement
-				info.HasAutoCol = true
-			} else if _, ok := updateCol[col.Name]; ok { // insert statement
-				info.HasAutoCol = true
+// FillPartitionBatchForInsert fills the partition batch for insert operation.
+func FillPartitionBatchForInsert(proc *process.Process, input *batch.Batch, buffer *batch.Batch, expect int32, partitionIdx int) error {
+	rid2pid := vector.MustFixedColWithTypeCheck[int32](input.Vecs[partitionIdx])
+	for i, partition := range rid2pid {
+		if !input.Vecs[partitionIdx].GetNulls().Contains(uint64(i)) {
+			if partition == -1 {
+				return moerr.NewInvalidInput(proc.Ctx, "Table has no partition for value from column_list")
+			} else if partition == expect {
+				for j := range buffer.Attrs {
+					if err := buffer.Vecs[j].UnionOne(input.Vecs[j], int64(i), proc.GetMPool()); err != nil {
+						return err
+					}
+				}
 			}
 		}
-		if !info.hasCompositePkey && col.Name != catalog.Row_ID && col.Primary {
-			info.pkPos = j
-		}
-		if col.Name != catalog.Row_ID {
-			info.Attrs = append(info.Attrs, col.Name)
-			info.IdxList = append(info.IdxList, int32(pos))
-			info.updateNameToPos[col.Name] = pos
-			pos++
-		}
 	}
-	if info.hasCompositePkey {
-		info.pkPos = pos
-	}
-
-	return info
+	buffer.SetRowCount(buffer.Vecs[0].Length())
+	return nil
 }
 
-func BatchDataNotNullCheck(tmpBat *batch.Batch, tableDef *plan.TableDef, ctx context.Context) error {
-	compNameMap := make(map[string]struct{})
-
-	// judge whether the table contains composite primary key
-	if tableDef.Pkey != nil && len(tableDef.Pkey.Names) > 1 {
-		for _, name := range tableDef.Pkey.Names {
-			compNameMap[name] = struct{}{}
+func BatchDataNotNullCheck(vecs []*vector.Vector, attrs []string, tableDef *plan.TableDef, ctx context.Context) error {
+	for j := range vecs {
+		if vecs[j] == nil {
+			continue
 		}
-	}
-
-	for j := range tmpBat.Vecs {
-		nsp := tmpBat.Vecs[j].GetNulls()
+		nsp := vecs[j].GetNulls()
 		if tableDef.Cols[j].Default != nil && !tableDef.Cols[j].Default.NullAbility && nulls.Any(nsp) {
-			return moerr.NewConstraintViolation(ctx, fmt.Sprintf("Column '%s' cannot be null", tmpBat.Attrs[j]))
-		}
-		if _, ok := compNameMap[tmpBat.Attrs[j]]; ok {
-			if nulls.Any(nsp) {
-				return moerr.NewConstraintViolation(ctx, fmt.Sprintf("Column '%s' cannot be null", tmpBat.Attrs[j]))
-			}
+			return moerr.NewConstraintViolation(ctx, fmt.Sprintf("Column '%s' cannot be null", attrs[j]))
 		}
 	}
 	return nil
+}
+
+func getRelationByObjRef(ctx context.Context, proc *process.Process, eg engine.Engine, ref *plan.ObjectRef) (engine.Relation, error) {
+	dbSource, err := eg.Database(ctx, ref.SchemaName, proc.GetTxnOperator())
+	if err != nil {
+		return nil, err
+	}
+	relation, err := dbSource.Relation(ctx, ref.ObjName, proc)
+	if err == nil {
+		return relation, nil
+	}
+
+	// try to get temporary table
+	dbSource, err = eg.Database(ctx, defines.TEMPORARY_DBNAME, proc.GetTxnOperator())
+	if err != nil {
+		return nil, moerr.NewNoSuchTable(ctx, ref.SchemaName, ref.ObjName)
+	}
+	newObjeName := engine.GetTempTableName(ref.SchemaName, ref.ObjName)
+	return dbSource.Relation(ctx, newObjeName, proc)
+}
+
+func GetRelAndPartitionRelsByObjRef(
+	ctx context.Context,
+	proc *process.Process,
+	eng engine.Engine,
+	ref *plan.ObjectRef,
+) (source engine.Relation, err error) {
+	source, err = getRelationByObjRef(proc.Ctx, proc, eng, ref)
+	if err != nil {
+		return
+	}
+	return
 }

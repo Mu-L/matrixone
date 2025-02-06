@@ -20,23 +20,34 @@ package catalog
 // Return a int code.
 type Processor interface {
 	OnDatabase(database *DBEntry) error
+	OnPostDatabase(database *DBEntry) error
 	OnTable(table *TableEntry) error
-	OnPostSegment(segment *SegmentEntry) error
-	OnSegment(segment *SegmentEntry) error
-	OnBlock(block *BlockEntry) error
+	OnPostTable(table *TableEntry) error
+	OnPostObject(object *ObjectEntry) error
+	OnObject(object *ObjectEntry) error
+	OnTombstone(tombstone *ObjectEntry) error
 }
 
 type LoopProcessor struct {
-	DatabaseFn    func(*DBEntry) error
-	TableFn       func(*TableEntry) error
-	SegmentFn     func(*SegmentEntry) error
-	BlockFn       func(*BlockEntry) error
-	PostSegmentFn func(*SegmentEntry) error
+	DatabaseFn     func(*DBEntry) error
+	TableFn        func(*TableEntry) error
+	ObjectFn       func(*ObjectEntry) error
+	PostDatabaseFn func(*DBEntry) error
+	PostTableFn    func(*TableEntry) error
+	PostObjectFn   func(*ObjectEntry) error
+	TombstoneFn    func(*ObjectEntry) error
 }
 
 func (p *LoopProcessor) OnDatabase(database *DBEntry) error {
 	if p.DatabaseFn != nil {
 		return p.DatabaseFn(database)
+	}
+	return nil
+}
+
+func (p *LoopProcessor) OnPostDatabase(database *DBEntry) error {
+	if p.PostDatabaseFn != nil {
+		return p.PostDatabaseFn(database)
 	}
 	return nil
 }
@@ -48,23 +59,29 @@ func (p *LoopProcessor) OnTable(table *TableEntry) error {
 	return nil
 }
 
-func (p *LoopProcessor) OnPostSegment(segment *SegmentEntry) error {
-	if p.PostSegmentFn != nil {
-		return p.PostSegmentFn(segment)
+func (p *LoopProcessor) OnPostTable(table *TableEntry) error {
+	if p.PostTableFn != nil {
+		return p.PostTableFn(table)
 	}
 	return nil
 }
 
-func (p *LoopProcessor) OnSegment(segment *SegmentEntry) error {
-	if p.SegmentFn != nil {
-		return p.SegmentFn(segment)
+func (p *LoopProcessor) OnPostObject(Object *ObjectEntry) error {
+	if p.PostObjectFn != nil {
+		return p.PostObjectFn(Object)
 	}
 	return nil
 }
 
-func (p *LoopProcessor) OnBlock(block *BlockEntry) error {
-	if p.BlockFn != nil {
-		return p.BlockFn(block)
+func (p *LoopProcessor) OnObject(Object *ObjectEntry) error {
+	if p.ObjectFn != nil {
+		return p.ObjectFn(Object)
+	}
+	return nil
+}
+func (p *LoopProcessor) OnTombstone(tombstone *ObjectEntry) error {
+	if p.TombstoneFn != nil {
+		return p.TombstoneFn(tombstone)
 	}
 	return nil
 }

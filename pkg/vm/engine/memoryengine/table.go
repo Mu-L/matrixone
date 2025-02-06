@@ -16,11 +16,18 @@ package memoryengine
 
 import (
 	"context"
+	"strings"
 
-	"github.com/matrixorigin/matrixone/pkg/pb/plan"
-	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
-
+	"github.com/matrixorigin/matrixone/pkg/catalog"
+	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
+	pb "github.com/matrixorigin/matrixone/pkg/pb/statsinfo"
+	plan2 "github.com/matrixorigin/matrixone/pkg/sql/plan"
+	"github.com/matrixorigin/matrixone/pkg/sql/util"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
@@ -35,26 +42,22 @@ type Table struct {
 
 var _ engine.Relation = new(Table)
 
-func (t *Table) Stats(ctx context.Context, e *plan2.Expr, statsInfoMap any) (*plan.Stats, error) {
-	stats := plan2.DefaultStats()
-	rows, err := t.Rows(ctx)
-	if err != nil {
-		return stats, err
-	}
-	stats.TableCnt = float64(rows)
-	stats.Cost = stats.TableCnt
-	stats.Outcnt = stats.TableCnt
-	return stats, nil
+func (t *Table) CollectChanges(_ context.Context, from, to types.TS, _ *mpool.MPool) (engine.ChangesHandle, error) {
+	panic("not support")
 }
 
-func (t *Table) Rows(ctx context.Context) (int64, error) {
+func (t *Table) Stats(ctx context.Context, sync bool) (*pb.StatsInfo, error) {
+	return nil, nil
+}
+
+func (t *Table) Rows(ctx context.Context) (uint64, error) {
 	resps, err := DoTxnRequest[TableStatsResp](
 		ctx,
 		t.txnOperator,
 		true,
 		t.engine.anyShard,
 		OpTableStats,
-		TableStatsReq{
+		&TableStatsReq{
 			TableID: t.id,
 		},
 	)
@@ -62,10 +65,10 @@ func (t *Table) Rows(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	resp := resps[0]
-	return int64(resp.Rows), err
+	return uint64(resp.Rows), err
 }
 
-func (t *Table) Size(ctx context.Context, columnName string) (int64, error) {
+func (t *Table) Size(ctx context.Context, columnName string) (uint64, error) {
 	return 1, nil
 }
 
@@ -77,9 +80,9 @@ func (t *Table) AddTableDef(ctx context.Context, def engine.TableDef) error {
 		false,
 		t.engine.allShards,
 		OpAddTableDef,
-		AddTableDefReq{
+		&AddTableDefReq{
 			TableID:      t.id,
-			Def:          def,
+			Def:          def.ToPBVersion(),
 			DatabaseName: t.databaseName,
 			TableName:    t.tableName,
 		},
@@ -99,11 +102,11 @@ func (t *Table) DelTableDef(ctx context.Context, def engine.TableDef) error {
 		false,
 		t.engine.allShards,
 		OpDelTableDef,
-		DelTableDefReq{
+		&DelTableDefReq{
 			TableID:      t.id,
 			DatabaseName: t.databaseName,
 			TableName:    t.tableName,
-			Def:          def,
+			Def:          def.ToPBVersion(),
 		},
 	)
 	if err != nil {
@@ -114,6 +117,9 @@ func (t *Table) DelTableDef(ctx context.Context, def engine.TableDef) error {
 }
 
 func (t *Table) Delete(ctx context.Context, bat *batch.Batch, colName string) error {
+	if bat == nil {
+		return nil
+	}
 	vec := bat.Vecs[0]
 	shards, err := t.engine.shardPolicy.Vector(
 		ctx,
@@ -121,7 +127,7 @@ func (t *Table) Delete(ctx context.Context, bat *batch.Batch, colName string) er
 		t.TableDefs,
 		colName,
 		vec,
-		getDNServices(t.engine.cluster),
+		getTNServices(t.engine.cluster),
 	)
 	if err != nil {
 		return err
@@ -134,7 +140,7 @@ func (t *Table) Delete(ctx context.Context, bat *batch.Batch, colName string) er
 			false,
 			thisShard(shard.Shard),
 			OpDelete,
-			DeleteReq{
+			&DeleteReq{
 				TableID:      t.id,
 				DatabaseName: t.databaseName,
 				TableName:    t.tableName,
@@ -166,7 +172,7 @@ func (t *Table) GetPrimaryKeys(ctx context.Context) ([]*engine.Attribute, error)
 		true,
 		t.engine.anyShard,
 		OpGetPrimaryKeys,
-		GetPrimaryKeysReq{
+		&GetPrimaryKeysReq{
 			TableID: t.id,
 		},
 	)
@@ -176,7 +182,13 @@ func (t *Table) GetPrimaryKeys(ctx context.Context) ([]*engine.Attribute, error)
 
 	resp := resps[0]
 
-	return resp.Attrs, nil
+	// convert from []engine.Attribute  to []*engine.Attribute
+	attrs := make([]*engine.Attribute, 0, len(resp.Attrs))
+	for i := 0; i < len(resp.Attrs); i++ {
+		attrs = append(attrs, &resp.Attrs[i])
+	}
+
+	return attrs, nil
 }
 
 func (t *Table) TableColumns(ctx context.Context) ([]*engine.Attribute, error) {
@@ -187,7 +199,7 @@ func (t *Table) TableColumns(ctx context.Context) ([]*engine.Attribute, error) {
 		true,
 		t.engine.anyShard,
 		OpGetTableColumns,
-		GetTableColumnsReq{
+		&GetTableColumnsReq{
 			TableID: t.id,
 		},
 	)
@@ -197,7 +209,13 @@ func (t *Table) TableColumns(ctx context.Context) ([]*engine.Attribute, error) {
 
 	resp := resps[0]
 
-	return resp.Attrs, nil
+	// convert from []engine.Attribute  to []*engine.Attribute
+	attrs := make([]*engine.Attribute, 0, len(resp.Attrs))
+	for i := 0; i < len(resp.Attrs); i++ {
+		attrs = append(attrs, &resp.Attrs[i])
+	}
+
+	return attrs, nil
 }
 
 func (t *Table) TableDefs(ctx context.Context) ([]engine.TableDef, error) {
@@ -208,7 +226,7 @@ func (t *Table) TableDefs(ctx context.Context) ([]engine.TableDef, error) {
 		true,
 		t.engine.anyShard,
 		OpGetTableDefs,
-		GetTableDefsReq{
+		&GetTableDefsReq{
 			TableID: t.id,
 		},
 	)
@@ -218,7 +236,144 @@ func (t *Table) TableDefs(ctx context.Context) ([]engine.TableDef, error) {
 
 	resp := resps[0]
 
-	return resp.Defs, nil
+	// convert from PB version to interface version
+	defs := make([]engine.TableDef, 0, len(resp.Defs))
+	for i := 0; i < len(resp.Defs); i++ {
+		defs = append(defs, resp.Defs[i].FromPBVersion())
+	}
+
+	return defs, nil
+}
+
+func (t *Table) CopyTableDef(ctx context.Context) *plan.TableDef {
+	return t.GetTableDef(ctx)
+}
+func (t *Table) GetTableDef(ctx context.Context) *plan.TableDef {
+	engineDefs, err := t.TableDefs(ctx)
+	if err != nil {
+		return nil
+	}
+
+	var clusterByDef *plan2.ClusterByDef
+	var cols []*plan2.ColDef
+	var schemaVersion uint32
+	var defs []*plan2.TableDefType
+	var properties []*plan2.Property
+	var TableType, Createsql string
+	var viewSql *plan2.ViewDef
+	var foreignKeys []*plan2.ForeignKeyDef
+	var primarykey *plan2.PrimaryKeyDef
+	var indexes []*plan2.IndexDef
+	var refChildTbls []uint64
+
+	for _, def := range engineDefs {
+		if attr, ok := def.(*engine.AttributeDef); ok {
+			col := &plan2.ColDef{
+				ColId:      attr.Attr.ID,
+				Name:       strings.ToLower(attr.Attr.Name),
+				OriginName: attr.Attr.Name,
+				Typ: plan2.Type{
+					Id:          int32(attr.Attr.Type.Oid),
+					Width:       attr.Attr.Type.Width,
+					Scale:       attr.Attr.Type.Scale,
+					AutoIncr:    attr.Attr.AutoIncrement,
+					Table:       t.tableName,
+					NotNullable: attr.Attr.Default != nil && !attr.Attr.Default.NullAbility,
+					Enumvalues:  attr.Attr.EnumVlaues,
+				},
+				Primary:   attr.Attr.Primary,
+				Default:   attr.Attr.Default,
+				OnUpdate:  attr.Attr.OnUpdate,
+				Comment:   attr.Attr.Comment,
+				ClusterBy: attr.Attr.ClusterBy,
+				Hidden:    attr.Attr.IsHidden,
+				Seqnum:    uint32(attr.Attr.Seqnum),
+			}
+			if attr.Attr.ClusterBy {
+				clusterByDef = &plan.ClusterByDef{
+					Name: attr.Attr.Name,
+				}
+			}
+			cols = append(cols, col)
+		} else if pro, ok := def.(*engine.PropertiesDef); ok {
+			for _, p := range pro.Properties {
+				switch p.Key {
+				case catalog.SystemRelAttr_Kind:
+					TableType = p.Value
+				case catalog.SystemRelAttr_CreateSQL:
+					Createsql = p.Value
+				default:
+				}
+				properties = append(properties, &plan2.Property{
+					Key:   p.Key,
+					Value: p.Value,
+				})
+			}
+		} else if viewDef, ok := def.(*engine.ViewDef); ok {
+			viewSql = &plan2.ViewDef{
+				View: viewDef.View,
+			}
+		} else if c, ok := def.(*engine.ConstraintDef); ok {
+			for _, ct := range c.Cts {
+				switch k := ct.(type) {
+				case *engine.IndexDef:
+					indexes = k.Indexes
+				case *engine.ForeignKeyDef:
+					foreignKeys = k.Fkeys
+				case *engine.RefChildTableDef:
+					refChildTbls = k.Tables
+				case *engine.PrimaryKeyDef:
+					primarykey = k.Pkey
+				case *engine.StreamConfigsDef:
+					properties = append(properties, k.Configs...)
+				}
+			}
+		} else if commnetDef, ok := def.(*engine.CommentDef); ok {
+			properties = append(properties, &plan2.Property{
+				Key:   catalog.SystemRelAttr_Comment,
+				Value: commnetDef.Comment,
+			})
+		} else if v, ok := def.(*engine.VersionDef); ok {
+			schemaVersion = v.Version
+		}
+	}
+	if len(properties) > 0 {
+		defs = append(defs, &plan2.TableDefType{
+			Def: &plan2.TableDef_DefType_Properties{
+				Properties: &plan2.PropertiesDef{
+					Properties: properties,
+				},
+			},
+		})
+	}
+
+	if primarykey != nil && primarykey.PkeyColName == catalog.CPrimaryKeyColName {
+		primarykey.CompPkeyCol = plan2.GetColDefFromTable(cols, catalog.CPrimaryKeyColName)
+	}
+	if clusterByDef != nil && util.JudgeIsCompositeClusterByColumn(clusterByDef.Name) {
+		clusterByDef.CompCbkeyCol = plan2.GetColDefFromTable(cols, clusterByDef.Name)
+	}
+	rowIdCol := plan2.MakeRowIdColDef()
+	cols = append(cols, rowIdCol)
+
+	tableDef := &plan2.TableDef{
+		TblId:        t.GetTableID(ctx),
+		Name:         t.tableName,
+		Cols:         cols,
+		Defs:         defs,
+		TableType:    TableType,
+		Createsql:    Createsql,
+		Pkey:         primarykey,
+		ViewSql:      viewSql,
+		Fkeys:        foreignKeys,
+		RefChildTbls: refChildTbls,
+		ClusterBy:    clusterByDef,
+		Indexes:      indexes,
+		Version:      schemaVersion,
+		IsTemporary:  t.GetEngineType() == engine.Memory,
+		DbName:       t.databaseName,
+	}
+	return tableDef
 }
 
 //func (t *Table) Truncate(ctx context.Context) (uint64, error) {
@@ -229,7 +384,7 @@ func (t *Table) TableDefs(ctx context.Context) ([]engine.TableDef, error) {
 //		false,
 //		t.engine.allShards,
 //		OpTruncate,
-//		TruncateReq{
+//		&TruncateReq{
 //			TableID:      t.id,
 //			DatabaseName: t.databaseName,
 //			TableName:    t.tableName,
@@ -252,14 +407,24 @@ func (t *Table) UpdateConstraint(context.Context, *engine.ConstraintDef) error {
 	return nil
 }
 
+func (t *Table) AlterTable(ctx context.Context, c *engine.ConstraintDef, reqs []*api.AlterTableReq) error {
+	// implement me
+	return nil
+}
+
+func (t *Table) TableRenameInTxn(ctx context.Context, constraint [][]byte) error {
+	// implement me
+	return nil
+}
+
 func (t *Table) Update(ctx context.Context, data *batch.Batch) error {
-	data.InitZsOne(data.Length())
+	data.SetRowCount(data.RowCount())
 	shards, err := t.engine.shardPolicy.Batch(
 		ctx,
 		t.id,
 		t.TableDefs,
 		data,
-		getDNServices(t.engine.cluster),
+		getTNServices(t.engine.cluster),
 	)
 	if err != nil {
 		return err
@@ -272,7 +437,7 @@ func (t *Table) Update(ctx context.Context, data *batch.Batch) error {
 			false,
 			thisShard(shard.Shard),
 			OpUpdate,
-			UpdateReq{
+			&UpdateReq{
 				TableID:      t.id,
 				DatabaseName: t.databaseName,
 				TableName:    t.tableName,
@@ -288,13 +453,13 @@ func (t *Table) Update(ctx context.Context, data *batch.Batch) error {
 }
 
 func (t *Table) Write(ctx context.Context, data *batch.Batch) error {
-	data.InitZsOne(data.Length())
+	data.SetRowCount(data.RowCount())
 	shards, err := t.engine.shardPolicy.Batch(
 		ctx,
 		t.id,
 		t.TableDefs,
 		data,
-		getDNServices(t.engine.cluster),
+		getTNServices(t.engine.cluster),
 	)
 	if err != nil {
 		return err
@@ -307,7 +472,7 @@ func (t *Table) Write(ctx context.Context, data *batch.Batch) error {
 			false,
 			thisShard(shard.Shard),
 			OpWrite,
-			WriteReq{
+			&WriteReq{
 				TableID:      t.id,
 				DatabaseName: t.databaseName,
 				TableName:    t.tableName,
@@ -322,14 +487,14 @@ func (t *Table) Write(ctx context.Context, data *batch.Batch) error {
 	return nil
 }
 
-func (t *Table) GetHideKeys(ctx context.Context) (attrs []*engine.Attribute, err error) {
+func (t *Table) GetHideKeys(ctx context.Context) ([]*engine.Attribute, error) {
 	resps, err := DoTxnRequest[GetHiddenKeysResp](
 		ctx,
 		t.txnOperator,
 		true,
 		t.engine.anyShard,
 		OpGetHiddenKeys,
-		GetHiddenKeysReq{
+		&GetHiddenKeysReq{
 			TableID: t.id,
 		},
 	)
@@ -339,13 +504,56 @@ func (t *Table) GetHideKeys(ctx context.Context) (attrs []*engine.Attribute, err
 
 	resp := resps[0]
 
-	return resp.Attrs, nil
+	// convert from []engine.Attribute  to []*engine.Attribute
+	attrs := make([]*engine.Attribute, 0, len(resp.Attrs))
+	for i := 0; i < len(resp.Attrs); i++ {
+		attrs = append(attrs, &resp.Attrs[i])
+	}
+
+	return attrs, nil
 }
 
 func (t *Table) GetTableID(ctx context.Context) uint64 {
 	return uint64(t.id)
 }
 
+// GetTableName implements the engine.Relation interface.
+func (t *Table) GetTableName() string {
+	return t.tableName
+}
+
+func (t *Table) GetDBID(ctx context.Context) uint64 {
+	return 0
+}
+
 func (t *Table) MaxAndMinValues(ctx context.Context) ([][2]any, []uint8, error) {
 	return nil, nil, nil
+}
+
+func (t *Table) GetColumMetadataScanInfo(ctx context.Context, name string) ([]*plan.MetadataScanInfo, error) {
+	return nil, nil
+}
+
+func (t *Table) PrimaryKeysMayBeModified(ctx context.Context, from types.TS, to types.TS, bat *batch.Batch, idx int32) (bool, error) {
+	return true, nil
+}
+
+func (t *Table) PrimaryKeysMayBeUpserted(ctx context.Context, from types.TS, to types.TS, bat *batch.Batch, idx int32) (bool, error) {
+	return true, nil
+}
+
+func (t *Table) ApproxObjectsNum(ctx context.Context) int {
+	return 0
+}
+
+func (t *Table) MergeObjects(ctx context.Context, objstats []objectio.ObjectStats, targetObjSize uint32) (*api.MergeCommitEntry, error) {
+	return nil, nil
+}
+
+func (t *Table) GetNonAppendableObjectStats(ctx context.Context) ([]objectio.ObjectStats, error) {
+	return nil, nil
+}
+
+func (t *Table) Reset(op client.TxnOperator) error {
+	return nil
 }

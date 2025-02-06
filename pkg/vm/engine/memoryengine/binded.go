@@ -17,6 +17,7 @@ package memoryengine
 import (
 	"context"
 
+	pb "github.com/matrixorigin/matrixone/pkg/pb/statsinfo"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/sql/plan"
 	"github.com/matrixorigin/matrixone/pkg/txn/client"
@@ -36,6 +37,10 @@ func (e *Engine) Bind(txnOp client.TxnOperator) *BindedEngine {
 }
 
 var _ engine.Engine = new(BindedEngine)
+
+func (b *BindedEngine) LatestLogtailAppliedTime() timestamp.Timestamp {
+	return b.engine.LatestLogtailAppliedTime()
+}
 
 func (b *BindedEngine) Commit(ctx context.Context, _ client.TxnOperator) error {
 	return b.engine.Commit(ctx, b.txnOp)
@@ -61,8 +66,14 @@ func (b *BindedEngine) Hints() engine.Hints {
 	return b.engine.Hints()
 }
 
-func (b *BindedEngine) NewBlockReader(_ context.Context, _ int, _ timestamp.Timestamp,
-	_ *plan.Expr, _ [][]byte, _ *plan.TableDef) ([]engine.Reader, error) {
+func (b *BindedEngine) BuildBlockReaders(
+	ctx context.Context,
+	proc any,
+	ts timestamp.Timestamp,
+	expr *plan.Expr,
+	def *plan.TableDef,
+	relData engine.RelData,
+	num int) ([]engine.Reader, error) {
 	return nil, nil
 }
 
@@ -70,8 +81,8 @@ func (b *BindedEngine) New(ctx context.Context, _ client.TxnOperator) error {
 	return b.engine.New(ctx, b.txnOp)
 }
 
-func (b *BindedEngine) Nodes() (cnNodes engine.Nodes, err error) {
-	return b.engine.Nodes()
+func (b *BindedEngine) Nodes(isInternal bool, tenant string, username string, cnLabel map[string]string) (cnNodes engine.Nodes, err error) {
+	return b.engine.Nodes(isInternal, tenant, username, cnLabel)
 }
 
 func (b *BindedEngine) Rollback(ctx context.Context, _ client.TxnOperator) error {
@@ -88,4 +99,27 @@ func (b *BindedEngine) GetRelationById(ctx context.Context, op client.TxnOperato
 
 func (b *BindedEngine) AllocateIDByKey(ctx context.Context, key string) (uint64, error) {
 	return b.engine.AllocateIDByKey(ctx, key)
+}
+
+func (b *BindedEngine) TryToSubscribeTable(ctx context.Context, dbID, tbID uint64) error {
+	return b.engine.TryToSubscribeTable(ctx, dbID, tbID)
+}
+
+func (b *BindedEngine) UnsubscribeTable(ctx context.Context, dbID, tbID uint64) error {
+	return b.engine.UnsubscribeTable(ctx, dbID, tbID)
+}
+
+func (b *BindedEngine) PrefetchTableMeta(ctx context.Context, key pb.StatsInfoKey) bool {
+	return b.engine.PrefetchTableMeta(ctx, key)
+}
+func (b *BindedEngine) Stats(ctx context.Context, key pb.StatsInfoKey, sync bool) *pb.StatsInfo {
+	return b.engine.Stats(ctx, key, sync)
+}
+
+func (b *BindedEngine) GetMessageCenter() any {
+	return nil
+}
+
+func (b *BindedEngine) GetService() string {
+	return b.engine.GetService()
 }

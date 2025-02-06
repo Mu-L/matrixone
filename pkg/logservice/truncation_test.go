@@ -19,7 +19,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/lni/dragonboat/v4"
+	"github.com/lni/goutils/leaktest"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
+	"github.com/matrixorigin/matrixone/pkg/hakeeper"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/stretchr/testify/assert"
 )
@@ -29,12 +33,12 @@ func TestTruncationExportSnapshot(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 		defer cancel()
 
-		dnID := uint64(100)
+		tnID := uint64(100)
 		req := pb.Request{
 			Method: pb.CONNECT_RO,
 			LogRequest: pb.LogRequest{
 				ShardID: 1,
-				DNID:    dnID,
+				TNID:    tnID,
 			},
 		}
 		resp := s.handleConnect(ctx, req)
@@ -42,7 +46,7 @@ func TestTruncationExportSnapshot(t *testing.T) {
 
 		for i := 0; i < 10; i++ {
 			data := make([]byte, 8)
-			cmd := getTestAppendCmd(dnID, data)
+			cmd := getTestAppendCmd(tnID, data)
 			req = pb.Request{
 				Method: pb.APPEND,
 				LogRequest: pb.LogRequest{
@@ -91,12 +95,12 @@ func TestTruncationImportSnapshot(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 		defer cancel()
 
-		dnID := uint64(100)
+		tnID := uint64(100)
 		req := pb.Request{
 			Method: pb.CONNECT_RO,
 			LogRequest: pb.LogRequest{
 				ShardID: 1,
-				DNID:    dnID,
+				TNID:    tnID,
 			},
 		}
 		resp := s.handleConnect(ctx, req)
@@ -104,7 +108,7 @@ func TestTruncationImportSnapshot(t *testing.T) {
 
 		for i := 0; i < 10; i++ {
 			data := make([]byte, 8)
-			cmd := getTestAppendCmd(dnID, data)
+			cmd := getTestAppendCmd(tnID, data)
 			req = pb.Request{
 				Method: pb.APPEND,
 				LogRequest: pb.LogRequest{
@@ -169,7 +173,7 @@ func TestTruncationImportSnapshot(t *testing.T) {
 
 		for i := 0; i < 10; i++ {
 			data := make([]byte, 8)
-			cmd := getTestAppendCmd(dnID, data)
+			cmd := getTestAppendCmd(tnID, data)
 			req = pb.Request{
 				Method: pb.APPEND,
 				LogRequest: pb.LogRequest{
@@ -199,4 +203,153 @@ func TestTruncationImportSnapshot(t *testing.T) {
 		assert.Equal(t, 0, s.store.snapshotMgr.Count(1, 1))
 	}
 	runServiceTest(t, false, true, fn)
+}
+
+func TestHAKeeperTruncation(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	fn := func(t *testing.T, s *Service) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
+		defer cancel()
+		req := pb.Request{
+			Method: pb.LOG_HEARTBEAT,
+			LogHeartbeat: &pb.LogStoreHeartbeat{
+				UUID: "uuid1",
+			},
+		}
+		for i := 0; i < 10; i++ {
+			resp := s.handleLogHeartbeat(ctx, req)
+			assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+		}
+		v, err := s.store.read(ctx, hakeeper.DefaultHAKeeperShardID, &hakeeper.IndexQuery{})
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(12), v.(uint64))
+
+		err = s.store.processHAKeeperTruncation(ctx)
+		assert.NoError(t, err)
+
+		checkTick := time.NewTicker(time.Millisecond * 100)
+		defer checkTick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				panic("failed to truncate logs")
+			case <-checkTick.C:
+				rs, err := s.store.nh.QueryRaftLog(hakeeper.DefaultHAKeeperShardID,
+					1, 100, 1024*100)
+				assert.NoError(t, err)
+				select {
+				case v := <-rs.ResultC():
+					// We cannot fetch the logs because they are truncated.
+					if v.RequestOutOfRange() {
+						return
+					}
+				case <-ctx.Done():
+					panic("failed to truncate logs")
+				}
+
+			}
+		}
+	}
+	runServiceTest(t, true, true, fn)
+}
+
+func TestTruncationImportSnapshot2(t *testing.T) {
+	fn := func(t *testing.T, s *Service) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+		defer cancel()
+
+		tnID := uint64(100)
+		req := pb.Request{
+			Method: pb.CONNECT_RO,
+			LogRequest: pb.LogRequest{
+				ShardID: 1,
+				TNID:    tnID,
+			},
+		}
+		resp := s.handleConnect(ctx, req)
+		assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+
+		for i := 0; i < 10; i++ {
+			data := make([]byte, 8)
+			cmd := getTestAppendCmd(tnID, data)
+			req = pb.Request{
+				Method: pb.APPEND,
+				LogRequest: pb.LogRequest{
+					ShardID: 1,
+				},
+			}
+			resp = s.handleAppend(ctx, req, cmd)
+			assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+			assert.Equal(t, uint64(4+i), resp.LogResponse.Lsn) // applied index is 4+i
+		}
+
+		req = pb.Request{
+			Method: pb.TRUNCATE,
+			LogRequest: pb.LogRequest{
+				ShardID: 1,
+				Lsn:     4,
+			},
+		}
+		resp = s.handleTruncate(ctx, req)
+		assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+		assert.Equal(t, uint64(0), resp.LogResponse.Lsn)
+
+		req = pb.Request{
+			Method: pb.GET_TRUNCATE,
+			LogRequest: pb.LogRequest{
+				ShardID: 1,
+			},
+		}
+		resp = s.handleGetTruncatedIndex(ctx, req)
+		assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+		assert.Equal(t, uint64(4), resp.LogResponse.Lsn)
+
+		ctx2, cancel2 := context.WithTimeoutCause(context.Background(), time.Second, moerr.NewInternalErrorNoCtx("ut tester"))
+		defer cancel2()
+
+		// after this, snapshot index 14 is exported.
+		err := s.store.processShardTruncateLog(ctx2, 1)
+		assert.NoError(t, err)
+
+	}
+	runServiceTest(t, false, true, fn)
+}
+
+func TestProcessShardTruncateLogError(t *testing.T) {
+	s := store{
+		nh:      &dragonboat.NodeHost{},
+		runtime: runtime.DefaultRuntime(),
+	}
+	assert.NoError(t, s.processShardTruncateLog(context.Background(), 100))
+}
+
+func TestHAKeeperTruncation2(t *testing.T) {
+	defer leaktest.AfterTest(t)()
+
+	fn := func(t *testing.T, s *Service) {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*20)
+		defer cancel()
+		req := pb.Request{
+			Method: pb.LOG_HEARTBEAT,
+			LogHeartbeat: &pb.LogStoreHeartbeat{
+				UUID: "uuid1",
+			},
+		}
+		for i := 0; i < 10; i++ {
+			resp := s.handleLogHeartbeat(ctx, req)
+			assert.Equal(t, uint32(moerr.Ok), resp.ErrorCode)
+		}
+		v, err := s.store.read(ctx, hakeeper.DefaultHAKeeperShardID, &hakeeper.IndexQuery{})
+		assert.NoError(t, err)
+		assert.Equal(t, uint64(12), v.(uint64))
+
+		//let ctx timeout
+		ctx2, cancel2 := context.WithTimeoutCause(context.Background(), 0, moerr.NewInternalErrorNoCtx("ut tester"))
+		defer cancel2()
+		err = s.store.processHAKeeperTruncation(ctx2)
+		assert.Error(t, err)
+
+	}
+	runServiceTest(t, true, true, fn)
 }

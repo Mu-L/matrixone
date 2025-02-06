@@ -1,14 +1,9 @@
 service-type = "CN"
 
 [log]
-level = "debug"
+level = "info"
 format = "console"
 max-size = 512
-
-[cn.rpc]
-max-message-size = "100mb"
-send-queue-size = 2
-busy-queue-size = 1
 
 [[fileservice]]
 backend = "DISK"
@@ -23,11 +18,14 @@ name = "SHARED"
 bucket = "mo-test"
 endpoint = "http://minio:9000"
 key-prefix = "server/data"
+cert-files = ["/etc/ssl/cert.pem"]
 
 [fileservice.cache]
 memory-capacity = "512MB"
-disk-capacity = "8GB"
+disk-capacity = "3GB"
 disk-path = "mo-data/file-service-cache"
+disk-min-evict-interval = "7m"
+disk-evict-target = 0.8
 
 [[fileservice]]
 backend = "MINIO"
@@ -46,11 +44,10 @@ service-addresses = ["logservice:32001"]
 #disableMetric = true
 
 [cn]
-uuid = "dd1dccb8-4d3c-41f9-b482-5251dc7a41bf"
-listen-address = "0.0.0.0:6002"
-service-address = "cn-0:6002"
+uuid = "dd1dccb3-4d3c-41f9-b482-5251dc7a41bf"
+port-base = 18100
+service-host = "cn-0"
 sql-address = "cn-0:6001"
-turn-on-push-model = false
 
 [cn.Engine]
 type = "distributed-tae"

@@ -15,6 +15,7 @@
 package types
 
 import (
+	"encoding/hex"
 	"github.com/google/uuid"
 )
 
@@ -27,7 +28,7 @@ func ParseUuid(str string) (Uuid, error) {
 }
 
 func BuildUuid() (Uuid, error) {
-	gUuid, err := uuid.NewUUID()
+	gUuid, err := uuid.NewV7()
 	if err != nil {
 		return Uuid{}, err
 	}
@@ -42,7 +43,7 @@ func EqualUuid(src Uuid, dest Uuid) bool {
 	return src == dest
 }
 
-func CompareUuid(left Uuid, right Uuid) int64 {
+func CompareUuid(left Uuid, right Uuid) int {
 	for i := 0; i < 16; i++ {
 		if left[i] == right[i] {
 			continue
@@ -55,8 +56,14 @@ func CompareUuid(left Uuid, right Uuid) int64 {
 	return 0
 }
 
-func (d Uuid) ToString() string {
+func (d Uuid) String() string {
 	return uuid.UUID(d).String()
+}
+
+func (d Uuid) ShortString() string {
+	var shortuuid [12]byte
+	hex.Encode(shortuuid[:], d[10:])
+	return string(shortuuid[:])
 }
 
 func (d Uuid) ClockSequence() int {
@@ -83,4 +90,43 @@ func (d Uuid) Gt(other Uuid) bool {
 }
 func (d Uuid) Ne(other Uuid) bool {
 	return d.Compare(other) != 0
+}
+
+// ProtoSize is used by gogoproto.
+func (d *Uuid) ProtoSize() int {
+	return 16
+}
+
+// MarshalToSizedBuffer is used by gogoproto.
+func (d *Uuid) MarshalToSizedBuffer(data []byte) (int, error) {
+	if len(data) < d.ProtoSize() {
+		panic("invalid byte slice")
+	}
+	n := copy(data, d[:])
+	return n, nil
+}
+
+// MarshalTo is used by gogoproto.
+func (d *Uuid) MarshalTo(data []byte) (int, error) {
+	size := d.ProtoSize()
+	return d.MarshalToSizedBuffer(data[:size])
+}
+
+// Marshal is used by gogoproto.
+func (d *Uuid) Marshal() ([]byte, error) {
+	data := make([]byte, d.ProtoSize())
+	n, err := d.MarshalToSizedBuffer(data)
+	if err != nil {
+		return nil, err
+	}
+	return data[:n], err
+}
+
+// Unmarshal is used by gogoproto.
+func (d *Uuid) Unmarshal(data []byte) error {
+	if len(data) < d.ProtoSize() {
+		panic("invalid byte slice")
+	}
+	copy(d[:], data)
+	return nil
 }

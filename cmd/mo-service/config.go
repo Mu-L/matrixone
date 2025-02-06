@@ -17,7 +17,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/matrixorigin/matrixone/pkg/util/metric/stats"
 	"hash/fnv"
 	"math"
 	"net"
@@ -26,18 +25,31 @@ import (
 	"strings"
 	"time"
 
+	logservicepb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
+	"github.com/matrixorigin/matrixone/pkg/util"
+
 	"github.com/BurntSushi/toml"
+	"go.uber.org/zap"
+
 	"github.com/matrixorigin/matrixone/pkg/cnservice"
+	"github.com/matrixorigin/matrixone/pkg/common/chaos"
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/config"
 	"github.com/matrixorigin/matrixone/pkg/defines"
-	"github.com/matrixorigin/matrixone/pkg/dnservice"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/perfcounter"
+	"github.com/matrixorigin/matrixone/pkg/proxy"
+	"github.com/matrixorigin/matrixone/pkg/tnservice"
+	"github.com/matrixorigin/matrixone/pkg/udf/pythonservice"
+	"github.com/matrixorigin/matrixone/pkg/util/debug/goroutine"
+	"github.com/matrixorigin/matrixone/pkg/util/metric/stats"
 	tomlutil "github.com/matrixorigin/matrixone/pkg/util/toml"
+	"github.com/matrixorigin/matrixone/pkg/version"
 )
 
 var (
@@ -45,9 +57,11 @@ var (
 	defaultMemoryLimit    = 1 << 40
 
 	supportServiceTypes = map[string]metadata.ServiceType{
-		metadata.ServiceType_CN.String():  metadata.ServiceType_CN,
-		metadata.ServiceType_DN.String():  metadata.ServiceType_DN,
-		metadata.ServiceType_LOG.String(): metadata.ServiceType_LOG,
+		metadata.ServiceType_CN.String():         metadata.ServiceType_CN,
+		metadata.ServiceType_TN.String():         metadata.ServiceType_TN,
+		metadata.ServiceType_LOG.String():        metadata.ServiceType_LOG,
+		metadata.ServiceType_PROXY.String():      metadata.ServiceType_PROXY,
+		metadata.ServiceType_PYTHON_UDF.String(): metadata.ServiceType_PYTHON_UDF,
 	}
 )
 
@@ -55,10 +69,32 @@ var (
 type LaunchConfig struct {
 	// LogServiceConfigFiles log service config files
 	LogServiceConfigFiles []string `toml:"logservices"`
-	// DNServiceConfigsFiles log service config files
-	DNServiceConfigsFiles []string `toml:"dnservices"`
+	// TNServiceConfigsFiles log service config files
+	TNServiceConfigsFiles []string `toml:"tnservices"`
 	// CNServiceConfigsFiles log service config files
 	CNServiceConfigsFiles []string `toml:"cnservices"`
+	// CNServiceConfigsFiles log service config files
+	ProxyServiceConfigsFiles []string `toml:"proxy-services"`
+	// PythonUdfServiceConfigsFiles python udf service config files
+	PythonUdfServiceConfigsFiles []string `toml:"python-udf-services"`
+	// Dynamic dynamic cn service config
+	Dynamic Dynamic `toml:"dynamic"`
+}
+
+// Dynamic dynamic cn config
+type Dynamic struct {
+	// Enable enable dynamic cn config
+	Enable bool `toml:"enable"`
+	// CtlAddress http server port for ctl dynamic cn
+	CtlAddress string `toml:"ctl-address"`
+	// CNTemplate cn template file
+	CNTemplate string `toml:"cn-template"`
+	// ServiceCount how many cn services to start
+	ServiceCount int `toml:"service-count"`
+	// CpuCount how many cpu can used pr cn instance
+	CpuCount int `toml:"cpu-count"`
+	// Chaos chaos test config
+	Chaos chaos.Config `toml:"chaos"`
 }
 
 // Config mo-service configuration
@@ -68,18 +104,23 @@ type Config struct {
 	// Log log config
 	Log logutil.LogConfig `toml:"log"`
 	// ServiceType service type, select the corresponding configuration to start the
-	// service according to the service type. [CN|DN|LOG]
+	// service according to the service type. [CN|TN|LOG|PROXY]
 	ServiceType string `toml:"service-type"`
 	// FileServices the config for file services
 	FileServices []fileservice.Config `toml:"fileservice"`
 	// HAKeeperClient hakeeper client config
 	HAKeeperClient logservice.HAKeeperClientConfig `toml:"hakeeper-client"`
-	// DN dn service config
-	DN dnservice.Config `toml:"dn"`
+	// TN tn service config
+	TN_please_use_getTNServiceConfig *tnservice.Config `toml:"tn"`
+	TNCompatible                     *tnservice.Config `toml:"dn"` // for old config files compatibility
 	// LogService is the config for log service
 	LogService logservice.Config `toml:"logservice"`
 	// CN cn service config
 	CN cnservice.Config `toml:"cn"`
+	// ProxyConfig is the config of proxy.
+	ProxyConfig proxy.Config `toml:"proxy"`
+	// PythonUdfServerConfig is the config of python udf server
+	PythonUdfServerConfig pythonservice.Config `toml:"python-udf-server"`
 	// Observability parameters for the metric/trace
 	Observability config.ObservabilityParameters `toml:"observability"`
 
@@ -98,6 +139,39 @@ type Config struct {
 	Limit struct {
 		// Memory memory usage limit, see mpool for details
 		Memory tomlutil.ByteSize `toml:"memory"`
+	}
+
+	// MetaCache the config for objectio metacache
+	MetaCache objectio.CacheConfig `toml:"metacache"`
+
+	// IsStandalone denotes the matrixone is running in standalone mode
+	// For the tn does not boost an independent queryservice.
+	// cn,tn shares the same queryservice in standalone mode.
+	// Under distributed deploy mode, cn,tn are independent os process.
+	// they have their own queryservice.
+	IsStandalone bool
+
+	// Goroutine goroutine config
+	Goroutine goroutine.Config `toml:"goroutine"`
+
+	// Malloc default config
+	Malloc malloc.Config `toml:"malloc"`
+}
+
+// NewConfig return Config with default values.
+func NewConfig() *Config {
+	return &Config{
+		HAKeeperClient: logservice.HAKeeperClientConfig{
+			DiscoveryAddress: "",
+			ServiceAddresses: []string{logservice.DefaultLogServiceServiceAddress},
+			AllocateIDBatch:  100,
+			EnableCompress:   false,
+		},
+		Observability: *config.NewObservabilityParameters(),
+		LogService:    logservice.DefaultConfig(),
+		CN: cnservice.Config{
+			AutomaticUpgrade: true,
+		},
 	}
 }
 
@@ -120,12 +194,23 @@ func parseFromString(data string, cfg any) error {
 }
 
 func (c *Config) validate() error {
-	if c.DataDir == "" {
-		c.DataDir = "./mo-data"
+	// data dir
+	if c.DataDir == "" ||
+		c.DataDir == "./mo-data" ||
+		c.DataDir == "mo-data" {
+		path, err := os.Getwd()
+		if err != nil {
+			panic(err)
+		}
+		c.DataDir = filepath.Join(path, "mo-data")
 	}
+
+	// service type
 	if _, err := c.getServiceType(); err != nil {
 		return err
 	}
+
+	// clock
 	if c.Clock.MaxClockOffset.Duration == 0 {
 		c.Clock.MaxClockOffset.Duration = defaultMaxClockOffset
 	}
@@ -133,58 +218,138 @@ func (c *Config) validate() error {
 		c.Clock.Backend = localClockBackend
 	}
 	if _, ok := supportTxnClockBackends[strings.ToUpper(c.Clock.Backend)]; !ok {
-		return moerr.NewInternalError(context.Background(), "%s clock backend not support", c.Clock.Backend)
+		return moerr.NewInternalErrorf(context.Background(), "%s clock backend not support", c.Clock.Backend)
 	}
 	if !c.Clock.EnableCheckMaxClockOffset {
 		c.Clock.MaxClockOffset.Duration = 0
 	}
-	for idx := range c.FileServices {
-		switch c.FileServices[idx].Name {
-		case defines.LocalFileServiceName, defines.ETLFileServiceName:
-			if c.FileServices[idx].DataDir == "" {
-				c.FileServices[idx].DataDir = filepath.Join(c.DataDir, strings.ToLower(c.FileServices[idx].Name))
-			}
-		}
-	}
+
+	// file service
+	c.setFileserviceDefaultValues()
+
+	// limit
 	if c.Limit.Memory == 0 {
 		c.Limit.Memory = tomlutil.ByteSize(defaultMemoryLimit)
 	}
+
+	// log
+	if c.Log.StacktraceLevel == "" {
+		c.Log.StacktraceLevel = zap.PanicLevel.String()
+	}
+
 	return nil
 }
 
-func (c *Config) createFileService(defaultName string, perfCounterSet *perfcounter.CounterSet, serviceType metadata.ServiceType, nodeUUID string) (*fileservice.FileServices, error) {
-	// create all services
-	services := make([]fileservice.FileService, 0, len(c.FileServices))
-
-	if perfCounterSet.FileServiceByName == nil {
-		perfCounterSet.FileServiceByName = make(map[string]*perfcounter.CounterSet)
+func (c *Config) setDefaultValue() error {
+	// data dir
+	if c.DataDir == "" {
+		c.DataDir = "./mo-data"
 	}
 
+	// clock
+	if c.Clock.MaxClockOffset.Duration == 0 {
+		c.Clock.MaxClockOffset.Duration = defaultMaxClockOffset
+	}
+	if c.Clock.Backend == "" {
+		c.Clock.Backend = localClockBackend
+	}
+	if _, ok := supportTxnClockBackends[strings.ToUpper(c.Clock.Backend)]; !ok {
+		return moerr.NewInternalErrorf(context.Background(), "%s clock backend not support", c.Clock.Backend)
+	}
+	if !c.Clock.EnableCheckMaxClockOffset {
+		c.Clock.MaxClockOffset.Duration = 0
+	}
+
+	// file service
+	c.setFileserviceDefaultValues()
+
+	// limit
+	if c.Limit.Memory == 0 {
+		c.Limit.Memory = tomlutil.ByteSize(defaultMemoryLimit)
+	}
+
+	// log
+	if c.Log.StacktraceLevel == "" {
+		c.Log.StacktraceLevel = zap.PanicLevel.String()
+	}
+	c.Log = logutil.GetDefaultConfig()
+
+	// HAKeeperClient has been set in NewConfig
+
+	// tn
+	if c.TN_please_use_getTNServiceConfig != nil {
+		c.TN_please_use_getTNServiceConfig.SetDefaultValue()
+	}
+	if c.TNCompatible != nil {
+		c.TNCompatible.SetDefaultValue()
+	}
+
+	// LogService has been set in NewConfig
+
+	// cn
+	c.CN.SetDefaultValue()
+
+	//no default proxy config
+
+	// Observability has been set in NewConfig
+
+	// meta cache
+	c.initMetaCache()
+
+	return nil
+}
+
+func (c *Config) initMetaCache() {
+	if c.MetaCache.MemoryCapacity > 0 {
+		objectio.InitMetaCache(int64(c.MetaCache.MemoryCapacity))
+	}
+}
+
+func (c *Config) defaultFileServiceDataDir(name string) string {
+	return filepath.Join(c.DataDir, strings.ToLower(name))
+}
+
+func (c *Config) createFileService(
+	ctx context.Context,
+	serviceType metadata.ServiceType,
+	nodeUUID string,
+) (*fileservice.FileServices, error) {
+
+	// set distributed cache callbacks
+	for i := range c.FileServices {
+		c.setCacheCallbacks(&c.FileServices[i])
+	}
+
+	services := make([]fileservice.FileService, 0, len(c.FileServices))
 	for _, config := range c.FileServices {
-
-		// for old config compatibility
-		if strings.EqualFold(config.Name, "s3") {
-			config.Name = defines.SharedFileServiceName
-		}
-
 		counterSet := new(perfcounter.CounterSet)
 		service, err := fileservice.NewFileService(
+			ctx,
 			config,
 			[]*perfcounter.CounterSet{
 				counterSet,
-				perfCounterSet,
 			},
 		)
 		if err != nil {
 			return nil, err
 		}
-		counterSetName := strings.Join([]string{
+		services = append(services, service)
+
+		// perf counter
+		counterSetName := perfcounter.NameForFileService(
 			serviceType.String(),
 			nodeUUID,
 			service.Name(),
-		}, " ")
-		perfCounterSet.FileServiceByName[counterSetName] = counterSet
-		services = append(services, service)
+		)
+		perfcounter.Named.Store(counterSetName, counterSet)
+
+		// set shared fs perf counter as node perf counter
+		if service.Name() == defines.SharedFileServiceName {
+			perfcounter.Named.Store(
+				perfcounter.NameForNode(serviceType.String(), nodeUUID),
+				counterSet,
+			)
+		}
 
 		// Create "Log Exporter" for this PerfCounter
 		counterLogExporter := perfcounter.NewCounterLogExporter(counterSet)
@@ -194,15 +359,9 @@ func (c *Config) createFileService(defaultName string, perfCounterSet *perfcount
 
 	// create FileServices
 	fs, err := fileservice.NewFileServices(
-		defaultName,
+		"",
 		services...,
 	)
-	if err != nil {
-		return nil, err
-	}
-
-	// validate default name
-	_, err = fileservice.Get[fileservice.FileService](fs, defaultName)
 	if err != nil {
 		return nil, err
 	}
@@ -219,9 +378,9 @@ func (c *Config) createFileService(defaultName string, perfCounterSet *perfcount
 		return nil, err
 	}
 
-	// ensure etl exists, for trace & metric
+	// ensure etl exists and is ETL
 	if !c.Observability.DisableMetric || !c.Observability.DisableTrace {
-		_, err = fileservice.Get[fileservice.FileService](fs, defines.ETLFileServiceName)
+		_, err = fileservice.Get[fileservice.ETLFileService](fs, defines.ETLFileServiceName)
 		if err != nil {
 			return nil, moerr.ConvertPanicError(context.Background(), err)
 		}
@@ -235,18 +394,29 @@ func (c *Config) getLogServiceConfig() logservice.Config {
 	logutil.Infof("hakeeper client cfg: %v", c.HAKeeperClient)
 	cfg.HAKeeperClientConfig = c.HAKeeperClient
 	cfg.DataDir = filepath.Join(c.DataDir, "logservice-data", cfg.UUID)
-	// Should sync directory structure with dragonboat.
-	hostname, err := os.Hostname()
-	if err != nil {
-		panic(fmt.Sprintf("cannot get hostname: %s", err))
+	var hostname string
+	var err error
+	hostname = cfg.ExplicitHostname
+	if len(hostname) == 0 {
+		// Should sync directory structure with dragonboat.
+		hostname, err = os.Hostname()
+		if err != nil {
+			panic(fmt.Sprintf("cannot get hostname: %s", err))
+		}
 	}
 	cfg.SnapshotExportDir = filepath.Join(cfg.DataDir, hostname,
 		fmt.Sprintf("%020d", cfg.DeploymentID), "exported-snapshot")
 	return cfg
 }
 
-func (c *Config) getDNServiceConfig() dnservice.Config {
-	cfg := c.DN
+func (c *Config) getTNServiceConfig() tnservice.Config {
+	if c.TN_please_use_getTNServiceConfig == nil && c.TNCompatible != nil {
+		c.TN_please_use_getTNServiceConfig = c.TNCompatible
+	}
+	var cfg tnservice.Config
+	if c.TN_please_use_getTNServiceConfig != nil {
+		cfg = *c.TN_please_use_getTNServiceConfig
+	}
 	cfg.HAKeeper.ClientConfig = c.HAKeeperClient
 	cfg.DataDir = filepath.Join(c.DataDir, "dn-data", cfg.UUID)
 	return cfg
@@ -255,15 +425,22 @@ func (c *Config) getDNServiceConfig() dnservice.Config {
 func (c *Config) getCNServiceConfig() cnservice.Config {
 	cfg := c.CN
 	cfg.HAKeeper.ClientConfig = c.HAKeeperClient
-	cfg.Frontend.SetLogAndVersion(&c.Log, Version)
-	cfg.Frontend.StorePath = filepath.Join(c.DataDir, "cn-data", cfg.UUID)
+	cfg.Frontend.SetLogAndVersion(&c.Log, version.Version)
+	if cfg.Txn.Trace.Dir == "" {
+		cfg.Txn.Trace.Dir = "trace"
+	}
+	return cfg
+}
+
+func (c *Config) getProxyConfig() proxy.Config {
+	cfg := c.ProxyConfig
+	cfg.HAKeeper.ClientConfig = c.HAKeeperClient
 	return cfg
 }
 
 func (c *Config) getObservabilityConfig() config.ObservabilityParameters {
-	cfg := c.Observability
-	cfg.SetDefaultValues(Version)
-	return cfg
+	c.Observability.SetDefaultValues(version.Version)
+	return c.Observability
 }
 
 // memberlist requires all gossip seed addresses to be provided as IP:PORT
@@ -289,7 +466,7 @@ func (c *Config) resolveGossipSeedAddresses() error {
 			}
 		}
 		if len(filtered) != 1 {
-			return moerr.NewBadConfig(context.Background(), "GossipSeedAddress %s", addr)
+			return moerr.NewBadConfigf(context.Background(), "GossipSeedAddress %s", addr)
 		}
 		result = append(result, net.JoinHostPort(filtered[0], port))
 	}
@@ -307,8 +484,8 @@ func (c *Config) hashNodeID() uint16 {
 	switch st {
 	case metadata.ServiceType_CN:
 		uuid = c.CN.UUID
-	case metadata.ServiceType_DN:
-		uuid = c.DN.UUID
+	case metadata.ServiceType_TN:
+		uuid = c.getTNServiceConfig().UUID
 	case metadata.ServiceType_LOG:
 		uuid = c.LogService.UUID
 	}
@@ -325,10 +502,13 @@ func (c *Config) hashNodeID() uint16 {
 }
 
 func (c *Config) getServiceType() (metadata.ServiceType, error) {
+	if c.ServiceType == "DN" { // for old config files compatibility
+		c.ServiceType = metadata.ServiceType_TN.String()
+	}
 	if v, ok := supportServiceTypes[strings.ToUpper(c.ServiceType)]; ok {
 		return v, nil
 	}
-	return metadata.ServiceType(0), moerr.NewInternalError(context.Background(), "service type %s not support", c.ServiceType)
+	return metadata.ServiceType(0), moerr.NewInternalErrorf(context.Background(), "service type %s not support", c.ServiceType)
 }
 
 func (c *Config) mustGetServiceType() metadata.ServiceType {
@@ -343,10 +523,179 @@ func (c *Config) mustGetServiceUUID() string {
 	switch c.mustGetServiceType() {
 	case metadata.ServiceType_CN:
 		return c.CN.UUID
-	case metadata.ServiceType_DN:
-		return c.DN.UUID
+	case metadata.ServiceType_TN:
+		return c.getTNServiceConfig().UUID
 	case metadata.ServiceType_LOG:
 		return c.LogService.UUID
+	case metadata.ServiceType_PROXY:
+		return c.ProxyConfig.UUID
+	case metadata.ServiceType_PYTHON_UDF:
+		return c.PythonUdfServerConfig.UUID
 	}
 	panic("impossible")
+}
+
+func (c *Config) setCacheCallbacks(fsConfig *fileservice.Config) {
+	fsConfig.Cache.SetRemoteCacheCallback()
+}
+
+// dumpCommonConfig gets the common config items except cn,tn,log,proxy
+func dumpCommonConfig(cfg Config) (map[string]*logservicepb.ConfigItem, error) {
+	defCfg := *NewConfig()
+	err := defCfg.setDefaultValue()
+	if err != nil {
+		return nil, err
+	}
+	ret, err := util.DumpConfig(cfg, defCfg)
+	if err != nil {
+		return nil, err
+	}
+
+	//specific config items should be remoted
+	filters := []string{
+		"config.tn_please_use_gettnserviceconfig",
+		"config.tncompatible",
+		"config.logservice",
+		"config.cn",
+		"config.proxyconfig",
+	}
+
+	//denote the common for cn,tn,log or proxy
+	prefix := "common"
+
+	newMap := make(map[string]*logservicepb.ConfigItem)
+	for s, item := range ret {
+		needDrop := false
+		for _, filter := range filters {
+			if strings.HasPrefix(strings.ToLower(s), strings.ToLower(filter)) {
+				needDrop = true
+				break
+			}
+		}
+		if needDrop {
+			continue
+		}
+
+		s = prefix + s
+		item.Name = s
+		newMap[s] = item
+	}
+
+	return newMap, err
+}
+
+func (c *Config) setFileserviceDefaultValues() {
+
+	for i := 0; i < len(c.FileServices); i++ {
+		config := &c.FileServices[i]
+
+		// rename 's3' to 'shared'
+		oldName := config.Name
+		if strings.EqualFold(config.Name, "s3") {
+			config.Name = defines.SharedFileServiceName
+		}
+
+		// set default data dir
+		if config.DataDir == "" {
+			// compatibility check
+			// if 's3' was renamed to 'shared' but 's3' is not empty, use it
+			oldDir := c.defaultFileServiceDataDir(oldName)
+			_, err := os.Stat(oldDir)
+			if err == nil {
+				config.DataDir = oldDir
+			} else {
+				config.DataDir = c.defaultFileServiceDataDir(config.Name)
+			}
+		}
+
+	}
+
+	// default LOCAL fs
+	ok := false
+	for _, config := range c.FileServices {
+		if strings.EqualFold(config.Name, defines.LocalFileServiceName) {
+			ok = true
+			break
+		}
+	}
+	// default to local disk
+	if !ok {
+		c.FileServices = append(c.FileServices, fileservice.Config{
+			Name:    defines.LocalFileServiceName,
+			Backend: "DISK",
+			DataDir: c.defaultFileServiceDataDir(defines.LocalFileServiceName),
+		})
+	}
+
+	// default SHARED fs
+	ok = false
+	for _, config := range c.FileServices {
+		if strings.EqualFold(config.Name, defines.SharedFileServiceName) {
+			ok = true
+			break
+		}
+	}
+	// default to local disk
+	if !ok {
+		c.FileServices = append(c.FileServices, fileservice.Config{
+			Name:    defines.SharedFileServiceName,
+			Backend: "DISK",
+			DataDir: c.defaultFileServiceDataDir(defines.SharedFileServiceName),
+		})
+	}
+
+	// default ETL fs
+	ok = false
+	for _, config := range c.FileServices {
+		if strings.EqualFold(config.Name, defines.ETLFileServiceName) {
+			ok = true
+			break
+		}
+	}
+	// default to local disk
+	if !ok {
+		c.FileServices = append(c.FileServices, fileservice.Config{
+			Name:    defines.ETLFileServiceName,
+			Backend: "DISK-ETL", // must be ETL
+			DataDir: c.defaultFileServiceDataDir(defines.ETLFileServiceName),
+		})
+	}
+
+	for i := 0; i < len(c.FileServices); i++ {
+		config := &c.FileServices[i]
+
+		// cache configs
+		switch config.Name {
+
+		case defines.LocalFileServiceName:
+			// memory
+			if config.Cache.MemoryCapacity == nil {
+				capacity := tomlutil.ByteSize(512 * (1 << 20))
+				config.Cache.MemoryCapacity = &capacity
+			}
+			// no disk
+
+		case defines.SharedFileServiceName:
+			// memory
+			if config.Cache.MemoryCapacity == nil {
+				capacity := tomlutil.ByteSize(512 * (1 << 20))
+				config.Cache.MemoryCapacity = &capacity
+			}
+			// disk
+			if config.Cache.DiskPath == nil {
+				path := config.DataDir + "-cache"
+				config.Cache.DiskPath = &path
+			}
+			if config.Cache.DiskCapacity == nil {
+				capacity := tomlutil.ByteSize(8 * (1 << 30))
+				config.Cache.DiskCapacity = &capacity
+			}
+
+		case defines.ETLFileServiceName:
+			// no caches
+
+		}
+
+	}
+
 }

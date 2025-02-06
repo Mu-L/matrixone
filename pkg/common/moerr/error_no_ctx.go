@@ -27,19 +27,28 @@ func NewBadS3ConfigNoCtx(msg string) *Error {
 	return newError(Context(), ErrBadS3Config, msg)
 }
 
-func NewInternalErrorNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrInternal, xmsg)
+func NewInternalErrorNoCtxf(format string, args ...any) *Error {
+	return NewInternalErrorNoCtx(fmt.Sprintf(format, args...))
 }
 
-func NewNYINoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrNYI, xmsg)
+func NewInternalErrorNoCtx(msg string) *Error {
+	return newError(Context(), ErrInternal, msg)
 }
 
-func NewNotSupportedNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrNotSupported, xmsg)
+func NewNYINoCtxf(format string, args ...any) *Error {
+	return NewNYINoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewNYINoCtx(msg string) *Error {
+	return newError(Context(), ErrNYI, msg)
+}
+
+func NewNotSupportedNoCtxf(format string, args ...any) *Error {
+	return NewNotSupportedNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewNotSupportedNoCtx(msg string) *Error {
+	return newError(Context(), ErrNotSupported, msg)
 }
 
 func NewOOMNoCtx() *Error {
@@ -50,43 +59,74 @@ func NewDivByZeroNoCtx() *Error {
 	return newError(Context(), ErrDivByZero)
 }
 
-func NewOutOfRangeNoCtx(typ string, msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrOutOfRange, typ, xmsg)
+func NewOutOfRangeNoCtxf(typ string, format string, args ...any) *Error {
+	return NewOutOfRangeNoCtx(typ, fmt.Sprintf(format, args...))
 }
 
-func NewDataTruncatedNoCtx(typ string, msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrDataTruncated, typ, xmsg)
+func NewOutOfRangeNoCtx(typ string, msg string) *Error {
+	return newError(Context(), ErrOutOfRange, typ, msg)
+}
+
+func NewDataTruncatedNoCtxf(typ string, format string, args ...any) *Error {
+	return NewDataTruncatedNoCtx(typ, fmt.Sprintf(format, args...))
+}
+
+func NewDataTruncatedNoCtx(typ string, msg string) *Error {
+	return newError(Context(), ErrDataTruncated, typ, msg)
 }
 
 func NewInvalidArgNoCtx(arg string, val any) *Error {
 	return newError(Context(), ErrInvalidArg, arg, fmt.Sprintf("%v", val))
 }
 
-func NewBadConfigNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrBadConfig, xmsg)
+func NewBadConfigNoCtxf(format string, args ...any) *Error {
+	return NewBadConfigNoCtx(fmt.Sprintf(format, args...))
 }
 
-func NewInvalidInputNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
+func NewBadConfigNoCtx(msg string) *Error {
+	return newError(Context(), ErrBadConfig, msg)
+}
+
+func NewInvalidInputNoCtxf(format string, args ...any) *Error {
+	return NewInvalidInputNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewInvalidInputNoCtx(msg string) *Error {
+	return newError(Context(), ErrInvalidInput, msg)
+}
+
+func NewArrayInvalidOpNoCtx(expected, actual int) *Error {
+	xmsg := fmt.Sprintf("vector ops between different dimensions (%v, %v) is not permitted.", expected, actual)
 	return newError(Context(), ErrInvalidInput, xmsg)
 }
 
-func NewSyntaxErrorNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrSyntaxError, xmsg)
+func NewArrayDefMismatchNoCtx(expected, actual int) *Error {
+	xmsg := fmt.Sprintf("expected vector dimension %v != actual dimension %v.", expected, actual)
+	return newError(Context(), ErrInvalidInput, xmsg)
 }
 
-func NewParseErrorNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrParseError, xmsg)
+func NewSyntaxErrorNoCtxf(format string, args ...any) *Error {
+	return NewSyntaxErrorNoCtx(fmt.Sprintf(format, args...))
 }
 
-func NewConstraintViolationNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrConstraintViolation, xmsg)
+func NewSyntaxErrorNoCtx(msg string) *Error {
+	return newError(Context(), ErrSyntaxError, msg)
+}
+
+func NewParseErrorNoCtxf(format string, args ...any) *Error {
+	return NewParseErrorNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewParseErrorNoCtx(msg string) *Error {
+	return newError(Context(), ErrParseError, msg)
+}
+
+func NewConstraintViolationNoCtxf(format string, args ...any) *Error {
+	return NewConstraintViolationNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewConstraintViolationNoCtx(msg string) *Error {
+	return newError(Context(), ErrConstraintViolation, msg)
 }
 
 func NewEmptyVectorNoCtx() *Error {
@@ -125,9 +165,12 @@ func NewInvalidPathNoCtx(f string) *Error {
 	return newError(Context(), ErrInvalidPath, f)
 }
 
-func NewInvalidStateNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrInvalidState, xmsg)
+func NewInvalidStateNoCtxf(format string, args ...any) *Error {
+	return NewInvalidStateNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewInvalidStateNoCtx(msg string) *Error {
+	return newError(Context(), ErrInvalidState, msg)
 }
 
 func NewInvalidServiceIndexNoCtx(idx int) *Error {
@@ -178,8 +221,11 @@ func NewNoAvailableBackendNoCtx() *Error {
 	return newError(Context(), ErrNoAvailableBackend)
 }
 
-func NewBackendCannotConnectNoCtx() *Error {
-	return newError(Context(), ErrBackendCannotConnect)
+func NewBackendCannotConnectNoCtx(args ...any) *Error {
+	if len(args) == 0 {
+		return newError(Context(), ErrBackendCannotConnect, "none")
+	}
+	return newError(Context(), ErrBackendCannotConnect, args...)
 }
 
 func NewTxnClosedNoCtx(txnID []byte) *Error {
@@ -190,22 +236,28 @@ func NewTxnClosedNoCtx(txnID []byte) *Error {
 	return newError(Context(), ErrTxnClosed, id)
 }
 
-func NewTxnWriteConflictNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrTxnWriteConflict, xmsg)
+func NewTxnWriteConflictNoCtxf(format string, args ...any) *Error {
+	return NewTxnWriteConflictNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewTxnWriteConflictNoCtx(msg string) *Error {
+	return newError(Context(), ErrTxnWriteConflict, msg)
 }
 
 func NewMissingTxnNoCtx() *Error {
 	return newError(Context(), ErrMissingTxn)
 }
 
-func NewTAEErrorNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrTAEError, xmsg)
+func NewTAEErrorNoCtxf(format string, args ...any) *Error {
+	return NewTAEErrorNoCtx(fmt.Sprintf(format, args...))
 }
 
-func NewDNShardNotFoundNoCtx(uuid string, id uint64) *Error {
-	return newError(Context(), ErrDNShardNotFound, uuid, id)
+func NewTAEErrorNoCtx(msg string) *Error {
+	return newError(Context(), ErrTAEError, msg)
+}
+
+func NewTNShardNotFoundNoCtx(uuid string, id uint64) *Error {
+	return newError(Context(), ErrTNShardNotFound, uuid, id)
 }
 
 func NewShardNotReportedNoCtx(uuid string, id uint64) *Error {
@@ -224,27 +276,66 @@ func NewTxnNotActiveNoCtx(st string) *Error {
 	return newError(Context(), ErrTxnNotActive, st)
 }
 
-func NewTAECommitNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrTAECommit, xmsg)
+func NewTAECommitNoCtxf(format string, args ...any) *Error {
+	return NewTAECommitNoCtx(fmt.Sprintf(format, args...))
 }
 
-func NewTAERollbackNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrTAERollback, xmsg)
+func NewTAECommitNoCtx(msg string) *Error {
+	return newError(Context(), ErrTAECommit, msg)
 }
 
-func NewTAEPrepareNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrTAEPrepare, xmsg)
+func NewTAERollbackNoCtxf(format string, args ...any) *Error {
+	return NewTAERollbackNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewTAERollbackNoCtx(msg string) *Error {
+	return newError(Context(), ErrTAERollback, msg)
+}
+
+func NewTAEPrepareNoCtxf(format string, args ...any) *Error {
+	return NewTAEPrepareNoCtx(fmt.Sprintf(format, args...))
+}
+
+func NewTAEPrepareNoCtx(msg string) *Error {
+	return newError(Context(), ErrTAEPrepare, msg)
 }
 
 func NewTxnRWConflictNoCtx() *Error {
 	return newError(Context(), ErrTxnRWConflict)
 }
 
-func NewTxnWWConflictNoCtx() *Error {
-	return newError(Context(), ErrTxnWWConflict)
+func NewTxnWWConflictNoCtx(
+	tableID uint64,
+	s string) *Error {
+	return NewTxnWWConflict(Context(), tableID, s)
+}
+
+func NewTAENeedRetryNoCtx() *Error {
+	return newError(Context(), ErrTAENeedRetry)
+}
+
+func NewTxnStaleNoCtx(msg string) *Error {
+	return newError(Context(), ErrTxnStale, msg)
+}
+
+func NewRetryForCNRollingRestart() *Error {
+	return newError(Context(), ErrRetryForCNRollingRestart)
+}
+
+func NewNewTxnInCNRollingRestart() *Error {
+	return newError(Context(), ErrNewTxnInCNRollingRestart)
+}
+
+func NewPrevCheckpointNotFinished() *Error {
+	return newError(Context(), ErrPrevCheckpointNotFinished)
+}
+
+func NewCantDelGCCheckerNoCtx() *Error {
+	return newError(Context(), ErrCantDelGCChecker)
+}
+
+func NewTxnControlErrorNoCtxf(format string, args ...any) *Error {
+	return newError(Context(), ErrTxnControl, fmt.Sprintf(format, args...))
 }
 
 func NewNotFoundNoCtx() *Error {
@@ -263,13 +354,16 @@ func NewRoleGrantedToSelfNoCtx(from, to string) *Error {
 	return newError(Context(), ErrRoleGrantedToSelf, from, to)
 }
 
-func NewTxnReadConflictNoCtx(msg string, args ...any) *Error {
-	xmsg := fmt.Sprintf(msg, args...)
-	return newError(Context(), ErrTxnReadConflict, xmsg)
+func NewTxnReadConflictNoCtxf(format string, args ...any) *Error {
+	return NewTxnReadConflictNoCtx(fmt.Sprintf(format, args...))
 }
 
-func NewAppendableSegmentNotFoundNoCtx() *Error {
-	return newError(Context(), ErrAppendableSegmentNotFound)
+func NewTxnReadConflictNoCtx(msg string) *Error {
+	return newError(Context(), ErrTxnReadConflict, msg)
+}
+
+func NewAppendableObjectNotFoundNoCtx() *Error {
+	return newError(Context(), ErrAppendableObjectNotFound)
 }
 
 func NewAppendableBlockNotFoundNoCtx() *Error {
@@ -280,6 +374,18 @@ func NewDeadLockDetectedNoCtx() *Error {
 	return newError(Context(), ErrDeadLockDetected)
 }
 
+func NewDeadlockCheckBusyNoCtx() *Error {
+	return newError(Context(), ErrDeadlockCheckBusy)
+}
+
+func NewCannotCommitOrphanNoCtx() *Error {
+	return NewCannotCommitOrphan(Context())
+}
+
+func NewCannotCommitOnInvalidCNNoCtx() *Error {
+	return NewCannotCommitOnInvalidCN(Context())
+}
+
 func NewLockTableBindChangedNoCtx() *Error {
 	return newError(Context(), ErrLockTableBindChanged)
 }
@@ -288,10 +394,70 @@ func NewLockTableNotFoundNoCtx() *Error {
 	return newError(Context(), ErrLockTableNotFound)
 }
 
+func NewLockConflictNoCtx() *Error {
+	return newError(Context(), ErrLockConflict)
+}
+
+func NewLockNeedUpgradeNoCtx() *Error {
+	return newError(Context(), ErrLockNeedUpgrade)
+}
+
 func NewUDFAlreadyExistsNoCtx(f string) *Error {
 	return newError(Context(), ErrFunctionAlreadyExists, f)
 }
 
 func NewNoUDFNoCtx(f string) *Error {
 	return newError(Context(), ErrDropNonExistsFunction, f)
+}
+
+func NewProcedureAlreadyExistsNoCtx(f string) *Error {
+	return newError(Context(), ErrProcedureAlreadyExists, f)
+}
+
+func NewTxnNeedRetryNoCtx() *Error {
+	return newError(Context(), ErrTxnNeedRetry)
+}
+
+func NewTxnNeedRetryWithDefChangedNoCtx() *Error {
+	return newError(Context(), ErrTxnNeedRetryWithDefChanged)
+}
+
+func NewTxnCannotRetryNoCtx() *Error {
+	return newError(Context(), ErrTxnCannotRetry)
+}
+
+func NewRPCTimeoutNoCtx() *Error {
+	return NewRPCTimeout(Context())
+}
+
+func NewKeyAlreadyExistsNoCtx() *Error {
+	return newError(Context(), ErrKeyAlreadyExists)
+}
+
+func NewErrTooLargeObjectSizeNoCtx(option uint64) *Error {
+	return newError(Context(), ErrTooLargeObjectSize, option)
+}
+
+func NewErrStaleReadNoCtx(minTS, start string) *Error {
+	return newError(Context(), ErrStaleRead, minTS, start)
+}
+
+func NewErrNoWatermarkFoundNoCtx(dbName, tblName string) *Error {
+	return newError(Context(), ErrNoWatermarkFound, dbName, tblName)
+}
+
+func NewArenaFullNoCtx() *Error {
+	return newError(Context(), ErrArenaFull)
+}
+
+func NewReplicaNotFound(replica string) *Error {
+	return newError(Context(), ErrReplicaNotFound, replica)
+}
+
+func NewReplicaNotMatch(current, received string) *Error {
+	return newError(Context(), ErrReplicaNotMatch, current, received)
+}
+
+func NewCantCompileForPrepareNoCtx() *Error {
+	return newError(Context(), ErrCantCompileForPrepare)
 }

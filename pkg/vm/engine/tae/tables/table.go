@@ -15,29 +15,39 @@
 package tables
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer/base"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/data"
 )
 
 type dataTable struct {
-	meta   *catalog.TableEntry
-	bufMgr base.INodeManager
-	aBlk   *ablock
+	meta       *catalog.TableEntry
+	aObj       *aobject
+	aTombstone *aobject
+	rt         *dbutils.Runtime
 }
 
-func newTable(meta *catalog.TableEntry, bufMgr base.INodeManager) *dataTable {
+func newTable(meta *catalog.TableEntry, rt *dbutils.Runtime) *dataTable {
 	return &dataTable{
-		meta:   meta,
-		bufMgr: bufMgr,
+		meta: meta,
+		rt:   rt,
 	}
 }
 
-func (table *dataTable) GetHandle() data.TableHandle {
-	return newHandle(table, table.aBlk)
+func (table *dataTable) GetHandle(isTombstone bool) data.TableHandle {
+	if isTombstone {
+		return newHandle(table, table.aTombstone, isTombstone)
+	} else {
+		return newHandle(table, table.aObj, isTombstone)
+	}
 }
 
-func (table *dataTable) ApplyHandle(h data.TableHandle) {
+func (table *dataTable) ApplyHandle(h data.TableHandle, isTombstone bool) {
 	handle := h.(*tableHandle)
-	table.aBlk = handle.block
+	if isTombstone {
+		table.aTombstone = handle.object
+	} else {
+		table.aObj = handle.object
+	}
+
 }

@@ -15,183 +15,99 @@
 package plan
 
 import (
+	"time"
+
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/tree"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
-func buildDelete(stmt *tree.Delete, ctx CompilerContext) (*Plan, error) {
+func buildDelete(stmt *tree.Delete, ctx CompilerContext, isPrepareStmt bool) (*Plan, error) {
+	start := time.Now()
+	defer func() {
+		v2.TxnStatementBuildDeleteHistogram.Observe(time.Since(start).Seconds())
+	}()
 	aliasMap := make(map[string][2]string)
 	for _, tbl := range stmt.TableRefs {
 		getAliasToName(ctx, tbl, "", aliasMap)
 	}
-	tblInfo, err := getDmlTableInfo(ctx, stmt.Tables, stmt.With, aliasMap)
+	tblInfo, err := getDmlTableInfo(ctx, stmt.Tables, stmt.With, aliasMap, "delete")
 	if err != nil {
 		return nil, err
 	}
-	builder := NewQueryBuilder(plan.Query_SELECT, ctx)
-	bindCtx := NewBindContext(builder, nil)
+	builder := NewQueryBuilder(plan.Query_SELECT, ctx, isPrepareStmt, false)
 
-	rewriteInfo := &dmlSelectInfo{
-		typ:     "delete",
-		rootId:  -1,
-		tblInfo: tblInfo,
+	queryBindCtx := NewBindContext(builder, nil)
+	lastNodeId, err := deleteToSelect(builder, queryBindCtx, stmt, true, tblInfo)
+	if err != nil {
+		return nil, err
 	}
-
-	canTruncate := false
-	if tblInfo.haveConstraint {
-		bindCtx.groupTag = builder.genNewTag()
-		bindCtx.aggregateTag = builder.genNewTag()
-		bindCtx.projectTag = builder.genNewTag()
-
-		// if delete table have constraint
-		err = initDeleteStmt(builder, bindCtx, rewriteInfo, stmt)
-		if err != nil {
-			return nil, err
-		}
-
-		for i, tableDef := range tblInfo.tableDefs {
-			err = rewriteDmlSelectInfo(builder, bindCtx, rewriteInfo, tableDef, rewriteInfo.derivedTableId, i)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// append ProjectNode
-		rewriteInfo.rootId = builder.appendNode(&plan.Node{
-			NodeType:    plan.Node_PROJECT,
-			ProjectList: rewriteInfo.projectList,
-			Children:    []int32{rewriteInfo.rootId},
-			BindingTags: []int32{bindCtx.projectTag},
-		}, bindCtx)
-		bindCtx.results = rewriteInfo.projectList
-	} else {
-		// if delete table have no constraint
-		if stmt.Where == nil && stmt.Limit == nil {
-			// we need to fix #7779 first, don't use truncate
-			// I will improve this after cn-write-s3 delete
-			canTruncate = false
-		}
-		rewriteInfo.rootId, err = deleteToSelect(builder, bindCtx, stmt, false)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	builder.qry.Steps = append(builder.qry.Steps, rewriteInfo.rootId)
+	sourceStep := builder.appendStep(lastNodeId)
 	query, err := builder.createQuery()
 	if err != nil {
 		return nil, err
 	}
+	builder.qry.Steps = append(builder.qry.Steps[:sourceStep], builder.qry.Steps[sourceStep+1:]...)
 
-	// append delete node
-	deleteCtx := &plan.DeleteCtx{
-		CanTruncate: canTruncate,
-		Ref:         rewriteInfo.tblInfo.objRef,
+	// append sink node
+	lastNodeId = appendSinkNode(builder, queryBindCtx, lastNodeId)
+	sourceStep = builder.appendStep(lastNodeId)
 
-		IdxRef: rewriteInfo.onIdxTbl,
-		IdxIdx: rewriteInfo.onIdx,
-
-		OnRestrictRef: rewriteInfo.onRestrictTbl,
-		OnRestrictIdx: rewriteInfo.onRestrict,
-		OnCascadeRef:  rewriteInfo.onCascadeRef,
-		OnCascadeIdx:  make([]int32, len(rewriteInfo.onCascade)),
-
-		OnSetRef:       rewriteInfo.onSetRef,
-		OnSetIdx:       make([]*plan.IdList, len(rewriteInfo.onSet)),
-		OnSetDef:       rewriteInfo.onSetTableDef,
-		OnSetUpdateCol: make([]*plan.ColPosMap, len(rewriteInfo.onSetUpdateCol)),
+	allDelTableIDs := make(map[uint64]struct{})
+	for _, tableDef := range tblInfo.tableDefs {
+		allDelTableIDs[tableDef.TblId] = struct{}{}
 	}
-	for i, idxList := range rewriteInfo.onCascade {
-		deleteCtx.OnCascadeIdx[i] = int32(idxList[0])
+
+	allDelTables := make(map[FkReferKey]struct{})
+	for i, tableDef := range tblInfo.tableDefs {
+		allDelTables[FkReferKey{Db: tblInfo.objRef[i].SchemaName, Tbl: tableDef.Name}] = struct{}{}
 	}
-	for i, setList := range rewriteInfo.onSet {
-		deleteCtx.OnSetIdx[i] = &plan.IdList{
-			List: setList,
+	// append delete plans
+	beginIdx := 0
+	// needLockTable := !tblInfo.isMulti && stmt.Where == nil && stmt.Limit == nil
+	// todo will do not lock table now.
+	isDeleteWithoutFilters := !tblInfo.isMulti && stmt.Where == nil && stmt.Limit == nil
+	needLockTable := isDeleteWithoutFilters
+	for i, tableDef := range tblInfo.tableDefs {
+		deleteBindCtx := NewBindContext(builder, nil)
+		delPlanCtx := getDmlPlanCtx()
+		delPlanCtx.objRef = tblInfo.objRef[i]
+		delPlanCtx.tableDef = tableDef
+		delPlanCtx.beginIdx = beginIdx
+		delPlanCtx.sourceStep = sourceStep
+		delPlanCtx.isMulti = tblInfo.isMulti
+		delPlanCtx.needAggFilter = tblInfo.needAggFilter
+		delPlanCtx.updateColLength = 0
+		delPlanCtx.rowIdPos = getRowIdPos(tableDef)
+		delPlanCtx.allDelTableIDs = allDelTableIDs
+		delPlanCtx.allDelTables = allDelTables
+		delPlanCtx.lockTable = needLockTable
+		delPlanCtx.isDeleteWithoutFilters = isDeleteWithoutFilters
+
+		lastNodeId = appendSinkScanNode(builder, deleteBindCtx, sourceStep)
+		lastNodeId, err = makePreUpdateDeletePlan(ctx, builder, deleteBindCtx, delPlanCtx, lastNodeId)
+		if err != nil {
+			return nil, err
 		}
-	}
-	for i, idxMap := range rewriteInfo.onSetUpdateCol {
-		deleteCtx.OnSetUpdateCol[i] = &plan.ColPosMap{
-			Map: idxMap,
+		lastNodeId = appendSinkNode(builder, deleteBindCtx, lastNodeId)
+		nextSourceStep := builder.appendStep(lastNodeId)
+		delPlanCtx.sourceStep = nextSourceStep
+
+		err = buildDeletePlans(ctx, builder, deleteBindCtx, delPlanCtx)
+		if err != nil {
+			return nil, err
 		}
+		beginIdx = beginIdx + len(tableDef.Cols)
+		putDmlPlanCtx(delPlanCtx)
 	}
 
-	node := &Node{
-		NodeType:  plan.Node_DELETE,
-		ObjRef:    nil,
-		TableDef:  nil,
-		Children:  []int32{query.Steps[len(query.Steps)-1]},
-		NodeId:    int32(len(query.Nodes)),
-		DeleteCtx: deleteCtx,
-	}
-	query.Nodes = append(query.Nodes, node)
-	query.Steps[len(query.Steps)-1] = node.NodeId
+	reduceSinkSinkScanNodes(query)
+	builder.tempOptimizeForDML()
+	reCheckifNeedLockWholeTable(builder)
 	query.StmtType = plan.Query_DELETE
-
 	return &Plan{
 		Plan: &plan.Plan_Query{
 			Query: query,
 		},
 	}, err
 }
-
-// // build rowid column abstract syntax tree expression of the table to be deleted
-// func buildRowIdAstExpr(ctx CompilerContext, tbinfo *tableInfo, schemaName string, tableName string) (tree.SelectExpr, error) {
-// 	hideKey := ctx.GetHideKeyDef(schemaName, tableName)
-// 	if hideKey == nil {
-// 		return tree.SelectExpr{}, moerr.NewInvalidState(ctx.GetContext(), "cannot find hide key")
-// 	}
-// 	tblAliasName := tableName
-// 	if tbinfo != nil {
-// 		tblAliasName = tbinfo.baseName2AliasMap[tableName]
-// 	}
-// 	expr := tree.SetUnresolvedName(tblAliasName, hideKey.Name)
-// 	return tree.SelectExpr{Expr: expr}, nil
-// }
-
-// // build Index table ast expr
-// func buildIndexTableExpr(indexTableName string) tree.TableExpr {
-// 	prefix := tree.ObjectNamePrefix{
-// 		CatalogName:     "",
-// 		SchemaName:      "",
-// 		ExplicitCatalog: false,
-// 		ExplicitSchema:  false,
-// 	}
-
-// 	tableExpr := tree.NewTableName(tree.Identifier(indexTableName), prefix)
-
-// 	aliasClause := tree.AliasClause{
-// 		Alias: "",
-// 	}
-// 	return tree.NewAliasedTableExpr(tableExpr, aliasClause)
-// }
-
-// // construct equivalent connection conditions between original table and index table
-// func buildJoinOnCond(tbinfo *tableInfo, originTableName string, indexTableName string, indexField *plan.Field) *tree.OnJoinCond {
-// 	originTableAlias := tbinfo.baseName2AliasMap[originTableName]
-// 	// If it is a single column index
-// 	if len(indexField.Parts) == 1 {
-// 		uniqueColName := indexField.Parts[0]
-// 		leftExpr := tree.SetUnresolvedName(originTableAlias, uniqueColName)
-// 		rightExpr := tree.SetUnresolvedName(indexTableName, strings.ToLower(catalog.IndexTableIndexColName))
-
-// 		onCondExpr := tree.NewComparisonExprWithSubop(tree.EQUAL, tree.EQUAL, leftExpr, rightExpr)
-// 		return tree.NewOnJoinCond(onCondExpr)
-// 	} else { // If it is a composite index
-// 		funcName := tree.SetUnresolvedName(strings.ToLower("serial"))
-// 		// build function parameters
-// 		exprs := make(tree.Exprs, len(indexField.Parts))
-// 		for i, part := range indexField.Parts {
-// 			exprs[i] = tree.SetUnresolvedName(originTableAlias, part)
-// 		}
-
-// 		// build composite index serialize function expression
-// 		leftExpr := &tree.FuncExpr{
-// 			Func:  tree.FuncName2ResolvableFunctionReference(funcName),
-// 			Exprs: exprs,
-// 		}
-
-// 		rightExpr := tree.SetUnresolvedName(indexTableName, strings.ToLower(catalog.IndexTableIndexColName))
-// 		onCondExpr := tree.NewComparisonExprWithSubop(tree.EQUAL, tree.EQUAL, leftExpr, rightExpr)
-// 		return tree.NewOnJoinCond(onCondExpr)
-// 	}
-// }

@@ -1,4 +1,4 @@
-FROM golang:1.19-buster as builder
+FROM golang:1.23.0-bookworm AS builder
 
 # goproxy
 ARG GOPROXY="https://proxy.golang.org,direct"
@@ -19,18 +19,20 @@ COPY . .
 
 RUN make build
 
-FROM ubuntu:latest
+FROM ubuntu:22.04
 
 COPY --from=builder /go/src/github.com/matrixorigin/matrixone/mo-service /mo-service
 COPY --from=builder /go/src/github.com/matrixorigin/matrixone/etc /etc
+
 # Install some utilities used for debugging or by startup script
 RUN apt-get update && apt-get install -y \
     dnsutils \
     curl \
-&& apt-get clean && rm -rf /var/lib/apt/lists/*
+    git \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /
 
 EXPOSE 6001
 
-ENTRYPOINT [ "/mo-service", "-launch", "/etc/quickstart/launch.toml"]
+ENTRYPOINT [ "/mo-service", "-debug-http=:12345", "-launch", "/etc/quickstart/launch.toml"]

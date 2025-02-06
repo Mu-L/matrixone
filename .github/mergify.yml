@@ -1,41 +1,79 @@
 queue_rules:
-  - name: default
-    conditions: []
+  - name: main
+    merge_conditions: []
     checks_timeout: 4h
+    merge_method: squash
+    commit_message_template: |
+        {{ title }} (#{{ number }})
+
+        {{ body.split("___\n\n### **PR Type**")[0] | trim | get_section("## What this PR does / why we need it:") }}
+
+        Approved by: @{{ approved_reviews_by | join(', @') }}
+  - name: release-1.2
+    merge_conditions: []
+    checks_timeout: 4h
+    merge_method: squash
+    commit_message_template: |
+        {{ title }} (#{{ number }})
+
+        {{ body.split("___\n\n### **PR Type**")[0] | trim | get_section("## What this PR does / why we need it:") }}
+
+        Approved by: @{{ approved_reviews_by | join(', @') }}
+  - name: release-2.0
+    merge_conditions: []
+    checks_timeout: 4h
+    merge_method: squash
+    commit_message_template: |
+      {{ title }} (#{{ number }})
+      
+      {{ body.split("___\n\n### **PR Type**")[0] | trim | get_section("## What this PR does / why we need it:") }}
+      
+      Approved by: @{{ approved_reviews_by | join(', @') }}
 
 pull_request_rules:
-  - name: Automatic merge on approval
+  - name: Automatic queue on approval for main
     conditions:
-      - "#approved-reviews-by>=1"
       - "#changes-requested-reviews-by<=0"
-      - "-label=do-not-merge/wip"
-      - "check-success=UT Test on Ubuntu/x64"
-      - "check-success=e2e BVT Test on Linux/x64(LAUNCH, PULL, 1CN)"
-      - "check-success=Multi-CN e2e BVT Test on Linux/x64(LAUNCH, PULL)"
-      - "check-success=e2e BVT Test on Linux/x64(LAUNCH, PUSH, 1CN)"
-      # - "check-success=Multi-CN e2e BVT Test on Linux/x64(LAUNCH, PUSH)"
-      # - "check-success=UT Test on Darwin/x86"
-      - "check-success=UT Test on Linux/Arm"
-      # - "check-success=BVT Test on Linux/x64"
-      # - "check-success=BVT Test on Linux/Arm"
-      # - "check-success=BVT Test on Darwin/x86"
-      - "check-success=SCA Test on Ubuntu/x64"
+      - label!=do-not-merge/wip
+      - base=main
     actions:
       queue:
-        name: default
-        method: squash
-        commit_message_template: |
-          {{ title }} (#{{ number }})
+        name: main
 
-          {{ body | get_section("## What this PR does / why we need it:") }}
+  - name: Automatic queue on approval for release-1.2
+    conditions:
+      - "#changes-requested-reviews-by<=0"
+      - label!=do-not-merge/wip
+      - base=1.2-dev
+      - approved-reviews-by=sukki37
+    actions:
+      queue:
+        name: release-1.2
 
-          Approved by: @{{ approved_reviews_by | join(', @') }}
-          
+  - name: Automatic queue on approval for release-2.0
+    conditions:
+      - "#changes-requested-reviews-by<=0"
+      - label!=do-not-merge/wip
+      - base=2.0-dev
+      - approved-reviews-by=sukki37
+    actions:
+      queue:
+        name: release-2.0
+
+
   - name: Auto update branch
     conditions:
       - created-at>=00:10 ago
     actions:
       update: 
+
+  - name: Auto Request Reviewer For Non Main Branch
+    conditions:
+      - base!=main
+    actions:
+      request_reviews:
+        users:
+          - sukki37
 
   - name: label for Bug
     conditions: 

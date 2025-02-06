@@ -15,15 +15,23 @@
 package mysql
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 
 	"github.com/matrixorigin/matrixone/pkg/sql/parsers/dialect"
 )
 
 const eofChar = 0x100
+
+var scannerPool = sync.Pool{
+	New: func() any {
+		return &Scanner{}
+	},
+}
 
 type Scanner struct {
 	LastToken           string
@@ -32,18 +40,39 @@ type Scanner struct {
 	dialectType         dialect.DialectType
 	MysqlSpecialComment *Scanner
 
-	Pos    int
-	Line   int
-	Col    int
-	PrePos int
-	buf    string
+	CommentFlag bool
+	Pos         int
+	Line        int
+	Col         int
+	PrePos      int
+	buf         string
+
+	strBuilder bytes.Buffer
+}
+
+func (s *Scanner) setSql(sql string) {
+	// This is a mysql scanner, so we set the dialect type to mysql
+	s.dialectType = dialect.MYSQL
+	s.LastToken = ""
+	s.LastError = nil
+	s.posVarIndex = 0
+	s.MysqlSpecialComment = nil
+	s.Pos = 0
+	s.Line = 0
+	s.Col = 0
+	s.PrePos = 0
+	s.buf = sql
+	s.strBuilder.Reset()
 }
 
 func NewScanner(dialectType dialect.DialectType, sql string) *Scanner {
+	scanner := scannerPool.Get().(*Scanner)
+	scanner.setSql(sql)
+	return scanner
+}
 
-	return &Scanner{
-		buf: sql,
-	}
+func PutScanner(scanner *Scanner) {
+	scannerPool.Put(scanner)
 }
 
 func (s *Scanner) Scan() (int, string) {
@@ -112,9 +141,23 @@ func (s *Scanner) Scan() (int, string) {
 				return strTyp, strStr
 			}
 
-		} else {
+		}
+
+		if ch == '_' {
+			if s.isCollate() {
+				s.incN(8)
+				s.skipBlank()
+				if s.cur() == '\'' {
+					s.inc()
+					return s.scanString('\'', STRING)
+				} else {
+					s.scanIdentifier(false)
+				}
+			}
 			return s.scanIdentifier(false)
 		}
+		return s.scanIdentifier(false)
+
 	case isDigit(ch):
 		return s.scanNumber()
 	case ch == ':':
@@ -122,8 +165,20 @@ func (s *Scanner) Scan() (int, string) {
 			s.incN(2)
 			return ASSIGNMENT, ""
 		}
+
 		// Like mysql -h ::1 ?
-		return s.scanBindVar()
+		id, str := s.scanBindVar()
+		if id == LEX_ERROR {
+			// test for 'label:'
+			s.skipBlank()
+			// LOOP WHILE REPEAT
+			if s.cur() != 'L' && s.cur() != 'l' && s.cur() != 'W' && s.cur() != 'w' && s.cur() != 'R' && s.cur() != 'r' {
+				return id, str
+			}
+			return ':', ""
+		} else {
+			return id, str
+		}
 	case ch == ';':
 		s.inc()
 		return ';', ""
@@ -141,10 +196,14 @@ func (s *Scanner) Scan() (int, string) {
 			return s.Scan()
 		case '*':
 			s.inc()
-			switch {
-			case s.cur() == '!' && s.dialectType == dialect.MYSQL:
-				// TODO: ExtractMysqlComment
-				return s.scanMySQLSpecificComment()
+			switch s.cur() {
+			case '!':
+				s.CommentFlag = true
+				s.inc()
+				if !s.readVersion() {
+					return LEX_ERROR, ""
+				}
+				return s.Scan()
 			default:
 				id, str := s.scanCommentTypeBlock()
 				if id == LEX_ERROR {
@@ -155,9 +214,113 @@ func (s *Scanner) Scan() (int, string) {
 		default:
 			return int(ch), ""
 		}
+	case ch == '*':
+		if !s.CommentFlag {
+			return s.stepBackOneChar(ch)
+		}
+		s.inc()
+		switch s.cur() {
+		case '/':
+			s.CommentFlag = false
+			s.inc()
+			return s.Scan()
+		default:
+			return s.stepBackOneChar(ch)
+		}
+	case ch == '\'':
+		if !s.CommentFlag {
+			return s.stepBackOneChar(ch)
+		}
+		s.inc()
+		switch {
+		case s.cur() == '+':
+			s.inc()
+			switch s.cur() {
+			case '\'':
+				return s.Scan()
+			default:
+				return s.scanStringAddPlus(ch, STRING)
+			}
+		case isLetter(s.cur()):
+			return s.scanString(ch, STRING)
+		case s.cur() == '-':
+			return s.scanString(ch, STRING)
+		case s.cur() == '\'':
+			return s.scanString(ch, STRING)
+		case s.cur() == '|':
+			return s.scanString(ch, STRING)
+		case isDigit(s.cur()):
+			return s.scanString(ch, STRING)
+		default:
+			return s.Scan()
+		}
+	case ch == '#':
+		s.inc()
+		id, str := s.scanCommentTypeLine(1)
+		if id == LEX_ERROR {
+			return id, str
+		}
+		return s.Scan()
 	default:
 		return s.stepBackOneChar(ch)
 	}
+}
+
+func (s *Scanner) isCollate() bool {
+	if s.peek(1) == 'u' && s.peek(2) == 't' && s.peek(3) == 'f' && s.peek(4) == '8' && s.peek(5) == 'm' && s.peek(6) == 'b' && s.peek(7) == '4' {
+		return true
+	}
+	return false
+}
+
+// ScanComment finds all Comment (/*  */, //) until gets EOF or LEX_ERROR
+func (s *Scanner) ScanComment() (int, string) {
+	s.PrePos = s.Pos
+	for {
+		s.skipBlank()
+		ch := s.cur()
+		for ch != '/' && ch != eofChar {
+			s.inc()
+			ch = s.cur()
+		}
+
+		if ch == eofChar {
+			break
+		}
+
+		s.inc()
+		switch s.cur() {
+		case '/': // //
+			s.inc()
+			return s.scanCommentTypeLine(2)
+		case '*': // /*
+			s.inc()
+			return s.scanCommentTypeBlock()
+		}
+	}
+	return eofChar, ""
+}
+
+func EofChar() int {
+	return eofChar
+}
+
+func (s *Scanner) readVersion() bool {
+	if s.Pos < len(s.buf) {
+		if isDigit(s.cur()) {
+			if s.Pos+4 < len(s.buf) {
+				for i := 0; i < 5; i++ {
+					if !isDigit(s.cur()) {
+						return false
+					}
+					s.inc()
+				}
+				return true
+			}
+			return false
+		}
+	}
+	return true
 }
 
 func (s *Scanner) stepBackOneChar(ch uint16) (int, string) {
@@ -258,7 +421,8 @@ func (s *Scanner) scanString(delim uint16, typ int) (int, string) {
 		s.inc() // advance the first '$'
 	}
 	ch := s.cur()
-	buf := new(strings.Builder)
+	buf := &s.strBuilder
+	defer s.strBuilder.Reset()
 	for s.Pos < len(s.buf) {
 		if ch == delim {
 			if delim != '$' {
@@ -284,7 +448,40 @@ func (s *Scanner) scanString(delim uint16, typ int) (int, string) {
 	return LEX_ERROR, buf.String()
 }
 
-func handleEscape(s *Scanner, buf *strings.Builder) uint16 {
+func (s *Scanner) scanStringAddPlus(delim uint16, typ int) (int, string) {
+	if delim == '$' {
+		s.inc() // advance the first '$'
+	}
+	ch := s.cur()
+	buf := &s.strBuilder
+	defer s.strBuilder.Reset()
+	buf.WriteByte(byte('+'))
+	for s.Pos < len(s.buf) {
+		if ch == delim {
+			if delim != '$' {
+				s.inc()
+			} else {
+				return typ, buf.String()
+			}
+			if s.cur() != delim {
+				return typ, buf.String()
+			}
+		} else if ch == '\\' {
+			ch = handleEscape(s, buf)
+			if ch == eofChar {
+				break
+			}
+		}
+		buf.WriteByte(byte(ch))
+		if s.Pos < len(s.buf) {
+			s.inc()
+			ch = s.cur()
+		}
+	}
+	return LEX_ERROR, buf.String()
+}
+
+func handleEscape(s *Scanner, buf *bytes.Buffer) uint16 {
 	s.inc()
 	ch0 := s.cur()
 	switch ch0 {
@@ -390,7 +587,7 @@ func (s *Scanner) scanCommentTypeBlock() (int, string) {
 }
 
 // scanMySQLSpecificComment scans a MySQL comment pragma, which always starts with '//*`
-func (s *Scanner) scanMySQLSpecificComment() (int, string) {
+/*func (s *Scanner) scanMySQLSpecificComment() (int, string) {
 	start := s.Pos - 3
 	for {
 		if s.cur() == '*' {
@@ -412,7 +609,7 @@ func (s *Scanner) scanMySQLSpecificComment() (int, string) {
 	s.MysqlSpecialComment = NewScanner(s.dialectType, sql)
 
 	return s.Scan()
-}
+}*/
 
 // ExtractMysqlComment extracts the version and SQL from a comment-only query
 // such as /*!50708 sql here */
@@ -493,12 +690,28 @@ func (s *Scanner) scanNumber() (int, string) {
 		if s.cur() == 'x' || s.cur() == 'X' {
 			token = HEXNUM
 			s.inc()
+			p1 := s.Pos
 			s.scanMantissa(16)
+			p2 := s.Pos
+			if p1 == p2 || isDigit(s.cur()) {
+				token = ID
+				s.scanIdentifier(false)
+				return token, strings.ToLower(s.buf[start:s.Pos])
+			}
+
 			goto exit
 		} else if s.cur() == 'b' || s.cur() == 'B' {
 			token = BIT_LITERAL
 			s.inc()
+			p1 := s.Pos
 			s.scanMantissa(2)
+			p2 := s.Pos
+			if p1 == p2 || isDigit(s.cur()) {
+				token = ID
+				s.scanIdentifier(false)
+				return token, strings.ToLower(s.buf[start:s.Pos])
+			}
+
 			goto exit
 		}
 	}
@@ -554,12 +767,30 @@ func (s *Scanner) scanIdentifier(isVariable bool) (int, string) {
 		if ch == '@' {
 			break
 		}
+
 		s.inc()
 	}
 	keywordName := s.buf[start:s.Pos]
 	lower := strings.ToLower(keywordName)
 	if keywordID, found := keywords[lower]; found {
-		return keywordID, keywordName
+		// make transaction statements coexist with plsql
+		if lower == "begin" {
+			cur := s.Pos
+			s.skipBlank()
+			if s.cur() == ';' || s.cur() == eofChar { // "begin ;" situation
+				s.Pos = cur
+				return keywordID, keywordName
+			}
+			typ, _ := s.scanIdentifier(false) // "begin work / begin transaction" situation
+			if typ == WORK || typ == TRANSACTION {
+				s.Pos = cur
+				return keywordID, keywordName
+			}
+			s.Pos = cur
+			return SPBEGIN, keywordName
+		} else {
+			return keywordID, keywordName
+		}
 	}
 	// dual must always be case-insensitive
 	if lower == "dual" {
@@ -571,7 +802,7 @@ func (s *Scanner) scanIdentifier(isVariable bool) (int, string) {
 func (s *Scanner) scanBitLiteral() (int, string) {
 	start := s.Pos
 	s.scanMantissa(2)
-	bit := s.buf[start:s.Pos]
+	bit := "0b" + s.buf[start:s.Pos]
 	if s.cur() != '\'' {
 		return LEX_ERROR, bit
 	}
@@ -582,7 +813,7 @@ func (s *Scanner) scanBitLiteral() (int, string) {
 func (s *Scanner) scanHex() (int, string) {
 	start := s.Pos
 	s.scanMantissa(16)
-	hex := s.buf[start:s.Pos]
+	hex := "0x" + s.buf[start:s.Pos]
 	if s.cur() != '\'' {
 		return LEX_ERROR, hex
 	}

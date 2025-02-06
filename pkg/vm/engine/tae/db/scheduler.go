@@ -18,13 +18,11 @@ import (
 	"fmt"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/container/types"
 
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/common"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks/ops/base"
 )
 
 var (
@@ -38,35 +36,39 @@ type taskScheduler struct {
 }
 
 func newTaskScheduler(db *DB, asyncWorkers int, ioWorkers int) *taskScheduler {
-	if asyncWorkers < 0 || asyncWorkers > 100 {
+	if asyncWorkers < 0 {
 		panic(fmt.Sprintf("bad param: %d txn workers", asyncWorkers))
 	}
-	if ioWorkers < 0 || ioWorkers > 100 {
+	if ioWorkers < 0 {
 		panic(fmt.Sprintf("bad param: %d io workers", ioWorkers))
 	}
 	s := &taskScheduler{
-		BaseScheduler: tasks.NewBaseScheduler("taskScheduler"),
+		BaseScheduler: tasks.NewBaseScheduler(db.Opts.Ctx, "taskScheduler"),
 		db:            db,
 	}
 	jobDispatcher := newAsyncJobDispatcher()
-	jobHandler := tasks.NewPoolHandler(asyncWorkers)
+	jobHandler := tasks.NewPoolHandler(db.Opts.Ctx, asyncWorkers)
 	jobHandler.Start()
 	jobDispatcher.RegisterHandler(tasks.DataCompactionTask, jobHandler)
 	// jobDispatcher.RegisterHandler(tasks.GCTask, jobHandler)
-	gcHandler := tasks.NewSingleWorkerHandler("gc")
+	gcHandler := tasks.NewSingleWorkerHandler(db.Opts.Ctx, "gc")
 	gcHandler.Start()
 	jobDispatcher.RegisterHandler(tasks.GCTask, gcHandler)
 
+	flushHandler := tasks.NewPoolHandler(db.Opts.Ctx, asyncWorkers)
+	flushHandler.Start()
+	jobDispatcher.RegisterHandler(tasks.FlushTableTailTask, flushHandler)
+
 	ckpDispatcher := tasks.NewBaseScopedDispatcher(tasks.DefaultScopeSharder)
 	for i := 0; i < 4; i++ {
-		handler := tasks.NewSingleWorkerHandler(fmt.Sprintf("[ckpworker-%d]", i))
+		handler := tasks.NewSingleWorkerHandler(db.Opts.Ctx, fmt.Sprintf("[ckpworker-%d]", i))
 		ckpDispatcher.AddHandle(handler)
 		handler.Start()
 	}
 
 	ioDispatcher := tasks.NewBaseScopedDispatcher(nil)
 	for i := 0; i < ioWorkers; i++ {
-		handler := tasks.NewSingleWorkerHandler(fmt.Sprintf("[ioworker-%d]", i))
+		handler := tasks.NewSingleWorkerHandler(db.Opts.Ctx, fmt.Sprintf("[ioworker-%d]", i))
 		ioDispatcher.AddHandle(handler)
 		handler.Start()
 	}
@@ -103,6 +105,27 @@ func (s *taskScheduler) ScheduleMultiScopedTxnTask(
 	return
 }
 
+func (s *taskScheduler) ScheduleMultiScopedTxnTaskWithObserver(
+	ctx *tasks.Context,
+	taskType tasks.TaskType,
+	scopes []common.ID,
+	factory tasks.TxnTaskFactory,
+	observers ...base.Observer) (task tasks.Task, err error) {
+	task = NewScheduledTxnTask(ctx, s.db, taskType, scopes, factory)
+	for _, observer := range observers {
+		task.AddObserver(observer)
+	}
+	err = s.Schedule(task)
+	return
+}
+
+func (s *taskScheduler) CheckAsyncScopes(scopes []common.ID) (err error) {
+	dispatcher := s.Dispatchers[tasks.DataCompactionTask].(*asyncJobDispatcher)
+	dispatcher.Lock()
+	defer dispatcher.Unlock()
+	return dispatcher.checkConflictLocked(scopes)
+}
+
 func (s *taskScheduler) ScheduleMultiScopedFn(
 	ctx *tasks.Context,
 	taskType tasks.TaskType,
@@ -113,40 +136,12 @@ func (s *taskScheduler) ScheduleMultiScopedFn(
 	return
 }
 
-func (s *taskScheduler) Checkpoint(indexes []*wal.Index) (err error) {
-	entry, err := s.db.Wal.Checkpoint(indexes)
-	if err != nil {
-		return err
-	}
-	s.db.BGCheckpointRunner.EnqueueWait(entry)
-	return
-}
-
-// TODO: implement later
-func (s *taskScheduler) GetGCTS() (ts types.TS) {
-	return
-}
-
-func (s *taskScheduler) GetCheckpointTS() types.TS {
-	return s.db.TxnMgr.StatMaxCommitTS()
-}
-
 func (s *taskScheduler) GetPenddingLSNCnt() uint64 {
 	return s.db.Wal.GetPenddingCnt()
 }
 
 func (s *taskScheduler) GetCheckpointedLSN() uint64 {
 	return s.db.Wal.GetCheckpointed()
-}
-
-func (s *taskScheduler) AddTransferPage(page *model.TransferHashPage) (err error) {
-	s.db.TransferTable.AddPage(page)
-	return
-}
-
-func (s *taskScheduler) DeleteTransferPage(id *common.ID) (err error) {
-	s.db.TransferTable.DeletePage(id)
-	return
 }
 
 func (s *taskScheduler) ScheduleFn(ctx *tasks.Context, taskType tasks.TaskType, fn func() error) (task tasks.Task, err error) {
@@ -164,8 +159,8 @@ func (s *taskScheduler) ScheduleScopedFn(ctx *tasks.Context, taskType tasks.Task
 func (s *taskScheduler) Schedule(task tasks.Task) (err error) {
 	taskType := task.Type()
 	// if taskType == tasks.DataCompactionTask || taskType == tasks.GCTask {
-	if taskType == tasks.DataCompactionTask {
-		dispatcher := s.Dispatchers[task.Type()].(*asyncJobDispatcher)
+	if taskType == tasks.DataCompactionTask || taskType == tasks.FlushTableTailTask {
+		dispatcher := s.Dispatchers[tasks.DataCompactionTask].(*asyncJobDispatcher)
 		return dispatcher.TryDispatch(task)
 	}
 	return s.BaseScheduler.Schedule(task)

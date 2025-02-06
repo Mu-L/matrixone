@@ -16,106 +16,169 @@ package product
 
 import (
 	"bytes"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	"github.com/matrixorigin/matrixone/pkg/vm"
+	"github.com/matrixorigin/matrixone/pkg/vm/message"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
 )
 
-func String(_ any, buf *bytes.Buffer) {
-	buf.WriteString(" cross join ")
+const opName = "product"
+
+func (product *Product) String(buf *bytes.Buffer) {
+	buf.WriteString(opName)
+	buf.WriteString(": cross join ")
 }
 
-func Prepare(proc *process.Process, arg any) error {
-	ap := arg.(*Argument)
-	ap.ctr = new(container)
+func (product *Product) OpType() vm.OpType {
+	return vm.Product
+}
+
+func (product *Product) Prepare(proc *process.Process) error {
+	if product.OpAnalyzer == nil {
+		product.OpAnalyzer = process.NewAnalyzer(product.GetIdx(), product.IsFirst, product.IsLast, "cross join")
+	} else {
+		product.OpAnalyzer.Reset()
+	}
+
 	return nil
 }
 
-func Call(idx int, proc *process.Process, arg any, isFirst bool, isLast bool) (bool, error) {
-	anal := proc.GetAnalyze(idx)
-	anal.Start()
-	defer anal.Stop()
-	ap := arg.(*Argument)
-	ctr := ap.ctr
+func (product *Product) Call(proc *process.Process) (vm.CallResult, error) {
+	analyzer := product.OpAnalyzer
+
+	ap := product
+	ctr := &ap.ctr
+	result := vm.NewCallResult()
+	var err error
 	for {
 		switch ctr.state {
 		case Build:
-			if err := ctr.build(ap, proc, anal); err != nil {
-				ap.Free(proc, true)
-				return false, err
+			if ctr.inBat == nil { // get one batch from leftchild before receive from build side
+				result, err = vm.ChildrenCall(product.GetChildren(0), proc, analyzer)
+				if err != nil {
+					return result, err
+				}
+				ctr.inBat = result.Batch
+				if ctr.inBat == nil {
+					ctr.state = End
+					continue
+				}
+				if ctr.inBat.IsEmpty() {
+					ctr.inBat = nil
+					continue
+				}
+			}
+
+			if err = product.build(proc, analyzer); err != nil {
+				return result, err
 			}
 			ctr.state = Probe
 
 		case Probe:
-			bat := <-proc.Reg.MergeReceivers[0].Ch
-			if bat == nil {
-				ctr.state = End
-				continue
-			}
-			if len(bat.Zs) == 0 {
-				continue
+			if ctr.inBat == nil {
+				result, err = vm.ChildrenCall(product.GetChildren(0), proc, analyzer)
+				if err != nil {
+					return result, err
+				}
+				ctr.inBat = result.Batch
+				if ctr.inBat == nil {
+					ctr.state = End
+					continue
+				}
+				if ctr.inBat.IsEmpty() {
+					ctr.inBat = nil
+					continue
+				}
 			}
 			if ctr.bat == nil {
-				bat.Clean(proc.Mp())
+				ctr.inBat = nil
 				continue
 			}
-			if err := ctr.probe(bat, ap, proc, anal, isFirst, isLast); err != nil {
-				bat.Clean(proc.Mp())
-				ap.Free(proc, true)
-				return false, err
+
+			if ctr.rbat == nil {
+				ctr.rbat = batch.NewOffHeapWithSize(len(product.Result))
+				for i, rp := range product.Result {
+					if rp.Rel == 0 {
+						ctr.rbat.Vecs[i] = vector.NewOffHeapVecWithType(*ctr.inBat.Vecs[rp.Pos].GetType())
+					} else {
+						ctr.rbat.Vecs[i] = vector.NewOffHeapVecWithType(*ctr.bat.Vecs[rp.Pos].GetType())
+					}
+				}
+			} else {
+				ctr.rbat.CleanOnlyData()
 			}
-			return false, nil
+
+			if err := ctr.probe(ap, proc, &result); err != nil {
+				return result, err
+			}
+
+			return result, nil
 
 		default:
-			ap.Free(proc, false)
-			proc.SetInputBatch(nil)
-			return true, nil
+			result.Batch = nil
+			result.Status = vm.ExecStop
+			return result, nil
 		}
 	}
 }
 
-func (ctr *container) build(ap *Argument, proc *process.Process, anal process.Analyze) error {
-	bat := <-proc.Reg.MergeReceivers[1].Ch
-	if bat != nil {
-		ctr.bat = bat
+func (product *Product) build(proc *process.Process, analyzer process.Analyzer) error {
+	ctr := &product.ctr
+	start := time.Now()
+	defer analyzer.WaitStop(start)
+	mp, err := message.ReceiveJoinMap(product.JoinMapTag, false, 0, proc.GetMessageBoard(), proc.Ctx)
+	if err != nil {
+		return err
 	}
+	if mp == nil {
+		return nil
+	}
+	batches := mp.GetBatches()
+
+	//maybe optimize this in the future
+	for i := range batches {
+		ctr.bat, err = ctr.bat.AppendWithCopy(proc.Ctx, proc.Mp(), batches[i])
+		if err != nil {
+			return err
+		}
+	}
+	mp.Free()
 	return nil
 }
 
-func (ctr *container) probe(bat *batch.Batch, ap *Argument, proc *process.Process, anal process.Analyze, isFirst bool, isLast bool) error {
-	defer bat.Clean(proc.Mp())
-	anal.Input(bat, isFirst)
-	rbat := batch.NewWithSize(len(ap.Result))
-	rbat.Zs = proc.Mp().GetSels()
-	for i, rp := range ap.Result {
-		if rp.Rel == 0 {
-			rbat.Vecs[i] = vector.NewVec(*bat.Vecs[rp.Pos].GetType())
-		} else {
-			rbat.Vecs[i] = vector.NewVec(*ctr.bat.Vecs[rp.Pos].GetType())
-		}
-	}
-	count := bat.Length()
-	for i := 0; i < count; i++ {
-		for j := 0; j < len(ctr.bat.Zs); j++ {
+func (ctr *container) probe(ap *Product, proc *process.Process, result *vm.CallResult) error {
+	count := ctr.inBat.RowCount()
+	count2 := ctr.bat.RowCount()
+	var i, j int
+	for j = ctr.probeIdx; j < count2; j++ {
+		for i = 0; i < count; i++ {
 			for k, rp := range ap.Result {
 				if rp.Rel == 0 {
-					if err := rbat.Vecs[k].UnionOne(bat.Vecs[rp.Pos], int64(i), proc.Mp()); err != nil {
-						rbat.Clean(proc.Mp())
+					if err := ctr.rbat.Vecs[k].UnionOne(ctr.inBat.Vecs[rp.Pos], int64(i), proc.Mp()); err != nil {
 						return err
 					}
 				} else {
-					if err := rbat.Vecs[k].UnionOne(ctr.bat.Vecs[rp.Pos], int64(j), proc.Mp()); err != nil {
-						rbat.Clean(proc.Mp())
+					if err := ctr.rbat.Vecs[k].UnionOne(ctr.bat.Vecs[rp.Pos], int64(j), proc.Mp()); err != nil {
 						return err
 					}
 				}
 			}
-			rbat.Zs = append(rbat.Zs, ctr.bat.Zs[j])
+		}
+		if ctr.rbat.Vecs[0].Length() >= colexec.DefaultBatchSize {
+			result.Batch = ctr.rbat
+			ctr.rbat.SetRowCount(ctr.rbat.Vecs[0].Length())
+			ctr.probeIdx = j + 1
+			return nil
 		}
 	}
-	rbat.ExpandNulls()
-	anal.Output(rbat, isLast)
-	proc.SetInputBatch(rbat)
+	// ctr.rbat.AddRowCount(count * count2)
+	ctr.probeIdx = 0
+	ctr.rbat.SetRowCount(ctr.rbat.Vecs[0].Length())
+	result.Batch = ctr.rbat
+	ctr.inBat = nil
 	return nil
 }

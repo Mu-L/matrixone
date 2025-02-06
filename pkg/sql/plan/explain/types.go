@@ -15,10 +15,12 @@
 package explain
 
 import (
+	"bytes"
 	"context"
 	"strings"
 
 	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 )
 
 type ExplainQuery interface {
@@ -39,7 +41,7 @@ type NodeDescribe interface {
 }
 
 type NodeElemDescribe interface {
-	GetDescription(ctx context.Context, options *ExplainOptions) (string, error)
+	GetDescription(ctx context.Context, options *ExplainOptions, buf *bytes.Buffer) error
 }
 
 type FormatSettings struct {
@@ -104,8 +106,27 @@ func (buf *ExplainDataBuffer) PushNewLine(line string, isNewNode bool, level int
 	}
 	buf.CurrentLine++
 	buf.Lines = append(buf.Lines, prefix+line)
-	logutil.Infof(buf.Lines[buf.CurrentLine])
+	logutil.Debug(buf.Lines[buf.CurrentLine])
 	buf.End++
+}
+
+func (buf *ExplainDataBuffer) PushPlanTitle(title string) {
+	if buf.Start == -1 {
+		buf.Start++
+	}
+	buf.CurrentLine++
+	buf.Lines = append(buf.Lines, title)
+	logutil.Info(buf.Lines[buf.CurrentLine])
+	buf.End++
+}
+
+func (buf *ExplainDataBuffer) ToString() string {
+	strBuffer := bytes.NewBufferString("")
+	rs := buf.Lines
+	for _, r := range rs {
+		strBuffer.WriteString(r + "\n")
+	}
+	return strBuffer.String()
 }
 
 type ExplainFormat int32
@@ -118,9 +139,10 @@ const (
 )
 
 type ExplainOptions struct {
-	Verbose bool
-	Analyze bool
-	Format  ExplainFormat
+	Verbose  bool
+	Analyze  bool
+	Format   ExplainFormat
+	NodeType plan.Node_NodeType
 }
 
 func NewExplainDefaultOptions() *ExplainOptions {

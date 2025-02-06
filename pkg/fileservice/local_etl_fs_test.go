@@ -26,7 +26,7 @@ import (
 func TestLocalETLFS(t *testing.T) {
 
 	t.Run("file service", func(t *testing.T) {
-		testFileService(t, func(name string) FileService {
+		testFileService(t, 0, func(name string) FileService {
 			dir := t.TempDir()
 			fs, err := NewLocalETLFS(name, dir)
 			assert.Nil(t, err)
@@ -44,6 +44,7 @@ func TestLocalETLFS(t *testing.T) {
 	})
 
 	t.Run("symlink to dir", func(t *testing.T) {
+		ctx := context.Background()
 		dir := t.TempDir()
 
 		aPath := filepath.Join(dir, "a")
@@ -63,10 +64,9 @@ func TestLocalETLFS(t *testing.T) {
 		assert.Nil(t, err)
 
 		filePathInB := filepath.Join(bPath, "foo")
-		fs, readPath, err := GetForETL(nil, filePathInB)
+		fs, readPath, err := GetForETL(ctx, nil, filePathInB)
 		assert.Nil(t, err)
 
-		ctx := context.Background()
 		vec := IOVector{
 			FilePath: readPath,
 			Entries: []IOEntry{
@@ -79,7 +79,7 @@ func TestLocalETLFS(t *testing.T) {
 		assert.Nil(t, err)
 		assert.Equal(t, []byte("foo"), vec.Entries[0].Data)
 
-		entries, err := fs.List(ctx, "")
+		entries, err := SortedList(fs.List(ctx, ""))
 		assert.Nil(t, err)
 		assert.Equal(t, 1, len(entries))
 		assert.Equal(t, "foo", entries[0].Name)
@@ -109,7 +109,7 @@ func TestLocalETLFS(t *testing.T) {
 		assert.Nil(t, err)
 
 		ctx := context.Background()
-		entries, err := fs.List(ctx, "")
+		entries, err := SortedList(fs.List(ctx, ""))
 		assert.Nil(t, err)
 		assert.Equal(t, 2, len(entries))
 		assert.True(t, entries[0].IsDir)
@@ -117,4 +117,27 @@ func TestLocalETLFS(t *testing.T) {
 
 	})
 
+}
+
+func TestLocalETLFSEmptyRootPath(t *testing.T) {
+	fs, err := NewLocalETLFS(
+		"test",
+		"",
+	)
+	assert.Nil(t, err)
+	assert.NotNil(t, fs)
+}
+
+func TestLocalETLFSWithBadSymlink(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	err := os.Symlink(
+		"file-not-exists-fdsafdsafdsa",
+		filepath.Join(dir, "foo"),
+	)
+	assert.Nil(t, err)
+	fs, err := NewLocalETLFS("test", dir)
+	assert.Nil(t, err)
+	_, err = SortedList(fs.List(ctx, ""))
+	assert.Nil(t, err)
 }

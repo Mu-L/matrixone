@@ -15,82 +15,76 @@
 package taestorage
 
 import (
-	"bytes"
 	"context"
-	"encoding/gob"
+	"encoding"
+	"io"
+
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
 	"github.com/matrixorigin/matrixone/pkg/txn/storage"
-	"io"
 )
 
 // Read implements storage.TxnTAEStorage
-
 func (s *taeStorage) Read(
 	ctx context.Context,
 	txnMeta txn.TxnMeta,
 	op uint32,
 	payload []byte) (res storage.ReadResult, err error) {
-
 	switch op {
-
 	case uint32(apipb.OpCode_OpGetLogTail):
-		return handleRead(
-			ctx, s,
-			txnMeta, payload,
-			s.taeHandler.HandleGetLogTail,
-		)
+		return handleRead(ctx, txnMeta, payload, s.taeHandler.HandleGetLogTail)
 	default:
-		panic(moerr.NewInfoNoCtx("op is not supported"))
+		return nil, moerr.NewNotSupportedf(ctx, "known read op: %v", op)
 	}
-
 }
 
-func handleRead[Req any, Resp any](
+type unmarshaler[T any] interface {
+	*T
+	encoding.BinaryUnmarshaler
+}
+
+type marshaller[T any] interface {
+	*T
+	encoding.BinaryMarshaler
+}
+
+func handleRead[PReq unmarshaler[Req], PResp marshaller[Resp], Req, Resp any](
 	ctx context.Context,
-	s *taeStorage,
 	txnMeta txn.TxnMeta,
 	payload []byte,
-	fn func(
-		ctx context.Context,
-		meta txn.TxnMeta,
-		req Req,
-		resp *Resp,
-	) (
-		err error,
-	),
-) (
-	res storage.ReadResult,
-	err error,
-) {
+	fn func(context.Context, txn.TxnMeta, PReq, PResp) (func(), error),
+) (res storage.ReadResult, err error) {
 
-	var req Req
+	var preq PReq = new(Req)
 	if len(payload) != 0 {
-		if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&req); err != nil {
+		if err := preq.UnmarshalBinary(payload); err != nil {
 			return nil, err
 		}
 	}
 
-	var resp Resp
-	defer logReq("read", req, txnMeta, &resp, &err)()
+	var presp PResp = new(Resp)
+	defer logReq("read", preq, txnMeta, presp, &err)()
 	defer func() {
-		if closer, ok := (any)(resp).(io.Closer); ok {
+		if closer, ok := (any)(presp).(io.Closer); ok {
 			_ = closer.Close()
 		}
 	}()
 
-	err = fn(ctx, txnMeta, req, &resp)
+	cb, err := fn(ctx, txnMeta, preq, presp)
+	if cb != nil {
+		defer cb()
+	}
 	if err != nil {
 		return nil, err
 	}
 
-	buf := new(bytes.Buffer)
-	if err := gob.NewEncoder(buf).Encode(resp); err != nil {
+	data, err := presp.MarshalBinary()
+	if err != nil {
 		return nil, err
 	}
 	res = &readResult{
-		payload: buf.Bytes(),
+		payload: data,
 	}
 
 	return res, nil

@@ -33,11 +33,14 @@ func TestCatalogHandler(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	catalog.SetupDefines("")
+
 	// new
 	clock := clock.NewHLCClock(func() int64 {
 		return time.Now().UnixNano()
 	}, math.MaxInt64)
 	catalogHandler, err := NewCatalogHandler(
+		"",
 		NewMemHandler(
 			mpool.MustNewZero(),
 			clock,
@@ -63,7 +66,7 @@ func TestCatalogHandler(t *testing.T) {
 	var dbID ID
 	{
 		var resp memoryengine.OpenDatabaseResp
-		err = handler.HandleOpenDatabase(ctx, meta, memoryengine.OpenDatabaseReq{
+		err = handler.HandleOpenDatabase(ctx, meta, &memoryengine.OpenDatabaseReq{
 			Name: catalog.MO_CATALOG,
 		}, &resp)
 		assert.Nil(t, err)
@@ -74,7 +77,7 @@ func TestCatalogHandler(t *testing.T) {
 	// get tables
 	{
 		var resp memoryengine.GetRelationsResp
-		err = handler.HandleGetRelations(ctx, meta, memoryengine.GetRelationsReq{
+		err = handler.HandleGetRelations(ctx, meta, &memoryengine.GetRelationsReq{
 			DatabaseID: dbID,
 		}, &resp)
 		assert.Nil(t, err)
@@ -85,7 +88,7 @@ func TestCatalogHandler(t *testing.T) {
 	var tableID ID
 	{
 		var resp memoryengine.OpenRelationResp
-		err = handler.HandleOpenRelation(ctx, meta, memoryengine.OpenRelationReq{
+		err = handler.HandleOpenRelation(ctx, meta, &memoryengine.OpenRelationReq{
 			DatabaseID: dbID,
 			Name:       catalog.MO_DATABASE,
 		}, &resp)
@@ -96,7 +99,7 @@ func TestCatalogHandler(t *testing.T) {
 	var iterID ID
 	{
 		var resp memoryengine.NewTableIterResp
-		err = handler.HandleNewTableIter(ctx, meta, memoryengine.NewTableIterReq{
+		err = handler.HandleNewTableIter(ctx, meta, &memoryengine.NewTableIterReq{
 			TableID: tableID,
 		}, &resp)
 		assert.Nil(t, err)
@@ -105,7 +108,7 @@ func TestCatalogHandler(t *testing.T) {
 	}
 	{
 		var resp memoryengine.ReadResp
-		err = handler.HandleRead(ctx, meta, memoryengine.ReadReq{
+		err = handler.HandleRead(ctx, meta, &memoryengine.ReadReq{
 			IterID: iterID,
 			ColNames: []string{
 				catalog.SystemDBAttr_Name,
@@ -113,12 +116,12 @@ func TestCatalogHandler(t *testing.T) {
 			},
 		}, &resp)
 		assert.Nil(t, err)
-		assert.Equal(t, 1, resp.Batch.Length())
+		assert.Equal(t, 1, resp.Batch.RowCount())
 		assert.Equal(t, 2, len(resp.Batch.Attrs))
 	}
 	{
 		var resp memoryengine.CloseTableIterResp
-		err = handler.HandleCloseTableIter(ctx, meta, memoryengine.CloseTableIterReq{
+		err = handler.HandleCloseTableIter(ctx, meta, &memoryengine.CloseTableIterReq{
 			IterID: iterID,
 		}, &resp)
 		assert.Nil(t, err)
@@ -127,7 +130,7 @@ func TestCatalogHandler(t *testing.T) {
 	// mo_tables
 	{
 		var resp memoryengine.OpenRelationResp
-		err = handler.HandleOpenRelation(ctx, meta, memoryengine.OpenRelationReq{
+		err = handler.HandleOpenRelation(ctx, meta, &memoryengine.OpenRelationReq{
 			DatabaseID: dbID,
 			Name:       catalog.MO_TABLES,
 		}, &resp)
@@ -137,7 +140,7 @@ func TestCatalogHandler(t *testing.T) {
 	}
 	{
 		var resp memoryengine.NewTableIterResp
-		err = handler.HandleNewTableIter(ctx, meta, memoryengine.NewTableIterReq{
+		err = handler.HandleNewTableIter(ctx, meta, &memoryengine.NewTableIterReq{
 			TableID: tableID,
 		}, &resp)
 		assert.Nil(t, err)
@@ -146,7 +149,7 @@ func TestCatalogHandler(t *testing.T) {
 	}
 	{
 		var resp memoryengine.ReadResp
-		err = handler.HandleRead(ctx, meta, memoryengine.ReadReq{
+		err = handler.HandleRead(ctx, meta, &memoryengine.ReadReq{
 			IterID: iterID,
 			ColNames: []string{
 				catalog.SystemRelAttr_Name,
@@ -154,12 +157,12 @@ func TestCatalogHandler(t *testing.T) {
 			},
 		}, &resp)
 		assert.Nil(t, err)
-		assert.Equal(t, 3, resp.Batch.Length())
+		assert.Equal(t, 3, resp.Batch.RowCount())
 		assert.Equal(t, 2, len(resp.Batch.Attrs))
 	}
 	{
 		var resp memoryengine.CloseTableIterResp
-		err = handler.HandleCloseTableIter(ctx, meta, memoryengine.CloseTableIterReq{
+		err = handler.HandleCloseTableIter(ctx, meta, &memoryengine.CloseTableIterReq{
 			IterID: iterID,
 		}, &resp)
 		assert.Nil(t, err)
@@ -168,7 +171,7 @@ func TestCatalogHandler(t *testing.T) {
 	// mo_columns
 	{
 		var resp memoryengine.OpenRelationResp
-		err = handler.HandleOpenRelation(ctx, meta, memoryengine.OpenRelationReq{
+		err = handler.HandleOpenRelation(ctx, meta, &memoryengine.OpenRelationReq{
 			DatabaseID: dbID,
 			Name:       catalog.MO_COLUMNS,
 		}, &resp)
@@ -178,7 +181,7 @@ func TestCatalogHandler(t *testing.T) {
 	}
 	{
 		var resp memoryengine.NewTableIterResp
-		err = handler.HandleNewTableIter(ctx, meta, memoryengine.NewTableIterReq{
+		err = handler.HandleNewTableIter(ctx, meta, &memoryengine.NewTableIterReq{
 			TableID: tableID,
 		}, &resp)
 		assert.Nil(t, err)
@@ -187,7 +190,7 @@ func TestCatalogHandler(t *testing.T) {
 	}
 	{
 		var resp memoryengine.ReadResp
-		err = handler.HandleRead(ctx, meta, memoryengine.ReadReq{
+		err = handler.HandleRead(ctx, meta, &memoryengine.ReadReq{
 			IterID: iterID,
 			ColNames: []string{
 				catalog.SystemColAttr_DBName,
@@ -197,13 +200,13 @@ func TestCatalogHandler(t *testing.T) {
 		assert.Nil(t, err)
 		totalColumns := len(catalog.MoDatabaseSchema) +
 			len(catalog.MoTablesSchema) +
-			len(catalog.MoColumnsSchema)
-		assert.Equal(t, totalColumns, resp.Batch.Length())
+			len(catalog.MoColumnsSchema) - 4 /*3 hiden cpkey + hiden extra*/
+		assert.Equal(t, totalColumns, resp.Batch.RowCount())
 		assert.Equal(t, 2, len(resp.Batch.Attrs))
 	}
 	{
 		var resp memoryengine.CloseTableIterResp
-		err = handler.HandleCloseTableIter(ctx, meta, memoryengine.CloseTableIterReq{
+		err = handler.HandleCloseTableIter(ctx, meta, &memoryengine.CloseTableIterReq{
 			IterID: iterID,
 		}, &resp)
 		assert.Nil(t, err)

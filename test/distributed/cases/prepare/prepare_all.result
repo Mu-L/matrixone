@@ -110,6 +110,7 @@ set @hit_str1='a2';
 set @not_hit_str2='a';
 execute s2 using @hit_str1;
 execute s2 using @not_hit_str1;
+invalid input: Incorrect arguments to EXECUTE
 select * from t1;
 str1	str2
 xx1	b1
@@ -142,9 +143,9 @@ time3 TIMESTAMP
 );
 insert into t2 values ('1000-01-01', '0001-01-01 00:00:00.000000', '2038-01-19 03:14:07.999999');
 insert into t2 values ('1000-01-01', '9999-12-31 23:59:59.999999', '2038-01-19 03:14:07.999999');
-invalid input: invalid datatime value 9999-12-31 23:59:59.999999
+invalid input: invalid datetime value 9999-12-31 23:59:59.999999
 insert into t2 values ('9999-12-31', '9999-12-31 23:59:59.999999', '2038-01-19 03:14:07.999999');
-invalid input: invalid datatime value 9999-12-31 23:59:59.999999
+invalid input: invalid datetime value 9999-12-31 23:59:59.999999
 insert into t2 values ('1000-01-01', '0001-01-01 00:00:00.000000', '1970-01-01 00:00:01.000000');
 insert into t2 values ('1000-01-01', '0001-01-01 00:00:00.000000', '1970-01-01 00:00:01.000000');
 insert into t2 values ('1000-01-01', '0001-01-01 00:00:00.000000', '1970-01-01 00:00:01.000000');
@@ -190,7 +191,7 @@ time1    time2    time3
 execute s2 using @min_date;
 time1    time2    time3
 execute s2 using @max_datetime;
-time1    time2    time3
+invalid input: invalid datetime value 9999-12-31 23:59:59.999999
 execute s2 using @min_datetime;
 time1    time2    time3
 1000-01-01    0001-01-01 00:00:00    2038-01-19 03:14:08
@@ -651,3 +652,13 @@ EXECUTE s USING @maxint;
 concat(?,"")
 18446744073709551615
 DEALLOCATE PREPARE s;
+CREATE DATABASE mocloud_meta;
+PREPARE mo_stmt_id_1 FROM SELECT SCHEMA_NAME from Information_schema.SCHEMATA where SCHEMA_NAME LIKE ? ORDER BY SCHEMA_NAME=? DESC,SCHEMA_NAME limit 1;
+SET @dbname1 = 'mocloud_meta%';
+SET @dbname2 = 'mocloud_meta';
+EXECUTE mo_stmt_id_1 USING @dbname1, @dbname2;
+schema_name
+mocloud_meta
+DEALLOCATE PREPARE mo_stmt_id_1;
+DROP DATABASE mocloud_meta;
+SET TIME_ZONE = "SYSTEM";

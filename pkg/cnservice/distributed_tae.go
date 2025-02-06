@@ -16,14 +16,17 @@ package cnservice
 
 import (
 	"context"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
 
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	"github.com/matrixorigin/matrixone/pkg/config"
 	"github.com/matrixorigin/matrixone/pkg/defines"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
-	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/frontend"
+	"github.com/matrixorigin/matrixone/pkg/objectio/ioutil"
 	"github.com/matrixorigin/matrixone/pkg/sql/colexec"
+	ie "github.com/matrixorigin/matrixone/pkg/util/internalExecutor"
+	"github.com/matrixorigin/matrixone/pkg/util/status"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/disttae"
 )
 
@@ -45,42 +48,72 @@ func (s *service) initDistributedTAE(
 		return err
 	}
 
-	// Should be no fixed or some size?
-	mp, err := mpool.NewMPool("distributed_tae", 0, mpool.NoFixed)
-	if err != nil {
-		return err
-	}
-
 	// use s3 as main fs
 	fs, err := fileservice.Get[fileservice.FileService](s.fileService, defines.SharedFileServiceName)
 	if err != nil {
 		return err
 	}
-	colexec.Srv = colexec.NewServer(hakeeper)
+	colexec.NewServer(hakeeper)
 
 	// start I/O pipeline
-	blockio.Start()
+	ioutil.Start(s.cfg.UUID)
+
+	internalExecutorFactory := func() ie.InternalExecutor {
+		return frontend.NewInternalExecutor(s.cfg.UUID)
+	}
 
 	// engine
-	pu.StorageEngine = disttae.New(
+	distributeTaeMp, err := mpool.NewMPool("distributed_tae", 0, mpool.NoFixed)
+	if err != nil {
+		return err
+	}
+	s.distributeTaeMp = distributeTaeMp
+	s.storeEngine = disttae.New(
 		ctx,
-		mp,
+		s.cfg.UUID,
+		distributeTaeMp,
 		fs,
 		client,
 		hakeeper,
-	)
+		s.gossipNode.StatsKeyRouter(),
+		s.cfg.LogtailUpdateWorkerFactor,
 
-	// log tail client to subscribe table and receive table log.
-	usePushModel := s.cfg.TurnOnPushModel
-	cnEngine := pu.StorageEngine.(*disttae.Engine)
-	cnEngine.SetPushModelFlag(usePushModel)
-	if usePushModel {
-		logutil.Info("cn turn push model on.")
-		err = cnEngine.InitLogTailPushModel(ctx)
-		if err != nil {
-			return err
-		}
+		disttae.WithCNTransferTxnLifespanThreshold(
+			s.cfg.Engine.CNTransferTxnLifespanThreshold),
+		disttae.WithMoTableStatsConf(s.cfg.Engine.Stats),
+		disttae.WithSQLExecFunc(internalExecutorFactory),
+		disttae.WithMoServerStateChecker(func() bool {
+			return frontend.MoServerIsStarted(s.cfg.UUID)
+		}),
+	)
+	pu.StorageEngine = s.storeEngine
+
+	// cdc mp
+	if s.cdcMp, err = mpool.NewMPool("cdc", 0, mpool.NoFixed); err != nil {
+		return err
 	}
 
+	// internal sql executor.
+	// InitLoTailPushModel presupposes that the internal sql executor has been initialized.
+	internalExecutorMp, _ := mpool.NewMPool("internal_executor", 0, mpool.NoFixed)
+	s.initInternalSQlExecutor(internalExecutorMp)
+
+	// set up log tail client to subscribe table and receive table log.
+	cnEngine := pu.StorageEngine.(*disttae.Engine)
+	err = cnEngine.InitLogTailPushModel(ctx, s.timestampWaiter)
+	if err != nil {
+		return err
+	}
+
+	ss, ok := runtime.ServiceRuntime(s.cfg.UUID).GetGlobalVariables(runtime.StatusServer)
+	if ok {
+		statusServer := ss.(*status.Server)
+		statusServer.SetTxnClient(s.cfg.UUID, client)
+		statusServer.SetLogTailClient(s.cfg.UUID, cnEngine.PushClient())
+	}
+
+	s.initProcessCodecService()
+	s.initPartitionService()
+	s.initShardService()
 	return nil
 }

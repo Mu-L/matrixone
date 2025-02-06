@@ -16,18 +16,17 @@ package taestorage
 
 import (
 	"context"
-
-	"go.uber.org/multierr"
+	"errors"
+	"fmt"
 
 	"github.com/matrixorigin/matrixone/pkg/common/runtime"
-	"github.com/matrixorigin/matrixone/pkg/fileservice"
-	"github.com/matrixorigin/matrixone/pkg/logservice"
 	"github.com/matrixorigin/matrixone/pkg/pb/metadata"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
+	rpc2 "github.com/matrixorigin/matrixone/pkg/txn/rpc"
 	"github.com/matrixorigin/matrixone/pkg/txn/storage"
+	"github.com/matrixorigin/matrixone/pkg/util/status"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/rpchandle"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/driver/logservicedriver"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail/service"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
@@ -35,7 +34,7 @@ import (
 )
 
 type taeStorage struct {
-	shard         metadata.DNShard
+	shard         metadata.TNShard
 	taeHandler    rpchandle.Handler
 	logtailServer *service.LogtailServer
 }
@@ -43,31 +42,30 @@ type taeStorage struct {
 var _ storage.TxnStorage = (*taeStorage)(nil)
 
 func NewTAEStorage(
+	ctx context.Context,
 	dataDir string,
-	shard metadata.DNShard,
-	factory logservice.ClientFactory,
-	fs fileservice.FileService,
+	opt *options.Options,
+	shard metadata.TNShard,
 	rt runtime.Runtime,
-	ckpCfg *options.CheckpointCfg,
 	logtailServerAddr string,
 	logtailServerCfg *options.LogtailServerCfg,
-	logStore options.LogstoreType,
-) (*taeStorage, error) {
-	opt := &options.Options{
-		Clock:         rt.Clock(),
-		Fs:            fs,
-		Lc:            logservicedriver.LogServiceClientFactory(factory),
-		Shard:         shard,
-		CheckpointCfg: ckpCfg,
-		LogStoreT:     logStore,
+	txnServer rpc2.TxnServer,
+) (storage.TxnStorage, error) {
+	if rt.ServiceUUID() != opt.SID {
+		panic(fmt.Sprintf("service uuid mismatch, %s != %s", rt.ServiceUUID(), opt.SID))
 	}
-
-	taeHandler := rpc.NewTAEHandle(dataDir, opt)
-	tae := taeHandler.GetTxnEngine().GetTAE(context.Background())
-	logtailer := logtail.NewLogtailer(tae.BGCheckpointRunner, tae.LogtailMgr, tae.Catalog)
-	server, err := service.NewLogtailServer(logtailServerAddr, logtailServerCfg, logtailer, rt)
+	taeHandler := rpc.NewTAEHandle(ctx, dataDir, opt)
+	tae := taeHandler.GetDB()
+	tae.TxnServer = txnServer
+	logtailer := logtail.NewLogtailer(ctx, tae, tae.LogtailMgr, tae.Catalog)
+	server, err := service.NewLogtailServer(logtailServerAddr, logtailServerCfg, logtailer, rt, nil)
 	if err != nil {
 		return nil, err
+	}
+
+	ss, ok := rt.GetGlobalVariables(runtime.StatusServer)
+	if ok {
+		ss.(*status.Server).SetLogtailServer(server)
 	}
 
 	return &taeStorage{
@@ -77,8 +75,6 @@ func NewTAEStorage(
 	}, nil
 }
 
-var _ storage.TxnStorage = new(taeStorage)
-
 // Start starts logtail push service.
 func (s *taeStorage) Start() error {
 	return s.logtailServer.Start()
@@ -86,15 +82,17 @@ func (s *taeStorage) Start() error {
 
 // Close implements storage.TxnTAEStorage
 func (s *taeStorage) Close(ctx context.Context) error {
-	if err := s.logtailServer.Close(); err != nil {
-		return multierr.Append(err, s.taeHandler.HandleClose(ctx))
-	}
-	return s.taeHandler.HandleClose(ctx)
+	return errors.Join(s.logtailServer.Close(), s.taeHandler.HandleClose(ctx))
 }
 
 // Commit implements storage.TxnTAEStorage
-func (s *taeStorage) Commit(ctx context.Context, txnMeta txn.TxnMeta) (timestamp.Timestamp, error) {
-	return s.taeHandler.HandleCommit(ctx, txnMeta)
+func (s *taeStorage) Commit(
+	ctx context.Context,
+	txnMeta txn.TxnMeta,
+	response *txn.TxnResponse,
+	commitRequests *txn.TxnCommitRequest,
+) (timestamp.Timestamp, error) {
+	return s.taeHandler.HandleCommit(ctx, txnMeta, response, commitRequests)
 }
 
 // Committing implements storage.TxnTAEStorage

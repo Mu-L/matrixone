@@ -238,6 +238,28 @@ drop table fk_03;
 drop table fk_02;
 drop table fk_01;
 
+create table f1(a int, b int, primary key (a,b));
+create table c1(id int primary key, aa int, bb int, CONSTRAINT `fk_aa` FOREIGN KEY(`aa`) REFERENCES `f1`(`a`));
+insert into f1 values (1,1);
+insert into c1 values (1,1,1);
+update f1 set a=a;
+update f1 set a=1;
+update f1 set a=a, b=2;
+update f1 set a=2;
+drop table c1;
+drop table f1;
+
+create table f1(a int, b int, primary key (a,b));
+create table c1(id int primary key, aa int, bb int, CONSTRAINT `fk_aa` FOREIGN KEY(`aa`,`bb`) REFERENCES `f1`(`a`,`b`));
+insert into f1 values (1,1);
+insert into c1 values (1,1,1);
+update f1 set a=a;
+update f1 set a=a, b=1;
+update f1 set b=1, a=a;
+update f1 set a=a, b=2;
+drop table c1;
+drop table f1;
+
 drop database if exists db1;
 create database db1;
 use db1;
@@ -267,3 +289,13 @@ show tables;
 drop database db2;
 -- @session
 drop account if exists acc1;
+
+drop database if exists db1;
+create database db1;
+use db1;
+create table t1(a int primary key);
+create table t2(a int primary key, b int);
+alter table t2 add constraint fk_t2_t1 foreign key(b) references t1(a), add constraint fk_t2_t1 foreign key(b) references t1(a);
+alter table t2 add constraint fk_t2_t1 foreign key(b) references t1(a);
+alter table t2 add constraint fk_t2_t1 foreign key(b) references t1(a);
+drop database db1;

@@ -16,6 +16,8 @@ package fileservice
 
 import (
 	"context"
+	"fmt"
+	"iter"
 	"path"
 	"strings"
 )
@@ -56,6 +58,9 @@ func (s *subPathFS) toUpstreamPath(p string) (string, error) {
 	return parsed.String(), nil
 }
 
+func (s *subPathFS) Close(ctx context.Context) {
+}
+
 func (s *subPathFS) Write(ctx context.Context, vector IOVector) error {
 	p, err := s.toUpstreamPath(vector.FilePath)
 	if err != nil {
@@ -75,28 +80,25 @@ func (s *subPathFS) Read(ctx context.Context, vector *IOVector) error {
 	return s.upstream.Read(ctx, &subVector)
 }
 
-func (s *subPathFS) List(ctx context.Context, dirPath string) ([]DirEntry, error) {
-	p, err := s.toUpstreamPath(dirPath)
+func (s *subPathFS) ReadCache(ctx context.Context, vector *IOVector) error {
+	subVector := *vector
+	p, err := s.toUpstreamPath(subVector.FilePath)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	entries, err := s.upstream.List(ctx, p)
-	if err != nil {
-		return nil, err
-	}
-	return entries, nil
+	subVector.FilePath = p
+	return s.upstream.ReadCache(ctx, &subVector)
 }
 
-func (s *subPathFS) Preload(ctx context.Context, filePath string) error {
-	p, err := s.toUpstreamPath(filePath)
-	if err != nil {
-		return err
+func (s *subPathFS) List(ctx context.Context, dirPath string) iter.Seq2[*DirEntry, error] {
+	return func(yield func(*DirEntry, error) bool) {
+		p, err := s.toUpstreamPath(dirPath)
+		if err != nil {
+			yield(nil, err)
+			return
+		}
+		s.upstream.List(ctx, p)(yield)
 	}
-	err = s.upstream.Preload(ctx, p)
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func (s *subPathFS) Delete(ctx context.Context, filePaths ...string) error {
@@ -127,4 +129,30 @@ func (s *subPathFS) StatFile(ctx context.Context, filePath string) (*DirEntry, e
 		return nil, err
 	}
 	return s.upstream.StatFile(ctx, p)
+}
+
+func (s *subPathFS) PrefetchFile(ctx context.Context, filePath string) error {
+	p, err := s.toUpstreamPath(filePath)
+	if err != nil {
+		return err
+	}
+	return s.upstream.PrefetchFile(ctx, p)
+}
+
+func (s *subPathFS) Cost() *CostAttr {
+	return s.upstream.Cost()
+}
+
+var _ MutableFileService = new(subPathFS)
+
+func (s *subPathFS) NewMutator(ctx context.Context, filePath string) (Mutator, error) {
+	p, err := s.toUpstreamPath(filePath)
+	if err != nil {
+		return nil, err
+	}
+	fs, ok := s.upstream.(MutableFileService)
+	if !ok {
+		panic(fmt.Sprintf("%T does not implement MutableFileService", s.upstream))
+	}
+	return fs.NewMutator(ctx, p)
 }

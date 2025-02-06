@@ -9,6 +9,7 @@ insert into t1 values(1, 1, 2, 43, 5, 35.5, 31.133, 14.314, "2012-03-10", "2012-
 insert into t1 values(71, 1, 2, 34, 5, 5.5, 341.13, 15.314, "2012-03-22", "2013-03-12 10:03:12", "2032-03-12 13:04:12", "abr23c", "3dcf");
 insert into t1 values(1, 1, 21, 4, 54, 53.5, 431.13, 14.394, "2011-03-12", "2015-03-12 10:03:12", "2002-03-12 13:03:12", "afbc", "dct5f");
 insert into t1 values(1, 71, 2, 34, 5, 5.5, 31.313, 124.314, "2012-01-12", "2019-03-12 10:03:12", "2013-03-12 13:03:12", "3abd1c", "dcvf");
+insert into t1 values(1, 1, 2, 34, 5, 5.5, 31.133, 14.314, "2023-11-08", "2023-11-08 15:03", "2023-11-08 15:03", "abcads3c", "dcdff");
 select dayofyear(a),dayofyear(b),dayofyear(c),dayofyear(d),dayofyear(e),dayofyear(f) from t1;
 invalid argument function dayofyear, bad value [TINYINT]
 select dayofyear(g),dayofyear(h),dayofyear(i),dayofyear(k),dayofyear(l),dayofyear(m),dayofyear(n) from t1;
@@ -78,7 +79,7 @@ dayofyear("2015-09-10")!=dayofyear("2016-04-24")
 true
 CREATE TABLE Product(Product_id INT,  Product_name VARCHAR(100) NOT NULL,Buying_price DECIMAL(13, 2) NOT NULL,Selling_price DECIMAL(13, 2) NOT NULL,Selling_Date Date NOT NULL,PRIMARY KEY(Product_id));
 INSERT INTO  Product(Product_name, Buying_price, Selling_price, Selling_Date) VALUES ('Audi Q8', 10000000.00, 15000000.00, '2018-01-26' ),('Volvo XC40', 2000000.00, 3000000.00, '2018-04-20' ),('Audi A6', 4000000.00, 5000000.00, '2018-07-25' ),('BMW X5', 5000500.00, 7006500.00, '2018-10-18'  ),('Jaguar XF', 5000000, 7507000.00, '2019-01-27'  ),('Mercedes-Benz C-Class', 4000000.00, 6000000.00, '2019-04-01'  ),('Jaguar F-PACE', 5000000.00, 7000000.00, '2019-12-26'  ),('Porsche Macan', 6500000.00, 8000000.00, '2020-04-16' ) ;
-invalid input: invalid default value
+invalid input: invalid default value for column 'product_id'
 SELECT  dayofyear (Selling_Date) dayofyear,  COUNT(Product_id) Product_Sold FROM Product GROUP BY dayofyear (Selling_Date) ORDER BY dayofyear (Selling_Date);
 dayofyear	Product_Sold
 DROP TABLE Product;

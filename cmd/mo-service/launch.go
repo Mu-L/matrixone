@@ -16,24 +16,30 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	"github.com/fagongzi/goetty/v2"
+	"go.uber.org/zap"
+
+	"github.com/matrixorigin/matrixone/pkg/backup"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/stopper"
 	"github.com/matrixorigin/matrixone/pkg/logservice"
 	"github.com/matrixorigin/matrixone/pkg/logutil"
 	logpb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
-	"github.com/matrixorigin/matrixone/pkg/perfcounter"
-	"go.uber.org/zap"
 )
 
 var (
 	cnProxy goetty.Proxy
 )
 
-func startCluster(ctx context.Context, stopper *stopper.Stopper, perfCounterSet *perfcounter.CounterSet) error {
+func startCluster(
+	ctx context.Context,
+	stopper *stopper.Stopper,
+	shutdownC chan struct{},
+) error {
 	if *launchFile == "" {
 		panic("launch file not set")
 	}
@@ -43,13 +49,34 @@ func startCluster(ctx context.Context, stopper *stopper.Stopper, perfCounterSet 
 		return err
 	}
 
-	if err := startLogServiceCluster(ctx, cfg.LogServiceConfigFiles, stopper, perfCounterSet); err != nil {
+	if cfg.Dynamic.Enable {
+		return startDynamicCluster(ctx, cfg, stopper, shutdownC)
+	}
+
+	/*
+		When the mo started in local cluster, we save all config files.
+		Because we can get all config files conveniently.
+	*/
+	backup.SaveLaunchConfigPath(backup.LaunchConfig, []string{*launchFile})
+	backup.SaveLaunchConfigPath(backup.LogConfig, cfg.LogServiceConfigFiles)
+	backup.SaveLaunchConfigPath(backup.DnConfig, cfg.TNServiceConfigsFiles)
+	backup.SaveLaunchConfigPath(backup.CnConfig, cfg.CNServiceConfigsFiles)
+	if err := startLogServiceCluster(ctx, cfg.LogServiceConfigFiles, stopper, shutdownC); err != nil {
 		return err
 	}
-	if err := startDNServiceCluster(ctx, cfg.DNServiceConfigsFiles, stopper, perfCounterSet); err != nil {
+	if err := startTNServiceCluster(ctx, cfg.TNServiceConfigsFiles, stopper, shutdownC); err != nil {
 		return err
 	}
-	if err := startCNServiceCluster(ctx, cfg.CNServiceConfigsFiles, stopper, perfCounterSet); err != nil {
+	if err := startCNServiceCluster(ctx, cfg.CNServiceConfigsFiles, stopper, shutdownC); err != nil {
+		return err
+	}
+	if *withProxy {
+		backup.SaveLaunchConfigPath(backup.ProxyConfig, cfg.ProxyServiceConfigsFiles)
+		if err := startProxyServiceCluster(ctx, cfg.ProxyServiceConfigsFiles, stopper, shutdownC); err != nil {
+			return err
+		}
+	}
+	if err := startPythonUdfServiceCluster(ctx, cfg.PythonUdfServiceConfigsFiles, stopper, shutdownC); err != nil {
 		return err
 	}
 	return nil
@@ -59,7 +86,7 @@ func startLogServiceCluster(
 	ctx context.Context,
 	files []string,
 	stopper *stopper.Stopper,
-	perfCounterSet *perfcounter.CounterSet,
+	shutdownC chan struct{},
 ) error {
 	if len(files) == 0 {
 		return moerr.NewBadConfig(context.Background(), "Log service config not set")
@@ -67,34 +94,36 @@ func startLogServiceCluster(
 
 	var cfg *Config
 	for _, file := range files {
-		cfg = &Config{}
+		cfg = NewConfig()
 		if err := parseConfigFromFile(file, cfg); err != nil {
 			return err
 		}
-		if err := startService(ctx, cfg, stopper, perfCounterSet); err != nil {
+		if err := startService(ctx, cfg, stopper, shutdownC); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func startDNServiceCluster(
+func startTNServiceCluster(
 	ctx context.Context,
 	files []string,
 	stopper *stopper.Stopper,
-	perfCounterSet *perfcounter.CounterSet,
+	shutdownC chan struct{},
 ) error {
 	if len(files) == 0 {
 		return moerr.NewBadConfig(context.Background(), "DN service config not set")
 	}
 
 	for _, file := range files {
-		cfg := &Config{}
+		cfg := NewConfig()
+		// mo boosting in standalone mode
+		cfg.IsStandalone = true
 		if err := parseConfigFromFile(file, cfg); err != nil {
 			return err
 		}
-		if err := startService(ctx, cfg, stopper, perfCounterSet); err != nil {
-			return nil
+		if err := startService(ctx, cfg, stopper, shutdownC); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -104,7 +133,7 @@ func startCNServiceCluster(
 	ctx context.Context,
 	files []string,
 	stopper *stopper.Stopper,
-	perfCounterSet *perfcounter.CounterSet,
+	shutdownC chan struct{},
 ) error {
 	if len(files) == 0 {
 		return moerr.NewBadConfig(context.Background(), "CN service config not set")
@@ -114,12 +143,12 @@ func startCNServiceCluster(
 
 	var cfg *Config
 	for _, file := range files {
-		cfg = &Config{}
+		cfg = NewConfig()
 		if err := parseConfigFromFile(file, cfg); err != nil {
 			return err
 		}
 		upstreams = append(upstreams, fmt.Sprintf("127.0.0.1:%d", cfg.getCNServiceConfig().Frontend.Port))
-		if err := startService(ctx, cfg, stopper, perfCounterSet); err != nil {
+		if err := startService(ctx, cfg, stopper, shutdownC); err != nil {
 			return err
 		}
 	}
@@ -137,30 +166,94 @@ func startCNServiceCluster(
 	return nil
 }
 
-func waitHAKeeperReady(cfg logservice.HAKeeperClientConfig) (logservice.CNHAKeeperClient, error) {
-	// wait hakeeper ready
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*30)
+func startProxyServiceCluster(
+	ctx context.Context,
+	files []string,
+	stopper *stopper.Stopper,
+	shutdownC chan struct{},
+) error {
+	if len(files) == 0 {
+		return moerr.NewBadConfig(context.Background(), "Proxy service config not set")
+	}
+
+	var cfg *Config
+	for _, file := range files {
+		cfg = NewConfig()
+		if err := parseConfigFromFile(file, cfg); err != nil {
+			return err
+		}
+		if err := startService(ctx, cfg, stopper, shutdownC); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func startPythonUdfServiceCluster(
+	ctx context.Context,
+	files []string,
+	stopper *stopper.Stopper,
+	shutdownC chan struct{},
+) error {
+	if len(files) == 0 {
+		return nil
+	}
+
+	for _, file := range files {
+		cfg := NewConfig()
+		if err := parseConfigFromFile(file, cfg); err != nil {
+			return err
+		}
+		if err := startService(ctx, cfg, stopper, shutdownC); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func waitHAKeeperReady(
+	service string,
+	cfg logservice.HAKeeperClientConfig,
+) (logservice.CNHAKeeperClient, error) {
+	getClient := func() (logservice.CNHAKeeperClient, error) {
+		ctx, cancel := context.WithTimeoutCause(context.Background(), time.Second*5, moerr.CauseWaitHAKeeperReader1)
+		defer cancel()
+		client, err := logservice.NewCNHAKeeperClient(ctx, service, cfg)
+		if err != nil {
+			err = moerr.AttachCause(ctx, err)
+			logutil.Errorf("hakeeper not ready, err: %v", err)
+			return nil, err
+		}
+		return client, nil
+	}
+
+	ctx, cancel := context.WithTimeoutCause(context.Background(), time.Minute*5, moerr.CauseWaitHAKeeperReader2)
 	defer cancel()
 	for {
-		var err error
-		client, err := logservice.NewCNHAKeeperClient(ctx, cfg)
-		if moerr.IsMoErrCode(err, moerr.ErrNoHAKeeper) {
-			// not ready
-			logutil.Info("hakeeper not ready, retry")
+		select {
+		case <-ctx.Done():
+			return nil, errors.Join(moerr.NewInternalErrorNoCtx("wait hakeeper ready timeout"), context.Cause(ctx))
+		default:
+			client, err := getClient()
+			if err == nil {
+				return client, nil
+			}
 			time.Sleep(time.Second)
-			continue
 		}
-		return client, err
 	}
 }
 
 func waitHAKeeperRunning(client logservice.CNHAKeeperClient) error {
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*30)
+	ctx, cancel := context.WithTimeoutCause(context.TODO(), time.Minute*2, moerr.CauseWaitHAKeeperRunning)
 	defer cancel()
 
 	// wait HAKeeper running
 	for {
 		state, err := client.GetClusterState(ctx)
+		if errors.Is(err, context.DeadlineExceeded) {
+			return moerr.AttachCause(ctx, err)
+		}
 		if moerr.IsMoErrCode(err, moerr.ErrNoHAKeeper) ||
 			state.State != logpb.HAKeeperRunning {
 			// not ready
@@ -173,7 +266,7 @@ func waitHAKeeperRunning(client logservice.CNHAKeeperClient) error {
 }
 
 func waitAnyShardReady(client logservice.CNHAKeeperClient) error {
-	ctx, cancel := context.WithTimeout(context.TODO(), time.Second*30)
+	ctx, cancel := context.WithTimeoutCause(context.TODO(), time.Second*30, moerr.CauseWaitAnyShardReady)
 	defer cancel()
 
 	// wait shard ready
@@ -181,9 +274,15 @@ func waitAnyShardReady(client logservice.CNHAKeeperClient) error {
 		if ok, err := func() (bool, error) {
 			details, err := client.GetClusterDetails(ctx)
 			if err != nil {
-				return false, err
+				if errors.Is(err, context.DeadlineExceeded) {
+					err = moerr.AttachCause(ctx, err)
+					logutil.Errorf("wait TN ready timeout: %s", err)
+					return false, err
+				}
+				logutil.Errorf("failed to get cluster details %s", err)
+				return false, nil
 			}
-			for _, store := range details.DNStores {
+			for _, store := range details.TNStores {
 				if len(store.Shards) > 0 {
 					return true, nil
 				}
@@ -201,10 +300,11 @@ func waitAnyShardReady(client logservice.CNHAKeeperClient) error {
 }
 
 func waitClusterCondition(
+	service string,
 	cfg logservice.HAKeeperClientConfig,
 	waitFunc func(logservice.CNHAKeeperClient) error,
 ) error {
-	client, err := waitHAKeeperReady(cfg)
+	client, err := waitHAKeeperReady(service, cfg)
 	if err != nil {
 		return err
 	}

@@ -32,6 +32,9 @@ func VectorAt(vec *vector.Vector, i int) (value Nullable) {
 	case types.T_bool:
 		return vectorAtFixed[bool](vec, i)
 
+	case types.T_bit:
+		return vectorAtFixed[uint64](vec, i)
+
 	case types.T_int8:
 		return vectorAtFixed[int8](vec, i)
 
@@ -74,6 +77,9 @@ func VectorAt(vec *vector.Vector, i int) (value Nullable) {
 	case types.T_datetime:
 		return vectorAtFixed[types.Datetime](vec, i)
 
+	case types.T_enum:
+		return vectorAtFixed[types.Enum](vec, i)
+
 	case types.T_timestamp:
 		return vectorAtFixed[types.Timestamp](vec, i)
 
@@ -88,11 +94,13 @@ func VectorAt(vec *vector.Vector, i int) (value Nullable) {
 
 	case types.T_Rowid:
 		return vectorAtFixed[types.Rowid](vec, i)
-
+	case types.T_Blockid:
+		return vectorAtFixed[types.Blockid](vec, i)
 	case types.T_uuid:
 		return vectorAtFixed[types.Uuid](vec, i)
 
-	case types.T_char, types.T_varchar, types.T_binary, types.T_varbinary, types.T_json, types.T_blob, types.T_text:
+	case types.T_char, types.T_varchar, types.T_binary, types.T_varbinary, types.T_json, types.T_blob, types.T_text,
+		types.T_array_float32, types.T_array_float64, types.T_datalink:
 		if vec.IsConstNull() {
 			value = Nullable{
 				IsNull: true,
@@ -121,7 +129,7 @@ func vectorAtFixed[T any](vec *vector.Vector, i int) (value Nullable) {
 		return
 	}
 
-	slice := vector.MustFixedCol[T](vec)
+	slice := vector.MustFixedColNoTypeCheck[T](vec)
 	if len(slice) != vec.Length() {
 		panic(fmt.Sprintf(
 			"bad vector length, expected %d, got %d",

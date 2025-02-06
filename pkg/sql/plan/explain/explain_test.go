@@ -36,7 +36,8 @@ func TestSingleSql(t *testing.T) {
 	//input := "explain verbose select * from part where p_container in ('SM CASE', 'SM BOX', 'SM PACK', 'SM PKG')"
 	//input := "explain select abs(N_REGIONKEY) from NATION"
 	//input := "explain verbose SELECT l.L_ORDERKEY a FROM CUSTOMER c, ORDERS o, LINEITEM l WHERE c.C_CUSTKEY = o.O_CUSTKEY and l.L_ORDERKEY = o.O_ORDERKEY and o.O_ORDERKEY < 10"
-	input := "explain verbose update emp set sal = sal + 500, comm = 1200 where deptno = 10"
+	//input := "explain verbose update emp set sal = sal + 500, comm = 1200 where deptno = 10"
+	input := "explain verbose select case when p_type like 'PROMO%' then l_extendedprice * (1 - l_discount) when p_type like 'PRX%' then l_extendedprice * (2 - l_discount) else 0 end from lineitem,part where l_shipdate < date '1996-04-01' + interval '1' month"
 	mock := plan.NewMockOptimizer(true)
 	err := runOneStmt(mock, t, input)
 	if err != nil {
@@ -208,6 +209,8 @@ func TestDMLInsert(t *testing.T) {
 		//"explain verbose INSERT NATION (N_NATIONKEY, N_REGIONKEY, N_NAME) VALUES (1, 21, 'NAME1'), (2, 22, 'NAME2')",
 		"explain INSERT INTO NATION SELECT * FROM NATION2",
 		"explain verbose INSERT INTO NATION SELECT * FROM NATION2",
+		"explain verbose insert ignore into nation select * from nation2",
+		"explain verbose insert into nation select * from nation2 on duplicate key update n_comment = n_name",
 	}
 	mockOptimizer := plan.NewMockOptimizer(false)
 	runTestShouldPass(mockOptimizer, t, sqls)
@@ -336,7 +339,7 @@ func runOneStmt(opt plan.Optimizer, t *testing.T, sql string) error {
 				} else if strings.EqualFold(v.Value, "FALSE") {
 					es.Verbose = false
 				} else {
-					return moerr.NewInvalidInput(ctx, "boolean value %v", v.Value)
+					return moerr.NewInvalidInputf(ctx, "boolean value %v", v.Value)
 				}
 			} else if strings.EqualFold(v.Name, "ANALYZE") {
 				if strings.EqualFold(v.Value, "TRUE") || v.Value == "NULL" {
@@ -344,26 +347,26 @@ func runOneStmt(opt plan.Optimizer, t *testing.T, sql string) error {
 				} else if strings.EqualFold(v.Value, "FALSE") {
 					es.Analyze = false
 				} else {
-					return moerr.NewInvalidInput(ctx, "boolean value %v", v.Value)
+					return moerr.NewInvalidInputf(ctx, "boolean value %v", v.Value)
 				}
 			} else if strings.EqualFold(v.Name, "FORMAT") {
 				if v.Name == "NULL" {
-					return moerr.NewInvalidInput(ctx, "parameter name %v", v.Name)
+					return moerr.NewInvalidInputf(ctx, "parameter name %v", v.Name)
 				} else if strings.EqualFold(v.Value, "TEXT") {
 					es.Format = EXPLAIN_FORMAT_TEXT
 				} else if strings.EqualFold(v.Value, "JSON") {
 					es.Format = EXPLAIN_FORMAT_JSON
 				} else {
-					return moerr.NewInvalidInput(ctx, "explain format %v", v.Value)
+					return moerr.NewInvalidInputf(ctx, "explain format %v", v.Value)
 				}
 			} else {
-				return moerr.NewInvalidInput(ctx, "EXPLAIN option %v", v.Name)
+				return moerr.NewInvalidInputf(ctx, "EXPLAIN option %v", v.Name)
 			}
 		}
 
 		// this sql always return one stmt
 		ctx := opt.CurrentContext()
-		logicPlan, err := plan.BuildPlan(ctx, stmt.Statement)
+		logicPlan, err := plan.BuildPlan(ctx, stmt.Statement, false)
 		if err != nil {
 			t.Errorf("Build Query Plan error: '%v'", tree.String(stmt, dialect.MYSQL))
 			return err
@@ -375,6 +378,7 @@ func runOneStmt(opt plan.Optimizer, t *testing.T, sql string) error {
 			t.Errorf("explain Query Plan error: '%v'", tree.String(stmt, dialect.MYSQL))
 			return err
 		}
+		t.Log("\n" + buffer.ToString())
 	}
 	return nil
 }

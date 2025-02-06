@@ -70,7 +70,7 @@ func (it *txnDBIt) Next() {
 		curr := node.GetPayload()
 		curr.RLock()
 		if curr.GetTenantID() == it.txn.GetTenantID() || isSysSharedDB(curr.GetName()) {
-			valid, err = curr.IsVisible(it.txn.GetStartTS(), curr.RWMutex)
+			valid, err = curr.IsVisibleWithLock(it.txn, curr.RWMutex)
 		}
 		curr.RUnlock()
 		if err != nil {
@@ -101,7 +101,7 @@ func newDatabase(db *txnDB) *txnDatabase {
 	return dbase
 
 }
-func (db *txnDatabase) GetID() uint64        { return db.txnDB.entry.GetID() }
+func (db *txnDatabase) GetID() uint64        { return db.txnDB.entry.ID }
 func (db *txnDatabase) GetName() string      { return db.txnDB.entry.GetName() }
 func (db *txnDatabase) String() string       { return db.txnDB.entry.String() }
 func (db *txnDatabase) IsSubscription() bool { return db.txnDB.entry.IsSubscription() }
@@ -123,24 +123,28 @@ func (db *txnDatabase) DropRelationByID(id uint64) (rel handle.Relation, err err
 	return db.Txn.GetStore().DropRelationByID(db.txnDB.entry.ID, id)
 }
 
+func cloneLatestSchema(meta *catalog.TableEntry) *catalog.Schema {
+	latest := meta.MVCCChain.GetLatestCommittedNodeLocked()
+	if latest != nil {
+		return latest.BaseNode.Schema.Clone()
+	}
+	return meta.GetLastestSchemaLocked(false).Clone()
+}
+
 func (db *txnDatabase) TruncateByName(name string) (rel handle.Relation, err error) {
-	newTableId := db.txnDB.entry.GetCatalog().IDAlloctor.NextTable()
+	newTableId := db.txnDB.entry.GetCatalog().IDAllocator.NextTable()
 
 	oldRel, err := db.DropRelationByName(name)
 	if err != nil {
-		err = moerr.NewInternalErrorNoCtx("%v: truncate %s error", err, name)
+		err = moerr.NewInternalErrorNoCtxf("%v: truncate %s error", err, name)
 		return
 	}
 	meta := oldRel.GetMeta().(*catalog.TableEntry)
-	schema := meta.GetSchema().Clone()
-	latest := meta.MVCCChain.GetLatestCommittedNode()
-	if latest != nil {
-		schema.Constraint = []byte(latest.(*catalog.TableMVCCNode).SchemaConstraints)
-	}
+	schema := cloneLatestSchema(meta)
 	db.Txn.BindAccessInfo(schema.AcInfo.TenantID, schema.AcInfo.UserID, schema.AcInfo.RoleID)
 	rel, err = db.CreateRelationWithID(schema, newTableId)
 	if err != nil {
-		err = moerr.NewInternalErrorNoCtx("%v: truncate %s error", err, name)
+		err = moerr.NewInternalErrorNoCtxf("%v: truncate %s error", err, name)
 	}
 	return
 }
@@ -149,19 +153,15 @@ func (db *txnDatabase) TruncateWithID(name string, newTableId uint64) (rel handl
 
 	oldRel, err := db.DropRelationByName(name)
 	if err != nil {
-		err = moerr.NewInternalErrorNoCtx("%v: truncate %s error", err, name)
+		err = moerr.NewInternalErrorNoCtxf("%v: truncate %s error", err, name)
 		return
 	}
 	meta := oldRel.GetMeta().(*catalog.TableEntry)
-	schema := meta.GetSchema().Clone()
-	latest := meta.MVCCChain.GetLatestCommittedNode()
-	if latest != nil {
-		schema.Constraint = []byte(latest.(*catalog.TableMVCCNode).SchemaConstraints)
-	}
+	schema := cloneLatestSchema(meta)
 	db.Txn.BindAccessInfo(schema.AcInfo.TenantID, schema.AcInfo.UserID, schema.AcInfo.RoleID)
 	rel, err = db.CreateRelationWithID(schema, newTableId)
 	if err != nil {
-		err = moerr.NewInternalErrorNoCtx("%v: truncate %s error", err, name)
+		err = moerr.NewInternalErrorNoCtxf("%v: truncate %s error", err, name)
 	}
 	return
 }
@@ -170,19 +170,15 @@ func (db *txnDatabase) TruncateByID(id uint64, newTableId uint64) (rel handle.Re
 
 	oldRel, err := db.DropRelationByID(id)
 	if err != nil {
-		err = moerr.NewInternalErrorNoCtx("%v: truncate %d error", err, id)
+		err = moerr.NewInternalErrorNoCtxf("%v: truncate error", err)
 		return
 	}
 	meta := oldRel.GetMeta().(*catalog.TableEntry)
-	schema := meta.GetSchema().Clone()
-	latest := meta.MVCCChain.GetLatestCommittedNode()
-	if latest != nil {
-		schema.Constraint = []byte(latest.(*catalog.TableMVCCNode).SchemaConstraints)
-	}
+	schema := cloneLatestSchema(meta)
 	db.Txn.BindAccessInfo(schema.AcInfo.TenantID, schema.AcInfo.UserID, schema.AcInfo.RoleID)
 	rel, err = db.CreateRelationWithID(schema, newTableId)
 	if err != nil {
-		err = moerr.NewInternalErrorNoCtx("%v: truncate %d error", err, id)
+		err = moerr.NewInternalErrorNoCtxf("%v: truncate %d error", err, id)
 	}
 	return
 }

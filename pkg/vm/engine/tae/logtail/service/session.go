@@ -29,6 +29,7 @@ import (
 	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/logtail"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
 type TableState int
@@ -51,7 +52,8 @@ var (
 // SessionManager manages all client sessions.
 type SessionManager struct {
 	sync.RWMutex
-	clients map[morpcStream]*Session
+	clients        map[morpcStream]*Session
+	deletedClients []*Session
 }
 
 // NewSessionManager constructs a session manager.
@@ -69,7 +71,7 @@ func (sm *SessionManager) GetSession(
 	notifier SessionErrorNotifier,
 	stream morpcStream,
 	sendTimeout time.Duration,
-	poisionTime time.Duration,
+	poisonTime time.Duration,
 	heartbeatInterval time.Duration,
 ) *Session {
 	sm.Lock()
@@ -78,7 +80,7 @@ func (sm *SessionManager) GetSession(
 	if _, ok := sm.clients[stream]; !ok {
 		sm.clients[stream] = NewSession(
 			rootCtx, logger, responses, notifier, stream,
-			sendTimeout, poisionTime, heartbeatInterval,
+			sendTimeout, poisonTime, heartbeatInterval,
 		)
 	}
 	return sm.clients[stream]
@@ -88,7 +90,19 @@ func (sm *SessionManager) GetSession(
 func (sm *SessionManager) DeleteSession(stream morpcStream) {
 	sm.Lock()
 	defer sm.Unlock()
-	delete(sm.clients, stream)
+	ss, ok := sm.clients[stream]
+	if ok {
+		delete(sm.clients, stream)
+		ss.deletedAt = time.Now()
+		sm.deletedClients = append(sm.deletedClients, ss)
+	}
+}
+
+func (sm *SessionManager) HasSession(stream morpcStream) bool {
+	sm.RLock()
+	defer sm.RUnlock()
+	_, ok := sm.clients[stream]
+	return ok
 }
 
 // ListSession takes a snapshot of all sessions.
@@ -103,8 +117,41 @@ func (sm *SessionManager) ListSession() []*Session {
 	return sessions
 }
 
+// AddSession is only for test.
+func (sm *SessionManager) AddSession(id uint64) {
+	sm.Lock()
+	defer sm.Unlock()
+	stream := morpcStream{
+		streamID: id,
+	}
+	if _, ok := sm.clients[stream]; !ok {
+		sm.clients[stream] = &Session{
+			stream: stream,
+		}
+	}
+}
+
+// AddDeletedSession is only for test.
+func (sm *SessionManager) AddDeletedSession(id uint64) {
+	sm.Lock()
+	defer sm.Unlock()
+	stream := morpcStream{streamID: id}
+	sm.deletedClients = append(sm.deletedClients, &Session{
+		stream: stream,
+	})
+}
+
+func (sm *SessionManager) DeletedSessions() []*Session {
+	sm.RLock()
+	defer sm.RUnlock()
+	sessions := make([]*Session, 0, len(sm.deletedClients))
+	sessions = append(sessions, sm.deletedClients...)
+	return sessions
+}
+
 // message describes response to be sent.
 type message struct {
+	createAt time.Time
 	timeout  time.Duration
 	response *LogtailResponse
 }
@@ -112,6 +159,7 @@ type message struct {
 // morpcStream describes morpc stream.
 type morpcStream struct {
 	streamID uint64
+	remote   string
 	limit    int
 	logger   *log.MOLogger
 	cs       morpc.ClientSession
@@ -135,7 +183,7 @@ func (s *morpcStream) write(
 	}
 	chunks := Split(buf[:n], s.limit)
 
-	s.logger.Debug("start to send response by segment",
+	s.logger.Debug("send response by segment",
 		zap.Int("chunk-number", len(chunks)),
 		zap.Int("chunk-limit", s.limit),
 		zap.Int("message-size", size),
@@ -152,12 +200,14 @@ func (s *morpcStream) write(
 
 		s.logger.Debug("real segment proto size", zap.Int("ProtoSize", seg.ProtoSize()))
 
-		if err := s.cs.Write(ctx, seg); err != nil {
-			s.segments.Release(seg)
+		st := time.Now()
+		err := s.cs.Write(ctx, seg)
+		v2.LogtailSendNetworkHistogram.Observe(time.Since(st).Seconds())
+		if err != nil {
 			return err
 		}
 	}
-
+	v2.LogTailServerSendCounter.Add(1)
 	return nil
 }
 
@@ -172,9 +222,9 @@ type Session struct {
 	responses   LogtailResponsePool
 	notifier    SessionErrorNotifier
 
-	stream      morpcStream
-	poisionTime time.Duration
-	sendChan    chan message
+	stream     morpcStream
+	poisonTime time.Duration
+	sendChan   chan message
 
 	active int32
 
@@ -185,6 +235,13 @@ type Session struct {
 	heartbeatTimer    *time.Timer
 	exactFrom         timestamp.Timestamp
 	publishInit       sync.Once
+
+	deletedAt time.Time
+	sendMu    struct {
+		sync.Mutex
+		lastBeforeSend time.Time
+		lastAfterSend  time.Time
+	}
 }
 
 type SessionErrorNotifier interface {
@@ -199,19 +256,19 @@ func NewSession(
 	notifier SessionErrorNotifier,
 	stream morpcStream,
 	sendTimeout time.Duration,
-	poisionTime time.Duration,
+	poisonTime time.Duration,
 	heartbeatInterval time.Duration,
 ) *Session {
 	ctx, cancel := context.WithCancel(rootCtx)
 	ss := &Session{
 		sessionCtx:        ctx,
 		cancelFunc:        cancel,
-		logger:            logger.With(zap.Uint64("stream-id", stream.streamID)),
+		logger:            logger.With(zap.Uint64("stream-id", stream.streamID), zap.String("remote", stream.remote)),
 		sendTimeout:       sendTimeout,
 		responses:         responses,
 		notifier:          notifier,
 		stream:            stream,
-		poisionTime:       poisionTime,
+		poisonTime:        poisonTime,
 		sendChan:          make(chan message, responseBufferSize), // buffer response for morpc client session
 		tables:            make(map[TableID]TableState),
 		heartbeatInterval: heartbeatInterval,
@@ -223,30 +280,52 @@ func NewSession(
 	sender := func() {
 		defer ss.wg.Done()
 
+		var cnt int64
+		timer := time.NewTimer(100 * time.Second)
+
 		for {
 			select {
 			case <-ss.sessionCtx.Done():
 				ss.logger.Error("stop session sender", zap.Error(ss.sessionCtx.Err()))
 				return
 
+			case <-timer.C:
+				ss.logger.Info("send logtail channel blocked", zap.Int64("sendRound", cnt))
+				if ss.TableCount() == 0 {
+					ss.logger.Error("no tables are subscribed yet, close this session")
+					ss.notifier.NotifySessionError(ss, moerr.NewInternalError(ctx, "no tables are subscribed"))
+					return
+				}
+				timer.Reset(10 * time.Second)
+
 			case msg, ok := <-ss.sendChan:
 				if !ok {
 					ss.logger.Info("session sender channel closed")
 					return
 				}
-
+				v2.LogTailSendQueueSizeGauge.Set(float64(len(ss.sendChan)))
 				sendFunc := func() error {
 					defer ss.responses.Release(msg.response)
 
-					ctx, cancel := context.WithTimeout(ss.sessionCtx, msg.timeout)
+					ctx, cancel := context.WithTimeoutCause(ss.sessionCtx, msg.timeout, moerr.CauseNewSession)
 					defer cancel()
 
+					now := time.Now()
+					v2.LogtailSendLatencyHistogram.Observe(float64(now.Sub(msg.createAt).Seconds()))
+
+					defer func() {
+						v2.LogtailSendTotalHistogram.Observe(time.Since(now).Seconds())
+					}()
+
+					ss.OnBeforeSend(now)
 					err := ss.stream.write(ctx, msg.response)
+					ss.OnAfterSend(now, cnt, msg.response.ProtoSize())
 					if err != nil {
+						err = moerr.AttachCause(ctx, err)
 						ss.logger.Error("fail to send logtail response",
 							zap.Error(err),
 							zap.String("timeout", msg.timeout.String()),
-							zap.String("response", msg.response.String()),
+							zap.String("remote address", ss.RemoteAddress()),
 						)
 						return err
 					}
@@ -257,6 +336,8 @@ func NewSession(
 					ss.notifier.NotifySessionError(ss, err)
 					return
 				}
+				cnt++
+				timer.Reset(10 * time.Second)
 			}
 		}
 	}
@@ -278,6 +359,21 @@ func (ss *Session) PostClean() {
 
 	ss.cancelFunc()
 	ss.wg.Wait()
+
+	left := len(ss.sendChan)
+
+	// release all left responses in sendChan
+	if left > 0 {
+		i := 0
+		for resp := range ss.sendChan {
+			ss.responses.Release(resp.response)
+			i++
+			if i >= left {
+				break
+			}
+		}
+		ss.logger.Info("release left responses", zap.Int("left", left))
+	}
 }
 
 // Register registers table for client.
@@ -326,12 +422,12 @@ func (ss *Session) FilterLogtail(tails ...wrapLogtail) []logtail.TableLogtail {
 	ss.mu.RLock()
 	defer ss.mu.RUnlock()
 
-	qualified := make([]logtail.TableLogtail, 0, len(ss.tables))
+	qualified := make([]logtail.TableLogtail, 0, 4)
 	for _, t := range tails {
 		if state, ok := ss.tables[t.id]; ok && state == TableSubscribed {
 			qualified = append(qualified, t.tail)
 		} else {
-			ss.logger.Info("table not subscribed, filter out",
+			ss.logger.Debug("table not subscribed, filter out",
 				zap.String("id", string(t.id)),
 				zap.String("checkpoint", t.tail.CkpLocation),
 			)
@@ -342,10 +438,13 @@ func (ss *Session) FilterLogtail(tails ...wrapLogtail) []logtail.TableLogtail {
 
 // Publish publishes incremental logtail.
 func (ss *Session) Publish(
-	ctx context.Context, from, to timestamp.Timestamp, wraps ...wrapLogtail,
+	ctx context.Context, from, to timestamp.Timestamp, closeCB func(), wraps ...wrapLogtail,
 ) error {
 	// no need to send incremental logtail if no table subscribed
 	if atomic.LoadInt32(&ss.active) <= 0 {
+		if closeCB != nil {
+			closeCB()
+		}
 		return nil
 	}
 
@@ -354,9 +453,6 @@ func (ss *Session) Publish(
 		ss.exactFrom = from
 	})
 
-	sendCtx, cancel := context.WithTimeout(ctx, ss.sendTimeout)
-	defer cancel()
-
 	qualified := ss.FilterLogtail(wraps...)
 	// if there's no incremental logtail, heartbeat by interval
 	if len(qualified) == 0 {
@@ -364,19 +460,29 @@ func (ss *Session) Publish(
 		case <-ss.heartbeatTimer.C:
 			break
 		default:
+			if closeCB != nil {
+				closeCB()
+			}
 			return nil
 		}
 	}
 
-	ss.logger.Debug("publish incremental logtail",
-		zap.Any("From", from.String()),
-		zap.Any("To", to.String()),
-	)
+	sendCtx, cancel := context.WithTimeoutCause(ctx, ss.sendTimeout, moerr.CausePublish)
+	defer cancel()
 
-	err := ss.SendUpdateResponse(sendCtx, ss.exactFrom, to, qualified...)
+	beforeSend := time.Now()
+	err := ss.SendUpdateResponse(sendCtx, ss.exactFrom, to, closeCB, qualified...)
 	if err == nil {
 		ss.heartbeatTimer.Reset(ss.heartbeatInterval)
 		ss.exactFrom = to
+	} else {
+		err = moerr.AttachCause(sendCtx, err)
+		ss.logger.Error("send update response failed",
+			zap.String("send timeout value", ss.sendTimeout.String()),
+			zap.String("send duration", time.Since(beforeSend).String()),
+			zap.Error(err),
+		)
+		ss.notifier.NotifySessionError(ss, err)
 	}
 	return err
 }
@@ -407,11 +513,12 @@ func (ss *Session) SendErrorResponse(
 
 // SendSubscriptionResponse sends subscription response.
 func (ss *Session) SendSubscriptionResponse(
-	sendCtx context.Context, tail logtail.TableLogtail,
+	sendCtx context.Context, tail logtail.TableLogtail, closeCB func(),
 ) error {
 	ss.logger.Info("send subscription response", zap.Any("table", tail.Table), zap.String("To", tail.Ts.String()))
 
 	resp := ss.responses.Acquire()
+	resp.closeCB = closeCB
 	resp.Response = newSubscritpionResponse(tail)
 	err := ss.SendResponse(sendCtx, resp)
 	if err == nil {
@@ -437,11 +544,12 @@ func (ss *Session) SendUnsubscriptionResponse(
 
 // SendUpdateResponse sends publishment response.
 func (ss *Session) SendUpdateResponse(
-	sendCtx context.Context, from, to timestamp.Timestamp, tails ...logtail.TableLogtail,
+	sendCtx context.Context, from, to timestamp.Timestamp, closeCB func(), tails ...logtail.TableLogtail,
 ) error {
 	ss.logger.Debug("send incremental logtail", zap.Any("From", from.String()), zap.String("To", to.String()), zap.Int("tables", len(tails)))
 
 	resp := ss.responses.Acquire()
+	resp.closeCB = closeCB
 	resp.Response = newUpdateResponse(from, to, tails...)
 	return ss.SendResponse(sendCtx, resp)
 }
@@ -466,8 +574,8 @@ func (ss *Session) SendResponse(
 	}
 
 	select {
-	case <-time.After(ss.poisionTime):
-		ss.logger.Error("poision morpc client session detected, close it",
+	case <-time.After(ss.poisonTime):
+		ss.logger.Error("poison morpc client session detected, close it",
 			zap.Int("buffer-capacity", cap(ss.sendChan)),
 			zap.Int("buffer-length", len(ss.sendChan)),
 		)
@@ -476,9 +584,73 @@ func (ss *Session) SendResponse(
 			ss.logger.Error("fail to close poision morpc client session", zap.Error(err))
 		}
 		return moerr.NewStreamClosedNoCtx()
-	case ss.sendChan <- message{timeout: ContextTimeout(sendCtx, ss.sendTimeout), response: response}:
+	case ss.sendChan <- message{timeout: ContextTimeout(sendCtx, ss.sendTimeout), response: response, createAt: time.Now()}:
 		return nil
 	}
+}
+
+func (ss *Session) Active() int {
+	return int(atomic.LoadInt32(&ss.active))
+}
+
+func (ss *Session) Tables() map[TableID]TableState {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	tables := make(map[TableID]TableState, len(ss.tables))
+	for k, v := range ss.tables {
+		tables[k] = v
+	}
+	return tables
+}
+
+func (ss *Session) TableCount() int {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return len(ss.tables)
+}
+
+func (ss *Session) OnBeforeSend(t time.Time) {
+	ss.sendMu.Lock()
+	defer ss.sendMu.Unlock()
+	ss.sendMu.lastBeforeSend = t
+}
+
+func (ss *Session) OnAfterSend(before time.Time, count int64, size int) {
+	ss.sendMu.Lock()
+	defer ss.sendMu.Unlock()
+	now := time.Now()
+	cost := now.Sub(before)
+	if cost > 10*time.Second {
+		ss.logger.Info("send logtail too much",
+			zap.Int64("sendRound", count),
+			zap.Duration("duration", cost),
+			zap.Int("msg size", size))
+	}
+	ss.sendMu.lastAfterSend = now
+}
+
+func (ss *Session) LastBeforeSend() time.Time {
+	ss.sendMu.Lock()
+	defer ss.sendMu.Unlock()
+	return ss.sendMu.lastBeforeSend
+}
+
+func (ss *Session) LastAfterSend() time.Time {
+	ss.sendMu.Lock()
+	defer ss.sendMu.Unlock()
+	return ss.sendMu.lastAfterSend
+}
+
+func (ss *Session) RemoteAddress() string {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.stream.remote
+}
+
+func (ss *Session) DeletedAt() time.Time {
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.deletedAt
 }
 
 // newUnsubscriptionResponse constructs response for unsubscription.

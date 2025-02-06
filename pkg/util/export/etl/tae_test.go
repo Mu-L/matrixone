@@ -16,46 +16,31 @@ package etl
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
+	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/matrixorigin/matrixone/pkg/util/export/table"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 	"github.com/matrixorigin/matrixone/pkg/util/trace/impl/motrace"
-	"github.com/stretchr/testify/require"
 )
-
-var dummyStrColumn = table.Column{Name: "str", ColType: table.TVarchar, Scale: 32, Default: "", Comment: "str column"}
-var dummyInt64Column = table.Column{Name: "int64", ColType: table.TInt64, Default: "0", Comment: "int64 column"}
-var dummyFloat64Column = table.Column{Name: "float64", ColType: table.TFloat64, Default: "0.0", Comment: "float64 column"}
-var dummyUInt64Column = table.Column{Name: "uint64", ColType: table.TUint64, Default: "0", Comment: "uint64 column"}
-var dummyDatetimeColumn = table.Column{Name: "datetime_6", ColType: table.TDatetime, Default: "", Comment: "datetime.6 column"}
-var dummyJsonColumn = table.Column{Name: "json_col", ColType: table.TJson, Default: "{}", Comment: "json column"}
-
-var dummyAllTypeTable = &table.Table{
-	Account:          "test",
-	Database:         "db_dummy",
-	Table:            "tbl_all_type_dummy",
-	Columns:          []table.Column{dummyStrColumn, dummyInt64Column, dummyFloat64Column, dummyUInt64Column, dummyDatetimeColumn, dummyJsonColumn},
-	PrimaryKeyColumn: []table.Column{dummyStrColumn, dummyInt64Column},
-	Engine:           table.ExternalTableEngine,
-	Comment:          "dummy table",
-	PathBuilder:      table.NewAccountDatePathBuilder(),
-	TableOptions:     nil,
-}
 
 func TestTAEWriter_WriteElems(t *testing.T) {
 	t.Logf("local timezone: %v", time.Local.String())
 	mp, err := mpool.NewMPool("test", 0, mpool.NoFixed)
 	require.Nil(t, err)
 	ctx := context.TODO()
-	fs := testutil.NewFS()
+	fs := testutil.NewSharedFS()
+	defer fs.Close(ctx)
 
 	filepath := path.Join(t.TempDir(), "file.tae")
 	writer := NewTAEWriter(ctx, dummyAllTypeTable, mp, filepath, fs)
@@ -74,7 +59,7 @@ func TestTAEWriter_WriteElems(t *testing.T) {
 	// Done. write
 
 	folder := path.Dir(filepath)
-	files, err := fs.List(ctx, folder)
+	files, err := fileservice.SortedList(fs.List(ctx, folder))
 	require.Nil(t, err)
 	require.Equal(t, 1, len(files))
 
@@ -85,16 +70,20 @@ func TestTAEWriter_WriteElems(t *testing.T) {
 
 	r, err := NewTaeReader(context.TODO(), dummyAllTypeTable, filepath, file.Size, fs, mp)
 	require.Nil(t, err)
+	defer r.Close()
 
 	// read data
 	batchs, err := r.ReadAll(ctx)
 	require.Nil(t, err)
 	require.Equal(t, (cnt+BatchSize)/BatchSize, len(batchs))
 
+	_, err = r.ReadLine()
+	require.Nil(t, err)
+
 	// read index
 	for _, bbs := range r.bs {
 		_, err = r.blockReader.LoadZoneMaps(context.Background(),
-			r.idxs, []uint32{bbs.GetExtent().Id()}, mp)
+			r.idxs, bbs.GetID(), mp)
 		require.Nil(t, err)
 	}
 
@@ -129,12 +118,12 @@ func genLines(cnt int) (lines []*table.Row) {
 	defer r.Free()
 	for i := 0; i < cnt; i++ {
 		row := r.Clone()
-		row.SetColumnVal(dummyStrColumn, fmt.Sprintf("str_val_%d", i))
-		row.SetColumnVal(dummyInt64Column, int64(i))
-		row.SetColumnVal(dummyFloat64Column, float64(i))
-		row.SetColumnVal(dummyUInt64Column, uint64(i))
-		row.SetColumnVal(dummyDatetimeColumn, time.Now())
-		row.SetColumnVal(dummyJsonColumn, fmt.Sprintf(`{"cnt":"%d"}`, i))
+		row.SetColumnVal(dummyStrColumn, table.StringField(fmt.Sprintf("str_val_%d", i)))
+		row.SetColumnVal(dummyInt64Column, table.Int64Field(int64(i)))
+		row.SetColumnVal(dummyFloat64Column, table.Float64Field(float64(i)))
+		row.SetColumnVal(dummyUInt64Column, table.Uint64Field(uint64(i)))
+		row.SetColumnVal(dummyDatetimeColumn, table.TimeField(time.Now()))
+		row.SetColumnVal(dummyJsonColumn, table.StringField(fmt.Sprintf(`{"cnt":"%d"}`, i)))
 		lines = append(lines, row)
 	}
 
@@ -146,7 +135,7 @@ func TestTAEWriter_WriteRow(t *testing.T) {
 	mp, err := mpool.NewMPool("test", 0, mpool.NoFixed)
 	require.Nil(t, err)
 	ctx := context.TODO()
-	fs := testutil.NewFS()
+	fs := testutil.NewSharedFS()
 
 	type fields struct {
 		ctx context.Context
@@ -197,7 +186,7 @@ func TestTAEWriter_WriteRow(t *testing.T) {
 				Account:              "MO",
 				User:                 "moroot",
 				Database:             "system",
-				Statement:            "show tables",
+				Statement:            []byte("show tables"),
 				StatementFingerprint: "show tables",
 				StatementTag:         "",
 				ExecPlan:             nil,
@@ -254,7 +243,7 @@ func TestTAEWriter_WriteRow(t *testing.T) {
 			writer.FlushAndClose()
 
 			folder := path.Dir(filePath)
-			entrys, err := fs.List(ctx, folder)
+			entrys, err := fileservice.SortedList(fs.List(ctx, folder))
 			require.Nil(t, err)
 			require.NotEqual(t, 0, len(entrys))
 			for _, e := range entrys {
@@ -271,9 +260,9 @@ func TestTaeReadFile(t *testing.T) {
 	mp, err := mpool.NewMPool("TestTaeReadFile", 0, mpool.NoFixed)
 	require.Nil(t, err)
 	ctx := context.TODO()
-	fs := testutil.NewFS()
+	fs := testutil.NewETLFS()
 
-	entrys, err := fs.List(context.TODO(), "etl:/")
+	entrys, err := fileservice.SortedList(fs.List(context.TODO(), "etl:/"))
 	require.Nil(t, err)
 	if len(entrys) == 0 {
 		t.Skip()
@@ -293,7 +282,7 @@ func TestTaeReadFile(t *testing.T) {
 	// read index
 	for _, bbs := range r.bs {
 		_, err = r.blockReader.LoadZoneMaps(context.Background(),
-			r.idxs, []uint32{bbs.GetExtent().Id()}, mp)
+			r.idxs, bbs.GetID(), mp)
 		require.Nil(t, err)
 	}
 
@@ -326,10 +315,10 @@ func TestTaeReadFile_ReadAll(t *testing.T) {
 	mp, err := mpool.NewMPool("TestTaeReadFile", 0, mpool.NoFixed)
 	require.Nil(t, err)
 	ctx := context.TODO()
-	fs := testutil.NewFS()
+	fs := testutil.NewETLFS()
 
 	folder := "/sys/logs/2023/01/11/rawlog"
-	entrys, err := fs.List(context.TODO(), "etl:"+folder)
+	entrys, err := fileservice.SortedList(fs.List(context.TODO(), "etl:"+folder))
 	require.Nil(t, err)
 	if len(entrys) == 0 {
 		t.Skip()
@@ -352,7 +341,7 @@ func TestTaeReadFile_ReadAll(t *testing.T) {
 		// read index
 		for _, bbs := range r.bs {
 			_, err = r.blockReader.LoadZoneMaps(context.Background(),
-				r.idxs, []uint32{bbs.GetExtent().Id()}, mp)
+				r.idxs, bbs.GetID(), mp)
 			require.Nil(t, err)
 		}
 
@@ -385,4 +374,64 @@ func TestTaeReadFile_ReadAll(t *testing.T) {
 		t.Logf("cnt: %v", itemsCnt)
 	}
 	t.Logf("cnt: %v", itemsCnt)
+}
+
+func TestTAEWriter_writeEmpty(t *testing.T) {
+	cfg := table.FilePathCfg{NodeUUID: "uuid", NodeType: "type", Extension: table.TaeExtension}
+	ctx := context.TODO()
+	tbl := motrace.SingleStatementTable
+	fs := testutil.NewSharedFS()
+	filePath := cfg.LogsFilePathFactory("sys", tbl, time.Now())
+	mp, err := mpool.NewMPool("test", 0, mpool.NoFixed)
+	require.Nil(t, err)
+	writer := NewTAEWriter(ctx, tbl, mp, filePath, fs)
+	_, err = writer.FlushAndClose()
+	require.NotNil(t, err)
+	var e *moerr.Error
+	require.True(t, errors.As(err, &e))
+	require.Equal(t, moerr.ErrEmptyRange, e.ErrorCode())
+}
+
+func TestTAEWriter_WriteStrings(t *testing.T) {
+
+	type fields struct {
+	}
+	type args struct {
+		prepare func() (Line []string)
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		args    args
+		wantErr bool
+	}{
+		{
+			name: "normal",
+			args: args{
+				prepare: func() (Line []string) {
+					rows := genLines(1)
+					return rows[0].ToStrings()
+				},
+			},
+			wantErr: false,
+		},
+	}
+
+	cfg := table.FilePathCfg{NodeUUID: "uuid", NodeType: "type", Extension: table.TaeExtension}
+	ctx := context.TODO()
+	tbl := dummyAllTypeTable
+	fs := testutil.NewSharedFS()
+	filePath := cfg.LogsFilePathFactory("sys", tbl, time.Now())
+	mp, err := mpool.NewMPool("test", 0, mpool.NoFixed)
+	require.Nil(t, err)
+	writer := NewTAEWriter(ctx, tbl, mp, filePath, fs)
+	defer writer.FlushAndClose()
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := writer.WriteStrings(tt.args.prepare()); (err != nil) != tt.wantErr {
+				t.Errorf("WriteStrings() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
 }

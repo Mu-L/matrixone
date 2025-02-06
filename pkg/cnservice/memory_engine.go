@@ -31,7 +31,6 @@ func (s *service) initMemoryEngine(
 	ctx context.Context,
 	pu *config.ParameterUnit,
 ) error {
-
 	// txn client
 	client, err := s.getTxnClient()
 	if err != nil {
@@ -52,6 +51,7 @@ func (s *service) initMemoryEngine(
 	}
 	pu.StorageEngine = memoryengine.New(
 		ctx,
+		s.cfg.UUID,
 		memoryengine.NewDefaultShardPolicy(mp),
 		memoryengine.NewHakeeperIDGenerator(hakeeper),
 		s.moCluster,
@@ -64,30 +64,36 @@ func (s *service) initMemoryEngineNonDist(
 	ctx context.Context,
 	pu *config.ParameterUnit,
 ) error {
-	ck := runtime.ProcessLevelRuntime().Clock()
+	ck := runtime.ServiceRuntime(s.cfg.UUID).Clock()
 	mp, err := mpool.NewMPool("cnservice_mem_engine_nondist", 0, mpool.NoFixed)
 	if err != nil {
 		return err
 	}
 
-	shard := metadata.DNShard{}
+	shard := metadata.TNShard{}
 	shard.ShardID = 2
 	shard.ReplicaID = 2
-	shards := []metadata.DNShard{
+	shards := []metadata.TNShard{
 		shard,
 	}
-	dnAddr := "1"
-	dnServices := []metadata.DNService{{
-		ServiceID:         uuid.NewString(),
-		TxnServiceAddress: dnAddr,
+	tnAddr := "1"
+	uid, _ := uuid.NewV7()
+	tnServices := []metadata.TNService{{
+		ServiceID:         uid.String(),
+		TxnServiceAddress: tnAddr,
 		Shards:            shards,
 	}}
-	cluster := clusterservice.NewMOCluster(nil, 0,
+	cluster := clusterservice.NewMOCluster(
+		s.cfg.UUID,
+		nil,
+		0,
 		clusterservice.WithDisableRefresh(),
-		clusterservice.WithServices(nil, dnServices))
-	runtime.ProcessLevelRuntime().SetGlobalVariables(runtime.ClusterService, cluster)
+		clusterservice.WithServices(nil, tnServices),
+	)
+	runtime.ServiceRuntime(s.cfg.UUID).SetGlobalVariables(runtime.ClusterService, cluster)
 
 	storage, err := memorystorage.NewMemoryStorage(
+		s.cfg.UUID,
 		mp,
 		ck,
 		memoryengine.RandomIDGenerator,
@@ -99,18 +105,19 @@ func (s *service) initMemoryEngineNonDist(
 	txnClient := memorystorage.NewStorageTxnClient(
 		ck,
 		map[string]*memorystorage.Storage{
-			dnAddr: storage,
+			tnAddr: storage,
 		},
 	)
 	pu.TxnClient = txnClient
 
-	engine := memoryengine.New(
+	s.storeEngine = memoryengine.New(
 		ctx,
+		s.cfg.UUID,
 		memoryengine.NewDefaultShardPolicy(mp),
 		memoryengine.RandomIDGenerator,
 		cluster,
 	)
-	pu.StorageEngine = engine
-
+	pu.StorageEngine = s.storeEngine
+	s.initInternalSQlExecutor(mp)
 	return nil
 }

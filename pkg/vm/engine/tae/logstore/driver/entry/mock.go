@@ -35,6 +35,7 @@ func MockEntry() *Entry {
 	payloadSize := 100
 
 	e := entry.GetBase()
+	e.SetType(entry.IOET_WALEntry_Test)
 	info := &entry.Info{GroupLSN: uint64(rand.Intn(1000))}
 	e.SetInfo(info)
 	payload := make([]byte, payloadSize)
@@ -45,4 +46,18 @@ func MockEntry() *Entry {
 	}
 	e.PrepareWrite()
 	return NewEntry(e)
+}
+
+func MockEntryWithPayload(payload []byte) *Entry {
+	e := entry.GetBase()
+	e.SetType(entry.IOET_WALEntry_Test)
+	info := &entry.Info{GroupLSN: uint64(rand.Intn(1000))}
+	e.SetInfo(info)
+	err := e.SetPayload(payload)
+	if err != nil {
+		panic(err)
+	}
+	e.PrepareWrite()
+	return NewEntry(e)
+
 }

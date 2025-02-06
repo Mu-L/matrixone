@@ -15,13 +15,17 @@
 package lockservice
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"io"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/log"
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/common/runtime"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/lock"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
+	v2 "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 	"github.com/matrixorigin/matrixone/pkg/util/trace"
 	"go.uber.org/zap"
 )
@@ -30,6 +34,7 @@ import (
 // And the remoteLockTable acts as a proxy for this LockTable locally.
 type remoteLockTable struct {
 	logger             *log.MOLogger
+	removeLockTimeout  time.Duration
 	serviceID          string
 	bind               pb.LockTable
 	client             Client
@@ -38,15 +43,16 @@ type remoteLockTable struct {
 
 func newRemoteLockTable(
 	serviceID string,
+	removeLockTimeout time.Duration,
 	binding pb.LockTable,
 	client Client,
-	bindChangedHandler func(pb.LockTable)) *remoteLockTable {
-	tag := "remote-lock-table"
-	logger := runtime.ProcessLevelRuntime().Logger().
-		Named(tag).
-		With(zap.String("binding", binding.DebugString()))
+	bindChangedHandler func(pb.LockTable),
+	logger *log.MOLogger,
+) *remoteLockTable {
+	logger = logger.With(zap.String("binding", binding.DebugString()))
 	l := &remoteLockTable{
 		logger:             logger,
+		removeLockTimeout:  removeLockTimeout,
 		serviceID:          serviceID,
 		client:             client,
 		bind:               binding,
@@ -59,98 +65,115 @@ func (l *remoteLockTable) lock(
 	ctx context.Context,
 	txn *activeTxn,
 	rows [][]byte,
-	opts LockOptions) (pb.Result, error) {
+	opts LockOptions,
+	cb func(pb.Result, error),
+) {
+	v2.TxnRemoteLockTotalCounter.Inc()
+
 	// FIXME(fagongzi): too many mem alloc in trace
 	ctx, span := trace.Debug(ctx, "lockservice.lock.remote")
 	defer span.End()
 
-	logRemoteLock(l.serviceID, txn, rows, opts, l.bind)
+	logRemoteLock(l.logger, txn, rows, opts, l.bind)
 
 	req := acquireRequest()
 	defer releaseRequest(req)
 
 	req.LockTable = l.bind
 	req.Method = pb.Method_Lock
-	req.Lock.Options = opts
+	req.Lock.Options = opts.LockOptions
 	req.Lock.TxnID = txn.txnID
 	req.Lock.ServiceID = l.serviceID
 	req.Lock.Rows = rows
 
+	// rpc maybe wait too long, to avoid deadlock, we need unlock txn, and lock again
+	// after rpc completed
+	txn.Unlock()
 	resp, err := l.client.Send(ctx, req)
+	txn.Lock()
+
+	// txn closed
+	if !bytes.Equal(req.Lock.TxnID, txn.txnID) {
+		cb(pb.Result{}, ErrTxnNotFound)
+		return
+	}
+
 	if err == nil {
 		defer releaseResponse(resp)
 		if err := l.maybeHandleBindChanged(resp); err != nil {
-			logRemoteLockFailed(l.serviceID, txn, rows, opts, l.bind, err)
-			return pb.Result{}, err
+			logRemoteLockFailed(l.logger, txn, rows, opts, l.bind, err)
+			cb(pb.Result{}, err)
+			return
 		}
 
-		// we use mutex lock here to avoid the deadlock detection
-		// mechanism reading an incorrect data.
-		txn.Lock()
-		defer txn.Unlock()
-		txn.lockAdded(l.serviceID, l.bind.Table, rows, true)
-		logRemoteLockAdded(l.serviceID, txn, rows, opts, l.bind)
-		return resp.Lock.Result, nil
+		err = txn.lockAdded(l.bind.Group, l.bind, rows, l.logger)
+		logRemoteLockAdded(l.logger, txn, rows, opts, l.bind)
+		cb(resp.Lock.Result, err)
+		return
 	}
 
-	logRemoteLockFailed(l.serviceID, txn, rows, opts, l.bind, err)
+	// encounter any error, we also added lock to txn, because we need unlock on remote
+	_ = txn.lockAdded(l.bind.Group, l.bind, rows, l.logger)
+	logRemoteLockFailed(l.logger, txn, rows, opts, l.bind, err)
 	// encounter any error, we need try to check bind is valid.
 	// And use origin error to return, because once handlerError
 	// swallows the error, the transaction will not be abort.
-	_ = l.handleError(txn.txnID, err)
-	return pb.Result{}, err
+	if e := l.handleError(err, true); e != nil {
+		err = e
+	}
+	cb(pb.Result{}, err)
 }
 
 func (l *remoteLockTable) unlock(
 	txn *activeTxn,
 	ls *cowSlice,
-	commitTS timestamp.Timestamp) {
+	commitTS timestamp.Timestamp,
+	mutations ...pb.ExtraMutation) {
 	logUnlockTableOnRemote(
-		l.serviceID,
+		l.logger,
 		txn,
-		l.bind)
+		l.bind,
+	)
 	for {
-		err := l.doUnlock(txn, commitTS)
+		err := l.doUnlock(txn, commitTS, mutations...)
 		if err == nil {
 			return
 		}
 
 		logUnlockTableOnRemoteFailed(
-			l.serviceID,
+			l.logger,
 			txn,
 			l.bind,
-			err)
+			err,
+		)
 		// unlock cannot fail and must ensure that all locks have been
 		// released.
 		//
 		// handleError returns nil meaning bind changed, then all locks
 		// will be released. If handleError returns any error, it means
 		// that the current bind is valid, retry unlock.
-		if err := l.handleError(txn.txnID, err); err == nil {
+		if err := l.handleError(err, false); err == nil {
 			return
 		}
 	}
 }
 
-func (l *remoteLockTable) getLock(txnID, key []byte, fn func(Lock)) {
+func (l *remoteLockTable) getLock(
+	key []byte,
+	txn pb.WaitTxn,
+	fn func(Lock)) {
 	for {
-		lock, ok, err := l.doGetLock(txnID, key)
+		lock, ok, err := l.doGetLock(key, txn)
 		if err == nil {
 			if ok {
 				fn(lock)
-				w := lock.waiter
-				for {
-					w = w.close(l.serviceID, notifyValue{})
-					if w == nil {
-						break
-					}
-				}
+				lock.close(notifyValue{})
 			}
 			return
 		}
 
 		// why use loop is similar to unlock
-		if err = l.handleError(txnID, err); err == nil {
+		if err = l.handleError(err, false); err == nil {
 			return
 		}
 	}
@@ -158,8 +181,9 @@ func (l *remoteLockTable) getLock(txnID, key []byte, fn func(Lock)) {
 
 func (l *remoteLockTable) doUnlock(
 	txn *activeTxn,
-	commitTS timestamp.Timestamp) error {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultRPCTimeout)
+	commitTS timestamp.Timestamp,
+	mutations ...pb.ExtraMutation) error {
+	ctx, cancel := context.WithTimeoutCause(context.Background(), defaultRPCTimeout, moerr.CauseDoUnlock)
 	defer cancel()
 
 	req := acquireRequest()
@@ -169,17 +193,18 @@ func (l *remoteLockTable) doUnlock(
 	req.LockTable = l.bind
 	req.Unlock.TxnID = txn.txnID
 	req.Unlock.CommitTS = commitTS
+	req.Unlock.Mutations = mutations
 
 	resp, err := l.client.Send(ctx, req)
 	if err == nil {
 		defer releaseResponse(resp)
 		return l.maybeHandleBindChanged(resp)
 	}
-	return err
+	return moerr.AttachCause(ctx, err)
 }
 
-func (l *remoteLockTable) doGetLock(txnID, key []byte) (Lock, bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), defaultRPCTimeout)
+func (l *remoteLockTable) doGetLock(key []byte, txn pb.WaitTxn) (Lock, bool, error) {
+	ctx, cancel := context.WithTimeoutCause(context.Background(), defaultRPCTimeout, moerr.CauseDoGetLock)
 	defer cancel()
 
 	req := acquireRequest()
@@ -188,7 +213,7 @@ func (l *remoteLockTable) doGetLock(txnID, key []byte) (Lock, bool, error) {
 	req.Method = pb.Method_GetTxnLock
 	req.LockTable = l.bind
 	req.GetTxnLock.Row = key
-	req.GetTxnLock.TxnID = txnID
+	req.GetTxnLock.TxnID = txn.TxnID
 
 	resp, err := l.client.Send(ctx, req)
 	if err == nil {
@@ -197,18 +222,22 @@ func (l *remoteLockTable) doGetLock(txnID, key []byte) (Lock, bool, error) {
 			return Lock{}, false, err
 		}
 
+		wq := newWaiterQueue()
+		wq.init(l.logger)
 		lock := Lock{
-			txnID:  txnID,
-			value:  byte(resp.GetTxnLock.Value),
-			waiter: acquireWaiter(l.serviceID, txnID),
+			holders: newHolders(),
+			waiters: wq,
+			value:   byte(resp.GetTxnLock.Value),
 		}
+		lock.holders.add(txn)
 		for _, v := range resp.GetTxnLock.WaitingList {
-			w := acquireWaiter(l.serviceID, v)
-			lock.waiter.add(l.serviceID, w)
+			w := acquireWaiter(v, "doGetLock", l.logger)
+			lock.addWaiter(l.logger, w)
+			w.close("doGetLock", l.logger)
 		}
 		return lock, true, nil
 	}
-	return Lock{}, false, err
+	return Lock{}, false, moerr.AttachCause(ctx, err)
 }
 
 func (l *remoteLockTable) getBind() pb.LockTable {
@@ -216,13 +245,21 @@ func (l *remoteLockTable) getBind() pb.LockTable {
 }
 
 func (l *remoteLockTable) close() {
-	logLockTableClosed(l.serviceID, l.bind, true)
+	logLockTableClosed(l.logger, l.bind, true)
 }
 
-func (l *remoteLockTable) handleError(txnID []byte, err error) error {
+func (l *remoteLockTable) handleError(
+	err error,
+	mustHandleLockBindChangedErr bool,
+) error {
+	if errors.Is(err, io.EOF) ||
+		errors.Is(err, io.ErrUnexpectedEOF) ||
+		moerr.IsMoErrCode(err, moerr.ErrUnexpectedEOF) {
+		err = moerr.NewBackendCannotConnectNoCtx(err.Error())
+	}
 	oldError := err
 	// ErrLockTableBindChanged error must already handled. Skip
-	if moerr.IsMoErrCode(err, moerr.ErrLockTableBindChanged) {
+	if !mustHandleLockBindChangedErr && moerr.IsMoErrCode(err, moerr.ErrLockTableBindChanged) {
 		return nil
 	}
 
@@ -232,10 +269,14 @@ func (l *remoteLockTable) handleError(txnID []byte, err error) error {
 	// the bind is valid.
 	new, err := getLockTableBind(
 		l.client,
+		l.bind.Group,
 		l.bind.Table,
-		l.serviceID)
+		l.bind.OriginTable,
+		l.serviceID,
+		l.bind.Sharding,
+	)
 	if err != nil {
-		logGetRemoteBindFailed(l.serviceID, l.bind.Table, err)
+		logGetRemoteBindFailed(l.logger, l.bind.Table, err)
 		return oldError
 	}
 	if new.Changed(l.bind) {
@@ -252,4 +293,12 @@ func (l *remoteLockTable) maybeHandleBindChanged(resp *pb.Response) error {
 	newBind := resp.NewBind
 	l.bindChangedHandler(*newBind)
 	return ErrLockTableBindChanged
+}
+
+func isRetryError(err error) bool {
+	if moerr.IsMoErrCode(err, moerr.ErrBackendClosed) ||
+		moerr.IsMoErrCode(err, moerr.ErrBackendCannotConnect) {
+		return false
+	}
+	return true
 }

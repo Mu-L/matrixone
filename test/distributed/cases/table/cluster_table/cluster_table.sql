@@ -48,6 +48,17 @@ use mo_catalog;
 drop table if exists cluster_table_1;
 create cluster table cluster_table_1(a int, b int);
 
+drop table if exists statement_cu;
+
+CREATE CLUSTER TABLE `statement_cu` (
+`statement_id` VARCHAR(36) NOT NULL,
+`account` VARCHAR(300) NOT NULL,
+`response_at` DATETIME DEFAULT NULL,
+`cu` DECIMAL(23,3) NOT NULL,
+PRIMARY KEY (`statement_id`,`account_id`)
+);
+
+
 drop account if exists test_account1;
 create account test_account1 admin_name = 'test_user' identified by '111';
 
@@ -56,7 +67,7 @@ create account test_account2 admin_name = 'test_user' identified by '111';
 
 insert into cluster_table_1 values(0,0,0),(1,1,0);
 insert into cluster_table_1 values(0,0,1),(1,1,1);
-insert into cluster_table_1 values(0,0,2),(1,1,2);
+insert into cluster_table_1 values(0,0,2),(1,1,2) on duplicate key update b=b;
 update cluster_table_1 set account_id=(select account_id from mo_account where account_name="test_account1") where account_id=1;
 update cluster_table_1 set account_id=(select account_id from mo_account where account_name="test_account2") where account_id=2;
 select a,b from cluster_table_1;
@@ -64,11 +75,13 @@ select a,b from cluster_table_1;
 -- @session:id=2&user=test_account1:test_user&password=111
 use mo_catalog;
 select * from cluster_table_1;
+SELECT attname AS name, mo_show_visible_bin(atttyp,3) AS data_type, replace(mo_table_col_max(att_database,att_relname,attname),'\\0', '') AS `maximum`,  mo_table_col_min(att_database,att_relname,attname) as minimum from mo_catalog.mo_columns where att_database='mo_catalog' and att_relname='statement_cu' and attname NOT IN  ('__mo_rowid', '__mo_cpkey_col', '__mo_fake_pk_col') ORDER BY attnum;
 -- @session
 
 -- @session:id=3&user=test_account2:test_user&password=111
 use mo_catalog;
 select * from cluster_table_1;
+SELECT attname AS name, mo_show_visible_bin(atttyp,3) AS data_type, replace(mo_table_col_max(att_database,att_relname,attname),'\\0', '') AS `maximum`,  mo_table_col_min(att_database,att_relname,attname) as minimum from mo_catalog.mo_columns where att_database='mo_catalog' and att_relname='statement_cu' and attname NOT IN  ('__mo_rowid', '__mo_cpkey_col', '__mo_fake_pk_col') ORDER BY attnum;
 -- @session
 
 insert into cluster_table_1 values(200,200, 0);
@@ -103,7 +116,7 @@ col8 text,
 col9 varchar
 );
 
-load data infile '$resources/load_data/cluster_table.csv' into table cluster_table_2;
+load data infile '$resources/load_data/cluster_table.csv' into table cluster_table_2 fields terminated by ',';
 update cluster_table_2 set account_id=(select account_id from mo_account where account_name="test_account1") where account_id=1;
 update cluster_table_2 set account_id=(select account_id from mo_account where account_name="test_account2") where account_id=2;
 select col1,col2,col3,col4,col5,col6,col7,col8,col9 from cluster_table_2;
@@ -379,3 +392,17 @@ CREATE CLUSTER TABLE mo_instance (id varchar(128) NOT NULL,name VARCHAR(255) NOT
 create account acc_idx ADMIN_NAME 'root' IDENTIFIED BY '123456';
 drop account acc_idx;
 drop table mo_instance;
+drop table if exists statement_cu;
+
+use mo_catalog;
+DROP TABLE IF EXISTS `mo_catalog`.`document`;
+CREATE CLUSTER TABLE IF NOT EXISTS `mo_catalog`.`document` (`id` VARCHAR(36) NOT NULL, `kb_id` BIGINT NOT NULL, `name` VARCHAR(100) NOT NULL, `user` VARCHAR(100) NOT NULL, `path` VARCHAR(256) NOT NULL, `reason` VARCHAR(256) NOT NULL, `size` BIGINT NOT NULL, `seg_count` BIGINT NOT NULL, `data_source` TINYINT NOT NULL, `doc_type` TINYINT NOT NULL, `status` TINYINT NOT NULL, `created_at` DATETIME(3) DEFAULT NULL, `updated_at` DATETIME(3) DEFAULT NULL,PRIMARY KEY (`id`, `account_id`));
+desc document;
+ALTER TABLE document add meta longtext;
+desc document;
+DROP TABLE document;
+CREATE CLUSTER TABLE IF NOT EXISTS `mo_catalog`.`document` (`id` VARCHAR(36) NOT NULL, `kb_id` BIGINT NOT NULL, `name` VARCHAR(100) NOT NULL, `user` VARCHAR(100) NOT NULL, `path` VARCHAR(256) NOT NULL, `reason` VARCHAR(256) NOT NULL, `size` BIGINT NOT NULL, `seg_count` BIGINT NOT NULL, `data_source` TINYINT NOT NULL, `doc_type` TINYINT NOT NULL, `status` TINYINT NOT NULL, `created_at` DATETIME(3) DEFAULT NULL, `updated_at` DATETIME(3) DEFAULT NULL,PRIMARY KEY (`id`, `account_id`));
+desc mo_catalog.document;
+ALTER TABLE mo_catalog.document add meta longtext;
+desc mo_catalog.document;
+DROP TABLE mo_catalog.document;

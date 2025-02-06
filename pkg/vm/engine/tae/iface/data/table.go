@@ -20,16 +20,15 @@ import (
 )
 
 var (
-	ErrAppendableBlockNotFound   = moerr.NewAppendableBlockNotFoundNoCtx()
-	ErrAppendableSegmentNotFound = moerr.NewAppendableSegmentNotFoundNoCtx()
+	ErrAppendableObjectNotFound = moerr.NewAppendableObjectNotFoundNoCtx()
 )
 
 type TableHandle interface {
-	GetAppender() (BlockAppender, error)
-	SetAppender(*common.ID) BlockAppender
+	GetAppender() (ObjectAppender, error)
+	SetAppender(*common.ID) ObjectAppender
 }
 
 type Table interface {
-	GetHandle() TableHandle
-	ApplyHandle(TableHandle)
+	GetHandle(bool) TableHandle
+	ApplyHandle(TableHandle, bool)
 }

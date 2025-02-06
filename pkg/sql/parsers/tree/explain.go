@@ -17,7 +17,35 @@ package tree
 import (
 	"strconv"
 	"strings"
+
+	"github.com/matrixorigin/matrixone/pkg/common/reuse"
 )
+
+func init() {
+	reuse.CreatePool[ExplainStmt](
+		func() *ExplainStmt { return &ExplainStmt{} },
+		func(e *ExplainStmt) { e.reset() },
+		reuse.DefaultOptions[ExplainStmt](), //.
+	) //WithEnableChecker()
+
+	reuse.CreatePool[ExplainAnalyze](
+		func() *ExplainAnalyze { return &ExplainAnalyze{} },
+		func(e *ExplainAnalyze) { e.reset() },
+		reuse.DefaultOptions[ExplainAnalyze](), //.
+	) //WithEnableChecker()
+
+	reuse.CreatePool[ExplainFor](
+		func() *ExplainFor { return &ExplainFor{} },
+		func(e *ExplainFor) { e.reset() },
+		reuse.DefaultOptions[ExplainFor](), //.
+	) //WithEnableChecker()
+
+	reuse.CreatePool[ExplainPhyPlan](
+		func() *ExplainPhyPlan { return &ExplainPhyPlan{} },
+		func(e *ExplainPhyPlan) { e.reset() },
+		reuse.DefaultOptions[ExplainPhyPlan](), //.
+	) //WithEnableChecker()
+}
 
 type Explain interface {
 	Statement
@@ -30,6 +58,9 @@ type explainImpl struct {
 	Options   []OptionElem
 }
 
+func (e *explainImpl) Free() {
+}
+
 // EXPLAIN stmt statement
 type ExplainStmt struct {
 	explainImpl
@@ -37,7 +68,7 @@ type ExplainStmt struct {
 
 func (node *ExplainStmt) Format(ctx *FmtCtx) {
 	ctx.WriteString("explain")
-	if node.Options != nil && len(node.Options) > 0 {
+	if len(node.Options) > 0 {
 		ctx.WriteString(" (")
 		var temp string
 		for _, v := range node.Options {
@@ -72,8 +103,23 @@ func (node *ExplainStmt) Format(ctx *FmtCtx) {
 func (node *ExplainStmt) GetStatementType() string { return "Explain" }
 func (node *ExplainStmt) GetQueryType() string     { return QueryTypeOth }
 
+// EXPLAIN FOR CONNECTION statement
+
+func (node *ExplainStmt) Free() {
+	reuse.Free[ExplainStmt](node, nil)
+}
+
+func (node *ExplainStmt) reset() {
+	*node = ExplainStmt{}
+}
+
+func (node ExplainStmt) TypeName() string { return "tree.ExplainStmt" }
+
 func NewExplainStmt(stmt Statement, f string) *ExplainStmt {
-	return &ExplainStmt{explainImpl{Statement: stmt, Format: f}}
+	ex := reuse.Alloc[ExplainStmt](nil)
+	ex.explainImpl.Statement = stmt
+	ex.explainImpl.Format = f
+	return ex
 }
 
 // EXPLAIN ANALYZE statement
@@ -83,7 +129,7 @@ type ExplainAnalyze struct {
 
 func (node *ExplainAnalyze) Format(ctx *FmtCtx) {
 	ctx.WriteString("explain")
-	if node.Options != nil && len(node.Options) > 0 {
+	if len(node.Options) > 0 {
 		ctx.WriteString(" (")
 		var temp string
 		for _, v := range node.Options {
@@ -118,8 +164,21 @@ func (node *ExplainAnalyze) Format(ctx *FmtCtx) {
 func (node *ExplainAnalyze) GetStatementType() string { return "Explain Analyze" }
 func (node *ExplainAnalyze) GetQueryType() string     { return QueryTypeOth }
 
+func (node *ExplainAnalyze) Free() {
+	reuse.Free[ExplainAnalyze](node, nil)
+}
+
+func (node *ExplainAnalyze) reset() {
+	*node = ExplainAnalyze{}
+}
+
+func (node ExplainAnalyze) TypeName() string { return "tree.ExplainAnalyze" }
+
 func NewExplainAnalyze(stmt Statement, f string) *ExplainAnalyze {
-	return &ExplainAnalyze{explainImpl{Statement: stmt, Format: f}}
+	ex := reuse.Alloc[ExplainAnalyze](nil)
+	ex.explainImpl.Statement = stmt
+	ex.explainImpl.Format = f
+	return ex
 }
 
 // EXPLAIN FOR CONNECTION statement
@@ -138,11 +197,21 @@ func (node *ExplainFor) Format(ctx *FmtCtx) {
 func (node *ExplainFor) GetStatementType() string { return "Explain Format" }
 func (node *ExplainFor) GetQueryType() string     { return QueryTypeOth }
 
+func (node *ExplainFor) Free() {
+	reuse.Free[ExplainFor](node, nil)
+}
+
+func (node *ExplainFor) reset() {
+	*node = ExplainFor{}
+}
+
+func (node ExplainFor) TypeName() string { return "tree.ExplainFor" }
+
 func NewExplainFor(f string, id uint64) *ExplainFor {
-	return &ExplainFor{
-		explainImpl: explainImpl{Statement: nil, Format: f},
-		ID:          id,
-	}
+	ex := reuse.Alloc[ExplainFor](nil)
+	ex.explainImpl = explainImpl{Statement: nil, Format: f}
+	ex.ID = id
+	return ex
 }
 
 type OptionElem struct {
@@ -172,4 +241,75 @@ func IsContainAnalyze(options []OptionElem) bool {
 		}
 	}
 	return false
+}
+
+func IsContainPhyPlan(options []OptionElem) bool {
+	if len(options) > 0 {
+		for _, option := range options {
+			if strings.EqualFold(option.Name, "phyplan") && strings.EqualFold(option.Value, "true") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// --------------------------------------------------------------------------------------
+// EXPLAIN PhyPlan statement
+type ExplainPhyPlan struct {
+	explainImpl
+}
+
+func (node *ExplainPhyPlan) Format(ctx *FmtCtx) {
+	ctx.WriteString("explain")
+	if len(node.Options) > 0 {
+		ctx.WriteString(" (")
+		var temp string
+		for _, v := range node.Options {
+			temp += v.Name
+			if v.Value != "NULL" {
+				temp += " " + v.Value
+			}
+			temp += ","
+		}
+		ctx.WriteString(temp[:len(temp)-1] + ")")
+	}
+
+	stmt := node.explainImpl.Statement
+	switch st := stmt.(type) {
+	case *ShowColumns:
+		if st.Table != nil {
+			ctx.WriteByte(' ')
+			st.Table.ToTableName().Format(ctx)
+		}
+		if st.ColName != nil {
+			ctx.WriteByte(' ')
+			st.ColName.Format(ctx)
+		}
+	default:
+		if stmt != nil {
+			ctx.WriteByte(' ')
+			stmt.Format(ctx)
+		}
+	}
+}
+
+func (node *ExplainPhyPlan) GetStatementType() string { return "Explain PhyPlan" }
+func (node *ExplainPhyPlan) GetQueryType() string     { return QueryTypeOth }
+
+func (node *ExplainPhyPlan) Free() {
+	reuse.Free[ExplainPhyPlan](node, nil)
+}
+
+func (node *ExplainPhyPlan) reset() {
+	*node = ExplainPhyPlan{}
+}
+
+func (node ExplainPhyPlan) TypeName() string { return "tree.ExplainPhyPlan" }
+
+func NewExplainPhyPlan(stmt Statement, f string) *ExplainPhyPlan {
+	ex := reuse.Alloc[ExplainPhyPlan](nil)
+	ex.explainImpl.Statement = stmt
+	ex.explainImpl.Format = f
+	return ex
 }

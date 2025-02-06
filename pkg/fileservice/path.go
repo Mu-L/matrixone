@@ -17,6 +17,7 @@ package fileservice
 import (
 	"encoding/csv"
 	"os"
+	"path/filepath"
 	"strings"
 	"unicode"
 
@@ -89,7 +90,7 @@ func parseService(str string) (service string, arguments []string, err error) {
 		return
 	}
 	if len(records) != 1 {
-		err = moerr.NewInvalidInputNoCtx("bad service: %v", str)
+		err = moerr.NewInvalidInputNoCtxf("bad service: %v", str)
 		return
 	}
 	service = records[0][0]
@@ -129,4 +130,12 @@ func toOSPath(filePath string) string {
 		return filePath
 	}
 	return strings.ReplaceAll(filePath, "/", osPathSeparatorStr)
+}
+
+func fromOSPath(diskPath string) string {
+	diskPath = filepath.Clean(diskPath)
+	if os.PathSeparator == '/' {
+		return diskPath
+	}
+	return strings.ReplaceAll(diskPath, osPathSeparatorStr, "/")
 }

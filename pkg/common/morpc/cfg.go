@@ -15,20 +15,23 @@
 package morpc
 
 import (
+	"math"
+	"runtime"
 	"time"
 
 	"github.com/fagongzi/goetty/v2"
-	"github.com/matrixorigin/matrixone/pkg/common/mpool"
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
 	"github.com/matrixorigin/matrixone/pkg/util/toml"
 	"go.uber.org/zap"
 )
 
 var (
-	defaultMaxConnections        = 400
+	defaultMaxConnections        = 1
 	defaultMaxIdleDuration       = time.Minute
 	defaultSendQueueSize         = 10240
 	defaultBufferSize            = 1024
 	defaultPayloadCopyBufferSize = 16 * 1024
+	defaultMaxMessageSize        = 1024 * 1024 * 100 // 100MB
 )
 
 // Config rpc client config
@@ -57,6 +60,11 @@ type Config struct {
 	PayloadCopyBufferSize toml.ByteSize `toml:"payload-copy-buffer-size"`
 	// EnableCompress enable compress message
 	EnableCompress bool `toml:"enable-compress"`
+
+	// ServerWorkers number of server workers for handle requests
+	ServerWorkers int `toml:"server-workers"`
+	// ServerBufferQueueSize queue size for server buffer requetsts
+	ServerBufferQueueSize int `toml:"server-buffer-queue-size"`
 
 	// BackendOptions extra backend options
 	BackendOptions []BackendOption `toml:"-"`
@@ -89,12 +97,24 @@ func (c *Config) Adjust() {
 	if c.PayloadCopyBufferSize == 0 {
 		c.PayloadCopyBufferSize = toml.ByteSize(defaultPayloadCopyBufferSize)
 	}
+	if c.SendQueueSize == 0 {
+		c.SendQueueSize = 100000
+	}
+	if c.ServerWorkers == 0 {
+		c.ServerWorkers = int(math.Max(100, float64(8*runtime.NumCPU())))
+	}
+	if c.ServerBufferQueueSize == 0 {
+		c.ServerBufferQueueSize = 100000
+	}
+	if c.MaxMessageSize == 0 {
+		c.MaxMessageSize = toml.ByteSize(defaultMaxMessageSize)
+	}
 }
 
 // NewClient create client from config
 func (c Config) NewClient(
-	tag string,
-	logger *zap.Logger,
+	sid string,
+	name string,
 	responseFactory func() Message) (RPCClient, error) {
 	var codecOpts []CodecOption
 	codecOpts = append(codecOpts,
@@ -103,27 +123,33 @@ func (c Config) NewClient(
 		WithCodecMaxBodySize(int(c.MaxMessageSize)))
 	codecOpts = append(codecOpts, c.CodecOptions...)
 	if c.EnableCompress {
-		mp, err := mpool.NewMPool(tag, 0, mpool.NoFixed)
-		if err != nil {
-			return nil, err
-		}
-		codecOpts = append(codecOpts, WithCodecEnableCompress(mp))
+		codecOpts = append(codecOpts, WithCodecEnableCompress(malloc.GetDefault(nil)))
 	}
 
 	codec := NewMessageCodec(
+		sid,
 		responseFactory,
-		codecOpts...)
-	bf := NewGoettyBasedBackendFactory(codec, c.getBackendOptions(logger.Named(tag))...)
-	return NewClient(bf, c.getClientOptions(tag, logger.Named(tag))...)
+		codecOpts...,
+	)
+	bf := NewGoettyBasedBackendFactory(
+		codec,
+		c.getBackendOptions(getLogger(sid).RawLogger().Named(name))...,
+	)
+	return NewClient(
+		name,
+		bf,
+		c.getClientOptions(getLogger(sid).RawLogger().Named(name))...,
+	)
 }
 
 // NewServer new rpc server
 func (c Config) NewServer(
-	tag string,
+	sid string,
+	name string,
 	address string,
-	logger *zap.Logger,
 	requestFactory func() Message,
-	responseReleaseFunc func(Message)) (RPCServer, error) {
+	responseReleaseFunc func(Message),
+	opts ...ServerOption) (RPCServer, error) {
 	var codecOpts []CodecOption
 	codecOpts = append(codecOpts,
 		WithCodecEnableChecksum(),
@@ -131,23 +157,22 @@ func (c Config) NewServer(
 		WithCodecMaxBodySize(int(c.MaxMessageSize)))
 	codecOpts = append(codecOpts, c.CodecOptions...)
 	if c.EnableCompress {
-		mp, err := mpool.NewMPool(tag, 0, mpool.NoFixed)
-		if err != nil {
-			return nil, err
-		}
-		codecOpts = append(codecOpts, WithCodecEnableCompress(mp))
+		codecOpts = append(codecOpts, WithCodecEnableCompress(malloc.GetDefault(nil)))
 	}
-	return NewRPCServer(
-		tag,
-		address,
-		NewMessageCodec(requestFactory, codecOpts...),
-		WithServerLogger(logger.Named(tag)),
+	opts = append(opts,
+		WithServerLogger(getLogger(sid).RawLogger().Named(name)),
 		WithServerGoettyOptions(goetty.WithSessionReleaseMsgFunc(func(v interface{}) {
 			m := v.(RPCMessage)
 			if !m.InternalMessage() {
 				responseReleaseFunc(m.Message)
 			}
 		})))
+	return NewRPCServer(
+		name,
+		address,
+		NewMessageCodec(sid, requestFactory, codecOpts...),
+		opts...,
+	)
 }
 
 func (c Config) getBackendOptions(logger *zap.Logger) []BackendOption {
@@ -163,13 +188,12 @@ func (c Config) getBackendOptions(logger *zap.Logger) []BackendOption {
 	return opts
 }
 
-func (c Config) getClientOptions(tag string, logger *zap.Logger) []ClientOption {
+func (c Config) getClientOptions(logger *zap.Logger) []ClientOption {
 	var opts []ClientOption
 	opts = append(opts,
 		WithClientLogger(logger),
 		WithClientMaxBackendPerHost(c.MaxConnections),
-		WithClientMaxBackendMaxIdleDuration(c.MaxIdleDuration.Duration),
-		WithClientTag(tag))
+		WithClientMaxBackendMaxIdleDuration(c.MaxIdleDuration.Duration))
 	opts = append(opts, c.ClientOptions...)
 	return opts
 }

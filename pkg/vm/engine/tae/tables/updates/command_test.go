@@ -15,10 +15,10 @@
 package updates
 
 import (
-	"bytes"
 	"testing"
 
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/objectio"
 
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/testutils"
@@ -29,35 +29,31 @@ import (
 func TestCompactBlockCmd(t *testing.T) {
 	defer testutils.AfterTest(t)()
 	schema := catalog.MockSchema(1, 0)
-	c := catalog.MockCatalog(nil)
+	c := catalog.MockCatalog()
 	defer c.Close()
 
 	db, _ := c.CreateDBEntry("db", "", "", nil)
 	table, _ := db.CreateTableEntry(schema, nil, nil)
-	seg, _ := table.CreateSegment(nil, catalog.ES_Appendable, nil, nil)
-	blk, _ := seg.CreateBlock(nil, catalog.ES_Appendable, nil, nil)
+	stats := objectio.NewObjectStatsWithObjectID(objectio.NewObjectid(), true, false, false)
+	obj, _ := table.CreateObject(nil, &objectio.CreateObjOpt{Stats: stats, IsTombstone: false}, nil)
 
-	controller := NewMVCCHandle(blk)
+	controller := NewAppendMVCCHandle(obj)
 
 	ts := types.NextGlobalTsForTest()
 	//node := MockAppendNode(341, 0, 2515, controller)
 	node := MockAppendNode(ts, 0, 2515, controller)
 	cmd := NewAppendCmd(1, node)
 
-	var w bytes.Buffer
-	_, err := cmd.WriteTo(&w)
+	buf, err := cmd.MarshalBinary()
 	assert.Nil(t, err)
 
-	buf := w.Bytes()
-	r := bytes.NewBuffer(buf)
-
-	cmd2, _, err := txnbase.BuildCommandFrom(r)
+	cmd2, err := txnbase.BuildCommandFrom(buf)
 	assert.Nil(t, err)
 	checkAppendCmdIsEqual(t, cmd, cmd2.(*UpdateCmd))
 }
 
 func checkAppendCmdIsEqual(t *testing.T, cmd1, cmd2 *UpdateCmd) {
-	assert.Equal(t, txnbase.CmdAppend, cmd1.GetType())
-	assert.Equal(t, txnbase.CmdAppend, cmd2.GetType())
+	assert.Equal(t, IOET_WALTxnCommand_AppendNode, cmd1.GetType())
+	assert.Equal(t, IOET_WALTxnCommand_AppendNode, cmd2.GetType())
 	assert.Equal(t, cmd1.append.maxRow, cmd2.append.maxRow)
 }

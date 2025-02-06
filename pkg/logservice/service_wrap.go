@@ -15,15 +15,10 @@
 package logservice
 
 import (
-	"context"
-	"time"
-
 	"github.com/lni/dragonboat/v4"
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
 	"github.com/matrixorigin/matrixone/pkg/fileservice"
 	pb "github.com/matrixorigin/matrixone/pkg/pb/logservice"
 	"github.com/matrixorigin/matrixone/pkg/taskservice"
-	"github.com/matrixorigin/matrixone/pkg/util/trace"
 )
 
 type WrappedService struct {
@@ -33,9 +28,10 @@ type WrappedService struct {
 func NewWrappedService(
 	c Config,
 	fileService fileservice.FileService,
+	shutdownC chan struct{},
 	opts ...Option,
 ) (*WrappedService, error) {
-	svc, err := NewService(c, fileService, opts...)
+	svc, err := NewService(c, fileService, shutdownC, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -64,31 +60,11 @@ func (w *WrappedService) GetClusterState() (*pb.CheckerState, error) {
 }
 
 func (w *WrappedService) SetInitialClusterInfo(
-	logShardNum, dnShardNum, logReplicaNum uint64,
+	logShardNum, tnShartnum, logReplicaNum uint64,
 ) error {
 	return w.svc.store.setInitialClusterInfo(
-		logShardNum, dnShardNum, logReplicaNum,
+		logShardNum, tnShartnum, logReplicaNum, 0, nil, nil,
 	)
-}
-
-func (w *WrappedService) CreateInitTasks() error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	ctx, span := trace.Start(ctx, "CreateInitTasks")
-	defer span.End()
-
-	for i := 0; i < checkBootstrapCycles; i++ {
-		select {
-		case <-ctx.Done():
-			return moerr.NewInternalError(ctx, "failed to create init tasks")
-		default:
-		}
-		if err := w.svc.createInitTasks(ctx); err == nil {
-			break
-		}
-		time.Sleep(time.Second)
-	}
-	return nil
 }
 
 func (w *WrappedService) GetTaskService() (taskservice.TaskService, bool) {

@@ -18,18 +18,20 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/matrixorigin/matrixone/pkg/common/mpool"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
+	"github.com/matrixorigin/matrixone/pkg/vm"
 	"github.com/matrixorigin/matrixone/pkg/vm/process"
-	"github.com/stretchr/testify/require"
 )
 
 type unnestTestCase struct {
-	arg      *Argument
+	arg      *TableFunction
 	proc     *process.Process
 	jsons    []string
 	paths    []string
@@ -45,14 +47,14 @@ var (
 	//	&plan.Expr_C{
 	//		C: &plan.Const{
 	//			Isnull: false,
-	//			Value: &plan.Const_Sval{}
+	//			Value: &plan.Literal_Sval{}
 	//		}
 	//	}
 	//}
 	defaultColDefs = []*plan.ColDef{
 		{
 			Name: "col",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       4,
@@ -60,14 +62,14 @@ var (
 		},
 		{
 			Name: "seq",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_int32),
 				NotNullable: false,
 			},
 		},
 		{
 			Name: "key",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       256,
@@ -75,7 +77,7 @@ var (
 		},
 		{
 			Name: "path",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       256,
@@ -83,14 +85,14 @@ var (
 		},
 		{
 			Name: "index",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_int32),
 				NotNullable: false,
 			},
 		},
 		{
 			Name: "value",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       1024,
@@ -98,7 +100,7 @@ var (
 		},
 		{
 			Name: "this",
-			Typ: &plan.Type{
+			Typ: plan.Type{
 				Id:          int32(types.T_varchar),
 				NotNullable: false,
 				Width:       1024,
@@ -118,7 +120,7 @@ func init() {
 }
 
 func newTestCase(m *mpool.MPool, attrs []string, jsons, paths []string, outers []bool, jsonType string, success bool) unnestTestCase {
-	proc := testutil.NewProcessWithMPool(m)
+	proc := testutil.NewProcessWithMPool("", m)
 	colDefs := make([]*plan.ColDef, len(attrs))
 	for i := range attrs {
 		for j := range defaultColDefs {
@@ -131,10 +133,17 @@ func newTestCase(m *mpool.MPool, attrs []string, jsons, paths []string, outers [
 
 	ret := unnestTestCase{
 		proc: proc,
-		arg: &Argument{
-			Attrs: attrs,
-			Rets:  colDefs,
-			Name:  "unnest",
+		arg: &TableFunction{
+			Attrs:    attrs,
+			Rets:     colDefs,
+			FuncName: "unnest",
+			OperatorBase: vm.OperatorBase{
+				OperatorInfo: vm.OperatorInfo{
+					Idx:     0,
+					IsFirst: false,
+					IsLast:  false,
+				},
+			},
 		},
 		jsons:    jsons,
 		paths:    paths,
@@ -148,58 +157,106 @@ func newTestCase(m *mpool.MPool, attrs []string, jsons, paths []string, outers [
 
 func TestUnnestString(t *testing.T) {
 	buf := new(bytes.Buffer)
-	for _, ut := range utc {
-		unnestString(ut.arg, buf)
+	for _, tc := range utc {
+		tc.arg.String(buf)
 	}
 }
 
 func TestUnnestCall(t *testing.T) {
 	for _, ut := range utc {
 
-		err := Prepare(ut.proc, ut.arg)
+		err := ut.arg.Prepare(ut.proc)
 		require.NotNil(t, err)
+
 		var inputBat *batch.Batch
 		switch ut.jsonType {
 		case "str":
-			beforeMem := ut.proc.Mp().CurrNB()
 			inputBat, err = makeUnnestBatch(ut.jsons, types.T_varchar, encodeStr, ut.proc)
 			require.Nil(t, err)
 			ut.arg.Args = makeConstInputExprs(ut.jsons, ut.paths, ut.jsonType, ut.outers)
-			ut.proc.SetInputBatch(inputBat)
-			err := unnestPrepare(ut.proc, ut.arg)
+
+			// fake retSchema
+			retSchema := make([]types.Type, len(ut.arg.Rets))
+			for i := range ut.arg.Rets {
+				typ := ut.arg.Rets[i].Typ
+				retSchema[i] = types.New(types.T(typ.Id), typ.Width, typ.Scale)
+			}
+			ut.arg.ctr.retSchema = retSchema
+
+			tvfst, err := unnestPrepare(ut.proc, ut.arg)
 			require.Nil(t, err)
-			end, err := unnestCall(0, ut.proc, ut.arg)
-			require.Nil(t, err)
-			require.False(t, end)
-			ut.proc.InputBatch().Clean(ut.proc.Mp())
-			inputBat.Clean(ut.proc.Mp())
-			afterMem := ut.proc.Mp().CurrNB()
-			require.Equal(t, beforeMem, afterMem)
+
+			// faking args.  unnestPrepare should have build place holders for 3 args.
+			require.True(t, len(ut.arg.Args) == 3)
+			require.True(t, len(ut.arg.ctr.argVecs) == 3)
+
+			// Got a valid batch, eval tbf args.  first eval input batch for args.
+			for i := range ut.arg.ctr.executorsForArgs {
+				ut.arg.ctr.argVecs[i], err = ut.arg.ctr.executorsForArgs[i].Eval(ut.proc, []*batch.Batch{inputBat}, nil)
+				require.Nil(t, err)
+			}
+
+			for i := 0; i < inputBat.RowCount(); i++ {
+				err = tvfst.start(ut.arg, ut.proc, i, nil)
+				require.Nil(t, err)
+				for {
+					res, err := tvfst.call(ut.arg, ut.proc)
+					if err != nil || res.Batch.IsDone() {
+						break
+					}
+				}
+			}
+			// we do not check result correctness?
+			tvfst.free(ut.arg, ut.proc, false, nil)
+
 		case "json":
-			beforeMem := ut.proc.Mp().CurrNB()
 			inputBat, err = makeUnnestBatch(ut.jsons, types.T_json, encodeJson, ut.proc)
 			require.Nil(t, err)
 			ut.arg.Args = makeColExprs(ut.jsonType, ut.paths, ut.outers)
-			ut.proc.SetInputBatch(inputBat)
-			err := unnestPrepare(ut.proc, ut.arg)
+
+			// fake retSchema
+			retSchema := make([]types.Type, len(ut.arg.Rets))
+			for i := range ut.arg.Rets {
+				typ := ut.arg.Rets[i].Typ
+				retSchema[i] = types.New(types.T(typ.Id), typ.Width, typ.Scale)
+			}
+			ut.arg.ctr.retSchema = retSchema
+
+			tvfst, err := unnestPrepare(ut.proc, ut.arg)
 			require.Nil(t, err)
-			end, err := unnestCall(0, ut.proc, ut.arg)
-			require.Nil(t, err)
-			require.False(t, end)
-			ut.proc.InputBatch().Clean(ut.proc.Mp())
-			inputBat.Clean(ut.proc.Mp())
-			afterMem := ut.proc.Mp().CurrNB()
-			require.Equal(t, beforeMem, afterMem)
+
+			// faking args.  unnestPrepare should have build place holders for 3 args.
+			require.True(t, len(ut.arg.Args) == 3)
+			require.True(t, len(ut.arg.ctr.argVecs) == 3)
+
+			// Got a valid batch, eval tbf args.  first eval input batch for args.
+			for i := range ut.arg.ctr.executorsForArgs {
+				ut.arg.ctr.argVecs[i], err = ut.arg.ctr.executorsForArgs[i].Eval(ut.proc, []*batch.Batch{inputBat}, nil)
+				require.Nil(t, err)
+			}
+
+			for i := 0; i < inputBat.RowCount(); i++ {
+				err = tvfst.start(ut.arg, ut.proc, i, nil)
+				require.Nil(t, err)
+				for {
+					res, err := tvfst.call(ut.arg, ut.proc)
+					if err != nil || res.Batch.IsDone() {
+						break
+					}
+				}
+			}
+			// we do not check result correctness?
+			tvfst.free(ut.arg, ut.proc, false, nil)
 		}
 	}
 }
 
 func makeUnnestBatch(jsons []string, typ types.T, fn func(str string) ([]byte, error), proc *process.Process) (*batch.Batch, error) {
-	bat := batch.New(true, []string{"a"})
+	bat := batch.NewWithSize(1)
+	bat.Attrs = []string{"a"}
 	for i := range bat.Vecs {
 		bat.Vecs[i] = vector.NewVec(types.New(typ, 256, 0))
 	}
-	bat.Cnt = 1
 	for _, json := range jsons {
 		bjBytes, err := fn(json)
 		if err != nil {
@@ -211,7 +268,7 @@ func makeUnnestBatch(jsons []string, typ types.T, fn func(str string) ([]byte, e
 			return nil, err
 		}
 	}
-	bat.InitZsOne(len(jsons))
+	bat.SetRowCount(len(jsons))
 	return bat, nil
 }
 
@@ -233,13 +290,13 @@ func makeConstInputExprs(jsons, paths []string, jsonType string, outers []bool) 
 		typeId = int32(types.T_json)
 	}
 	ret[0] = &plan.Expr{
-		Typ: &plan.Type{
+		Typ: plan.Type{
 			Id:    typeId,
 			Width: 256,
 		},
-		Expr: &plan.Expr_C{
-			C: &plan.Const{
-				Value: &plan.Const_Sval{
+		Expr: &plan.Expr_Lit{
+			Lit: &plan.Literal{
+				Value: &plan.Literal_Sval{
 					Sval: jsons[0],
 				},
 			},
@@ -256,7 +313,7 @@ func makeColExprs(jsonType string, paths []string, outers []bool) []*plan.Expr {
 		typeId = int32(types.T_json)
 	}
 	ret[0] = &plan.Expr{
-		Typ: &plan.Type{
+		Typ: plan.Type{
 			Id: typeId,
 		},
 		Expr: &plan.Expr_Col{
@@ -271,25 +328,25 @@ func makeColExprs(jsonType string, paths []string, outers []bool) []*plan.Expr {
 
 func appendOtherExprs(ret []*plan.Expr, paths []string, outers []bool) []*plan.Expr {
 	ret[1] = &plan.Expr{
-		Typ: &plan.Type{
+		Typ: plan.Type{
 			Id:    int32(types.T_varchar),
 			Width: 256,
 		},
-		Expr: &plan.Expr_C{
-			C: &plan.Const{
-				Value: &plan.Const_Sval{
+		Expr: &plan.Expr_Lit{
+			Lit: &plan.Literal{
+				Value: &plan.Literal_Sval{
 					Sval: paths[0],
 				},
 			},
 		},
 	}
 	ret[2] = &plan.Expr{
-		Typ: &plan.Type{
+		Typ: plan.Type{
 			Id: int32(types.T_bool),
 		},
-		Expr: &plan.Expr_C{
-			C: &plan.Const{
-				Value: &plan.Const_Bval{
+		Expr: &plan.Expr_Lit{
+			Lit: &plan.Literal{
+				Value: &plan.Literal_Bval{
 					Bval: outers[0],
 				},
 			},

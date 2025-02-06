@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"github.com/lni/vfs"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -38,10 +37,10 @@ func TestTestClient(t *testing.T) {
 
 	// get two clients, you can get many clients to be used concurrently
 	// but each client itself is not goroutine safe
-	client1, err := NewClient(ctx, ccfg)
+	client1, err := NewClient(ctx, "", ccfg)
 	require.NoError(t, err)
 	defer client1.Close()
-	client2, err := NewClient(ctx, ccfg)
+	client2, err := NewClient(ctx, "", ccfg)
 	require.NoError(t, err)
 	defer client2.Close()
 
@@ -65,4 +64,12 @@ func TestTestClient(t *testing.T) {
 	assert.Equal(t, 2, len(recs))
 	assert.Equal(t, rec1.Payload(), recs[0].Payload())
 	assert.Equal(t, rec2.Payload(), recs[1].Payload())
+
+	client3 := NewStandbyClientWithRetry(ctx, "", ccfg)
+	defer client3.Close()
+
+	//let ValidateStandbyClient return error
+	ccfg.LogShardID = 0
+	client4 := NewStandbyClientWithRetry(ctx, "", ccfg)
+	assert.Nil(t, client4)
 }

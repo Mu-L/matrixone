@@ -16,17 +16,19 @@ package rpchandle
 
 import (
 	"context"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/cmd_util"
 
 	apipb "github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/pb/txn"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db"
 )
 
 type Handler interface {
 	HandleCommit(
 		ctx context.Context,
 		meta txn.TxnMeta,
+		response *txn.TxnResponse,
+		commitRequests *txn.TxnCommitRequest,
 	) (timestamp.Timestamp, error)
 
 	HandleRollback(
@@ -59,35 +61,117 @@ type Handler interface {
 	HandleGetLogTail(
 		ctx context.Context,
 		meta txn.TxnMeta,
-		req apipb.SyncLogTailReq,
+		req *apipb.SyncLogTailReq,
 		resp *apipb.SyncLogTailResp,
-	) error
+	) (func(), error)
 
 	HandlePreCommitWrite(
 		ctx context.Context,
 		meta txn.TxnMeta,
-		req apipb.PrecommitWriteCmd,
-		resp *apipb.SyncLogTailResp,
+		req *apipb.PrecommitWriteCmd,
+		resp *apipb.TNStringResponse,
 	) error
 
 	HandleFlushTable(
 		ctx context.Context,
 		meta txn.TxnMeta,
-		req db.FlushTable,
+		req *cmd_util.FlushTable,
 		resp *apipb.SyncLogTailResp,
+	) (func(), error)
+
+	HandleCommitMerge(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *apipb.MergeCommitEntry,
+		resp *apipb.TNStringResponse,
 	) error
 
 	HandleForceCheckpoint(
 		ctx context.Context,
 		meta txn.TxnMeta,
-		req db.Checkpoint,
+		req *cmd_util.Checkpoint,
 		resp *apipb.SyncLogTailResp,
-	) error
+	) (func(), error)
 
-	HandleInspectDN(
+	HandleForceGlobalCheckpoint(
 		ctx context.Context,
 		meta txn.TxnMeta,
-		req db.InspectDN,
-		resp *db.InspectResp,
-	) error
+		req *cmd_util.Checkpoint,
+		resp *apipb.SyncLogTailResp,
+	) (func(), error)
+	HandleInspectTN(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.InspectTN,
+		resp *cmd_util.InspectResp,
+	) (func(), error)
+
+	HandleAddFaultPoint(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.FaultPoint,
+		resp *apipb.SyncLogTailResp,
+	) (func(), error)
+
+	HandleBackup(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.Checkpoint,
+		resp *apipb.SyncLogTailResp,
+	) (func(), error)
+
+	HandleTraceSpan(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.TraceSpan,
+		resp *apipb.SyncLogTailResp,
+	) (func(), error)
+
+	HandleStorageUsage(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.StorageUsageReq,
+		resp *cmd_util.StorageUsageResp_V3,
+	) (func(), error)
+
+	HandleSnapshotRead(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.SnapshotReadReq,
+		resp *cmd_util.SnapshotReadResp,
+	) (func(), error)
+
+	HandleInterceptCommit(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.InterceptCommit,
+		resp *apipb.SyncLogTailResp,
+	) (func(), error)
+	HandleDiskCleaner(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.DiskCleaner,
+		resp *apipb.SyncLogTailResp,
+	) (cb func(), err error)
+
+	HandleGetLatestCheckpoint(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.Checkpoint,
+		resp *apipb.CheckpointResp,
+	) (cb func(), err error)
+
+	HandleGetChangedTableList(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.GetChangedTableListReq,
+		resp *cmd_util.GetChangedTableListResp,
+	) (func(), error)
+
+	HandleFaultInject(
+		ctx context.Context,
+		meta txn.TxnMeta,
+		req *cmd_util.FaultInjectReq,
+		resp *apipb.TNStringResponse,
+	) (cb func(), err error)
 }

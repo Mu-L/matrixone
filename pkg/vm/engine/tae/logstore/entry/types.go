@@ -23,23 +23,17 @@ import (
 type Type = uint16
 
 const (
-	ETInvalid Type = iota
-	ETNoop
-	ETFlush
-	ETCheckpoint
-	ETUncommitted
-	ETTxn
-	ETPostCommit
-	ETMeta
-	ETCustomizedStart
-)
-
-const (
 	GTInvalid uint32 = iota
 	GTNoop
 	GTCKp
 	GTInternal
-	GTCustomizedStart
+
+	// GTFiles is used to store files, and the scenario is master-slave synchronization.
+	// The logservice will read the files required for checkpoint and gc in GTFiles,
+	// and then transfer them to the follower.
+	GTFiles
+
+	GTCustomized uint32 = 11
 )
 
 type Desc interface {
@@ -52,8 +46,6 @@ type Desc interface {
 	GetMetaSize() int
 	TotalSize() int
 	GetMetaBuf() []byte
-	IsFlush() bool
-	IsCheckpoint() bool
 }
 
 type Entry interface {
@@ -70,6 +62,7 @@ type Entry interface {
 	Unmarshal(buf []byte) error
 	Marshal() (buf []byte, err error)
 	ReadFrom(io.Reader) (int64, error)
+	UnmarshalBinary(buf []byte) (n int64, err error)
 	ReadAt(r *os.File, offset int) (int, error)
 	WriteTo(io.Writer) (int64, error)
 	PrepareWrite()

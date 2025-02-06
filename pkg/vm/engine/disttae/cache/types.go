@@ -16,12 +16,19 @@ package cache
 
 import (
 	"bytes"
+	"encoding/hex"
+	"fmt"
+	"sync"
+	"unsafe"
 
+	"github.com/tidwall/btree"
+
+	"github.com/matrixorigin/matrixone/pkg/catalog"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/pb/api"
 	"github.com/matrixorigin/matrixone/pkg/pb/plan"
 	"github.com/matrixorigin/matrixone/pkg/pb/timestamp"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
-	"github.com/tidwall/btree"
 )
 
 const (
@@ -34,8 +41,23 @@ const (
 	MO_TIMESTAMP_IDX = 1
 )
 
+type TableChangeQuery struct {
+	AccountId  uint32
+	DatabaseId uint64
+	Name       string
+	Version    uint32
+	TableId    uint64
+	Ts         timestamp.Timestamp
+}
+
 // catalog cache
 type CatalogCache struct {
+	mu struct {
+		sync.Mutex
+		start types.TS
+		end   types.TS
+	}
+	//tables and database is safe to be read concurrently.
 	tables    *tableCache
 	databases *databaseCache
 }
@@ -43,21 +65,21 @@ type CatalogCache struct {
 // database cache:
 //
 //		. get by database key
-//	    . del by rowid
+//	    . del by consulting cpkey
 //	    . gc by timestamp
 type databaseCache struct {
 	data       *btree.BTreeG[*DatabaseItem]
-	rowidIndex *btree.BTreeG[*DatabaseItem]
+	cpkeyIndex *btree.BTreeG[*DatabaseItem]
 }
 
 // table cache:
 //
 //		. get by table key
-//	    . del by rowid
+//	    . del by consulting cpkey
 //	    . gc by timestamp
 type tableCache struct {
 	data       *btree.BTreeG[*TableItem]
-	rowidIndex *btree.BTreeG[*TableItem]
+	cpkeyIndex *btree.BTreeG[*TableItem]
 }
 
 type DatabaseItem struct {
@@ -65,15 +87,23 @@ type DatabaseItem struct {
 	AccountId uint32
 	Name      string
 	Ts        timestamp.Timestamp
+	deleted   bool // Mark if it is a delete
 
 	// database value
 	Id        uint64
-	Rowid     types.Rowid
 	Typ       string
 	CreateSql string
+	Rowid     types.Rowid
+	CPKey     []byte
+}
 
-	// Mark if it is a delete
-	deleted bool
+func (item *DatabaseItem) String() string {
+	return fmt.Sprintln(
+		"item ptr", uintptr(unsafe.Pointer(item)),
+		"item pk",
+		hex.EncodeToString(item.CPKey),
+		"accId",
+		item.AccountId, item.Name, item.Id, item.Ts, item.deleted)
 }
 
 type TableItem struct {
@@ -82,60 +112,81 @@ type TableItem struct {
 	DatabaseId uint64
 	Name       string
 	Ts         timestamp.Timestamp
+	deleted    bool // Mark if it is a delete
 
 	// table value
-	Id       uint64
-	TableDef *plan.TableDef
-	Defs     []engine.TableDef
-	Rowid    types.Rowid
+	Id           uint64
+	TableDef     *plan.TableDef
+	Defs         []engine.TableDef
+	Version      uint32
+	DatabaseName string
+
+	CPKey []byte
 
 	// table def
-	Kind        string
-	ViewDef     string
-	Constraint  []byte
-	Comment     string
-	Partitioned int8
-	Partition   string
-	CreateSql   string
+	Kind           string
+	ViewDef        string
+	Constraint     []byte
+	Comment        string
+	Partitioned    int8
+	Partition      string
+	CreateSql      string
+	CatalogVersion uint32
+	ExtraInfo      *api.SchemaExtra
 
 	// primary index
-	PrimaryIdx int
+	PrimaryIdx    int
+	PrimarySeqnum int
 	// clusterBy key
 	ClusterByIdx int
-
-	// Mark if it is a delete
-	deleted bool
 }
 
-type tableItemKey struct {
-	AccountId    uint32
-	DatabaseId   uint64
-	Name         string
-	PhysicalTime uint64
-	LogicalTime  uint32
-	NodeId       uint32
+func (item *TableItem) IsDeleted() bool {
+	return item.deleted
 }
 
-type column struct {
-	name            string
-	typ             []byte
-	num             int32
-	comment         string
-	hasDef          int8
-	defaultExpr     []byte
-	constraintType  string
-	isHidden        int8
-	isAutoIncrement int8
-	hasUpdate       int8
-	updateExpr      []byte
-	isClusterBy     int8
+func (item *TableItem) String() string {
+	return fmt.Sprintln(
+		"item ptr", uintptr(unsafe.Pointer(item)),
+		"item pk",
+		hex.EncodeToString(item.CPKey),
+		"accId",
+		item.AccountId, item.DatabaseName, item.DatabaseId, item.Name, item.Id, item.Ts, item.deleted)
 }
 
-type columns []column
+type noSliceTs struct {
+	pTime  int64
+	lTime  uint32
+	nodeId uint32
+}
 
-func (cols columns) Len() int           { return len(cols) }
-func (cols columns) Swap(i, j int)      { cols[i], cols[j] = cols[j], cols[i] }
-func (cols columns) Less(i, j int) bool { return cols[i].num < cols[j].num }
+func (s *noSliceTs) fromTs(ts *timestamp.Timestamp) {
+	s.pTime = ts.PhysicalTime
+	s.lTime = ts.LogicalTime
+	s.nodeId = ts.NodeID
+}
+
+func (s *noSliceTs) toTs() timestamp.Timestamp {
+	return timestamp.Timestamp{
+		PhysicalTime: s.pTime,
+		LogicalTime:  s.lTime,
+		NodeID:       s.nodeId,
+	}
+}
+
+type TableItemKey struct {
+	AccountId  uint32
+	DatabaseId uint64
+	Name       string
+	Id         uint64
+	Ts         noSliceTs
+}
+
+type Columns []catalog.Column
+
+func (cols Columns) Len() int           { return len(cols) }
+func (cols Columns) Swap(i, j int)      { cols[i], cols[j] = cols[j], cols[i] }
+func (cols Columns) Less(i, j int) bool { return cols[i].Num < cols[j].Num }
 
 func databaseItemLess(a, b *DatabaseItem) bool {
 	if a.AccountId < b.AccountId {
@@ -149,6 +200,11 @@ func databaseItemLess(a, b *DatabaseItem) bool {
 	}
 	if a.Name > b.Name {
 		return false
+	}
+	if a.Ts.Equal(b.Ts) {
+		if !a.deleted && b.deleted {
+			return true
+		}
 	}
 	return a.Ts.Greater(b.Ts)
 }
@@ -172,16 +228,95 @@ func tableItemLess(a, b *TableItem) bool {
 	if a.Name > b.Name {
 		return false
 	}
-	if a.Ts.Equal(b.Ts) {
-		return a.deleted
+
+	// Let's think about how to arrange items for the same name table.
+	// how many types of items does a table have?
+	// 1. create table (deleted=false, ts=t1, tid=x1, rowid=r1)
+	// 2. drop table (deleted=true, ts=t2, tid=x1, rowid=r1)
+	// 3. truncate
+	//    1. drop table (delete=true, ts=t1, tid=x1， rowid=r1)
+	//    2. create table (delete=false, ts=t1, tid=x2, rowid=r2)
+	// 4. alter table
+	//    1. delete table row (delete=true, ts=t1，tid=x1, rowid=r1)
+	//    2. create table row (delete=false, ts=t1, tid=x1, rowid=r2)
+	//
+	// Note: What logtail in mo_tables/mo_columns will CN receive is exactly dependent on what CN sends to TN.
+	// No matter how many ddl operations happened in one txn, it will eventually generate at most a pair of delete and insert batch.
+	// --- example1:
+	// begin;
+	// truncate table t1; (drop x1, create t1 with tid x2)
+	// truncate table t1; (drop x2, create t1 with tid x3)
+	// alter table t1 comment 'new comment1'; (as x3 is created in the txn, adjust its create batch with new comment1)
+	// alter table t1 comment 'new comment1'; (as x3 is created in the txn, adjust its create batch again)
+	// commit;
+	// --- TN received requests to drop x1 and create x3
+	// --- TN replayed logtail as:
+	// drop table t1 (delete=true, ts=t1, tid=x1, rowid=r1)
+	// create table t1 (delete=false, ts=t1, tid=x3, rowid=r2, comment='new comment2')
+	//
+	// Order rule:
+	// 1. By timestamp descending (order by txn)
+	// 2. By delete flag, delete is behind of insert (check the last status in the txn)
+	//
+	// Given the order of the items, it is simple to lookup a table by name:
+	// 1. Find the first item with the same name, if it is not deleted, return found, not found otherwise.
+
+	if a.Ts.Equal(b.Ts) { // happen in the same txn. it is a delete and a insert.
+		if !a.deleted && b.deleted {
+			return true
+		}
 	}
 	return a.Ts.Greater(b.Ts)
 }
 
-func databaseItemRowidLess(a, b *DatabaseItem) bool {
-	return bytes.Compare(a.Rowid[:], b.Rowid[:]) < 0
+func databaseItemCPKeyLess(a, b *DatabaseItem) bool {
+	cmp := bytes.Compare(a.CPKey[:], b.CPKey[:])
+	if cmp < 0 {
+		return true
+	}
+	if cmp > 0 {
+		return false
+	}
+	return a.Ts.Greater(b.Ts)
 }
 
-func tableItemRowidLess(a, b *TableItem) bool {
-	return bytes.Compare(a.Rowid[:], b.Rowid[:]) < 0
+func tableItemCPKeyLess(a, b *TableItem) bool {
+	cmp := bytes.Compare(a.CPKey[:], b.CPKey[:])
+	if cmp < 0 {
+		return true
+	}
+	if cmp > 0 {
+		return false
+	}
+	return a.Ts.Greater(b.Ts)
+}
+
+// copyTableItem copies src to dst
+func copyTableItem(dst, src *TableItem) {
+	dst.Id = src.Id
+	dst.Defs = src.Defs
+	dst.Kind = src.Kind
+	dst.Comment = src.Comment
+	dst.ViewDef = src.ViewDef
+	dst.TableDef = src.TableDef
+	dst.Constraint = src.Constraint
+	dst.Partitioned = src.Partitioned
+	dst.Partition = src.Partition
+	dst.CreateSql = src.CreateSql
+	dst.PrimaryIdx = src.PrimaryIdx
+	dst.ClusterByIdx = src.ClusterByIdx
+	dst.PrimarySeqnum = src.PrimarySeqnum
+	dst.Version = src.Version
+	dst.ExtraInfo = api.MustUnmarshalTblExtra(api.MustMarshalTblExtra(src.ExtraInfo))
+}
+
+func copyDatabaseItem(dest, src *DatabaseItem) {
+	dest.AccountId = src.AccountId
+	dest.Name = src.Name
+	dest.Ts = src.Ts
+	dest.Id = src.Id
+	copy(dest.Rowid[:], src.Rowid[:])
+	dest.Typ = src.Typ
+	dest.CreateSql = src.CreateSql
+	//deleted bool
 }

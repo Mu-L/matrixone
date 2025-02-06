@@ -16,21 +16,24 @@ package entry
 
 import (
 	"bytes"
-	"encoding/binary"
 	"io"
 	"os"
 	"sync"
 
+	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logstore/entry"
 )
 
 type Entry struct {
 	Entry entry.Entry
 	Info  *entry.Info //for wal in post append
-	Lsn   uint64
-	Ctx   any //for addr in batchstore
+	DSN   uint64      // driver sequence number
+	Ctx   any         //for addr in batchstore
 	err   error
 	wg    *sync.WaitGroup
+
+	//for replay
+	isEnd bool
 }
 
 func NewEntry(e entry.Entry) *Entry {
@@ -49,6 +52,15 @@ func NewEmptyEntry() *Entry {
 	en.wg.Add(1)
 	return en
 }
+
+func NewEndEntry() *Entry {
+	return &Entry{
+		isEnd: true,
+	}
+}
+func (e *Entry) IsEnd() bool {
+	return e.isEnd
+}
 func (e *Entry) SetInfo() {
 	info := e.Entry.GetInfo()
 	if info != nil {
@@ -56,13 +68,25 @@ func (e *Entry) SetInfo() {
 	}
 }
 func (e *Entry) ReadFrom(r io.Reader) (n int64, err error) {
-	if err = binary.Read(r, binary.BigEndian, &e.Lsn); err != nil {
+	if _, err = r.Read(types.EncodeUint64(&e.DSN)); err != nil {
 		return
 	}
 	_, err = e.Entry.ReadFrom(r)
 	if err != nil {
 		panic(err)
 	}
+	e.Info = e.Entry.GetInfo().(*entry.Info)
+	return
+}
+
+func (e *Entry) UnmarshalBinary(buf []byte) (n int64, err error) {
+	e.DSN = types.DecodeUint64(buf[:8])
+	n += 8
+	n2, err := e.Entry.UnmarshalBinary(buf[n:])
+	if err != nil {
+		panic(err)
+	}
+	n += n2
 	e.Info = e.Entry.GetInfo().(*entry.Info)
 	return
 }
@@ -76,7 +100,7 @@ func (e *Entry) ReadAt(r *os.File, offset int) (int, error) {
 	offset += 8
 
 	bbuf := bytes.NewBuffer(lsnbuf)
-	if err := binary.Read(bbuf, binary.BigEndian, &e.Lsn); err != nil {
+	if _, err := bbuf.Read(types.EncodeUint64(&e.DSN)); err != nil {
 		return n, err
 	}
 
@@ -85,7 +109,7 @@ func (e *Entry) ReadAt(r *os.File, offset int) (int, error) {
 }
 
 func (e *Entry) WriteTo(w io.Writer) (int64, error) {
-	if err := binary.Write(w, binary.BigEndian, e.Lsn); err != nil {
+	if _, err := w.Write(types.EncodeUint64(&e.DSN)); err != nil {
 		return 0, err
 	}
 	n, err := e.Entry.WriteTo(w)

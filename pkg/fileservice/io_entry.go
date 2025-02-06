@@ -18,134 +18,116 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
+	"time"
 
-	"github.com/matrixorigin/matrixone/pkg/common/moerr"
+	"github.com/matrixorigin/matrixone/pkg/common/malloc"
+	"github.com/matrixorigin/matrixone/pkg/fileservice/fscache"
+	metric "github.com/matrixorigin/matrixone/pkg/util/metric/v2"
 )
 
-type ioEntriesReader struct {
-	ctx     context.Context
-	entries []IOEntry
-	offset  int64
-}
-
-var _ io.Reader = new(ioEntriesReader)
-
-func newIOEntriesReader(ctx context.Context, entries []IOEntry) *ioEntriesReader {
-	es := make([]IOEntry, len(entries))
-	copy(es, entries)
-	return &ioEntriesReader{
-		ctx:     ctx,
-		entries: es,
-	}
-}
-
-func (i *ioEntriesReader) Read(buf []byte) (n int, err error) {
-	for {
-
-		select {
-		case <-i.ctx.Done():
-			return n, i.ctx.Err()
-		default:
-		}
-
-		// no more data
-		if len(i.entries) == 0 {
-			err = io.EOF
-			return
-		}
-
-		entry := i.entries[0]
-
-		// gap
-		if i.offset < entry.Offset {
-			numBytes := entry.Offset - i.offset
-			if l := int64(len(buf)); l < numBytes {
-				numBytes = l
-			}
-			buf = buf[numBytes:] // skip
-			n += int(numBytes)
-			i.offset += numBytes
-		}
-
-		// buffer full
-		if len(buf) == 0 {
-			return
-		}
-
-		// copy data
-		var bytesRead int
-
-		if entry.ReaderForWrite != nil && entry.Size < 0 {
-			// read from size unknown reader
-			bytesRead, err = entry.ReaderForWrite.Read(buf)
-			i.entries[0].Offset += int64(bytesRead)
-			if err == io.EOF {
-				i.entries = i.entries[1:]
-			} else if err != nil {
-				return
-			}
-
-		} else if entry.ReaderForWrite != nil {
-			bytesToRead := entry.Size
-			if l := int64(len(buf)); bytesToRead > l {
-				bytesToRead = l
-			}
-			r := io.LimitReader(entry.ReaderForWrite, int64(bytesToRead))
-			bytesRead, err = io.ReadFull(r, buf[:bytesToRead])
-			if err != nil {
-				return
-			}
-			if int64(bytesRead) != bytesToRead {
-				err = moerr.NewSizeNotMatchNoCtx("")
-				return
-			}
-			i.entries[0].Offset += int64(bytesRead)
-			i.entries[0].Size -= int64(bytesRead)
-			if i.entries[0].Size == 0 {
-				i.entries = i.entries[1:]
-			}
-
-		} else {
-			bytesToRead := entry.Size
-			if l := int64(len(buf)); bytesToRead > l {
-				bytesToRead = l
-			}
-			if int64(len(entry.Data)) != entry.Size {
-				err = moerr.NewSizeNotMatchNoCtx("")
-				return
-			}
-			bytesRead = copy(buf, entry.Data[:bytesToRead])
-			if int64(bytesRead) != bytesToRead {
-				err = moerr.NewSizeNotMatchNoCtx("")
-				return
-			}
-			i.entries[0].Data = entry.Data[bytesRead:]
-			i.entries[0].Offset += int64(bytesRead)
-			i.entries[0].Size -= int64(bytesRead)
-			if i.entries[0].Size == 0 {
-				i.entries = i.entries[1:]
-			}
-		}
-
-		buf = buf[bytesRead:]
-		i.offset += int64(bytesRead)
-		n += int(bytesRead)
-
-	}
-}
-
-func (e *IOEntry) setObjectFromData() error {
-	if e.ToObject == nil {
+func (i *IOEntry) setCachedData(ctx context.Context, allocator CacheDataAllocator) error {
+	LogEvent(ctx, str_set_cache_data_begin)
+	t0 := time.Now()
+	defer func() {
+		LogEvent(ctx, str_set_cache_data_end)
+		metric.FSReadDurationSetCachedData.Observe(time.Since(t0).Seconds())
+	}()
+	if i.ToCacheData == nil {
 		return nil
 	}
-	if len(e.Data) == 0 {
+	if len(i.Data) == 0 {
 		return nil
 	}
-	obj, size, err := e.ToObject(bytes.NewReader(e.Data), e.Data)
+	LogEvent(ctx, str_to_cache_data_begin)
+	cacheData, err := i.ToCacheData(ctx, bytes.NewReader(i.Data), i.Data, allocator)
+	LogEvent(ctx, str_to_cache_data_end)
 	if err != nil {
 		return err
 	}
-	e.Object = obj
-	e.ObjectSize = size
+	if cacheData == nil {
+		panic("ToCacheData returns nil cache data")
+	}
+	i.CachedData = cacheData
 	return nil
 }
+
+func (i *IOEntry) ReadFromOSFile(ctx context.Context, file *os.File, allocator CacheDataAllocator) (err error) {
+	LogEvent(ctx, str_ReadFromOSFile_begin)
+	defer LogEvent(ctx, str_ReadFromOSFile_end)
+
+	finally := i.prepareData(ctx)
+	defer finally(&err)
+
+	r := io.LimitReader(file, i.Size)
+	LogEvent(ctx, str_io_readfull_begin)
+	n, err := io.ReadFull(r, i.Data)
+	LogEvent(ctx, str_io_readfull_end)
+	if err != nil {
+		return err
+	}
+	if n != int(i.Size) {
+		return io.ErrUnexpectedEOF
+	}
+
+	if i.WriterForRead != nil {
+		LogEvent(ctx, str_WriterForRead_Write_begin)
+		_, err := i.WriterForRead.Write(i.Data)
+		LogEvent(ctx, str_WriterForRead_Write_end)
+		if err != nil {
+			return err
+		}
+	}
+	if i.ReadCloserForRead != nil {
+		*i.ReadCloserForRead = io.NopCloser(bytes.NewReader(i.Data))
+	}
+	if err := i.setCachedData(ctx, allocator); err != nil {
+		return err
+	}
+
+	i.done = true
+
+	return nil
+}
+
+func CacheOriginalData(ctx context.Context, r io.Reader, data []byte, allocator CacheDataAllocator) (cacheData fscache.Data, err error) {
+	if len(data) == 0 {
+		data, err = io.ReadAll(r)
+		if err != nil {
+			return
+		}
+	}
+	cacheData = allocator.CopyToCacheData(ctx, data)
+	return
+}
+
+func (i *IOEntry) prepareData(ctx context.Context) (finally func(err *error)) {
+	LogEvent(ctx, str_prepareData_begin)
+	defer LogEvent(ctx, str_prepareData_end)
+	if cap(i.Data) < int(i.Size) {
+		slice, dec, err := ioAllocator().Allocate(uint64(i.Size), malloc.NoHints)
+		if err != nil {
+			panic(err)
+		}
+		i.Data = slice
+		if i.releaseData != nil {
+			i.releaseData()
+		}
+		i.releaseData = func() {
+			dec.Deallocate(malloc.NoHints)
+		}
+		finally = func(err *error) {
+			if err != nil && *err != nil {
+				dec.Deallocate(malloc.NoHints)
+			}
+		}
+
+	} else {
+		i.Data = i.Data[:i.Size]
+		finally = noopFinally
+	}
+
+	return
+}
+
+func noopFinally(*error) {}

@@ -17,12 +17,12 @@ package testengine
 import (
 	"context"
 	"fmt"
-	"log"
 
 	"github.com/matrixorigin/matrixone/pkg/compress"
 	"github.com/matrixorigin/matrixone/pkg/container/batch"
 	"github.com/matrixorigin/matrixone/pkg/container/types"
 	"github.com/matrixorigin/matrixone/pkg/container/vector"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
 	"github.com/matrixorigin/matrixone/pkg/testutil"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine"
 )
@@ -37,9 +37,10 @@ func CreateR(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "orderid",
-					Type: types.New(types.T_varchar, 10, 0),
+					Alg:     compress.Lz4,
+					Name:    "orderid",
+					Type:    types.New(types.T_varchar, 10, 0),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -55,15 +56,15 @@ func CreateR(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "r", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
-	r, err := db.Relation(ctx, "r")
+	r, err := db.Relation(ctx, "r", nil)
 	if err != nil {
-		log.Fatal(err)
+		logutil.Fatal(err.Error())
 	}
 	{
-		bat := batch.New(true, []string{"orderid", "uid", "price"})
+		bat := batch.New([]string{"orderid", "uid", "price"})
 		{
 			{
 				vec := vector.NewVec(types.T_varchar.ToType())
@@ -73,7 +74,7 @@ func CreateR(db engine.Database) {
 				}
 				// XXX MPOOL
 				if err := vector.AppendBytesList(vec, vs, nil, testEngineMp); err != nil {
-					log.Fatal(err)
+					logutil.Fatal(err.Error())
 				}
 				bat.Vecs[0] = vec
 			}
@@ -84,7 +85,7 @@ func CreateR(db engine.Database) {
 					vs[i] = uint32(i % 4)
 				}
 				if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-					log.Fatal(err)
+					logutil.Fatal(err.Error())
 				}
 				bat.Vecs[1] = vec
 			}
@@ -95,17 +96,17 @@ func CreateR(db engine.Database) {
 					vs[i] = float64(i)
 				}
 				if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-					log.Fatal(err)
+					logutil.Fatal(err.Error())
 				}
 				bat.Vecs[2] = vec
 			}
 		}
 		if err := r.Write(ctx, bat); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 	{
-		bat := batch.New(true, []string{"orderid", "uid", "price"})
+		bat := batch.New([]string{"orderid", "uid", "price"})
 		{
 			vec := vector.NewVec(types.T_varchar.ToType())
 			vs := make([][]byte, 10)
@@ -113,7 +114,7 @@ func CreateR(db engine.Database) {
 				vs[i-10] = []byte(fmt.Sprintf("%v", i))
 			}
 			if err := vector.AppendBytesList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[0] = vec
 		}
@@ -124,7 +125,7 @@ func CreateR(db engine.Database) {
 				vs[i-10] = uint32(i % 4)
 			}
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[1] = vec
 		}
@@ -135,12 +136,12 @@ func CreateR(db engine.Database) {
 				vs[i-10] = float64(i)
 			}
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[2] = vec
 		}
 		if err := r.Write(ctx, bat); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 }
@@ -153,9 +154,10 @@ func CreateS(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "orderid",
-					Type: types.New(types.T_varchar, 10, 0),
+					Alg:     compress.Lz4,
+					Name:    "orderid",
+					Type:    types.New(types.T_varchar, 10, 0),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -171,24 +173,24 @@ func CreateS(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "s", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
-	r, err := db.Relation(ctx, "s")
+	r, err := db.Relation(ctx, "s", nil)
 	if err != nil {
-		log.Fatal(err)
+		logutil.Fatal(err.Error())
 	}
 	{
-		bat := batch.New(true, []string{"orderid", "uid", "price"})
+		bat := batch.New([]string{"orderid", "uid", "price"})
 		{
 			{
 				vec := vector.NewVec(types.T_varchar.ToType())
 				vs := make([][]byte, 10)
 				for i := 0; i < 10; i++ {
-					vs[i] = []byte(fmt.Sprintf("%v", i*2))
+					vs[i] = []byte(fmt.Sprintf("%v", 30+i))
 				}
 				if err := vector.AppendBytesList(vec, vs, nil, testEngineMp); err != nil {
-					log.Fatal(err)
+					logutil.Fatal(err.Error())
 				}
 				bat.Vecs[0] = vec
 			}
@@ -199,7 +201,7 @@ func CreateS(db engine.Database) {
 					vs[i] = uint32(i % 2)
 				}
 				if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-					log.Fatal(err)
+					logutil.Fatal(err.Error())
 				}
 				bat.Vecs[1] = vec
 			}
@@ -210,25 +212,25 @@ func CreateS(db engine.Database) {
 					vs[i] = float64(i)
 				}
 				if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-					log.Fatal(err)
+					logutil.Fatal(err.Error())
 				}
 				bat.Vecs[2] = vec
 			}
 		}
 		if err := r.Write(ctx, bat); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 	{
-		bat := batch.New(true, []string{"orderid", "uid", "price"})
+		bat := batch.New([]string{"orderid", "uid", "price"})
 		{
 			vec := vector.NewVec(types.T_varchar.ToType())
 			vs := make([][]byte, 10)
 			for i := 10; i < 20; i++ {
-				vs[i-10] = []byte(fmt.Sprintf("%v", i*2))
+				vs[i-10] = []byte(fmt.Sprintf("%v", 40+i))
 			}
 			if err := vector.AppendBytesList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[0] = vec
 		}
@@ -239,7 +241,7 @@ func CreateS(db engine.Database) {
 				vs[i-10] = uint32(i % 2)
 			}
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[1] = vec
 		}
@@ -250,12 +252,12 @@ func CreateS(db engine.Database) {
 				vs[i-10] = float64(i)
 			}
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[2] = vec
 		}
 		if err := r.Write(ctx, bat); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 }
@@ -268,9 +270,10 @@ func CreateT(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "id",
-					Type: types.T_varchar.ToType(),
+					Alg:     compress.Lz4,
+					Name:    "id",
+					Type:    types.T_varchar.ToType(),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -280,7 +283,7 @@ func CreateT(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "t", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 
@@ -294,9 +297,10 @@ func CreateT1(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "spid",
-					Type: types.T_int32.ToType(),
+					Alg:     compress.Lz4,
+					Name:    "spid",
+					Type:    types.T_int32.ToType(),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -312,15 +316,15 @@ func CreateT1(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "t1", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
-	r, err := db.Relation(ctx, "t1")
+	r, err := db.Relation(ctx, "t1", nil)
 	if err != nil {
-		log.Fatal(err)
+		logutil.Fatal(err.Error())
 	}
 	{
-		bat := batch.New(true, []string{"spid", "userid", "score"})
+		bat := batch.New([]string{"spid", "userid", "score"})
 		{
 			vec := vector.NewVec(types.T_int32.ToType())
 			vs := make([]int32, 5)
@@ -330,7 +334,7 @@ func CreateT1(db engine.Database) {
 			vs[3] = 3
 			vs[4] = 1
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[0] = vec
 		}
@@ -343,7 +347,7 @@ func CreateT1(db engine.Database) {
 			vs[3] = 3
 			vs[4] = 1
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[1] = vec
 		}
@@ -356,23 +360,23 @@ func CreateT1(db engine.Database) {
 			vs[3] = 3
 			vs[4] = 5
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[2] = vec
 		}
 		if err := r.Write(ctx, bat); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 	{
-		bat := batch.New(true, []string{"spid", "userid", "score"})
+		bat := batch.New([]string{"spid", "userid", "score"})
 		{
 			vec := vector.NewVec(types.T_int32.ToType())
 			vs := make([]int32, 2)
 			vs[0] = 4
 			vs[1] = 5
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[0] = vec
 		}
@@ -382,7 +386,7 @@ func CreateT1(db engine.Database) {
 			vs[0] = 6
 			vs[1] = 11
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[1] = vec
 		}
@@ -392,12 +396,12 @@ func CreateT1(db engine.Database) {
 			vs[0] = 10
 			vs[1] = 99
 			if err := vector.AppendFixedList(vec, vs, nil, testEngineMp); err != nil {
-				log.Fatal(err)
+				logutil.Fatal(err.Error())
 			}
 			bat.Vecs[2] = vec
 		}
 		if err := r.Write(ctx, bat); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 }
@@ -410,9 +414,10 @@ func CreateCustomer(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "c_custkey",
-					Type: types.T_int64.ToType(),
+					Alg:     compress.Lz4,
+					Name:    "c_custkey",
+					Type:    types.T_int64.ToType(),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -458,7 +463,7 @@ func CreateCustomer(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "customer", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 }
@@ -573,7 +578,7 @@ func CreateLineorder(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "lineorder", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 }
@@ -586,9 +591,10 @@ func CreatePart(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "p_partkey",
-					Type: types.T_int64.ToType(),
+					Alg:     compress.Lz4,
+					Name:    "p_partkey",
+					Type:    types.T_int64.ToType(),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -640,7 +646,7 @@ func CreatePart(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "part", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 }
@@ -653,9 +659,10 @@ func CreateSupplier(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "s_suppkey",
-					Type: types.T_int64.ToType(),
+					Alg:     compress.Lz4,
+					Name:    "s_suppkey",
+					Type:    types.T_int64.ToType(),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -695,7 +702,7 @@ func CreateSupplier(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "supplier", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
 		}
 	}
 }
@@ -708,9 +715,10 @@ func CreateDate(db engine.Database) {
 		{
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
-					Alg:  compress.Lz4,
-					Name: "d_datekey",
-					Type: types.T_varchar.ToType(),
+					Alg:     compress.Lz4,
+					Name:    "d_datekey",
+					Type:    types.T_varchar.ToType(),
+					Primary: true,
 				}})
 			attrs = append(attrs, &engine.AttributeDef{
 				Attr: engine.Attribute{
@@ -762,7 +770,45 @@ func CreateDate(db engine.Database) {
 				}})
 		}
 		if err := db.Create(ctx, "dates", attrs); err != nil {
-			log.Fatal(err)
+			logutil.Fatal(err.Error())
+		}
+	}
+}
+
+func CreateCompressFileTable(db engine.Database) {
+	ctx := context.TODO()
+	{
+		var attrs []engine.TableDef
+
+		{
+			attrs = append(attrs, &engine.AttributeDef{
+				Attr: engine.Attribute{
+					Alg:  compress.Lz4,
+					Name: "a",
+					Type: types.T_int32.ToType(),
+				}})
+			attrs = append(attrs, &engine.AttributeDef{
+				Attr: engine.Attribute{
+					Alg:     compress.Lz4,
+					Name:    "b",
+					Type:    types.T_int32.ToType(),
+					Primary: true,
+				}})
+			attrs = append(attrs, &engine.AttributeDef{
+				Attr: engine.Attribute{
+					Alg:  compress.Lz4,
+					Name: "c",
+					Type: types.T_int32.ToType(),
+				}})
+			attrs = append(attrs, &engine.AttributeDef{
+				Attr: engine.Attribute{
+					Alg:  compress.Lz4,
+					Name: "d",
+					Type: types.T_int32.ToType(),
+				}})
+		}
+		if err := db.Create(ctx, "pressTbl", attrs); err != nil {
+			logutil.Fatal(err.Error())
 		}
 	}
 }

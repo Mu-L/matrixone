@@ -33,15 +33,16 @@ func RunLockServicesForTest(
 	serviceIDs []string,
 	lockTableBindTimeout time.Duration,
 	fn func(LockTableAllocator, []LockService),
-	adjustConfig func(*Config)) {
+	adjustConfig func(*Config),
+	opts ...Option,
+) {
+	defaultLazyCheckDuration.Store(time.Millisecond * 50)
 	testSockets := fmt.Sprintf("unix:///tmp/%d.sock", time.Now().Nanosecond())
-	runtime.SetupProcessLevelRuntime(runtime.DefaultRuntimeWithLevel(level))
-	allocator := NewLockTableAllocator(testSockets, lockTableBindTimeout, morpc.Config{})
 	services := make([]LockService, 0, len(serviceIDs))
-
 	cns := make([]metadata.CNService, 0, len(serviceIDs))
 	configs := make([]Config, 0, len(serviceIDs))
 	for _, v := range serviceIDs {
+		runtime.SetupServiceBasedRuntime(v, runtime.ServiceRuntime(""))
 		address := fmt.Sprintf("unix:///tmp/service-%d-%s.sock",
 			time.Now().Nanosecond(), v)
 		if err := os.RemoveAll(address[7:]); err != nil {
@@ -53,26 +54,41 @@ func RunLockServicesForTest(
 		})
 		configs = append(configs, Config{ServiceID: v, ListenAddress: address})
 	}
+
 	cluster := clusterservice.NewMOCluster(
+		"",
 		nil,
 		0,
 		clusterservice.WithDisableRefresh(),
 		clusterservice.WithServices(
 			cns,
-			[]metadata.DNService{
+			[]metadata.TNService{
 				{
 					LockServiceAddress: testSockets,
 				},
 			}))
-	runtime.ProcessLevelRuntime().SetGlobalVariables(runtime.ClusterService, cluster)
+	runtime.ServiceRuntime("").SetGlobalVariables(runtime.ClusterService, cluster)
+	defer cluster.Close()
 
+	var removeDisconnectDuration time.Duration
 	for _, cfg := range configs {
 		if adjustConfig != nil {
 			adjustConfig(&cfg)
+			removeDisconnectDuration = cfg.removeDisconnectDuration
 		}
 		services = append(services,
-			NewLockService(cfg).(*service))
+			NewLockService(cfg, opts...).(*service))
 	}
+
+	allocator := NewLockTableAllocator(
+		"",
+		testSockets,
+		lockTableBindTimeout,
+		morpc.Config{},
+		func(lta *lockTableAllocator) {
+			lta.options.removeDisconnectDuration = removeDisconnectDuration
+		},
+	)
 	fn(allocator.(*lockTableAllocator), services)
 
 	for _, s := range services {
@@ -88,26 +104,76 @@ func RunLockServicesForTest(
 // WaitWaiters wait waiters
 func WaitWaiters(
 	ls LockService,
+	group uint32,
 	table uint64,
 	key []byte,
 	waitersCount int) error {
 	s := ls.(*service)
-	v, err := s.getLockTable(table)
+	v, err := s.getLockTable(group, table)
 	if err != nil {
 		return err
 	}
 
-	lb := v.(*localLockTable)
-	lb.mu.Lock()
-	lock, ok := lb.mu.store.Get(key)
-	if !ok {
-		panic("missing lock")
+	return waitLocalWaiters(v.(*localLockTable), key, waitersCount)
+}
+
+func waitLocalWaiters(
+	lt *localLockTable,
+	key []byte,
+	waitersCount int) error {
+	fn := func() bool {
+		lt.mu.Lock()
+		defer lt.mu.Unlock()
+
+		lock, ok := lt.mu.store.Get(key)
+		if waitersCount == 0 && !ok {
+			return true
+		}
+
+		if !ok {
+			return false
+		}
+
+		waiters := make([]*waiter, 0)
+		lock.waiters.iter(func(w *waiter) bool {
+			waiters = append(waiters, w)
+			return true
+		})
+		return len(waiters) == waitersCount
 	}
-	lb.mu.Unlock()
+
 	for {
-		if lock.waiter.waiters.len() == waitersCount {
+		if fn() {
 			return nil
 		}
 		time.Sleep(time.Millisecond * 10)
 	}
+}
+
+func checkLocalWaitersStatus(
+	lt *localLockTable,
+	key []byte,
+	status []waiterStatus) bool {
+	lt.mu.Lock()
+	defer lt.mu.Unlock()
+
+	lock, ok := lt.mu.store.Get(key)
+	if !ok {
+		panic("missing lock")
+	}
+
+	if lock.waiters.size() != len(status) {
+		return false
+	}
+
+	i := 0
+	statusCheckOK := true
+	lock.waiters.iter(func(w *waiter) bool {
+		if statusCheckOK {
+			statusCheckOK = w.getStatus() == status[i]
+		}
+		i++
+		return true
+	})
+	return statusCheckOK
 }

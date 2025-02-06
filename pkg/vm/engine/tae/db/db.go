@@ -15,74 +15,261 @@
 package db
 
 import (
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/dataio/blockio"
+	"context"
+	"fmt"
 	"io"
 	"sync/atomic"
-
-	gc2 "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/gc"
-
-	"github.com/matrixorigin/matrixone/pkg/objectio"
-
-	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"time"
 
 	"github.com/matrixorigin/matrixone/pkg/common/moerr"
-	"github.com/matrixorigin/matrixone/pkg/txn/client"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/buffer/base"
+	"github.com/matrixorigin/matrixone/pkg/container/types"
+	"github.com/matrixorigin/matrixone/pkg/logutil"
+	"github.com/matrixorigin/matrixone/pkg/txn/rpc"
+	"github.com/matrixorigin/matrixone/pkg/util/fault"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/catalog"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/checkpoint"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/gc"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/dbutils"
+	gc2 "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/gc/v3"
+	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/db/merge"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/iface/txnif"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/logtail"
-	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/model"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/options"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tables"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks"
 	wb "github.com/matrixorigin/matrixone/pkg/vm/engine/tae/tasks/worker/base"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/txn/txnbase"
 	"github.com/matrixorigin/matrixone/pkg/vm/engine/tae/wal"
+	"go.uber.org/zap"
 )
 
 var (
 	ErrClosed = moerr.NewInternalErrorNoCtx("tae: closed")
 )
 
+type DBTxnMode uint32
+
+const (
+	DBTxnMode_Write DBTxnMode = iota
+	DBTxnMode_Replay
+)
+
+func (m DBTxnMode) String() string {
+	switch m {
+	case DBTxnMode_Write:
+		return "TxnWriteMode"
+	case DBTxnMode_Replay:
+		return "TxnReplayMode"
+	default:
+		return fmt.Sprintf("UnknownTxnMode(%d)", m)
+	}
+}
+
+func (m DBTxnMode) IsValid() bool {
+	return m == DBTxnMode_Write || m == DBTxnMode_Replay
+}
+
+func (m DBTxnMode) IsWriteMode() bool {
+	return m == DBTxnMode_Write
+}
+
+func (m DBTxnMode) IsReplayMode() bool {
+	return m == DBTxnMode_Replay
+}
+
+type DBOption func(*DB)
+
+func WithTxnMode(mode DBTxnMode) DBOption {
+	return func(db *DB) {
+		db.TxnMode.Store(uint32(mode))
+	}
+}
+
 type DB struct {
-	Dir  string
+	Dir        string
+	TxnMode    atomic.Uint32
+	Controller *Controller
+
+	TxnServer rpc.TxnServer
+
 	Opts *options.Options
 
-	Catalog *catalog.Catalog
+	usageMemo *logtail.TNUsageMemo
+	Catalog   *catalog.Catalog
 
-	MTBufMgr  base.INodeManager
-	TxnBufMgr base.INodeManager
-
-	TxnMgr        *txnbase.TxnManager
-	TransferTable *model.HashPageTable
+	TxnMgr *txnbase.TxnManager
 
 	LogtailMgr *logtail.Manager
 	Wal        wal.Driver
 
-	Scheduler tasks.TaskScheduler
-
-	GCManager *gc.Manager
+	CronJobs *tasks.CancelableJobs
 
 	BGScanner          wb.IHeartbeater
 	BGCheckpointRunner checkpoint.Runner
+	BGFlusher          checkpoint.Flusher
+
+	MergeScheduler *merge.Scheduler
 
 	DiskCleaner *gc2.DiskCleaner
-	Pipeline    *blockio.IoPipeline
 
-	Fs *objectio.ObjectFS
+	Runtime *dbutils.Runtime
 
 	DBLocker io.Closer
 
 	Closed *atomic.Value
 }
 
+func (db *DB) GetTxnMode() DBTxnMode {
+	return DBTxnMode(db.TxnMode.Load())
+}
+
+func (db *DB) IsReplayMode() bool {
+	return db.GetTxnMode() == DBTxnMode_Replay
+}
+
+func (db *DB) IsWriteMode() bool {
+	return db.GetTxnMode() == DBTxnMode_Write
+}
+
+func (db *DB) SwitchTxnMode(
+	ctx context.Context,
+	iarg int,
+	sarg string,
+) error {
+	return db.Controller.SwitchTxnMode(ctx, iarg, sarg)
+}
+
+func (db *DB) GetUsageMemo() *logtail.TNUsageMemo {
+	return db.usageMemo
+}
+
+func (db *DB) CollectCheckpointsInRange(
+	ctx context.Context, start, end types.TS,
+) (ckpLoc string, lastEnd types.TS, err error) {
+	return db.BGCheckpointRunner.CollectCheckpointsInRange(ctx, start, end)
+}
+
 func (db *DB) FlushTable(
+	ctx context.Context,
 	tenantID uint32,
 	dbId, tableId uint64,
-	ts types.TS) (err error) {
-	err = db.BGCheckpointRunner.FlushTable(dbId, tableId, ts)
+	ts types.TS,
+) (err error) {
+	err = db.BGFlusher.FlushTable(ctx, dbId, tableId, ts)
+	return
+}
+
+func (db *DB) ForceFlush(
+	ctx context.Context, ts types.TS,
+) (err error) {
+	return db.BGFlusher.ForceFlush(
+		ctx, ts,
+	)
+}
+
+func (db *DB) ForceCheckpoint(
+	ctx context.Context,
+	ts types.TS,
+) (err error) {
+	var (
+		t0        = time.Now()
+		flushCost time.Duration
+	)
+
+	defer func() {
+		logger := logutil.Info
+		if err != nil {
+			logger = logutil.Error
+		}
+		logger(
+			"ICKP-Control-Force-End",
+			zap.Error(err),
+			zap.Duration("total-cost", time.Since(t0)),
+			zap.String("ts", ts.ToString()),
+			zap.Duration("flush-cost", flushCost),
+		)
+	}()
+
+	err = db.BGFlusher.ForceFlush(ctx, ts)
+	flushCost = time.Since(t0)
+	if err != nil {
+		return
+	}
+
+	err = db.BGCheckpointRunner.ForceICKP(ctx, &ts)
+	return
+}
+
+func (db *DB) ForceGlobalCheckpoint(
+	ctx context.Context,
+	ts types.TS,
+	histroyRetention time.Duration,
+) (err error) {
+	t0 := time.Now()
+	err = db.BGFlusher.ForceFlush(ctx, ts)
+	forceICKPDuration := time.Since(t0)
+	defer func() {
+		logger := logutil.Info
+		if err != nil {
+			logger = logutil.Error
+		}
+		logger(
+			"DB-Force-ICKP",
+			zap.Duration("total-cost", time.Since(t0)),
+			zap.Duration("force-flush-cost", forceICKPDuration),
+			zap.Duration("histroy-retention", histroyRetention),
+			zap.Error(err),
+		)
+	}()
+
+	if err != nil {
+		return
+	}
+
+	err = db.BGCheckpointRunner.ForceGCKP(
+		ctx, ts, histroyRetention,
+	)
+	return err
+}
+
+func (db *DB) ForceCheckpointForBackup(
+	ctx context.Context,
+	ts types.TS,
+) (location string, err error) {
+	t0 := time.Now()
+	err = db.ForceCheckpoint(ctx, ts)
+	t1 := time.Now()
+
+	defer func() {
+		logger := logutil.Info
+		if err != nil {
+			logger = logutil.Error
+		}
+		logger(
+			"Force-Backup-CKP",
+			zap.Duration("total-cost", time.Since(t0)),
+			zap.Duration("force-ickp-cost", t1.Sub(t0)),
+			zap.Duration("create-backup-cost", time.Since(t1)),
+			zap.String("location", location),
+			zap.Error(err),
+		)
+	}()
+
+	if err != nil {
+		return
+	}
+
+	maxEntry := db.BGCheckpointRunner.MaxIncrementalCheckpoint()
+	maxEnd := maxEntry.GetEnd()
+	start := maxEnd.Next()
+	end := db.TxnMgr.Now()
+	if err = db.BGFlusher.ForceFlush(ctx, end); err != nil {
+		return
+	}
+
+	location, err = db.BGCheckpointRunner.CreateSpecialCheckpointFile(
+		ctx, start, end,
+	)
+
 	return
 }
 
@@ -91,12 +278,11 @@ func (db *DB) StartTxn(info []byte) (txnif.AsyncTxn, error) {
 }
 
 func (db *DB) CommitTxn(txn txnif.AsyncTxn) (err error) {
-	return txn.Commit()
+	return txn.Commit(context.Background())
 }
 
-func (db *DB) GetTxnByCtx(txnOperator client.TxnOperator) (txn txnif.AsyncTxn, err error) {
-	txnID := txnOperator.Txn().ID
-	txn = db.TxnMgr.GetTxnByCtx(txnID)
+func (db *DB) GetTxnByID(id []byte) (txn txnif.AsyncTxn, err error) {
+	txn = db.TxnMgr.GetTxnByCtx(id)
 	if txn == nil {
 		err = moerr.NewNotFoundNoCtx()
 	}
@@ -106,32 +292,59 @@ func (db *DB) GetTxnByCtx(txnOperator client.TxnOperator) (txn txnif.AsyncTxn, e
 func (db *DB) GetOrCreateTxnWithMeta(
 	info []byte,
 	id []byte,
-	ts types.TS) (txn txnif.AsyncTxn, err error) {
+	ts types.TS,
+) (txn txnif.AsyncTxn, err error) {
 	return db.TxnMgr.GetOrCreateTxnWithMeta(info, id, ts)
 }
 
-func (db *DB) GetTxn(id string) (txn txnif.AsyncTxn, err error) {
-	txn = db.TxnMgr.GetTxn(id)
-	if txn == nil {
-		err = moerr.NewTxnNotFoundNoCtx()
-	}
-	return
+func (db *DB) StartTxnWithStartTSAndSnapshotTS(
+	info []byte,
+	ts types.TS,
+) (txn txnif.AsyncTxn, err error) {
+	return db.TxnMgr.StartTxnWithStartTSAndSnapshotTS(info, ts, ts)
 }
 
 func (db *DB) RollbackTxn(txn txnif.AsyncTxn) error {
-	return txn.Rollback()
+	return txn.Rollback(context.Background())
 }
 
-func (db *DB) Replay(dataFactory *tables.DataFactory, maxTs types.TS) {
-	// maxTs := db.Catalog.GetCheckpointed().MaxTS
-	replayer := newReplayer(dataFactory, db, maxTs)
-	replayer.OnTimeStamp(maxTs)
-	replayer.Replay()
-
-	err := db.TxnMgr.Init(replayer.GetMaxTS())
-	if err != nil {
-		panic(err)
+func (db *DB) ReplayWal(
+	ctx context.Context,
+	dataFactory *tables.DataFactory,
+	maxTs types.TS,
+	lsn uint64,
+	valid bool,
+) (err error) {
+	if !valid {
+		logutil.Infof("checkpoint version is too small, LSN check is disable")
 	}
+	replayer := newWalReplayer(dataFactory, db, maxTs, lsn, valid)
+	if err = replayer.Replay(ctx); err != nil {
+		return
+	}
+
+	if err = db.TxnMgr.Init(replayer.GetMaxTS()); err != nil {
+		return
+	}
+
+	// TODO: error?
+	db.usageMemo.EstablishFromCKPs(db.Catalog)
+	return
+}
+
+func (db *DB) AddFaultPoint(
+	ctx context.Context, name string, freq string,
+	action string, iarg int64, sarg string, constant bool,
+) error {
+	return fault.AddFaultPoint(ctx, name, freq, action, iarg, sarg, constant)
+}
+
+func (db *DB) ResetTxnHeartbeat() {
+	db.TxnMgr.ResetHeartbeat()
+}
+
+func (db *DB) StopTxnHeartbeat() {
+	db.TxnMgr.StopHeartbeat()
 }
 
 func (db *DB) Close() error {
@@ -139,15 +352,18 @@ func (db *DB) Close() error {
 		panic(err)
 	}
 	db.Closed.Store(ErrClosed)
-	db.GCManager.Stop()
+	db.Controller.Stop()
+	db.CronJobs.Reset()
 	db.BGScanner.Stop()
+	db.BGFlusher.Stop()
 	db.BGCheckpointRunner.Stop()
-	db.Scheduler.Stop()
+	db.Runtime.Scheduler.Stop()
 	db.TxnMgr.Stop()
 	db.LogtailMgr.Stop()
-	db.Wal.Close()
-	db.Opts.Catalog.Close()
+	db.Catalog.Close()
 	db.DiskCleaner.Stop()
-	db.TransferTable.Close()
+	db.Wal.Close()
+	db.Runtime.TransferTable.Close()
+	db.usageMemo.Clear()
 	return db.DBLocker.Close()
 }
